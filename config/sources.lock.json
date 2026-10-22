@@ -3,33 +3,80 @@
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "unixnu": {
     "repo": "https://github.com/UniXNU/UniXNU",
-    "commit": null,
-    "commit_note": "M0 must pin an actual commit; null = not yet frozen. Do not build from a moving branch."
+    "commit": "b881ac7dc1695ce676c856873051a487c6a9f963",
+    "commit_note": "Pinned 2026-10-22 from the working clone under local-private/upstream/UniXNU. Do not build from a moving branch."
   },
   "device_repo": {
     "repo": "https://github.com/xVanTuring/UniXNU-qemu",
-    "commit": null,
-    "commit_note": "M0 must pin an actual commit; null = not yet frozen."
+    "commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
+    "commit_note": "Pinned 2026-10-22 from the working clone under local-private/upstream/UniXNU-qemu. Its board.toml is the source of the system_identity fields below."
   },
-  "submodules": [],
-  "feeds": [],
+  "submodules": [
+    {"path": "drivers/ArmCpu", "commit": "1951cc8444b340d7d8879e9418220cf29eb711d7"},
+    {"path": "drivers/ArmDTPlatform", "commit": "0d544705c2e89725caabc0542bb96bc8febd8c70"},
+    {"path": "drivers/ArmVirtPlatform", "commit": "532de8c017e394e69a0b48dc0ffc4ac0d0701177"},
+    {"path": "drivers/DarwinBoot", "commit": "d099354d0eab34df5088ca1ba89c9c88bc3260bb"},
+    {"path": "drivers/NativeAES", "commit": "a34964b8c2fec2e83c8e4f68fb7d6fb7e4b2227b"},
+    {"path": "drivers/NativeAdreno", "commit": "cedcaa2949c795e71a47e78ae413c8a41b17d7d0"},
+    {"path": "drivers/NativeGeniSpi", "commit": "b5399b5646c4d7415deec6d887fd51715a97a024"},
+    {"path": "drivers/NativeHidInput", "commit": "28f9b463b48e862f2def91d29c11b9143785715e"},
+    {"path": "drivers/NativeKeyStoreEvents", "commit": "e59bac4ad1ac8825919ae94da8440a64d8ab90b3"},
+    {"path": "drivers/NativeMetal", "commit": "a96feceda55e8fed1e20c0a2998736cef7aab006"},
+    {"path": "drivers/NativeMobileDisplay", "commit": "c031d882b9721d943383d11f66dc4748252ce929"},
+    {"path": "drivers/NativeRamBlock", "commit": "d4d22d9819b0162eda49f6402235dddc2279410d"},
+    {"path": "drivers/NativeUfs", "commit": "af785c1777161a62931425c2faaa536ce0bebd5b"},
+    {"path": "drivers/NativeVirtioBlock", "commit": "98909eb9198a4360d7a43be831887cb8b74d814d"},
+    {"path": "drivers/NativeVirtioConsole", "commit": "066f9bded311233ed56824e13a5628077619efda"},
+    {"path": "kits/AdrenoFirmware", "commit": "40fdb8ea87606612ac6f1e80bbb49955d0ce4051"},
+    {"path": "kits/AdrenoPM4", "commit": "445f8fe6d115738352b9d78dc70af6d61aa7f62f"},
+    {"path": "kits/AirNir", "commit": "032a867b5dc3121164bbd706e4e81e3b9fcd2b8f"},
+    {"path": "kits/ArmSmmu4K", "commit": "4d0d6598b1a36aeec3de01091893fa6660e49388"},
+    {"path": "kits/NativePrelink", "commit": "2b6ffb50117eee820b98aca9bd51b5c7dfb2970e"},
+    {"path": "kits/VerifiedRoot", "commit": "2854c61f6c4dfda870ac3d93e1f03d9181edb041"}
+  ],
+  "feeds": [
+    {"name": "xnu", "git": "https://github.com/apple-oss-distributions/xnu.git", "ref": "xnu-10063.141.1", "commit": "d8b80295118ef25ac3a784134bcf95cd8e88109f", "darwin": "23.6.0", "version": "10063.141.1"},
+    {"name": "libplatform", "git": "https://github.com/apple-oss-distributions/libplatform.git", "ref": "libplatform-316.100.10", "commit": "a00a4cc36da2110578bcf3b8eeeeb93dcc7f4e11"},
+    {"name": "libdispatch", "git": "https://github.com/apple-oss-distributions/libdispatch.git", "ref": "libdispatch-1477.100.9", "commit": "30fe6a7d945340ce69cef121132f049e810089a5"},
+    {"name": "AvailabilityVersions", "git": "https://github.com/apple-oss-distributions/AvailabilityVersions.git", "ref": "AvailabilityVersions-141.1", "commit": "933f9360f1b70dfbda5548386a3d65e0358b4f7d"},
+    {"name": "edk2", "git": "https://github.com/microsoft/mu_basecore.git", "ref": "release/202608", "commit": "cfb93724a06ff86ff5ba971413368a7809ee42a5"},
+    {"name": "libpthread", "git": "https://github.com/apple-oss-distributions/libpthread.git", "ref": "libpthread-519.120.4", "commit": "c0e60fb5ecfc54cf379c261d3f9572cc22ded891"},
+    {"name": "corecrypto-2023", "git": "https://github.com/ONLYA/corecrypto-2023.git", "commit": "11fba65b12d8830630e248dfa8344caf8b065f26"},
+    {"name": "IOStorageFamily", "git": "https://github.com/apple-oss-distributions/IOStorageFamily.git", "ref": "main", "commit": "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"}
+  ],
   "system_identity": {
     "board": "iPad7,1",
+    "product": "iPad_Pro_HFR",
     "system": "iPadOS 17.7.11",
+    "build": "21H461",
+    "device_class": "j120ap",
+    "chip_id": "0x8011",
+    "board_id": 12,
     "build_candidates": ["21H161", "21H461"],
-    "discrepancy": "PRD cites both build 21H161 (appendix A) and 21H461 (section 2.1 E04). M0 must resolve the exact build from the pinned board.toml / actual IPSW and update this field with evidence."
+    "resolved_to": "21H461",
+    "resolution": "RESOLVED 2026-10-23 (ADR-0001 open item 3). Evidence: (a) the pinned device_repo board.toml line 18 declares build = \"21H461\"; (b) the same board.toml line 15 pins the IPSW URL whose filename carries 21H461; (c) the downloaded IPSW's BuildManifest.plist reports ProductBuildVersion 21H461. The PRD appendix A spelling 21H161 is therefore the transcription error and is superseded.",
+    "resolution_evidence": [
+      "local-private/upstream/UniXNU-qemu/board.toml:15-18",
+      "local-private/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw BuildManifest.plist ProductBuildVersion"
+    ]
   },
   "ipsw": {
-    "name": null,
-    "sha256": null,
-    "source": null,
+    "name": "iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw",
+    "sha256": "c84ad24b6981a859eec499b1802be9ac593acfd3dc0a185a76d06e4d767a1451",
+    "size": 6835124840,
+    "source": "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw",
+    "component_pins": {
+      "044-76040-038.dmg": "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d",
+      "044-76034-038.dmg": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+    },
     "note": "Apple IPSW stays in local-private/ and is never committed (PRD 12)."
   },
   "tools": {
-    "qemu": {"version": null, "build": "native Windows", "accel": "tcg", "note": "M0 must record the exact qemu-system-aarch64 build and version; accelerator must be explicitly TCG on this Intel host."},
-    "xcode": {"version": null, "note": "macOS runner only; recorded from the Actions job."},
-    "python": {"version": "3.12.9", "note": "host inventory 2026-10-22"}
+    "qemu": {"version": null, "build": "native Windows", "accel": "tcg", "note": "Pending: exact qemu-system-aarch64 build and version must be recorded from the installed F:/iosvirtual/local-private/tools/qemu. Accelerator must be explicitly TCG on this Intel host."},
+    "xcode": {"version": null, "note": "macOS runner only; recorded from the Actions job. Not applicable to this Windows host."},
+    "python": {"version": "3.12.9", "note": "host inventory 2026-10-22"},
+    "clang": {"version": null, "note": "Pending: LLVM for Windows install path and version."}
   },
   "frozen": false,
-  "frozen_note": "Set frozen=true only when every null above is filled with evidence."
+  "frozen_note": "Not frozen: tools.qemu.version and tools.clang.version are still null. Every other previously-null field is now filled with evidence. Set frozen=true only after the installed QEMU and clang versions are recorded and a clean build has been run against these pins."
 }

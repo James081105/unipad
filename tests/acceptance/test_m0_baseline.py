@@ -238,10 +238,19 @@ def test_sources_lock_is_present_and_records_frozen_false_as_an_open_item():
     # the open item is *recorded*, with the condition that closes it
     note = lock.get("frozen_note", "")
     assert "frozen=true" in note
-    assert lock["unixnu"]["commit"] is None
-    assert lock["device_repo"]["commit"] is None
-    assert lock["unixnu"]["commit_note"]
-    assert lock["ipsw"]["sha256"] is None  # Apple material stays in local-private/
+
+    # M0 pinned the sources: the commits are real 40-hex SHAs now, not nulls.
+    # A null here would mean the lock regressed to a moving branch.
+    for block in (lock["unixnu"], lock["device_repo"]):
+        commit = block["commit"]
+        assert isinstance(commit, str) and len(commit) == 40, commit
+        int(commit, 16)  # raises for anything that is not hexadecimal
+        assert block["commit_note"]
+
+    # Apple material is referenced by hash, never copied into the repository
+    # (PRD 12): the lock records the IPSW digest, not the file.
+    assert lock["ipsw"]["sha256"] is not None
+    assert lock["ipsw"]["size"] > 0
 
     # tools pinned for M0: Python is recorded, QEMU/Xcode are not yet
     assert lock["tools"]["python"]["version"] == platform.python_version()
@@ -250,7 +259,7 @@ def test_sources_lock_is_present_and_records_frozen_false_as_an_open_item():
 
 
 def test_sources_lock_carries_the_build_number_discrepancy_field():
-    """PRD 2.1 E04: 21H161 vs 21H461 must stay visible until M0 resolves it."""
+    """PRD 2.1 E04: 21H161 vs 21H461 must stay visible, resolved or not."""
     lock = read_json(SOURCES_LOCK)
     identity = lock["system_identity"]
 
@@ -261,11 +270,21 @@ def test_sources_lock_carries_the_build_number_discrepancy_field():
     for build in BUILD_CANDIDATES:
         assert build in candidates
 
-    discrepancy = identity["discrepancy"]
-    assert isinstance(discrepancy, str) and discrepancy.strip()
+    # The history is never dropped: whichever field carries the answer, both
+    # candidate spellings must still appear in it and it must name who decided.
+    resolution = identity.get("resolution") or identity.get("discrepancy") or ""
+    assert isinstance(resolution, str) and resolution.strip()
     for build in BUILD_CANDIDATES:
-        assert build in discrepancy, "the discrepancy field must name both builds"
-    assert "M0" in discrepancy  # and say who has to resolve it
+        assert build in resolution, "the resolution field must name both builds"
+    assert "M0" in resolution or "ADR-0001" in resolution
+
+    # Once resolved, the resolved value must be one of the candidates -- a
+    # third spelling would mean the evidence was not checked.
+    resolved = identity.get("resolved_to")
+    if resolved is not None:
+        assert resolved in candidates
+        assert identity["build"] == resolved
+        assert identity["resolution_evidence"], "a resolution needs citations"
 
 
 # ---------------------------------------------------------------------------
