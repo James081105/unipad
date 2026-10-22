@@ -39,7 +39,13 @@ local-private/  IPSW、客体镜像、种子、密钥（**绝不入 Git**）
 ## 快速开始（代码阶段，Windows）
 
 ```powershell
-python -m pip install -e .          # 安装 unipad 包
+python -m pip install pytest        # 已随本机 Python 3.12.9 提供则跳过
 python -m pytest tests -q           # 运行全部单元与模拟验收测试
 python -m unipad doctor             # 宿主与工具链盘点（WP00 复查）
 ```
+
+> 本机注意：当前 Windows 用户名含非 ASCII 字符，`pip install -e .` 会失败
+> （setuptools "Unexpected condition testing for writable directory"）。
+> 已改用 `.pth` 方式完成可编辑导入：site-packages 下 `unipad.pth` 内容为
+> `F:/iosvirtual/src`。新环境复现时执行：
+> `python -c "import site;print(site.getsitepackages()[0])"` 得到目录后写入同名 `.pth`。
