@@ -1,0 +1,420 @@
+# UniPad pipeline #1: preflight -- PRD 8.2 step 1 ("preflight: 验证输入、锁文件、空间和工具版本")
+# and PRD 8.3 (workflow requirements: dispatch, timeouts, concurrency dedupe, cache keys).
+#
+# What this gate proves (code stage only):
+#   * config/sources.lock.json is structurally valid -- either every required
+#     field is non-null, or the run reports "not frozen" LOUDLY (never silently).
+#   * the package compiles (python -m compileall src),
+#   * the unit stage passes on Windows (python -m pytest tests/unit -q),
+#   * `python -m unipad.controller doctor` can inventory the host/toolchain.
+#
+# It runs on windows-latest because the product target is the Intel Windows host
+# (PRD 4.1) and Windows runners do not spend macOS minutes (PRD 8.4).
+#
+# FOUR-FIELD RULE (CLAUDE.md): this is CODE-STAGE verification on a GitHub
+# runner.  It never claims that iPadOS booted on the user's machine; real-host
+# acceptance stays UNVERIFIED/BLOCKED.
+#
+# Secret handling: only the implicit GITHUB_TOKEN is used (by actions/*), it is
+# never echoed, and no step enables shell tracing (`set -x`).
+
+name: preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Least privilege: preflight only reads the repository (PRD 8.3).
+permissions:
+  contents: read
+
+# PRD 8.3 "同一实验并发去重": dedupe concurrent runs of the same ref.
+# preflight is cheap, so a superseded run may be cancelled without losing
+# paid work or evidence (paid builds use cancel-in-progress: false).
+concurrency:
+  group: unipad-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: preflight (lock, compile, unit tests, doctor)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        id: setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          check-latest: false
+
+      # PRD 8.3: "缓存键包含源码、配置和工具版本" -- the key hashes the pinned
+      # source lock, the packaging config and the Python sources/tests, plus the
+      # runner OS and the exact interpreter version.  Only the pip download cache
+      # is restored across runs; resolved versions come from pyproject.toml, so a
+      # stale cache can never make an old dependency set "succeed".
+      - name: 'Cache pip downloads (key: source + config + tool version)'
+        uses: actions/cache@v4
+        with:
+          path: '~\AppData\Local\pip\Cache'
+          key: unipad-preflight-pip-${{ runner.os }}-py${{ steps.setup.outputs.python-version }}-${{ hashFiles('config/sources.lock.json', 'pyproject.toml', 'src/**/*.py', 'tests/**/*.py') }}
+          restore-keys: |
+            unipad-preflight-pip-${{ runner.os }}-py${{ steps.setup.outputs.python-version }}-
+
+      - name: Install package (editable) and dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Compile package (fails on syntax errors)
+        id: compile
+        run: |
+          mkdir -p preflight
+          python -m compileall -q src 2>&1 | tee preflight/compile.log
+
+      # PRD 8.2 step 1: validate the lock, host free space and tool versions.
+      # A lock that is not yet frozen is a reported condition, not a silent pass;
+      # a lock that CLAIMS frozen=true while required fields are null is a hard
+      # failure (config_invalid) because that is a self-contradictory input.
+      - name: Validate sources.lock.json, disk space and tool versions
+        id: lock
+        env:
+          LOCK_PATH: config/sources.lock.json
+          REPORT_DIR: preflight
+        run: |
+          python - <<'PY'
+          """Structural validation of config/sources.lock.json (PRD 8.1 inputs).
+
+          Writes preflight/lock-report.json.  Exit 0 when the lock is usable or
+          merely not frozen (reported); exit 1 on a self-contradictory or
+          unreadable lock.
+          """
+          import hashlib
+          import json
+          import os
+          import shutil
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          LOCK = Path(os.environ.get("LOCK_PATH", "config/sources.lock.json"))
+          OUT_DIR = Path(os.environ.get("REPORT_DIR", "preflight"))
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          REQUIRED = (
+              "unixnu.repo",
+              "unixnu.commit",
+              "device_repo.repo",
+              "device_repo.commit",
+              "system_identity.board",
+              "system_identity.system",
+              "tools.qemu.version",
+              "tools.qemu.accel",
+              "tools.python.version",
+          )
+
+          report = {
+              "schema_version": 1,
+              "check": "sources.lock",
+              "lock_path": LOCK.as_posix(),
+              "lock_sha256": None,
+              "frozen": None,
+              "status": "fail",
+              "missing_fields": [],
+              "fields": {},
+              "accelerator": None,
+              "problems": [],
+              "warnings": [],
+          }
+
+          def dig(dotted, data):
+              cur = data
+              for part in dotted.split("."):
+                  if not isinstance(cur, dict) or part not in cur:
+                      return None, False
+                  cur = cur[part]
+              return cur, True
+
+          def write_report():
+              (OUT_DIR / "lock-report.json").write_text(
+                  json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+              )
+
+          try:
+              raw = LOCK.read_bytes()
+          except OSError as exc:
+              report["problems"].append(f"cannot read {LOCK.as_posix()}: {exc.__class__.__name__}")
+              write_report()
+              print("::error::cannot read config/sources.lock.json")
+              sys.exit(1)
+
+          report["lock_sha256"] = hashlib.sha256(raw).hexdigest()
+          try:
+              data = json.loads(raw.decode("utf-8"))
+          except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+              report["problems"].append(f"lock is not valid JSON/UTF-8: {exc.__class__.__name__}")
+              write_report()
+              print("::error::config/sources.lock.json is not valid JSON (config_invalid)")
+              sys.exit(1)
+          if not isinstance(data, dict):
+              report["problems"].append("lock root is not a JSON object")
+              write_report()
+              sys.exit(1)
+
+          for dotted in REQUIRED:
+              value, present = dig(dotted, data)
+              non_null = present and value not in (None, "", [], {})
+              if isinstance(value, str) and len(value) > 120:
+                  value = value[:117] + "..."
+              report["fields"][dotted] = {"present": present, "non_null": bool(non_null), "value": value}
+
+          frozen = bool(data.get("frozen", False))
+          report["frozen"] = frozen
+          missing = [d for d in REQUIRED if not report["fields"][d]["non_null"]]
+          report["missing_fields"] = missing
+
+          accel = data.get("tools", {}).get("qemu", {}).get("accel") if isinstance(data.get("tools"), dict) else None
+          report["accelerator"] = accel
+          if accel is not None and accel != "tcg":
+              report["problems"].append(
+                  "tools.qemu.accel must be 'tcg' on the Intel Windows host (accelerator_not_tcg)"
+              )
+
+          if frozen and missing:
+              report["problems"].append(
+                  "sources.lock.json declares frozen=true but required fields are null: " + ", ".join(missing)
+              )
+          if not frozen:
+              report["warnings"].append("sources.lock.json is NOT FROZEN (frozen=false)")
+              if missing:
+                  report["warnings"].append("missing required fields: " + ", ".join(missing))
+                  report["status"] = "not_frozen"
+              else:
+                  report["warnings"].append(
+                      "all required fields are non-null but frozen=false; set frozen=true only with evidence"
+                  )
+                  report["status"] = "unfrozen_but_complete"
+          else:
+              report["status"] = "frozen" if not report["problems"] else "fail"
+
+          usage = shutil.disk_usage(Path.cwd())
+          report["host"] = {
+              "cwd": Path.cwd().as_posix(),
+              "free_bytes": usage.free,
+              "free_gb": round(usage.free / 1024 ** 3, 2),
+              "python": sys.version.split()[0],
+              "checked_at": datetime.now(timezone.utc).isoformat(),
+          }
+
+          write_report()
+
+          print(f"source lock status: {report['status']} (frozen={frozen})")
+          for warning in report["warnings"]:
+              print(f"::warning::{warning}")
+          for problem in report["problems"]:
+              print(f"::error::{problem}")
+          print(f"free disk on workspace volume: {report['host']['free_gb']} GB")
+          if report["status"] == "not_frozen":
+              print("::notice::builds that depend on a frozen lock stay BLOCKED until M0 pins real commits (PRD 8.1)")
+
+          sys.exit(1 if report["problems"] else 0)
+          PY
+
+      # Unit stage only at this point (PRD: acceptance/simulation suites live in
+      # tests/acceptance and are run by the controller, not by this cheap gate).
+      # pytest exit code 5 ("no tests collected") is reported as a warning, not a
+      # failure: tests/unit is still being populated in the code stage and an
+      # empty directory is not a failing test.
+      - name: Run unit tests (tests/unit)
+        id: unit
+        run: |
+          mkdir -p preflight
+          set +e
+          python -m pytest tests/unit -q 2>&1 | tee preflight/pytest-unit.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "pytest_exit_code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0)
+              echo "unit tests passed"
+              ;;
+            5)
+              echo "::warning::pytest collected no tests (exit 5): tests/unit is empty at this stage"
+              ;;
+            *)
+              echo "::error::pytest failed with exit code $code"
+              exit "$code"
+              ;;
+          esac
+
+      - name: Doctor (host and toolchain inventory)
+        id: doctor
+        run: |
+          mkdir -p preflight
+          if ! python -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("unipad.controller") else 1)'; then
+            echo "::error::unipad.controller is not importable: the controller package is missing (code-stage blocker, PRD 9.1)"
+            exit 3
+          fi
+          python -m unipad.controller doctor 2>&1 | tee preflight/doctor.log
+
+      - name: Build machine-readable preflight report
+        id: report
+        if: always()
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REF: ${{ github.ref }}
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_NAME: ${{ runner.name }}
+          OUTCOME_COMPILE: ${{ steps.compile.outcome }}
+          OUTCOME_LOCK: ${{ steps.lock.outcome }}
+          OUTCOME_UNIT: ${{ steps.unit.outcome }}
+          OUTCOME_DOCTOR: ${{ steps.doctor.outcome }}
+          PYTEST_EXIT: ${{ steps.unit.outputs.pytest_exit_code }}
+        run: |
+          python - <<'PY'
+          """Merge the preflight evidence into preflight-report.json (PRD 9.2)."""
+          import json
+          import os
+          import platform
+          import shutil
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          lock_report = {}
+          lock_file = Path("preflight/lock-report.json")
+          if lock_file.is_file():
+              try:
+                  lock_report = json.loads(lock_file.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  lock_report = {"status": "fail", "problems": ["lock-report.json is not valid JSON"]}
+
+          pytest_exit = os.environ.get("PYTEST_EXIT", "")
+
+          def outcome(key):
+              return os.environ.get("OUTCOME_" + key.upper(), "unknown")
+
+          usage = shutil.disk_usage(Path.cwd())
+          report = {
+              "schema_version": 1,
+              "workflow": "preflight",
+              "run_id": os.environ.get("RUN_ID", ""),
+              "run_attempt": os.environ.get("RUN_ATTEMPT", ""),
+              "ref": os.environ.get("REF", ""),
+              "commit": os.environ.get("COMMIT", ""),
+              "repository": os.environ.get("REPO", ""),
+              "runner": {
+                  "os": os.environ.get("RUNNER_OS", ""),
+                  "arch": os.environ.get("RUNNER_ARCH", ""),
+                  "name": os.environ.get("RUNNER_NAME", ""),
+              },
+              "python": platform.python_version(),
+              "disk": {
+                  "cwd": Path.cwd().as_posix(),
+                  "free_bytes": usage.free,
+                  "free_gb": round(usage.free / 1024 ** 3, 2),
+              },
+              "source_lock": lock_report,
+              "steps": {
+                  "compile": {"outcome": outcome("compile")},
+                  "source_lock": {
+                      "outcome": outcome("lock"),
+                      "status": lock_report.get("status"),
+                  },
+                  "unit_tests": {
+                      "outcome": outcome("unit"),
+                      "pytest_exit_code": int(pytest_exit) if pytest_exit.isdigit() else None,
+                  },
+                  "doctor": {"outcome": outcome("doctor")},
+              },
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+          }
+
+          failures = [
+              f"{name}: {info['outcome']}"
+              for name, info in report["steps"].items()
+              if info["outcome"] not in ("success", "skipped")
+          ]
+          report["blocking_failures"] = failures
+          report["status"] = "fail" if failures else "pass"
+
+          Path("preflight-report.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          summary = {
+              "status": report["status"],
+              "source_lock_status": lock_report.get("status"),
+              "unit_tests_exit": report["steps"]["unit_tests"]["pytest_exit_code"],
+              "blocking_failures": failures,
+          }
+          print(json.dumps(summary, sort_keys=True))
+          sys.exit(1 if failures else 0)
+          PY
+
+      - name: Upload preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unipad-preflight-${{ github.run_id }}
+          path: |
+            preflight/
+            preflight-report.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Step summary
+        if: always()
+        env:
+          REPORT: preflight-report.json
+          PYTEST_EXIT: ${{ steps.unit.outputs.pytest_exit_code }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          """Write the GitHub step summary from preflight-report.json (evidence, PRD 9.2)."""
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path(os.environ.get("REPORT", "preflight-report.json"))
+          lines = [
+              "### UniPad preflight",
+              "",
+              f"- run_id: {os.environ.get('RUN_ID', '')}",
+              f"- pytest exit code: {os.environ.get('PYTEST_EXIT', '') or 'n/a'}",
+          ]
+          if report_path.is_file():
+              data = json.loads(report_path.read_text(encoding="utf-8"))
+              lines += [
+                  f"- status: {data.get('status')}",
+                  f"- source lock: {data.get('source_lock', {}).get('status')}",
+                  f"- free disk: {data.get('disk', {}).get('free_gb')} GB",
+                  f"- blocking failures: {data.get('blocking_failures')}",
+              ]
+          else:
+              lines.append("- report unavailable: an early step failed before the report was written")
+          lines.append("")
+          lines.append(f"Evidence: artifact `unipad-preflight-{os.environ.get('RUN_ID', '')}` (preflight-report.json, lock-report.json, compile.log, pytest-unit.log, doctor.log).")
+          text = "\n".join(lines) + "\n"
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+          print(text)
+          PY

@@ -1,0 +1,612 @@
+# UniPad pipeline #2: build-macos -- PRD 8.2 step 2 ("build-macos: 按固定版本运行最小构建；只执行所需阶段")
+# plus PRD 8.1 (macOS build input/output contract) and PRD 8.3 (pinned versions,
+# TCG/HVF separation, concurrency dedupe, job timeout, artifact retention, cache keys).
+#
+# Inputs are validated against config/sources.lock.json BEFORE any paid macOS
+# minute is spent: a mismatch fails the job (PRD 8.4 "fail fast").
+#
+# PRD 8.2 step 4 / PRD 12: this job uploads ONLY allowlisted roles
+# (firmware / bootloader / kernel / devicetree / auxiliary).  Full system
+# images, IPSW/DMG/raw disk payloads and private data are excluded by default
+# deny; the manifest records every excluded file so the exclusion is auditable.
+#
+# PINNING NOTE (PRD 8.3): `macos-latest` is deliberately NOT assumed to keep a
+# stable architecture or Xcode.  After M0 the runner image and Xcode/SDK must be
+# pinned here (e.g. runs-on: macos-14 plus an explicit Xcode selection); the
+# resolved versions are already recorded in artifact-manifest.json so a pinning
+# change is visible in the artifact contract.  Even on an arm64 runner, HVF
+# nesting is NOT assumed to exist: the build must stand alone.
+#
+# Cost note (PRD 8.4): the job timeout is also the per-run macOS budget ceiling
+# (~60 min of standard macOS overage is roughly 3.72 USD on a private repo), so
+# the job is expected to finish or fail well before the ceiling.
+
+name: build-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment_id:
+        description: 'Experiment/build identity, e.g. exp-2026-10-22-m2 (PRD 7.3). Also the concurrency dedupe key.'
+        required: true
+        type: string
+      unixnu_commit:
+        description: 'Pinned UniXNU commit (full or abbreviated sha) to build.'
+        required: true
+        type: string
+      device_commit:
+        description: 'Pinned device-repo (UniXNU-qemu) commit to build.'
+        required: true
+        type: string
+      stage:
+        description: 'Milestone/stage to build for, e.g. M2|M3|M4|M5... (PRD 6).'
+        required: false
+        default: 'M2'
+        type: string
+      system_build:
+        description: 'System build identity, e.g. 21H161. Must be one of the pinned build_candidates when the lock is frozen.'
+        required: false
+        default: ''
+        type: string
+      payload_target:
+        description: 'Payload target. tcg for the Intel Windows host; hvf only as a comparison experiment and never published as tcg.'
+        required: false
+        default: 'tcg'
+        type: choice
+        options:
+          - tcg
+          - hvf
+
+# Least privilege: the build reads the repository and uploads an artifact.
+# Release/issue permissions are not granted here (publish-artifacts owns that,
+# narrowly, and only in its publish job).
+permissions:
+  contents: read
+
+# PRD 8.3 "同一实验并发去重": one build per experiment id.  cancel-in-progress is
+# false on purpose -- cancelling a paid macOS build would throw away minutes and
+# evidence, so a duplicate run is queued instead.
+concurrency:
+  group: unipad-build-${{ inputs.experiment_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build-macos (${{ inputs.stage }}, target=${{ inputs.payload_target }})
+    # TODO(M0, PRD 8.3): pin the runner image and Xcode/SDK after M0 verifies the
+    # toolchain (e.g. runs-on: macos-14 with an explicit Xcode selection).  Do not
+    # assume macos-latest keeps the same architecture; do not assume HVF nesting
+    # exists on an arm64 runner.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record toolchain versions (feeds cache key and manifest)
+        id: toolchain
+        run: |
+          set -euo pipefail
+          os="${{ runner.os }}"
+          arch="${{ runner.arch }}"
+          xcode="$(xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//' || true)"
+          clang="$(clang --version 2>/dev/null | head -n 1 || true)"
+          py="$(python3 --version 2>&1 || true)"
+          {
+            echo "runner_os=$os"
+            echo "runner_arch=$arch"
+            echo "xcode_version=${xcode:-unknown}"
+            echo "clang_version=${clang:-unknown}"
+            echo "python_version=${py:-unknown}"
+          } >> "$GITHUB_OUTPUT"
+          echo "toolchain: os=$os arch=$arch xcode=${xcode:-unknown} clang=${clang:-unknown} python=${py:-unknown}"
+
+      # PRD 8.1/8.3: validate the dispatch inputs against the pinned source lock
+      # before spending macOS minutes.  A frozen lock that disagrees with the
+      # requested commits is a hard failure; an unfrozen lock is reported loudly.
+      - name: Validate inputs against sources.lock.json
+        id: inputs
+        env:
+          LOCK_PATH: config/sources.lock.json
+          REPORT_DIR: build
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          STAGE: ${{ inputs.stage }}
+          SYSTEM_BUILD: ${{ inputs.system_build }}
+          PAYLOAD_TARGET: ${{ inputs.payload_target }}
+        run: |
+          mkdir -p build
+          python3 - <<'PY'
+          """Validate build inputs against config/sources.lock.json (PRD 8.1 inputs).
+
+          Writes build/input-validation.json.  Exit 1 on any mismatch so the job
+          fails before paid macOS minutes are consumed (PRD 8.4).
+          """
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          LOCK = Path(os.environ.get("LOCK_PATH", "config/sources.lock.json"))
+          OUT_DIR = Path(os.environ.get("REPORT_DIR", "build"))
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          MILESTONES = (
+              "M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9",
+              "M9a", "M9b", "M10", "M10a", "M11", "M12", "M13", "M14", "M15",
+          )
+          EXP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+          SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+          BUILD_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.]{0,31}$")
+
+          experiment_id = os.environ.get("EXPERIMENT_ID", "").strip()
+          unixnu_commit = os.environ.get("UNIXNU_COMMIT", "").strip()
+          device_commit = os.environ.get("DEVICE_COMMIT", "").strip()
+          stage = os.environ.get("STAGE", "").strip()
+          system_build = os.environ.get("SYSTEM_BUILD", "").strip()
+          payload_target = os.environ.get("PAYLOAD_TARGET", "tcg").strip().lower()
+
+          problems = []
+          warnings = []
+          if not EXP_RE.match(experiment_id):
+              problems.append("experiment_id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ (it is the concurrency key and artifact name)")
+          if not SHA_RE.match(unixnu_commit):
+              problems.append("unixnu_commit is not a git sha")
+          if not SHA_RE.match(device_commit):
+              problems.append("device_commit is not a git sha")
+          if stage not in MILESTONES:
+              problems.append(f"stage must be one of {','.join(MILESTONES)} (got '{stage}')")
+          if payload_target not in ("tcg", "hvf"):
+              problems.append("payload_target must be tcg or hvf")
+          if payload_target == "hvf":
+              warnings.append("payload_target=hvf: comparison build only. HVF payloads must never be fetched to the Intel Windows host or published as tcg (PRD 8.3).")
+
+          lock = {}
+          lock_sha = None
+          frozen = False
+          lock_loaded = False
+          try:
+              raw = LOCK.read_bytes()
+              lock_sha = hashlib.sha256(raw).hexdigest()
+              parsed = json.loads(raw.decode("utf-8"))
+              if not isinstance(parsed, dict):
+                  raise ValueError("lock root is not an object")
+              lock = parsed
+              lock_loaded = True
+              frozen = bool(lock.get("frozen", False))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+              problems.append(f"cannot read config/sources.lock.json: {exc.__class__.__name__}")
+
+          candidates = []
+          if isinstance(lock.get("system_identity"), dict):
+              candidates = lock["system_identity"].get("build_candidates") or []
+          if system_build:
+              if not BUILD_RE.match(system_build):
+                  problems.append("system_build must match ^[0-9A-Za-z][0-9A-Za-z.]{0,31}$")
+              if candidates and system_build not in candidates:
+                  problems.append(f"system_build '{system_build}' is not one of the pinned build_candidates {candidates}")
+          else:
+              warnings.append("system_build is empty; the manifest records it as null (PRD 8.1 platform info)")
+
+          if lock_loaded:
+              if not isinstance(lock.get("unixnu"), dict) or not isinstance(lock.get("device_repo"), dict):
+                  problems.append("sources.lock.json must contain 'unixnu' and 'device_repo' objects (PRD 8.1 inputs)")
+              lock_unixnu = (lock.get("unixnu") or {}).get("commit") if isinstance(lock.get("unixnu"), dict) else None
+              lock_device = (lock.get("device_repo") or {}).get("commit") if isinstance(lock.get("device_repo"), dict) else None
+              if frozen:
+                  if lock_unixnu and lock_unixnu.lower() != unixnu_commit.lower():
+                      problems.append(f"unixnu_commit '{unixnu_commit}' != sources.lock.json unixnu.commit '{lock_unixnu}'")
+                  if lock_device and lock_device.lower() != device_commit.lower():
+                      problems.append(f"device_commit '{device_commit}' != sources.lock.json device_repo.commit '{lock_device}'")
+                  if not lock_unixnu or not lock_device:
+                      problems.append("sources.lock.json is frozen but a repository commit is null")
+              else:
+                  warnings.append("sources.lock.json is NOT FROZEN: the dispatch inputs are the freeze candidates and are recorded verbatim in artifact-manifest.json")
+          elif not any("sources.lock.json" in problem for problem in problems):
+              problems.append("sources.lock.json is empty or has no repository pins (PRD 8.1 inputs)")
+
+          head = ""
+          try:
+              head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+          except OSError:
+              head = ""
+
+          report = {
+              "schema_version": 1,
+              "check": "build-inputs",
+              "experiment_id": experiment_id,
+              "stage": stage,
+              "payload_target": payload_target,
+              "unixnu_commit": unixnu_commit,
+              "device_commit": device_commit,
+              "system_build": system_build or None,
+              "lock": {
+                  "path": LOCK.as_posix(),
+                  "sha256": lock_sha,
+                  "frozen": frozen,
+                  "build_candidates": candidates,
+              },
+              "checked_out_head": head or None,
+              "problems": problems,
+              "warnings": warnings,
+              "status": "fail" if problems else "pass",
+          }
+          (OUT_DIR / "input-validation.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          for warning in warnings:
+              print(f"::warning::{warning}")
+          for problem in problems:
+              print(f"::error::{problem}")
+          print(f"input validation status: {report['status']}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      # PRD 8.3: the cache key carries the source commits, the stage, the system
+      # build, the lock hash, the build-script hash and the toolchain versions.
+      # No restore-keys: a stale toolchain/bootstrap cache must never be able to
+      # make an old input set "succeed" (PRD 11, 构建不可复现), and a signing
+      # key/policy change is part of the lock hash.
+      - name: 'Restore build toolchain cache (key: source + config + tool versions)'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/unipad-macos-build
+          key: unipad-macos-build-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ inputs.unixnu_commit }}-${{ inputs.device_commit }}-${{ inputs.stage }}-${{ inputs.system_build }}-${{ hashFiles('config/sources.lock.json', 'scripts/macos/**') }}
+
+      - name: Compute artifact name (sanitized experiment id)
+        id: naming
+        env:
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          safe="$(printf '%s' "$EXPERIMENT_ID" | tr -c 'A-Za-z0-9._-' '_')"
+          name="unipad-build-${safe}-${RUN_ID}"
+          echo "artifact_name=$name" >> "$GITHUB_OUTPUT"
+          echo "artifact name: $name"
+
+      - name: Run macOS build (scripts/macos/build-macos.sh)
+        id: build
+        env:
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          STAGE: ${{ inputs.stage }}
+          SYSTEM_BUILD: ${{ inputs.system_build }}
+          PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          BUILD_OUTPUT_DIR: build-output
+          STAGE_DIR: staged
+          BUILD_LOG: macos-build.log
+          TOOLCHAIN_CACHE_DIR: ~/.cache/unipad-macos-build
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/macos/build-macos.sh ]; then
+            echo "::error::scripts/macos/build-macos.sh is missing: the macOS build entry point has not landed yet (code-stage blocker, PRD 9 scripts/macos/)"
+            exit 3
+          fi
+          mkdir -p "$BUILD_OUTPUT_DIR"
+          started=$(date -u +%s)
+          echo "started_at=$started" >> "$GITHUB_OUTPUT"
+          bash scripts/macos/build-macos.sh 2>&1 | tee "$BUILD_LOG"
+          finished=$(date -u +%s)
+          echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
+          echo "build duration: $((finished - started))s"
+
+      # PRD 8.2 step 4 / 8.3: stage ONLY allowlisted roles, hash everything, and
+      # build the machine-readable artifact-manifest.json (PRD 8.1).  Default
+      # deny: an unrecognised file is excluded and recorded, never uploaded.
+      - name: Stage allowlisted artifacts and build artifact-manifest.json
+        id: stage
+        env:
+          BUILD_OUTPUT_DIR: build-output
+          STAGE_DIR: staged
+          BUILD_LOG: macos-build.log
+          REPORT_DIR: build
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          STAGE: ${{ inputs.stage }}
+          SYSTEM_BUILD: ${{ inputs.system_build }}
+          PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          XCODE_VERSION: ${{ steps.toolchain.outputs.xcode_version }}
+          CLANG_VERSION: ${{ steps.toolchain.outputs.clang_version }}
+          PYTHON_VERSION: ${{ steps.toolchain.outputs.python_version }}
+          BUILD_STARTED_AT: ${{ steps.build.outputs.started_at }}
+          BUILD_FINISHED_AT: ${{ steps.build.outputs.finished_at }}
+          MAX_FILE_BYTES: '2147483648'
+        run: |
+          python3 - <<'PY'
+          """Hash build outputs, stage allowlisted roles, write artifact-manifest.json.
+
+          PRD 8.1 (artifact contract) and 8.2 step 4 (never upload full system
+          images or private data).  Roles come from build-output/artifact-roles.json
+          when the build script emits it, otherwise from a conservative name table;
+          anything unmatched is excluded (default deny) and recorded in the
+          manifest's "excluded" list.
+          """
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUT = Path(os.environ.get("BUILD_OUTPUT_DIR", "build-output"))
+          STAGE = Path(os.environ.get("STAGE_DIR", "staged"))
+          BUILD_LOG = Path(os.environ.get("BUILD_LOG", "macos-build.log"))
+          REPORT = Path(os.environ.get("REPORT_DIR", "build"))
+          TARGET = (os.environ.get("PAYLOAD_TARGET", "tcg") or "tcg").strip().lower()
+          MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", "2147483648"))
+
+          ALLOWED_ROLES = ("firmware", "bootloader", "kernel", "devicetree", "auxiliary")
+          DENIED_ROLES = ("system-image", "private-data")
+          GENERATED = ("artifact-manifest.json", "build-report.json")
+          PRIVATE_PATTERNS = (
+              "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
+              "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
+              "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+          )
+          METADATA_SUFFIXES = {".json", ".txt", ".log", ".md", ".cfg", ".toml", ".csv", ".plist"}
+          ROLE_RULES = (
+              ("kernel", ("kernelcache", "kernel-cache", "kernel_cache", "kernel")),
+              ("devicetree", ("devicetree", "device-tree", "device_tree", ".dtb")),
+              ("firmware", ("firmware", "uefi", "bootrom", "bios")),
+              ("bootloader", ("bootloader", "boot-loader", "unixnu", "darwinboot", "boot")),
+          )
+
+          problems = []
+          warnings = []
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def role_from_table(rel):
+              low = rel.lower()
+              for role, tokens in ROLE_RULES:
+                  if any(token in low for token in tokens):
+                      return role
+              if Path(rel).suffix.lower() in METADATA_SUFFIXES:
+                  return "auxiliary"
+              return None
+
+          roles_map = {}
+          roles_file = OUT / "artifact-roles.json"
+          if roles_file.is_file():
+              try:
+                  loaded = json.loads(roles_file.read_text(encoding="utf-8"))
+                  if isinstance(loaded, dict):
+                      for key, value in loaded.items():
+                          if isinstance(value, str) and value in ALLOWED_ROLES + DENIED_ROLES:
+                              roles_map[key.replace("\\", "/")] = value
+                  warnings.append("using build-output/artifact-roles.json for role assignment")
+              except (OSError, json.JSONDecodeError) as exc:
+                  warnings.append(f"artifact-roles.json unreadable ({exc.__class__.__name__}); using the name table")
+
+          if not OUT.is_dir():
+              print(f"::error::build output directory '{OUT.as_posix()}' does not exist")
+              sys.exit(1)
+
+          entries = []
+          excluded = []
+          for path in sorted(OUT.rglob("*")):
+              if not path.is_file():
+                  continue
+              rel = path.relative_to(OUT).as_posix()
+              if rel in GENERATED or rel == "artifact-roles.json":
+                  continue
+              size = path.stat().st_size
+              role = roles_map.get(rel) or role_from_table(rel)
+              reason = None
+              if role in DENIED_ROLES:
+                  reason = f"role '{role}' is denied for upload (PRD 8.2 step 4)"
+              elif role is None:
+                  reason = "role is not on the allowlist (default deny)"
+              elif role not in ALLOWED_ROLES:
+                  reason = f"role '{role}' is not allowlisted"
+              if reason is None and any(fnmatch.fnmatch(rel.lower(), pat) for pat in PRIVATE_PATTERNS):
+                  reason = "filename matches a system-image/private-data pattern"
+              if reason is None and "local-private" in rel.lower():
+                  reason = "path is under local-private/ (PRD 12)"
+              if reason is None and size == 0:
+                  reason = "zero-size file"
+              if reason is None and size > MAX_FILE_BYTES:
+                  reason = f"file larger than {MAX_FILE_BYTES} bytes (PRD 8.4 prefers small artifacts)"
+              if reason is not None:
+                  excluded.append({"path": rel, "role": role, "size_bytes": size, "reason": reason})
+                  continue
+              entries.append({
+                  "name": rel,
+                  "path": rel,
+                  "role": role,
+                  "sha256": sha256_of(path),
+                  "size_bytes": size,
+                  "arch": None,
+              })
+
+          # The build log is evidence rather than a build product: include it
+          # explicitly under a stable relative name so the manifest never carries
+          # an absolute host path.
+          log_name = BUILD_LOG.name or "macos-build.log"
+          if log_name not in {entry["name"] for entry in entries} and BUILD_LOG.is_file() and BUILD_LOG.stat().st_size > 0:
+              entries.append({
+                  "name": log_name,
+                  "path": log_name,
+                  "role": "auxiliary",
+                  "sha256": sha256_of(BUILD_LOG),
+                  "size_bytes": BUILD_LOG.stat().st_size,
+                  "arch": None,
+              })
+          elif BUILD_LOG.is_file() and BUILD_LOG.stat().st_size > 0:
+              warnings.append(f"a build-output file is already named '{log_name}'; the build log was not staged twice")
+          else:
+              warnings.append("build log is missing or empty; the upload will not contain build evidence")
+
+          # A build that produced no firmware/bootloader/kernel/devicetree is a
+          # failed build even if it left logs: evidence alone must never pass
+          # (PRD 7.4).
+          if not any(entry["role"] != "auxiliary" for entry in entries):
+              print("::error::no allowlisted payload artifact was produced, only evidence/log files: nothing to deliver (PRD 7.4, 8.2 step 4)")
+              print(f"::error::excluded files: {[item['path'] for item in excluded]}")
+              REPORT.mkdir(parents=True, exist_ok=True)
+              (REPORT / "staging-report.json").write_text(
+                  json.dumps({"status": "fail", "excluded": excluded, "problems": problems, "warnings": warnings}, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              sys.exit(1)
+
+          STAGE.mkdir(parents=True, exist_ok=True)
+          for entry in entries:
+              src = BUILD_LOG if entry["name"] == log_name else OUT / entry["path"]
+              dst = STAGE / entry["path"]
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_bytes(src.read_bytes())
+              if sha256_of(dst) != entry["sha256"] or dst.stat().st_size != entry["size_bytes"]:
+                  problems.append(f"staged copy of {entry['path']} does not match its hash/size")
+              if dst.stat().st_size == 0:
+                  problems.append(f"staged copy of {entry['path']} is zero bytes")
+
+          started = os.environ.get("BUILD_STARTED_AT", "")
+          finished = os.environ.get("BUILD_FINISHED_AT", "")
+          duration = int(finished) - int(started) if started.isdigit() and finished.isdigit() else None
+
+          def iso(epoch):
+              return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat() if epoch.isdigit() else None
+
+          toolchain = {
+              "runner_os": os.environ.get("RUNNER_OS", ""),
+              "runner_arch": os.environ.get("RUNNER_ARCH", ""),
+              "xcode": os.environ.get("XCODE_VERSION", ""),
+              "clang": os.environ.get("CLANG_VERSION", ""),
+              "python": os.environ.get("PYTHON_VERSION", ""),
+          }
+          manifest = {
+              "schema_version": 1,
+              "run_id": os.environ.get("RUN_ID", ""),
+              "run_attempt": os.environ.get("RUN_ATTEMPT", ""),
+              "experiment_id": os.environ.get("EXPERIMENT_ID", ""),
+              "stage": os.environ.get("STAGE", ""),
+              "target": TARGET,
+              "accel": TARGET,
+              "unixnu_commit": os.environ.get("UNIXNU_COMMIT", ""),
+              "device_repo_commit": os.environ.get("DEVICE_COMMIT", ""),
+              "system_build": os.environ.get("SYSTEM_BUILD", "") or None,
+              "repository": os.environ.get("REPO", ""),
+              "ref": os.environ.get("REF", ""),
+              "head_sha": os.environ.get("HEAD_SHA", ""),
+              "toolchain": toolchain,
+              "artifacts": entries,
+              "excluded": excluded,
+              "generated_by": "build-macos.yml",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+          }
+          (STAGE / "artifact-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          report = {
+              "schema_version": 1,
+              "run_id": os.environ.get("RUN_ID", ""),
+              "experiment_id": os.environ.get("EXPERIMENT_ID", ""),
+              "stage": os.environ.get("STAGE", ""),
+              "payload_target": TARGET,
+              "started_at": iso(started),
+              "finished_at": iso(finished),
+              "duration_seconds": duration,
+              "toolchain": toolchain,
+              "artifact_count": len(entries),
+              "artifact_bytes": sum(item["size_bytes"] for item in entries),
+              "roles": {role: sum(1 for item in entries if item["role"] == role) for role in sorted({item["role"] for item in entries})},
+              "excluded_count": len(excluded),
+              "excluded": excluded,
+              "problems": problems,
+              "warnings": warnings,
+              "status": "fail" if problems else "pass",
+          }
+          REPORT.mkdir(parents=True, exist_ok=True)
+          (REPORT / "staging-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          (STAGE / "build-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          print(f"staged {len(entries)} allowlisted file(s), {report['artifact_bytes']} bytes, roles={report['roles']}")
+          print(f"excluded {len(excluded)} file(s) by default deny: {[item['path'] for item in excluded]}")
+          print(f"manifest sha256: {hashlib.sha256((STAGE / 'artifact-manifest.json').read_bytes()).hexdigest()}")
+          for warning in warnings:
+              print(f"::warning::{warning}")
+          for problem in problems:
+              print(f"::error::{problem}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: Upload build artifact (allowlisted roles only, 30-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.naming.outputs.artifact_name }}
+          path: staged/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Step summary
+        if: always()
+        env:
+          ARTIFACT_NAME: ${{ steps.naming.outputs.artifact_name }}
+          REPORT_DIR: build
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          STAGE: ${{ inputs.stage }}
+          PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ inputs.device_commit }}
+        run: |
+          python3 - <<'PY'
+          """Write the GitHub step summary from build/staging-report.json (evidence, PRD 9.2)."""
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path(os.environ.get("REPORT_DIR", "build")) / "staging-report.json"
+          lines = [
+              "### UniPad macOS build",
+              "",
+              f"- experiment: {os.environ.get('EXPERIMENT_ID', '')}",
+              f"- stage: {os.environ.get('STAGE', '')} / payload target: {os.environ.get('PAYLOAD_TARGET', '')}",
+              f"- unixnu: {os.environ.get('UNIXNU_COMMIT', '')}",
+              f"- device repo: {os.environ.get('DEVICE_COMMIT', '')}",
+              f"- artifact: `{os.environ.get('ARTIFACT_NAME', '')}` (retention 30 days)",
+              "",
+          ]
+          if report_path.is_file():
+              data = json.loads(report_path.read_text(encoding="utf-8"))
+              lines += [
+                  f"- staged files: {data.get('artifact_count')} ({data.get('artifact_bytes')} bytes)",
+                  f"- roles: {data.get('roles')}",
+                  f"- build duration: {data.get('duration_seconds')}s",
+                  f"- excluded by default deny: {data.get('excluded_count')}",
+                  f"- status: {data.get('status')}",
+              ]
+          else:
+              lines.append("- staging report unavailable: the build failed before staging, so no artifact was uploaded")
+          text = "\n".join(lines) + "\n"
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+          print(text)
+          PY

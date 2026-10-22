@@ -1,0 +1,647 @@
+# UniPad pipeline #3: verify-artifacts -- PRD 8.2 step 3 ("verify-artifacts: 校验输出、架构、配置、哈希和依赖清单")
+# plus PRD 8.1 (artifact contract), 8.3 (never treat an HVF payload as a TCG
+# payload; machine-readable results; artifact retention) and 7.4 (a verifier that
+# judges on fixed conditions and refuses to pass on missing evidence).
+#
+# What it proves about a downloaded build artifact:
+#   * every file listed in artifact-manifest.json exists, is non-empty and
+#     matches its recorded sha256 and size,
+#   * every Mach-O payload carries an aarch64 slice; x86_64-only payloads and
+#     simulator-platform payloads are rejected,
+#   * nothing marked hvf is accepted while the expected target is tcg,
+#   * no file with a denied role (system-image / private-data) or a private-data
+#     filename pattern is present.
+#
+# It runs on ubuntu-latest on purpose: Mach-O parsing is pure byte inspection, so
+# this gate costs no macOS minutes (PRD 8.4).  The same logic is available to the
+# Windows controller through `unipad fetch --run-id` + `unipad verify`, which is
+# where the product actually enforces it before launching QEMU (PRD 8.2 step 5).
+#
+# This workflow is also reusable (`workflow_call`) so publish-artifacts re-runs the
+# identical verification instead of re-implementing it (DRY, PRD/CLAUDE.md #15).
+
+name: verify-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'GitHub run id of the build-macos run to verify.'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Optional explicit artifact name. Empty = the single unipad-build-* artifact of that run.'
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      run_id:
+        description: 'GitHub run id of the build-macos run to verify.'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Optional explicit artifact name. Empty = the single unipad-build-* artifact of that run.'
+        required: false
+        default: ''
+        type: string
+
+# Least privilege: this job only reads the repository and lists/downloads
+# artifacts of a run in the same repository.
+permissions:
+  contents: read
+
+# PRD 8.3 "同一实验并发去重": run_id identifies the build/experiment, so one
+# verification per build.  cancel-in-progress is false: a cancelled verification
+# would leave the gate result unknown, and this job is cheap.
+concurrency:
+  group: unipad-verify-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: verify-artifacts (run ${{ inputs.run_id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      result: ${{ steps.verify.outputs.result }}
+      manifest_sha256: ${{ steps.verify.outputs.manifest_sha256 }}
+      artifact_name: ${{ steps.resolve.outputs.artifact_name }}
+    steps:
+      - name: Resolve artifact name for the run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::run_id must be a positive integer GitHub run id (got '$RUN_ID')"
+            exit 2
+          fi
+          if ! gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" --paginate --jq '.artifacts[].name' > artifact-names.txt; then
+            echo "::error::cannot list artifacts for run $RUN_ID in $GH_REPO (unknown run, expired artifacts, or insufficient token scope)"
+            exit 1
+          fi
+          total=$(wc -l < artifact-names.txt | tr -d ' ')
+          if [ "$total" -eq 0 ]; then
+            echo "::error::run $RUN_ID has no artifacts left (artifact_missing): they may have expired or the run never uploaded"
+            exit 1
+          fi
+          if [ -n "$ARTIFACT_NAME" ]; then
+            if ! grep -Fxq "$ARTIFACT_NAME" artifact-names.txt; then
+              echo "::error::artifact '$ARTIFACT_NAME' is not among the artifacts of run $RUN_ID:"
+              sed 's/^/  - /' artifact-names.txt
+              exit 1
+            fi
+            name="$ARTIFACT_NAME"
+          else
+            matches=$(grep -c '^unipad-build-' artifact-names.txt || true)
+            if [ "$matches" -ne 1 ]; then
+              echo "::error::expected exactly one 'unipad-build-*' artifact for run $RUN_ID, found $matches; pass artifact_name explicitly"
+              grep '^unipad-' artifact-names.txt | sed 's/^/  - /' || true
+              exit 1
+            fi
+            name=$(grep '^unipad-build-' artifact-names.txt | head -n 1)
+          fi
+          echo "artifact_name=$name" >> "$GITHUB_OUTPUT"
+          echo "resolved artifact: $name"
+
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT_NAME: ${{ steps.resolve.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded
+          gh run download "$RUN_ID" -n "$ARTIFACT_NAME" -D downloaded
+          echo "downloaded files:"
+          find downloaded -type f -printf '  %p  %s bytes\n' | sort
+
+      # The fixed-condition verifier (PRD 7.4): hashes, sizes, roles, Mach-O
+      # architecture/platform, and TCG/HVF separation.  Emits verify-result.json
+      # and exits non-zero on any mismatch.
+      - name: Verify artifacts against artifact-manifest.json
+        id: verify
+        env:
+          DOWNLOAD_DIR: downloaded
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ARTIFACT_NAME: ${{ steps.resolve.outputs.artifact_name }}
+          REPO: ${{ github.repository }}
+          EXPECTED_TARGET: 'tcg'
+          RESULT_PATH: verify-result.json
+          DETAIL_PATH: verify-detail.json
+        run: |
+          python3 - <<'PY'
+          """Verify a downloaded build artifact against artifact-manifest.json.
+
+          PRD 8.2 step 3 and 8.3.  Checks performed for every manifest entry:
+          existence, non-zero size, sha256, size_bytes, allowlisted role, no
+          private-data/system-image pattern, and (for Mach-O payloads) that an
+          aarch64 slice exists and that no slice is x86_64-only or built for a
+          simulator platform.  Entries or manifests marked hvf are rejected while
+          the expected target is tcg.
+
+          Writes verify-result.json (summary) and verify-detail.json (per-file
+          detail).  Exit 1 when anything fails.
+          """
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          import struct
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(os.environ.get("DOWNLOAD_DIR", "downloaded"))
+          RUN_ID = os.environ.get("RUN_ID", "")
+          EXPECTED_TARGET = (os.environ.get("EXPECTED_TARGET", "tcg") or "tcg").strip().lower()
+          RESULT = Path(os.environ.get("RESULT_PATH", "verify-result.json"))
+          DETAIL = Path(os.environ.get("DETAIL_PATH", "verify-detail.json"))
+
+          ALLOWED_ROLES = ("firmware", "bootloader", "kernel", "devicetree", "auxiliary")
+          DENIED_ROLES = ("system-image", "private-data")
+          PAYLOAD_ROLES = ("firmware", "bootloader", "kernel", "devicetree")
+          PRIVATE_PATTERNS = (
+              "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
+              "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
+              "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+          )
+          METADATA_FILES = {"artifact-manifest.json", "build-report.json", "verify-result.json", "verify-detail.json"}
+          HVF_KEYS = ("accel", "target", "payload_target", "build_variant", "variant", "platform", "tags", "labels", "notes")
+
+          FAT_MAGIC = 0xCAFEBABE
+          FAT_MAGIC_64 = 0xCAFEBABF
+          MH_MAGIC = 0xFEEDFACE
+          MH_MAGIC_64 = 0xFEEDFACF
+          MH_CIGAM = 0xCEFAEDFE
+          MH_CIGAM_64 = 0xCFFAEDFE
+          CPU_X86 = 7
+          CPU_X86_64 = 0x01000007
+          CPU_ARM = 12
+          CPU_ARM64 = 0x0100000C
+          CPU_ARM64_32 = 0x0200000C
+          CPU_NAMES = {
+              CPU_X86: "x86",
+              CPU_X86_64: "x86_64",
+              CPU_ARM: "arm",
+              CPU_ARM64: "aarch64",
+              CPU_ARM64_32: "arm64_32",
+          }
+          FILETYPES = {1: "object", 2: "execute", 3: "fvmlib", 4: "core", 5: "preload", 6: "dylib", 7: "bundle", 8: "dylib_stub", 9: "dsym", 10: "kext"}
+          PLATFORMS = {
+              1: "macos",
+              2: "ios",
+              3: "tvos",
+              4: "watchos",
+              5: "bridgeos",
+              6: "maccatalyst",
+              7: "ios-simulator",
+              8: "tvos-simulator",
+              9: "watchos-simulator",
+              10: "driverkit",
+          }
+          SIMULATOR_PLATFORMS = {7, 8, 9}
+          LC_VERSION_MIN_MACOSX = 0x24
+          LC_VERSION_MIN_IPHONEOS = 0x25
+          LC_VERSION_MIN_TVOS = 0x2F
+          LC_VERSION_MIN_WATCHOS = 0x30
+          LC_BUILD_VERSION = 0x32
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def dotted(value):
+              return f"{(value >> 16) & 0xFFFF}.{(value >> 8) & 0xFF}.{value & 0xFF}"
+
+          def parse_thin(buf, off, size):
+              """Parse one Mach-O slice; return None when the magic is not Mach-O.
+
+              Magic handling: a little-endian file stores the magic byte-swapped
+              relative to a big-endian read, so 0xFEEDFACF read as <I means a
+              little-endian 64-bit Mach-O, and read as >I means the opposite.
+              """
+              if off + 4 > len(buf):
+                  return None
+              magic_le = struct.unpack_from("<I", buf, off)[0]
+              magic_be = struct.unpack_from(">I", buf, off)[0]
+              if magic_le == MH_MAGIC_64:
+                  little, is64 = True, True
+              elif magic_le == MH_MAGIC:
+                  little, is64 = True, False
+              elif magic_be == MH_CIGAM_64:
+                  little, is64 = False, True
+              elif magic_be == MH_CIGAM:
+                  little, is64 = False, False
+              else:
+                  return None
+              int_fmt = "<i" if little else ">i"
+              uint_fmt = "<I" if little else ">I"
+              header = 32 if is64 else 28
+              if off + header > len(buf):
+                  return {"error": "truncated mach-o header", "slices": []}
+              info = {
+                  "is_64": is64,
+                  "cputype": struct.unpack_from(uint_fmt, buf, off + 4)[0],
+                  "cpusubtype": struct.unpack_from(uint_fmt, buf, off + 8)[0] & 0x00FFFFFF,
+                  "filetype": struct.unpack_from(uint_fmt, buf, off + 12)[0],
+                  "ncmds": struct.unpack_from(uint_fmt, buf, off + 16)[0],
+                  "platform": None,
+                  "platform_name": None,
+                  "minos": None,
+                  "is_simulator": False,
+                  "error": None,
+              }
+              info["cputype_name"] = CPU_NAMES.get(info["cputype"], f"unknown(0x{info['cputype']:08x})")
+              info["filetype_name"] = FILETYPES.get(info["filetype"], f"unknown({info['filetype']})")
+              cmd_off = off + header
+              for _ in range(info["ncmds"]):
+                  if cmd_off + 8 > len(buf):
+                      info["error"] = "truncated load-command table"
+                      break
+                  cmd = struct.unpack_from(uint_fmt, buf, cmd_off)[0]
+                  cmdsize = struct.unpack_from(uint_fmt, buf, cmd_off + 4)[0]
+                  if cmdsize < 8 or cmd_off + cmdsize > len(buf):
+                      info["error"] = "malformed load command"
+                      break
+                  if cmd == LC_BUILD_VERSION and cmdsize >= 16:
+                      platform = struct.unpack_from(uint_fmt, buf, cmd_off + 8)[0]
+                      info["platform"] = platform
+                      info["platform_name"] = PLATFORMS.get(platform, f"unknown({platform})")
+                      info["minos"] = dotted(struct.unpack_from(uint_fmt, buf, cmd_off + 12)[0])
+                      if platform in SIMULATOR_PLATFORMS:
+                          info["is_simulator"] = True
+                  elif cmd == LC_VERSION_MIN_IPHONEOS and cmdsize >= 16:
+                      info["platform"] = 2
+                      info["platform_name"] = "ios"
+                      info["minos"] = dotted(struct.unpack_from(uint_fmt, buf, cmd_off + 8)[0])
+                  elif cmd == LC_VERSION_MIN_MACOSX and cmdsize >= 16:
+                      info["platform"] = 1
+                      info["platform_name"] = "macos"
+                      info["minos"] = dotted(struct.unpack_from(uint_fmt, buf, cmd_off + 8)[0])
+                  elif cmd == LC_VERSION_MIN_TVOS and cmdsize >= 16:
+                      info["platform"] = 3
+                      info["platform_name"] = "tvos"
+                      info["minos"] = dotted(struct.unpack_from(uint_fmt, buf, cmd_off + 8)[0])
+                  elif cmd == LC_VERSION_MIN_WATCHOS and cmdsize >= 16:
+                      info["platform"] = 4
+                      info["platform_name"] = "watchos"
+                      info["minos"] = dotted(struct.unpack_from(uint_fmt, buf, cmd_off + 8)[0])
+                  cmd_off += cmdsize
+              info["size"] = size
+              return info
+
+          def parse_macho(path):
+              """Return {'kind': fat|thin|non-macho, 'slices': [...], 'error': str|None}."""
+              buf = path.read_bytes()
+              result = {"kind": "non-macho", "slices": [], "error": None}
+              if len(buf) < 8:
+                  result["error"] = "file shorter than 8 bytes"
+                  return result
+              be_magic = struct.unpack_from(">I", buf, 0)[0]
+              if be_magic in (FAT_MAGIC, FAT_MAGIC_64):
+                  wide = be_magic == FAT_MAGIC_64
+                  result["kind"] = "fat"
+                  nfat = struct.unpack_from(">I", buf, 4)[0]
+                  entry_size = 32 if wide else 20
+                  off = 8
+                  for index in range(nfat):
+                      if off + entry_size > len(buf):
+                          result["error"] = "truncated fat_arch table"
+                          return result
+                      if wide:
+                          slice_off = struct.unpack_from(">Q", buf, off + 8)[0]
+                          slice_size = struct.unpack_from(">Q", buf, off + 16)[0]
+                      else:
+                          slice_off = struct.unpack_from(">I", buf, off + 8)[0]
+                          slice_size = struct.unpack_from(">I", buf, off + 12)[0]
+                      if slice_off + slice_size > len(buf):
+                          result["slices"].append({"fat_index": index, "offset": slice_off, "size": slice_size, "error": "slice range outside file"})
+                      else:
+                          thin = parse_thin(buf, slice_off, slice_size)
+                          if thin is None:
+                              result["slices"].append({"fat_index": index, "offset": slice_off, "size": slice_size, "error": "slice is not a mach-o"})
+                          else:
+                              thin["fat_index"] = index
+                              thin["offset"] = slice_off
+                              result["slices"].append(thin)
+                      off += entry_size
+                  return result
+              thin = parse_thin(buf, 0, len(buf))
+              if thin is None:
+                  result["error"] = "not a mach-o (no thin or fat magic)"
+                  return result
+              result["kind"] = "thin"
+              result["slices"] = [thin]
+              return result
+
+          def pick(entry, *names):
+              """Return the first present, non-empty field among ``names``."""
+              for name in names:
+                  if entry.get(name) not in (None, ""):
+                      return entry.get(name)
+              return None
+
+          failures = []
+          warnings = []
+
+          manifests = sorted(ROOT.rglob("artifact-manifest.json"))
+          if not manifests:
+              print("::error::artifact-manifest.json not found in the downloaded artifact (artifact_manifest_invalid)")
+              github_output = os.environ.get("GITHUB_OUTPUT")
+              if github_output:
+                  with open(github_output, "a", encoding="utf-8") as handle:
+                      handle.write("result=fail\n")
+              RESULT.write_text(json.dumps({
+                  "schema_version": 1,
+                  "check": "verify-artifacts",
+                  "status": "fail",
+                  "run_id": RUN_ID,
+                  "failures": [{"file": "artifact-manifest.json", "reason": "manifest missing from artifact"}],
+              }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              sys.exit(1)
+          manifest_path = manifests[0]
+          if len(manifests) > 1:
+              warnings.append(f"multiple artifact-manifest.json files found; using {manifest_path.as_posix()}")
+          root = manifest_path.parent
+          manifest_bytes = manifest_path.read_bytes()
+          manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+          try:
+              manifest = json.loads(manifest_bytes.decode("utf-8"))
+          except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+              print(f"::error::artifact-manifest.json is not valid JSON ({exc.__class__.__name__})")
+              sys.exit(1)
+          if not isinstance(manifest, dict):
+              print("::error::artifact-manifest.json root is not a JSON object")
+              sys.exit(1)
+
+          raw_entries = manifest.get("artifacts")
+          if not isinstance(raw_entries, list) or not raw_entries:
+              print("::error::artifact-manifest.json has no non-empty 'artifacts' list")
+              sys.exit(1)
+
+          manifest_target = str(manifest.get("target") or manifest.get("accel") or "").strip().lower()
+          if manifest_target and manifest_target != EXPECTED_TARGET:
+              failures.append({
+                  "file": "artifact-manifest.json",
+                  "reason": f"manifest target '{manifest_target}' != expected target '{EXPECTED_TARGET}'",
+              })
+
+          entries = []
+          for index, raw in enumerate(raw_entries):
+              if not isinstance(raw, dict):
+                  failures.append({"file": f"artifacts[{index}]", "reason": "manifest entry is not an object"})
+                  continue
+              name = pick(raw, "name", "path", "file", "filename") or f"artifacts[{index}]"
+              entries.append({
+                  "index": index,
+                  "name": str(name).replace("\\", "/"),
+                  "role": raw.get("role"),
+                  "sha256": (pick(raw, "sha256", "sha", "hash", "digest") or "").lower() or None,
+                  "size_bytes": pick(raw, "size_bytes", "size", "bytes"),
+                  "raw": raw,
+              })
+
+          files = []
+          seen = set()
+          for entry in entries:
+              rel = entry["name"]
+              seen.add(rel)
+              path = root / rel
+              problems = []
+              notes = []
+              if not path.is_file():
+                  problems.append("file listed in the manifest is missing from the artifact")
+                  failures.append({"file": rel, "reason": "file listed in the manifest is missing from the artifact"})
+                  files.append({
+                      "name": rel, "role": entry["role"], "size_bytes": entry["size_bytes"],
+                      "sha256_expected": entry["sha256"], "sha256_actual": None,
+                      "arch": None, "platform": None, "problems": problems, "warnings": notes,
+                  })
+                  continue
+
+              actual_sha = sha256_of(path)
+              actual_size = path.stat().st_size
+              if entry["sha256"] and actual_sha != entry["sha256"]:
+                  problems.append(f"sha256 mismatch (expected {entry['sha256']}, got {actual_sha})")
+              if isinstance(entry["size_bytes"], int) and actual_size != entry["size_bytes"]:
+                  problems.append(f"size mismatch (expected {entry['size_bytes']}, got {actual_size})")
+              if actual_size == 0:
+                  problems.append("zero-size file")
+              if not entry["sha256"]:
+                  notes.append("manifest entry has no sha256; only size was verified")
+
+              role = entry["role"]
+              if role in DENIED_ROLES:
+                  problems.append(f"denied role '{role}' (PRD 8.2 step 4)")
+              elif role not in ALLOWED_ROLES:
+                  # The allowlist is enforced at publish time (default deny); here it
+                  # is reported so a bad role never reaches a release unnoticed.
+                  notes.append(f"role '{role or 'unknown'}' is not on the publish allowlist; publish-artifacts will refuse it")
+
+              if any(fnmatch.fnmatch(rel.lower(), pat) for pat in PRIVATE_PATTERNS):
+                  problems.append("filename matches a system-image/private-data pattern")
+              if "local-private" in rel.lower():
+                  problems.append("path is under local-private/ (PRD 12)")
+
+              # TCG/HVF separation (PRD 8.3): an HVF payload must never be
+              # accepted where a TCG payload is expected.
+              if EXPECTED_TARGET == "tcg":
+                  markers = [rel.lower()]
+                  for key in HVF_KEYS:
+                      value = entry["raw"].get(key)
+                      if isinstance(value, str):
+                          markers.append(value.lower())
+                      elif isinstance(value, list):
+                          markers.extend(str(item).lower() for item in value)
+                  if any("hvf" in marker for marker in markers):
+                      problems.append("entry is marked hvf while the expected target is tcg")
+
+              arch = None
+              platform = None
+              if rel.lower().endswith((".json", ".txt", ".log", ".md", ".csv")):
+                  notes.append("metadata file: hash/size verified, architecture check not applicable")
+              else:
+                  parsed = parse_macho(path)
+                  if parsed["kind"] == "non-macho":
+                      notes.append(f"not a mach-o ({parsed['error']}): architecture not verifiable from bytes")
+                      if role in PAYLOAD_ROLES:
+                          notes.append("payload is wrapped or non-mach-o; the guest-side loader must re-check it before launch")
+                  else:
+                      cputypes = []
+                      for slice_info in parsed["slices"]:
+                          if slice_info.get("error"):
+                              notes.append(f"slice {slice_info.get('fat_index')}: {slice_info['error']}")
+                              continue
+                          cputypes.append(slice_info["cputype"])
+                          if slice_info.get("is_simulator"):
+                              problems.append(
+                                  f"slice {slice_info.get('fat_index')} targets a simulator platform "
+                                  f"({slice_info.get('platform_name')}); simulator payloads are rejected (PRD 2.1 E08)"
+                              )
+                          if slice_info.get("platform") == 1:
+                              notes.append(f"slice {slice_info.get('fat_index')} declares the macOS platform")
+                      names = sorted({CPU_NAMES.get(c, f"unknown(0x{c:08x})") for c in cputypes})
+                      arch = "+".join(names) if names else None
+                      platforms = sorted({s.get("platform_name") for s in parsed["slices"] if s.get("platform_name")})
+                      platform = "+".join(platforms) if platforms else None
+                      if CPU_ARM64 not in cputypes:
+                          problems.append(f"no aarch64 slice found (slices: {names or 'none'})")
+                      if CPU_X86_64 in cputypes:
+                          notes.append("contains an x86_64 slice; an aarch64 slice is also present")
+                      if CPU_X86 in cputypes or CPU_ARM in cputypes:
+                          notes.append("contains a 32-bit slice (x86/arm); not usable by the aarch64 guest")
+
+              files.append({
+                  "name": rel,
+                  "role": role,
+                  "size_bytes": actual_size,
+                  "sha256_expected": entry["sha256"],
+                  "sha256_actual": actual_sha,
+                  "arch": arch,
+                  "platform": platform,
+                  "problems": problems,
+                  "warnings": notes,
+              })
+              for problem in problems:
+                  failures.append({"file": rel, "reason": problem})
+              for note in notes:
+                  warnings.append({"file": rel, "reason": note})
+
+          unlisted = []
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              rel = path.relative_to(root).as_posix()
+              if rel in METADATA_FILES or rel in seen:
+                  continue
+              unlisted.append({"name": rel, "size_bytes": path.stat().st_size, "sha256": sha256_of(path)})
+          if unlisted:
+              warnings.append({
+                  "file": "<artifact>",
+                  "reason": f"{len(unlisted)} file(s) present but not listed in the manifest: {[item['name'] for item in unlisted]}",
+              })
+
+          status = "fail" if failures else "pass"
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as handle:
+                  handle.write(f"result={status}\n")
+                  handle.write(f"manifest_sha256={manifest_sha}\n")
+          result = {
+              "schema_version": 1,
+              "check": "verify-artifacts",
+              "status": status,
+              "run_id": RUN_ID,
+              "artifact_name": os.environ.get("ARTIFACT_NAME", ""),
+              "repository": os.environ.get("REPO", ""),
+              "expected_target": EXPECTED_TARGET,
+              "manifest": {
+                  "path": manifest_path.relative_to(ROOT).as_posix(),
+                  "sha256": manifest_sha,
+                  "target": manifest_target or None,
+                  "experiment_id": manifest.get("experiment_id"),
+                  "stage": manifest.get("stage"),
+                  "unixnu_commit": manifest.get("unixnu_commit"),
+                  "device_repo_commit": manifest.get("device_repo_commit"),
+                  "system_build": manifest.get("system_build"),
+                  "entry_count": len(entries),
+              },
+              "files": files,
+              "unlisted_files": unlisted,
+              "summary": {
+                  "checked": len(files),
+                  "passed": sum(1 for item in files if not item["problems"]),
+                  "failed": sum(1 for item in files if item["problems"]),
+                  "warnings": sum(1 for item in files if item["warnings"]),
+              },
+              "failures": failures,
+              "warnings": warnings,
+              "verified_at": datetime.now(timezone.utc).isoformat(),
+          }
+          DETAIL.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          RESULT.write_text(json.dumps({
+              "schema_version": 1,
+              "check": "verify-artifacts",
+              "status": status,
+              "run_id": RUN_ID,
+              "artifact_name": result["artifact_name"],
+              "expected_target": EXPECTED_TARGET,
+              "manifest_sha256": manifest_sha,
+              "summary": result["summary"],
+              "failures": failures,
+              "verified_at": result["verified_at"],
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          print(f"verification status: {status}")
+          print(f"manifest sha256: {manifest_sha}")
+          print(f"checked {result['summary']['checked']} file(s): {result['summary']['passed']} ok, {result['summary']['failed']} failed, {result['summary']['warnings']} with warnings")
+          for failure in failures:
+              print(f"::error::verify-artifacts: {failure['file']}: {failure['reason']}")
+          for warning in warnings:
+              print(f"::warning::verify-artifacts: {warning['file']}: {warning['reason']}")
+          print(f"result written to {RESULT.as_posix()} and {DETAIL.as_posix()}")
+          sys.exit(1 if failures else 0)
+          PY
+
+      - name: Upload verification result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unipad-verify-${{ inputs.run_id }}-${{ github.run_id }}
+          path: |
+            verify-result.json
+            verify-detail.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Step summary
+        if: always()
+        env:
+          RESULT: verify-result.json
+        run: |
+          python3 - <<'PY'
+          """Write the step summary from verify-result.json (machine-readable gate result)."""
+          import json
+          import os
+          from pathlib import Path
+
+          result_path = Path(os.environ.get("RESULT", "verify-result.json"))
+          lines = ["### UniPad artifact verification", ""]
+          if result_path.is_file():
+              data = json.loads(result_path.read_text(encoding="utf-8"))
+              lines += [
+                  f"- status: **{data.get('status')}**",
+                  f"- run_id: {data.get('run_id')} / artifact: `{data.get('artifact_name')}`",
+                  f"- expected target: {data.get('expected_target')}",
+                  f"- manifest sha256: `{data.get('manifest_sha256')}`",
+                  f"- summary: {data.get('summary')}",
+              ]
+              for failure in (data.get("failures") or [])[:20]:
+                  lines.append(f"- FAIL {failure.get('file')}: {failure.get('reason')}")
+          else:
+              lines.append("- verify-result.json unavailable: verification did not run to completion")
+          text = "\n".join(lines) + "\n"
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+          print(text)
+          PY

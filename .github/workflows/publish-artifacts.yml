@@ -1,0 +1,391 @@
+# UniPad pipeline #4: publish-artifacts -- PRD 8.2 step 4
+# ("publish-build-artifacts: 上传明确允许的文件；默认不上传完整系统镜像与个人 Data")
+# plus PRD 8.3 (least privilege, no secrets in logs/artifacts, concurrency
+# dedupe, artifact retention) and PRD 12 (code and private material stay
+# separate; publicly available is not the same as redistributable).
+#
+# Guarantees implemented here:
+#   * verification is RE-RUN by calling the reusable verify-artifacts workflow,
+#     so a publish can never follow an unverified or stale build;
+#   * publishing is DEFAULT DENY with an explicit role allowlist
+#     (firmware / bootloader / kernel / devicetree / auxiliary);
+#   * the job refuses outright when any entry's role is 'system-image' or
+#     'private-data', when the payload target is not tcg, or when a filename
+#     matches a private-data/system-image pattern;
+#   * a public GitHub release (which would make assets public) is opt-in and
+#     additionally requires an explicit redistribution confirmation, because
+#     PRD 12 forbids turning private material into a public artifact.
+#
+# Cost note (PRD 8.4): the default publish path is an artifact, not a release,
+# and this job runs on ubuntu-latest so it spends no macOS minutes.
+
+name: publish-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'GitHub run id of the verified build-macos run to publish.'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Optional explicit artifact name. Empty = the single unipad-build-* artifact of that run.'
+        required: false
+        default: ''
+        type: string
+      publish_mode:
+        description: 'artifact = versioned Actions artifact (default, private). release = versioned GitHub release asset (public on a public repo, requires confirmation).'
+        required: false
+        default: 'artifact'
+        type: choice
+        options:
+          - artifact
+          - release
+      release_tag:
+        description: 'Release tag for publish_mode=release. Empty = unipad-<run_id>.'
+        required: false
+        default: ''
+        type: string
+      confirm_redistribution:
+        description: 'Type yes only when every allowlisted asset is cleared for redistribution (PRD 12). Required for publish_mode=release.'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+
+# Least privilege: the verify job only reads; the publish job additionally needs
+# contents:write, and only when it actually creates a release.
+permissions:
+  contents: read
+
+# PRD 8.3 "同一实验并发去重": run_id identifies the build/experiment.
+# cancel-in-progress is false: publishing is not idempotent-cancellable, and a
+# half-finished release would be worse than a queued duplicate.
+concurrency:
+  group: unipad-publish-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # PRD 8.2 step 3 must run again before step 4: reuse the verifier instead of
+  # re-implementing it (DRY), so the publish gate and the CI gate are identical.
+  verify:
+    name: verify (reusable verify-artifacts)
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/verify-artifacts.yml
+    with:
+      run_id: ${{ inputs.run_id }}
+      artifact_name: ${{ inputs.artifact_name }}
+
+  publish:
+    name: publish allowlisted roles (${{ inputs.publish_mode }})
+    needs: verify
+    if: needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::run_id must be a positive integer GitHub run id"
+            exit 2
+          fi
+          mkdir -p downloaded
+          if [ -z "$ARTIFACT_NAME" ]; then
+            names=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" --paginate --jq '.artifacts[].name')
+            matches=$(printf '%s\n' "$names" | grep -c '^unipad-build-' || true)
+            if [ "$matches" -ne 1 ]; then
+              echo "::error::expected exactly one 'unipad-build-*' artifact for run $RUN_ID, found $matches"
+              exit 1
+            fi
+            ARTIFACT_NAME=$(printf '%s\n' "$names" | grep '^unipad-build-' | head -n 1)
+          fi
+          gh run download "$RUN_ID" -n "$ARTIFACT_NAME" -D downloaded
+          echo "downloaded files:"
+          find downloaded -type f -printf '  %p  %s bytes\n' | sort
+
+      # PRD 8.2 step 4: default deny, explicit allowlist.  Anything that is not
+      # an allowlisted role -- and in particular any 'system-image' or
+      # 'private-data' entry -- refuses the whole publish.
+      - name: Allowlist gate (refuse system images and private data)
+        id: gate
+        env:
+          DOWNLOAD_DIR: downloaded
+          RUN_ID: ${{ inputs.run_id }}
+          PUBLISH_MODE: ${{ inputs.publish_mode }}
+          CONFIRM_REDISTRIBUTION: ${{ inputs.confirm_redistribution }}
+          STAGE_DIR: publish
+        run: |
+          python3 - <<'PY'
+          """Publish gate: default-deny allowlist over the verified artifact (PRD 8.2 step 4).
+
+          Refuses (exit 1) when any manifest entry has a denied or non-allowlisted
+          role, when the payload target is not tcg, when a file is missing or its
+          hash changed, or when a filename matches a private-data/system-image
+          pattern.  Stages the surviving allowlisted files into publish/ and
+          writes publish-manifest.json plus publish-report.json.
+          """
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(os.environ.get("DOWNLOAD_DIR", "downloaded"))
+          STAGE = Path(os.environ.get("STAGE_DIR", "publish"))
+          RUN_ID = os.environ.get("RUN_ID", "")
+          PUBLISH_MODE = os.environ.get("PUBLISH_MODE", "artifact")
+          CONFIRM = (os.environ.get("CONFIRM_REDISTRIBUTION", "no") or "no").strip().lower()
+
+          ALLOWED_ROLES = ("firmware", "bootloader", "kernel", "devicetree", "auxiliary")
+          DENIED_ROLES = ("system-image", "private-data")
+          PRIVATE_PATTERNS = (
+              "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
+              "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
+              "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+          )
+          METADATA_FILES = {"artifact-manifest.json", "build-report.json", "verify-result.json", "verify-detail.json"}
+
+          problems = []
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          manifests = sorted(ROOT.rglob("artifact-manifest.json"))
+          if not manifests:
+              print("::error::artifact-manifest.json not found in the downloaded artifact")
+              sys.exit(1)
+          manifest_path = manifests[0]
+          root = manifest_path.parent
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+              print("::error::artifact-manifest.json is malformed")
+              sys.exit(1)
+
+          target = str(manifest.get("target") or manifest.get("accel") or "").strip().lower()
+          if target != "tcg":
+              problems.append(f"payload target '{target or 'unknown'}' is not tcg; HVF payloads must never be published as tcg (PRD 8.3)")
+
+          if PUBLISH_MODE == "release" and CONFIRM != "yes":
+              problems.append("publish_mode=release requires confirm_redistribution=yes (PRD 12: publicly available is not redistributable)")
+
+          entries = []
+          for raw in manifest["artifacts"]:
+              if not isinstance(raw, dict):
+                  problems.append("manifest entry is not an object")
+                  continue
+              rel = str(raw.get("path") or raw.get("name") or "").replace("\\", "/")
+              role = raw.get("role")
+              if role in DENIED_ROLES:
+                  problems.append(f"refusing to publish '{rel}': role '{role}' is explicitly denied (PRD 8.2 step 4)")
+              elif role not in ALLOWED_ROLES:
+                  problems.append(f"refusing to publish '{rel}': role '{role or 'unknown'}' is not on the allowlist (default deny)")
+              if any(fnmatch.fnmatch(rel.lower(), pat) for pat in PRIVATE_PATTERNS):
+                  problems.append(f"refusing to publish '{rel}': filename matches a private-data/system-image pattern")
+              if "local-private" in rel.lower():
+                  problems.append(f"refusing to publish '{rel}': path is under local-private/ (PRD 12)")
+              path = root / rel
+              if not path.is_file():
+                  problems.append(f"cannot publish '{rel}': file missing from the artifact")
+                  continue
+              actual = sha256_of(path)
+              expected = str(raw.get("sha256") or "").lower()
+              if expected and actual != expected:
+                  problems.append(f"refusing to publish '{rel}': sha256 changed since the build")
+              if path.stat().st_size == 0:
+                  problems.append(f"refusing to publish '{rel}': zero-size file")
+              entries.append({
+                  "name": rel,
+                  "path": rel,
+                  "role": role,
+                  "sha256": actual,
+                  "size_bytes": path.stat().st_size,
+                  "arch": raw.get("arch"),
+              })
+
+          report = {
+              "schema_version": 1,
+              "check": "publish-allowlist",
+              "run_id": RUN_ID,
+              "publish_mode": PUBLISH_MODE,
+              "payload_target": target or None,
+              "allowed_roles": list(ALLOWED_ROLES),
+              "denied_roles": list(DENIED_ROLES),
+              "published_count": len(entries),
+              "published_bytes": sum(item["size_bytes"] for item in entries),
+              "roles": {role: sum(1 for item in entries if item["role"] == role) for role in sorted({item["role"] for item in entries})},
+              "experiment_id": manifest.get("experiment_id"),
+              "stage": manifest.get("stage"),
+              "unixnu_commit": manifest.get("unixnu_commit"),
+              "device_repo_commit": manifest.get("device_repo_commit"),
+              "problems": problems,
+              "status": "fail" if problems else "pass",
+              "checked_at": datetime.now(timezone.utc).isoformat(),
+          }
+
+          if problems:
+              Path("publish-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              for problem in problems:
+                  print(f"::error::publish refused: {problem}")
+              sys.exit(1)
+
+          STAGE.mkdir(parents=True, exist_ok=True)
+          for entry in entries:
+              dst = STAGE / entry["path"]
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_bytes((root / entry["path"]).read_bytes())
+              if sha256_of(dst) != entry["sha256"]:
+                  problems.append(f"staged copy of {entry['path']} does not match its hash")
+
+          publish_manifest = {
+              "schema_version": 1,
+              "run_id": RUN_ID,
+              "experiment_id": manifest.get("experiment_id"),
+              "stage": manifest.get("stage"),
+              "target": target,
+              "unixnu_commit": manifest.get("unixnu_commit"),
+              "device_repo_commit": manifest.get("device_repo_commit"),
+              "system_build": manifest.get("system_build"),
+              "toolchain": manifest.get("toolchain"),
+              "artifacts": entries,
+              "source_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+              "generated_by": "publish-artifacts.yml",
+              "generated_at": report["checked_at"],
+          }
+          (STAGE / "publish-manifest.json").write_text(json.dumps(publish_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          Path("publish-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          print(f"publish gate passed: {len(entries)} allowlisted file(s), {report['published_bytes']} bytes, roles={report['roles']}")
+          print(f"roles allowed: {list(ALLOWED_ROLES)}; denied: {list(DENIED_ROLES)}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: Publish versioned artifact (default, private)
+        if: inputs.publish_mode == 'artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unipad-release-${{ inputs.run_id }}
+          path: publish/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Create versioned release and upload allowlisted assets
+        if: inputs.publish_mode == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-unipad-${RUN_ID}}"
+          if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$'; then
+            echo "::error::release_tag must match ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$"
+            exit 2
+          fi
+          python3 - publish/publish-manifest.json "$tag" <<'PY'
+          """Write the release notes from publish-manifest.json (no secrets, PRD 9.2)."""
+          import json
+          import sys
+          from pathlib import Path
+
+          manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          tag = sys.argv[2]
+          lines = [
+              f"UniPad verified build for run {manifest.get('run_id')}",
+              "",
+              f"- experiment: {manifest.get('experiment_id')}",
+              f"- stage: {manifest.get('stage')}",
+              f"- payload target: {manifest.get('target')}",
+              f"- UniXNU commit: {manifest.get('unixnu_commit')}",
+              f"- device repo commit: {manifest.get('device_repo_commit')}",
+              f"- system build: {manifest.get('system_build')}",
+              "",
+              "## Assets (allowlisted roles only)",
+              "",
+              "| file | role | size | sha256 |",
+              "| --- | --- | --- | --- |",
+          ]
+          for entry in manifest.get("artifacts", []):
+              lines.append(f"| {entry.get('name')} | {entry.get('role')} | {entry.get('size_bytes')} | {entry.get('sha256')} |")
+          lines += [
+              "",
+              "Full system images and private data are never published here (PRD 8.2 step 4, PRD 12).",
+              "Published by an automated UniPad pipeline; verify with .github/workflows/verify-artifacts.yml.",
+          ]
+          Path("release-notes.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
+          PY
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "::error::release '$tag' already exists; refusing to overwrite a published version (PRD FR10)"
+            exit 1
+          fi
+          gh release create "$tag" --repo "$GH_REPO" --title "$tag" --notes-file release-notes.md --verify-tag
+          gh release upload "$tag" --repo "$GH_REPO" --clobber=false publish/publish-manifest.json publish/artifact-manifest.json publish/build-report.json
+          find publish -type f ! -name 'publish-manifest.json' ! -name 'artifact-manifest.json' ! -name 'build-report.json' -print0 \
+            | xargs -0 -r gh release upload "$tag" --repo "$GH_REPO"
+          echo "published release: $tag"
+
+      - name: Step summary
+        if: always()
+        env:
+          REPORT: publish-report.json
+          PUBLISH_MODE: ${{ inputs.publish_mode }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          python3 - <<'PY'
+          """Write the step summary from publish-report.json (evidence, PRD 9.2)."""
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path(os.environ.get("REPORT", "publish-report.json"))
+          lines = [
+              "### UniPad artifact publish",
+              "",
+              f"- run_id: {os.environ.get('RUN_ID', '')}",
+              f"- publish mode: {os.environ.get('PUBLISH_MODE', '')}",
+          ]
+          if report_path.is_file():
+              data = json.loads(report_path.read_text(encoding="utf-8"))
+              lines += [
+                  f"- status: **{data.get('status')}**",
+                  f"- payload target: {data.get('payload_target')}",
+                  f"- published files: {data.get('published_count')} ({data.get('published_bytes')} bytes)",
+                  f"- roles: {data.get('roles')}",
+                  f"- allowlist: {data.get('allowed_roles')} (denied: {data.get('denied_roles')})",
+              ]
+              for problem in (data.get("problems") or [])[:20]:
+                  lines.append(f"- REFUSED: {problem}")
+          else:
+              lines.append("- publish-report.json unavailable: the gate did not run to completion")
+          text = "\n".join(lines) + "\n"
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+          print(text)
+          PY
