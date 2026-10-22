@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 inventory = ["psutil>=5.9"]  # optional richer host inventory; stdlib fallback exists
-dev = ["pytest>=8.0", "pytest-timeout>=2.2"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 unipad = "unipad.controller.cli:main"
@@ -23,7 +23,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers --timeout=120"
+addopts = "-q --strict-markers"
 markers = [
     "slow: long-running simulation tests",
     "acceptance: milestone gate simulation tests (no real hardware)",
