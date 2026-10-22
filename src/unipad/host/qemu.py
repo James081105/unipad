@@ -53,6 +53,90 @@ def _qemu_path(path: Path | str) -> str:
     return Path(path).as_posix()
 
 
+#: Network backends an operator may choose for the guest (PRD 3.2 P1 (1)).
+#: ``user`` is QEMU's user-mode (SLIRP) stack -- the only one that works without
+#: host administrator rights, and the only one that can be confined to loopback
+#: with ``restrict=on``.  ``tap``/``bridge`` need a host bridge device that does
+#: not exist on a stock Windows install, so they are deliberately absent: a
+#: spelling that would put the guest on a real LAN must fail loudly.
+NETWORK_MODES: tuple[str, ...] = ("none", "user")
+
+
+def _network_argument(net: Mapping[str, Any]) -> str:
+    """Return the ``-nic`` value for the configured guest network.
+
+    Fail-closed in both directions.  A network that is off is spelled
+    ``none`` rather than omitted, because omitting it leaves the guest's
+    connectivity to whatever QEMU defaults to for the machine type -- a
+    decision recorded nowhere.  A network that is on must say what it is: an
+    unfinished configuration is a usage error, never a guess, and the only
+    permitted backend defaults to loopback-only.
+
+    Raises:
+        UniPadError: ``config_invalid`` for an unknown mode, a missing mode,
+            a non-boolean ``enabled``, or a non-boolean ``restrict``.
+    """
+    if not isinstance(net, Mapping):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.net must be an object",
+            net_type=type(net).__name__,
+        )
+
+    enabled = net.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.net.enabled must be a boolean",
+            enabled=repr(enabled),
+        )
+    if not enabled:
+        return "none"
+
+    mode = net.get("mode")
+    if not mode or not isinstance(mode, str):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.net.mode is required when the network is enabled",
+            known_modes=list(NETWORK_MODES),
+        )
+    if mode not in NETWORK_MODES:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "unknown guest network mode",
+            mode=mode,
+            known_modes=list(NETWORK_MODES),
+        )
+    if mode == "none":
+        return "none"
+
+    model = str(net.get("model") or "virtio-net")
+    # ``restrict`` keeps the guest off the public internet through the host.
+    # Both a JSON boolean and QEMU's own "on"/"off" spelling are accepted so a
+    # configuration can be copied out of a QEMU command line unchanged; the
+    # default is on, so a config that omits it is confined, not open.
+    restrict = net.get("restrict", True)
+    if isinstance(restrict, str):
+        normalised = restrict.strip().lower()
+        if normalised in ("on", "yes", "true"):
+            restrict = True
+        elif normalised in ("off", "no", "false"):
+            restrict = False
+        else:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "machine devices.net.restrict must be a boolean or on/off",
+                restrict=repr(restrict),
+            )
+    if not isinstance(restrict, bool):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.net.restrict must be a boolean or on/off",
+            restrict=repr(restrict),
+        )
+    return f"user,id=unipad-net,model={model},restrict={'on' if restrict else 'off'}"
+
+
 def _unquote(token: str) -> str:
     """Strip one layer of matching double quotes (Windows command-line style)."""
     if len(token) >= 2 and token[0] == token[-1] == '"':
@@ -338,6 +422,12 @@ class QemuLauncher:
             args.extend(["-device", "ramfb"])
         if headless:
             args.extend(["-display", "none"])
+
+        # The guest network decision is explicit in the argv (PRD 3.2 P1 (1)):
+        # "off" is spelled ``-nic none`` rather than left to QEMU's default, and
+        # "on" must name its backend.  A configuration that cannot be turned
+        # into exactly one decision is a usage error, not a default.
+        args.extend(["-nic", _network_argument(dict(machine.devices or {}).get("net") or {})])
 
         # QMP over TCP: Windows has no AF_UNIX QMP socket.
         args.extend(["-qmp", f"tcp:{self.qmp_host}:{qmp_port},server=on,wait=off"])

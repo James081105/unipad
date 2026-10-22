@@ -33,9 +33,13 @@ import pytest
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host.qemu import QemuLauncher
-from unipad.models import MachineConfig
+from unipad.models import MachineConfig, read_json
 from tests.fakes import fake_qemu as fq
 from tests.fakes.fake_qemu import BOOT_MARKERS, PARTIAL_BOOT_MARKERS
+
+#: The shipped machine definition, read from disk so a drift between the
+#: repository configuration and the launcher is caught here and not in the field.
+MACHINE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "machine.json"
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +296,116 @@ def test_build_args_appends_extra_arguments_verbatim(launcher, images, tmp_path)
     )
 
     assert args[-2:] == ["-global", "virtio-mmio.force-bit=1"]
+
+
+# ---------------------------------------------------------------------------
+# the network decision (PRD 3.2 P1 (1))
+# ---------------------------------------------------------------------------
+
+
+def test_build_args_states_the_network_decision_in_the_argv(launcher, images, tmp_path):
+    """A disabled network is spelled ``-nic none``, not left to QEMU's default.
+
+    ``config/machine.json`` declares ``net.enabled: false``.  Emitting no
+    network argument at all means the argv does not carry that decision, and
+    the guest's connectivity would be whatever QEMU happens to default to for
+    the machine type -- a decision recorded nowhere.
+    """
+    args = _args(launcher, images, tmp_path, fq.free_tcp_port())
+
+    assert _option_value(args, "-nic") == "none"
+    assert "-netdev" not in args
+    assert "-net" not in args
+
+
+def test_build_args_never_emits_two_network_decisions(launcher, images, tmp_path):
+    """One ``-nic`` per launch: two would be ambiguous about which one wins."""
+    args = _args(launcher, images, tmp_path, fq.free_tcp_port())
+
+    assert args.count("-nic") == 1
+
+
+def test_a_machine_that_enables_the_network_gets_an_explicit_backend(tmp_path):
+    """PRD 3.2 P1 (1): enabling the network is a config choice with a backend.
+
+    The default stays loopback-only: an operator who flips ``net.enabled``
+    must also say what the guest may reach, so no configuration accidentally
+    puts the guest on the public internet through the host.
+    """
+    machine = MachineConfig(
+        devices={
+            "net": {
+                "enabled": True,
+                "model": "virtio-net",
+                "mode": "user",
+                "restrict": "on",
+            }
+        }
+    )
+    launcher = QemuLauncher(machine)
+    firmware = tmp_path / "fw.bin"
+    firmware.write_bytes(b"fw")
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"sys")
+
+    args = launcher.build_args(firmware, system, None, tmp_path, 4444)
+
+    nic = _option_value(args, "-nic")
+    assert nic is not None
+    assert "virtio-net" in nic
+    # loopback-only unless the operator said otherwise
+    assert "restrict=on" in nic
+
+
+def test_an_unknown_network_mode_is_refused_rather_than_guessed(tmp_path):
+    """A typo must not silently become a network the operator did not ask for."""
+    machine = MachineConfig(devices={"net": {"enabled": True, "mode": "bridged"}})
+    launcher = QemuLauncher(machine)
+    firmware = tmp_path / "fw.bin"
+    firmware.write_bytes(b"fw")
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"sys")
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.build_args(firmware, system, None, tmp_path, 4444)
+
+    assert excinfo.value.code == ErrorCode.CONFIG_INVALID
+    assert "mode" in excinfo.value.message
+
+
+def test_a_partial_network_config_fails_closed(tmp_path):
+    """``enabled`` with no mode is an unfinished decision, not a default."""
+    machine = MachineConfig(devices={"net": {"enabled": True}})
+    launcher = QemuLauncher(machine)
+    firmware = tmp_path / "fw.bin"
+    firmware.write_bytes(b"fw")
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"sys")
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.build_args(firmware, system, None, tmp_path, 4444)
+
+    assert excinfo.value.code == ErrorCode.CONFIG_INVALID
+
+
+def test_the_repository_machine_config_agrees_with_the_launcher():
+    """``config/machine.json`` must not claim a network the argv does not build.
+
+    This reads the real file rather than a fixture: the drift this guards
+    against is between the shipped configuration and the shipped launcher.
+    """
+    machine = MachineConfig.from_dict(read_json(MACHINE_CONFIG_PATH))
+    launcher = QemuLauncher(machine)
+    args = launcher.build_args(
+        MACHINE_CONFIG_PATH, MACHINE_CONFIG_PATH, None, Path.cwd(), 4444
+    )
+
+    net = dict(machine.devices or {}).get("net", {})
+    if net.get("enabled"):
+        assert args.count("-nic") == 1
+        assert _option_value(args, "-nic") != "none"
+    else:
+        assert _option_value(args, "-nic") == "none"
 
 
 @pytest.mark.parametrize("port", [0, -1, 65536, "4444"])
