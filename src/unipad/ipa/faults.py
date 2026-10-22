@@ -26,9 +26,12 @@ from ..errors import ErrorCode, UniPadError
 
 __all__ = [
     "InstallStage",
+    "TERMINAL_STAGES",
+    "SUCCESS_STAGES",
     "FaultEntry",
     "classify",
     "is_terminal",
+    "is_success",
     "first_fault_code",
     "fault_codes",
 ]
@@ -70,6 +73,11 @@ class InstallStage(str, Enum):
 
 #: Stages after which the install chain performs no further work.
 TERMINAL_STAGES: tuple[str, ...] = ("installed", "registered", "failed")
+
+#: Stages that report the install actually succeeded.  ``failed`` is terminal
+#: but is not a success, so anything that asks "did the install complete" must
+#: test against this, never against :data:`TERMINAL_STAGES`.
+SUCCESS_STAGES: tuple[str, ...] = ("installed", "registered")
 
 #: Reasonable stable reasons for precheck faults.  Not exhaustive: a caller
 #: may add a reason, but existing spellings must not change meaning.
@@ -148,6 +156,17 @@ def is_terminal(stage: "InstallStage | str") -> bool:
     """Return True when ``stage`` ends the install chain (PRD 9.1)."""
     value = stage.value if isinstance(stage, InstallStage) else str(stage)
     return value in TERMINAL_STAGES
+
+
+def is_success(stage: "InstallStage | str") -> bool:
+    """Return True only when ``stage`` reports the install succeeded.
+
+    ``failed`` is terminal, so :func:`is_terminal` answers "is this over?"
+    while this answers "did it work?".  A gate that wants the second must call
+    this one; using :func:`is_terminal` there lets a failed install pass.
+    """
+    value = stage.value if isinstance(stage, InstallStage) else str(stage)
+    return value in SUCCESS_STAGES
 
 
 def first_fault_code(faults: Iterable[FaultEntry]) -> str | None:

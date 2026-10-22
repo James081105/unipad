@@ -59,7 +59,7 @@ VERIFIER_ID = "unipad.controller.verifier"
 
 #: Version of the verification logic.  Bump on any condition change and record
 #: the reason in ``docs/decisions/`` (PRD 7.4).
-VERIFIER_VERSION = "1.0.0"
+VERIFIER_VERSION = "1.1.0"
 
 #: File written into a run directory when ``run_dir`` is supplied.
 VERIFICATION_FILENAME = "verification.json"
@@ -179,12 +179,25 @@ def _install_fact(ctx: CheckContext) -> dict[str, Any] | None:
 
 
 def _install_stage_terminal(ctx: CheckContext) -> list[str]:
-    """The install reached a terminal stage; a file copy alone is not install."""
+    """The install reached a terminal *successful* stage.
+
+    A file copy alone is not install, and neither is a failure.  ``failed`` is
+    in :data:`InstallResult.TERMINAL_STAGES`, so asking only "did it reach a
+    terminal stage" would let a failed install satisfy this condition; the
+    installer always pairs ``failed`` with an ``error_code`` today, but this
+    module reads ``install.json`` off disk, so a truncated, hand-edited or
+    future-producer fact file could report ``failed`` with no error code and
+    slip through every install condition.
+
+    Each condition therefore has to hold on its own rather than rely on a
+    sibling condition to catch the gap (PRD 7.4: the verifier disposes, and
+    missing or contradictory data fails closed).
+    """
     install = _install_fact(ctx)
     if install is None:
         return ["facts_missing:install"]
     stage = install.get("stage")
-    if stage not in InstallResult.TERMINAL_STAGES:
+    if stage not in InstallResult.SUCCESS_STAGES:
         return [f"install_stage_not_terminal:{stage}"]
     return []
 
@@ -260,7 +273,10 @@ _GUEST: tuple[Condition, ...] = (
     _condition("evidence.guest_log_present", "a guest-side log is recorded (serial alone is not proof)"),
 )
 _INSTALL: tuple[Condition, ...] = (
-    _condition("install.stage_terminal", "install reached a terminal stage (copy is not install)"),
+    _condition(
+        "install.stage_terminal",
+        "install reached a terminal successful stage -- neither a copy nor a failure counts",
+    ),
     _condition("install.bundle_id_recorded", "bundle id is recorded"),
     _condition("install.error_free", "no install error code is recorded"),
 )

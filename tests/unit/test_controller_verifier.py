@@ -287,6 +287,43 @@ def test_an_install_error_code_fails_the_gate_even_at_a_terminal_stage(
     assert f"install_error:{ErrorCode.REGISTRATION_FAILED}" in outcome.result.failure_reasons
 
 
+def test_a_failed_install_without_an_error_code_still_fails_the_gate(
+    verifier: Verifier, tmp_path: Path
+) -> None:
+    """A failed stage is not a success, even with no error code recorded.
+
+    ``stage='failed'`` is in :data:`InstallResult.TERMINAL_STAGES`, so a
+    condition that only asks "did it reach *a* terminal stage" treats a failure
+    as satisfying it.  The installer always pairs the two today, but the
+    verifier reads ``install.json`` off disk, so a truncated, hand-edited or
+    future-producer fact file could report ``failed`` with no ``error_code``
+    and slip past every install condition.
+
+    The verifier is the last line of defence (PRD 7.4: the model proposes, the
+    verifier disposes), so each condition must hold on its own instead of
+    relying on a sibling condition to catch the gap.
+    """
+    evidence = _complete_evidence(tmp_path)
+    shot = tmp_path / "screenshots" / "noerror.ppm"
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    shot.write_bytes(b"P6\n2 2\n255\nrgb")
+    evidence.screenshots = ["screenshots/noerror.ppm"]
+    facts = {
+        "install": {
+            "package_sha256": "c" * 64,
+            "bundle_id": "com.unipad.hello",
+            "stage": "failed",
+            "trust_mode": None,
+            "error_code": None,
+        }
+    }
+
+    outcome = verifier.evaluate_detailed("M10", "M10", evidence, run_dir=tmp_path, facts=facts)
+
+    assert outcome.result.passed is False
+    assert "install_stage_not_terminal:failed" in outcome.result.failure_reasons
+
+
 def test_missing_install_facts_fail_closed(verifier: Verifier, tmp_path: Path) -> None:
     # PRD 7.4: "no data" is a failure, not a pass.
     evidence = _complete_evidence(tmp_path)

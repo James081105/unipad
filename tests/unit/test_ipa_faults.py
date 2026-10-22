@@ -39,12 +39,14 @@ from unipad.ipa.faults import (
     REASON_NO_ARM64_SLICE,
     REASON_PLATFORM_UNKNOWN,
     REASON_SIMULATOR_PLATFORM,
+    SUCCESS_STAGES,
     TERMINAL_STAGES,
     FaultEntry,
     InstallStage,
     classify,
     fault_codes,
     first_fault_code,
+    is_success,
     is_terminal,
 )
 from unipad.ipa.precheck import run_precheck
@@ -110,6 +112,37 @@ def test_terminal_stages_agree_with_the_model():
     # ``transferred`` is *not* terminal: PRD 9.1 leaves the guest to finish.
     assert "transferred" not in TERMINAL_STAGES
     assert "checked" not in TERMINAL_STAGES
+
+
+def test_success_stages_exclude_the_failure_that_is_also_terminal():
+    """``failed`` ends the chain but is not a success.
+
+    The two vocabularies exist because "is this over?" and "did it work?" are
+    different questions, and a gate that wants the second must not be handed
+    the answer to the first.
+    """
+    # arrange / act / assert
+    assert SUCCESS_STAGES == InstallResult.SUCCESS_STAGES
+    assert set(SUCCESS_STAGES) == {"installed", "registered"}
+    assert set(SUCCESS_STAGES) < set(TERMINAL_STAGES)
+    assert "failed" not in SUCCESS_STAGES
+    assert "failed" in TERMINAL_STAGES
+
+
+@pytest.mark.parametrize("stage", list(InstallStage), ids=lambda s: s.value)
+def test_is_success_is_true_only_for_a_completed_install(stage):
+    """``is_success`` accepts the enum and the raw string alike."""
+    # arrange / act / assert
+    expected = stage.value in SUCCESS_STAGES
+    assert is_success(stage) is expected
+    assert is_success(stage.value) is expected
+
+
+def test_is_success_rejects_a_failure_that_is_terminal():
+    """The distinction the verifier depends on (PRD 9.1 / 7.4)."""
+    # arrange / act / assert
+    assert is_terminal("failed") is True
+    assert is_success("failed") is False
 
 
 def test_stage_str_and_json_share_one_spelling():

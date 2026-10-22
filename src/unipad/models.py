@@ -210,6 +210,10 @@ class InstallResult:
 
     TERMINAL_STAGES = ("installed", "registered", "failed")
 
+    #: Terminal stages that report success.  ``failed`` is terminal but is not
+    #: a success; a gate asking "did the install complete" must use this.
+    SUCCESS_STAGES = ("installed", "registered")
+
     @property
     def ok(self) -> bool:
         return self.stage in ("installed", "registered") and self.error_code is None

@@ -64,7 +64,7 @@ from unipad.models import (
     read_json,
     write_json,
 )
-from unipad.controller.verifier import Verifier, load_facts
+from unipad.controller.verifier import VERIFIER_ID, VERIFIER_VERSION, Verifier, load_facts
 from tests.fakes import fake_qemu as fq
 from tests.fixtures.ipa_builder import build_ipa, hello_ipa, notes_ipa
 
@@ -841,7 +841,7 @@ def test_ipa_mvp_gate_passes_on_complete_simulation_evidence(stack, desktop_sess
     assert outcome.result.milestone == "M12"
     assert outcome.result.failure_reasons == []
     assert outcome.code is None
-    assert outcome.result.verifier_id == "unipad.controller.verifier@1.0.0"
+    assert outcome.result.verifier_id == f"{VERIFIER_ID}@{VERIFIER_VERSION}"
     assert bundle.missing == []
 
     verification = read_json(run_dir / "verification.json")

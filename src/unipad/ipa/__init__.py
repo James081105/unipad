@@ -27,12 +27,14 @@ Runtime dependencies: Python standard library only.
 from __future__ import annotations
 
 from .faults import (
+    SUCCESS_STAGES,
     TERMINAL_STAGES,
     FaultEntry,
     InstallStage,
     classify,
     fault_codes,
     first_fault_code,
+    is_success,
     is_terminal,
 )
 from .macho import (
@@ -130,9 +132,11 @@ __all__ = [
     "FaultEntry",
     "classify",
     "is_terminal",
+    "is_success",
     "fault_codes",
     "first_fault_code",
     "TERMINAL_STAGES",
+    "SUCCESS_STAGES",
     # transfer
     "GuestTransport",
     "HostSideTransfer",
