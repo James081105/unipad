@@ -275,13 +275,15 @@ class ImageManager:
 
         Raises:
             UniPadError: ``image_not_found`` when the file is missing,
+                ``config_invalid`` when ``expected_sha256`` is not a 64-character
+                hex digest (a caller bug, not a manifest problem),
                 ``image_hash_mismatch`` with both digests in ``details`` when
                 they differ.
         """
         expected = (expected_sha256 or "").strip().lower()
         if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
             raise UniPadError(
-                ErrorCode.ARTIFACT_MANIFEST_INVALID,
+                ErrorCode.CONFIG_INVALID,
                 "expected_sha256 must be a 64-character lowercase hex digest",
                 expected_sha256=expected_sha256,
             )

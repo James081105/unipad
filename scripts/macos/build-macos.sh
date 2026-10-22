@@ -123,7 +123,15 @@ emit_error() {
 }
 
 die() { # die CODE MESSAGE [DETAIL_JSON] EXIT
-    local code="$1" message="$2" details="${3:-{\}}" exit_code="$4"
+    if (( $# != 4 )); then
+        # A wrong arity here used to shift the message into the details slot and
+        # the details JSON into the exit-code slot, producing unparseable error
+        # output and a "numeric argument required" exit.  Fail loudly instead.
+        printf '{"error":{"code":"internal_error","message":"die() called with %d arguments, expected 4","details":{}}}\n' "$#" >&2
+        printf 'prepare-image: FAILED [internal_error] die() called with %d arguments, expected 4\n' "$#" >&2
+        exit "$EXIT_FAILURE"
+    fi
+    local code="$1" message="$2" details="$3" exit_code="$4"
     emit_error "$code" "$message" "$details"
     log "FAILED [$code] $message"
     exit "$exit_code"
@@ -148,9 +156,13 @@ Options:
   --out <dir>              Output directory for artifacts and manifests.
                            Default <repo>/scripts/macos/build-out/<run-id>.
   --run-id <id>            Override the generated run id.
-  --include <path[:role[:arch]]]
+  --include <path[::role[::arch]]]
                            Declare a deliverable that must exist and be hashed
-                           into the manifest.  Repeatable.
+                           into the manifest.  Repeatable.  '::' separates the
+                           optional role and arch, so a Windows drive letter
+                           ("C:/x") is never mistaken for a delimiter.
+                           A missing file is a failure, never a silently
+                           empty manifest.
   --min-free-gb <n>        Required free space on the output filesystem.
   --skip-sources           Continue when a pinned source checkout is absent.
                            Recorded in build-report.json; the build steps stay
@@ -271,37 +283,58 @@ MANIFEST_PATH=''
 # ---------------------------------------------------------------------------
 # lock file validation (PRD 8.1 inputs)
 # ---------------------------------------------------------------------------
-# Prefer Python (a required build tool anyway); fall back to jq.
-read_lock_field() { # read_lock_field JSON_PATH
-    local path="$1"
+# All fields are read in ONE interpreter invocation.  A per-field fork was not
+# only slower, it was unreliable on hosts whose process creation is fragile, and
+# the failure was swallowed by `2>/dev/null || true` -- silently turning a
+# pinned commit into an empty string and a valid lock into a refusal.
+read_lock_fields() { # read_lock_fields -- prints KEY<TAB>VALUE per line
     if [[ -n "$PY" ]]; then
-        "$PY" - "$LOCK_PATH" "$path" <<'PY' 2>/dev/null || true
+        "$PY" - "$LOCK_PATH" <<'PY' 2>/dev/null || true
 import json, sys
-path = sys.argv[2].split('.')
+
+WANTED = (
+    ('frozen', ('frozen',)),
+    ('unixnu_commit', ('unixnu', 'commit')),
+    ('device_commit', ('device_repo', 'commit')),
+    ('qemu_accel', ('tools', 'qemu', 'accel')),
+    ('ipsw_sha256', ('ipsw', 'sha256')),
+    ('ipsw_name', ('ipsw', 'name')),
+)
 try:
     with open(sys.argv[1], 'r', encoding='utf-8') as handle:
-        node = json.load(handle)
+        root = json.load(handle)
 except Exception:
     sys.exit(0)
-for key in path:
-    if not isinstance(node, dict) or key not in node:
-        sys.exit(0)
-    node = node[key]
-if node is None:
-    print('')
-elif isinstance(node, bool):
-    print('true' if node else 'false')
-else:
-    print(node)
+for name, path in WANTED:
+    node = root
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            node = None
+            break
+        node = node[key]
+    if node is None:
+        value = ''
+    elif isinstance(node, bool):
+        value = 'true' if node else 'false'
+    else:
+        value = str(node)
+    print('%s\t%s' % (name, value.replace('\t', ' ').replace('\n', ' ')))
 PY
         return 0
     fi
     if command -v jq >/dev/null 2>&1; then
-        jq -r --arg p "$path" 'getpath($p | split(".")) | if . == null then "" else tostring end' \
+        jq -r '
+            def v(p): (getpath(p) // "") | tostring;
+            ["frozen\t" + v(["frozen"]),
+             "unixnu_commit\t" + v(["unixnu", "commit"]),
+             "device_commit\t" + v(["device_repo", "commit"]),
+             "qemu_accel\t" + v(["tools", "qemu", "accel"]),
+             "ipsw_sha256\t" + v(["ipsw", "sha256"]),
+             "ipsw_name\t" + v(["ipsw", "name"])] | .[]' \
             "$LOCK_PATH" 2>/dev/null || true
         return 0
     fi
-    printf ''
+    printf 'frozen\t\nunixnu_commit\t\ndevice_commit\t\nqemu_accel\t\nipsw_sha256\t\nipsw_name\t\n'
 }
 
 LOCK_FROZEN=''
@@ -309,6 +342,7 @@ LOCK_UNIXNU_COMMIT=''
 LOCK_DEVICE_COMMIT=''
 LOCK_QEMU_ACCEL=''
 LOCK_IPSW_SHA256=''
+LOCK_IPSW_NAME=''
 
 validate_lock() {
     if [[ ! -f "$LOCK_PATH" ]]; then
@@ -334,16 +368,24 @@ validate_lock() {
             "{\"lock\":\"$(json_escape "$LOCK_PATH")\"}" "$EXIT_BLOCKED"
     fi
 
-    LOCK_FROZEN="$(read_lock_field frozen)"
-    LOCK_UNIXNU_COMMIT="$(read_lock_field unixnu.commit)"
-    LOCK_DEVICE_COMMIT="$(read_lock_field device_repo.commit)"
-    LOCK_QEMU_ACCEL="$(read_lock_field tools.qemu.accel)"
-    LOCK_IPSW_SHA256="$(read_lock_field ipsw.sha256)"
+    local key value
+    while IFS="$(printf '\t')" read -r key value; do
+        # A Windows interpreter writes CRLF on a pipe; strip it so a value of
+        # "true\r" is never mistaken for "not frozen".
+        value="${value%$'\r'}"
+        case "$key" in
+            frozen)         LOCK_FROZEN="$value" ;;
+            unixnu_commit)  LOCK_UNIXNU_COMMIT="$value" ;;
+            device_commit)  LOCK_DEVICE_COMMIT="$value" ;;
+            qemu_accel)     LOCK_QEMU_ACCEL="$value" ;;
+            ipsw_sha256)    LOCK_IPSW_SHA256="$value" ;;
+            ipsw_name)      LOCK_IPSW_NAME="$value" ;;
+        esac
+    done < <(read_lock_fields)
 
     if [[ "$LOCK_FROZEN" != 'true' ]]; then
         die 'config_invalid' \
-            "sources lock is not frozen (frozen=$LOCK_FROZEN). " \
-            'Fill every null with evidence and set frozen=true before building (PRD 8.1).' \
+            "sources lock is not frozen (frozen=$LOCK_FROZEN). Fill every null with evidence and set frozen=true before building (PRD 8.1)." \
             "{\"lock\":\"$(json_escape "$LOCK_PATH")\",\"frozen\":\"$(json_escape "$LOCK_FROZEN")\"}" \
             "$EXIT_USAGE"
     fi
@@ -363,8 +405,7 @@ validate_lock() {
     # host.  The lock file's declared accelerator is the authority.
     if [[ "$TARGET" != "$LOCK_QEMU_ACCEL" ]]; then
         die 'accelerator_not_tcg' \
-            "target '$TARGET' contradicts the locked accelerator '$LOCK_QEMU_ACCEL'. " \
-            'Refusing to build a payload for the wrong accelerator (PRD 8.3).' \
+            "target '$TARGET' contradicts the locked accelerator '$LOCK_QEMU_ACCEL'; refusing to build a payload for the wrong accelerator (PRD 8.3)." \
             "{\"requested_target\":\"$(json_escape "$TARGET")\",\"locked_accel\":\"$(json_escape "$LOCK_QEMU_ACCEL")\"}" \
             "$EXIT_USAGE"
     fi
@@ -537,15 +578,22 @@ main() {
     # Each --include is an input that must exist; a missing one is a failure,
     # never a silently empty manifest (PRD 7.4).
     local -a inc_paths=() inc_roles=() inc_archs=()
-    local spec path role arch
+    local spec path role arch rest
     for spec in ${INCLUDES[@]+"${INCLUDES[@]}"}; do
-        path="$spec"; role=''; arch=''
-        IFS=':' read -r path role arch <<<"$spec"
+        # '::' is the delimiter, not ':': a Windows drive letter ("C:/x") must
+        # not be split into a path of "C" and a role of "/x".  Splitting with
+        # IFS=':' cannot express that, so use parameter expansion instead.
+        path="${spec%%::*}"
+        rest="${spec#*::}"
+        [[ "$rest" == "$spec" ]] && rest=''
+        role="${rest%%::*}"
+        arch="${rest#*::}"
+        [[ "$arch" == "$rest" ]] && arch=''
         if [[ -z "$path" ]]; then
             die 'config_invalid' "--include needs a path." '{}' "$EXIT_USAGE"
         fi
-        # Relative include paths resolve against the repository root.
-        if [[ "$path" != /* ]]; then
+        # Absolute means POSIX "/..." or a Windows drive "C:/" / "C:\".
+        if [[ "$path" != /* && ! "$path" =~ ^[A-Za-z]:[/\\] ]]; then
             path="$REPO_ROOT/$path"
         fi
         if [[ ! -f "$path" ]]; then
@@ -656,7 +704,9 @@ main() {
         esac
     done
 
-    write_outputs 1 "${#inc_paths[@]}"
+    # "$sources_present" and not a literal 1: with --skip-sources the ledger
+    # says the sources were absent, so the report must agree with it.
+    write_outputs "$sources_present" "${#inc_paths[@]}"
 
     step "summary"
     log "run_id:  $RUN_ID"
@@ -745,9 +795,14 @@ write_outputs() {
     # --- artifact-manifest.json -------------------------------------------
     # Written through Python so the bytes match unipad.models.write_json
     # (ensure_ascii=False, sort_keys=True, indent=2, trailing newline) exactly.
-    # Records arrive on stdin, one per artifact, fields separated by US (0x1f):
-    #   name <US> sha256 <US> size_bytes <US> role <US> arch <US> path
-    printf '%s\n' ${records[@]+"${records[@]}"} | write_manifest
+    # The records go through a temp file rather than a pipe: the manifest
+    # writer's heredoc would otherwise replace stdin and silently drop every
+    # record, producing a valid manifest with an empty artifacts list.
+    local records_file
+    records_file="$(mktemp 2>/dev/null || printf '%s/.records.%s.tmp' "$OUT_DIR" "$$")"
+    printf '%s\n' ${records[@]+"${records[@]}"} >"$records_file"
+    write_manifest "$records_file"
+    rm -f -- "$records_file"
     if [[ ! -s "$MANIFEST_PATH" ]]; then
         die 'evidence_incomplete' "artifact manifest was not written: $MANIFEST_PATH" \
             "{\"manifest\":\"$(json_escape "$MANIFEST_PATH")\"}" "$EXIT_FAILURE"
@@ -762,35 +817,42 @@ write_outputs() {
     fi
 }
 
-# write_manifest -- read artifact records on stdin, write MANIFEST_PATH.
+# write_manifest RECORDS_FILE -- write MANIFEST_PATH from one-record-per-line
+# TSV (fields separated by US, 0x1f):
+#   name <US> sha256 <US> size_bytes <US> role <US> arch <US> path
 # The shape is unipad.models.ArtifactManifest exactly: run_id, artifacts[],
 # target, unixnu_commit, device_repo_commit, toolchain.
 write_manifest() {
+    local records_file="$1"
     [[ -n "$PY" ]] || die 'blocked' 'no Python interpreter for the manifest writer.' \
         '{}' "$EXIT_BLOCKED"
+    [[ -f "$records_file" ]] || die 'evidence_incomplete' \
+        "artifact records file is missing: $records_file" '{}' "$EXIT_FAILURE"
     "$PY" - "$MANIFEST_PATH" "$RUN_ID" "$TARGET" \
-        "$LOCK_UNIXNU_COMMIT" "$LOCK_DEVICE_COMMIT" \
+        "$LOCK_UNIXNU_COMMIT" "$LOCK_DEVICE_COMMIT" "$records_file" \
         "$TOOL_XCODEBUILD" "$TOOL_CLANG" "$TOOL_PYTHON" "$TOOL_GIT" <<'PYEOF'
 import json
 import sys
 
 sep = "\037"
 (manifest_path, run_id, target, unixnu_commit, device_repo_commit,
- xcodebuild, clang, python3, git) = sys.argv[1:10]
+ records_file, xcodebuild, clang, python3, git) = sys.argv[1:11]
 
 artifacts = []
-for line in sys.stdin.read().split("\n"):
-    if not line:
-        continue
-    name, sha256, size_bytes, role, arch, path = line.split(sep)
-    artifacts.append({
-        "name": name,
-        "sha256": sha256,
-        "size_bytes": int(size_bytes),
-        "arch": arch if arch else None,
-        "role": role if role else None,
-        "path": path,
-    })
+with open(records_file, 'r', encoding='utf-8') as handle:
+    for line in handle.read().split("\n"):
+        line = line.rstrip("\r")
+        if not line:
+            continue
+        name, sha256, size_bytes, role, arch, path = line.split(sep)
+        artifacts.append({
+            "name": name,
+            "sha256": sha256,
+            "size_bytes": int(size_bytes),
+            "arch": arch if arch else None,
+            "role": role if role else None,
+            "path": path,
+        })
 
 manifest = {
     "run_id": run_id,

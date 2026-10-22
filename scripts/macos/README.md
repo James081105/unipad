@@ -9,5 +9,5 @@ macOS 专用入口（PRD §4.1、§8.1）。Xcode、Apple SDK 与磁盘工具只
 | `prepare-image.sh` | IPSW/RootFS 准备（校验 sha256、解包、生成本地清单） | 只写 `local-private/` 之外的调用方指定目录；绝不写入仓库；产物绝不提交 |
 
 Windows 侧通过 GitHub run ID 下载对应产物并核验后运行（PRD 8.2 步骤 5–6）。
-上游 Apple 工具相关步骤标注 `TODO(macos-only)`，其实现在现场（macOS）验证，
+上游 Apple 工具相关步骤标注 `TODO(macos-verified-only)`，其实现在现场（macOS）验证，
 Windows 代码阶段只保证契约、输入校验与发布守卫可执行、可测试。

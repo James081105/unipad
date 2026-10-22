@@ -39,7 +39,6 @@ from ..models import (
     M14,
     M15,
     EvidenceSet,
-    ExperimentRecord,
     GateResult,
     InstallResult,
 )
@@ -691,16 +690,4 @@ def describe_gate(gate_id: str) -> dict[str, Any]:
         "verifier_id": VERIFIER_ID,
         "verifier_version": VERIFIER_VERSION,
         "conditions": [condition.to_dict() for condition in Verifier.conditions_for(gate_id)],
-    }
-
-
-def record_experiment_summary(record: ExperimentRecord) -> dict[str, Any]:
-    """Return the journal fields a gate report should quote (no prose claims)."""
-    return {
-        "experiment_id": record.experiment_id,
-        "milestone": record.milestone,
-        "status": record.status,
-        "result": record.result,
-        "evidence_count": len(record.evidence),
-        "changes_count": len(record.changes),
     }

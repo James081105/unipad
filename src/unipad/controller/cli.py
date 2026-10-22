@@ -22,8 +22,9 @@ Contract
   run on this host (no QEMU binary, no artifacts, no guest channel) the
   command returns a structured ``blocked`` result with a concrete reason --
   never a faked success and never a fixed countdown (PRD FR08);
-* no secrets are printed (PRD 9.2): child stdout is captured, truncated and
-  reported as a byte count plus a short tail.
+* no secrets are printed (PRD 9.2): stdout produced by a capability is
+  captured and reported as a byte count only, so child output can never leak
+  into the envelope.
 
 Capability probing
 ------------------
@@ -101,9 +102,6 @@ _VALUE_OPTIONS = frozenset(
         "--artifacts-root",
     }
 )
-
-#: How long a captured child stdout tail may be (bytes) in the envelope.
-_CHILD_STDOUT_TAIL = 2000
 
 #: Evidence file names mapped onto :class:`unipad.models.EvidenceSet` fields.
 _EVIDENCE_FILES: dict[str, tuple[str, ...]] = {
@@ -980,6 +978,17 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
         f"  experiment_id={experiment_id}",
     ]
 
+    def _persist_install_log() -> None:
+        """Append the install log so every reported ``log_path`` exists.
+
+        A blocked install still has to leave the evidence behind: the envelope
+        names this file, so writing it must not depend on reaching the end of
+        the chain (PRD 9.1).
+        """
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(log_lines) + "\n")
+
     # 1. Package precheck (PRD 10): platform, arch, minimum OS, encryption.
     #    unipad.ipa.precheck never raises for a rejectable package, so a
     #    structurally broken IPA comes back as a fault list instead.
@@ -1022,13 +1031,15 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
     # 2. Guest channel: the transfer target must exist (PRD 10, FR06).
     channel_factory = _resolve_capability("guest_channel")
     if channel_factory is None:
+        log_lines.append("  guest_channel=missing")
+        _persist_install_log()
         raise blocked(
             "no guest channel available; cannot transfer the package into the guest",
             command="install",
             experiment_id=experiment_id,
             package_sha256=package_sha256,
             stage="checked",
-            reason="guest_channel_missing",
+            blocked_reason="guest_channel_missing",
             probed=_probed("guest_channel"),
             data={
                 "package_sha256": package_sha256,
@@ -1042,12 +1053,24 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
     try:
         channel, channel_dropped, _channel_stdout = _call_capability(channel_factory)
     except Exception as exc:  # noqa: BLE001 - a dead channel is a blocked host, not a crash
+        log_lines.append(f"  guest_channel={type(exc).__name__}: {exc}")
+        _persist_install_log()
         raise blocked(
             "guest channel could not be established",
             command="install",
             experiment_id=experiment_id,
             package_sha256=package_sha256,
+            stage="checked",
+            blocked_reason="guest_channel_unavailable",
             error=f"{type(exc).__name__}: {exc}",
+            data={
+                "package_sha256": package_sha256,
+                "bundle_id": getattr(report, "bundle_id", None),
+                "stage": "checked",
+                "trust_mode": None,
+                "error_code": ErrorCode.BLOCKED,
+                "log_path": log_path.as_posix(),
+            },
         ) from exc
 
     # 3. Installer: transfer + install service + registration.  The precheck
@@ -1061,13 +1084,14 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
         )
     except UniPadError as exc:
         log_lines.append(f"  installer={exc.code}: {exc.message}")
+        _persist_install_log()
         raise blocked(
             exc.message,
             command="install",
             experiment_id=experiment_id,
             package_sha256=package_sha256,
             stage="checked",
-            reason=exc.details.get("reason") or exc.code,
+            blocked_reason=exc.details.get("reason") or exc.code,
             data={
                 "package_sha256": package_sha256,
                 "bundle_id": getattr(report, "bundle_id", None),
@@ -1101,7 +1125,7 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
             log_lines=log_lines,
             precheck=precheck,
             dropped=sorted({*precheck_dropped, *channel_dropped}),
-            budget=report_budget,
+            budget=budget_report,
             prior_install_check="performed_by_controller",
         )
     log_lines.append(f"  installer_stdout_bytes={len(install_stdout)}")
@@ -1119,7 +1143,7 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
         log_lines=log_lines,
         precheck=precheck,
         dropped=sorted({*precheck_dropped, *channel_dropped}),
-        budget=report_budget,
+        budget=budget_report,
         prior_install_check="performed_by_controller",
     )
 
@@ -1291,7 +1315,7 @@ def cmd_stop(args: argparse.Namespace) -> CommandOutcome:
             command="stop",
             run=run_id,
             expected=record_path.as_posix(),
-            reason="no_launch_record",
+            blocked_reason="no_launch_record",
         )
     pid = int(record["pid"])
     alive = _pid_alive(pid)
@@ -1318,7 +1342,7 @@ def cmd_stop(args: argparse.Namespace) -> CommandOutcome:
         command="stop",
         run=run_id,
         pid=pid,
-        reason="no_owned_instance",
+        blocked_reason="no_owned_instance",
         probed=_probed("stop"),
         data=data,
     )
@@ -1371,19 +1395,17 @@ def cmd_collect(args: argparse.Namespace) -> CommandOutcome:
         else:
             notes.append(f"{name} is empty; an empty command line is not evidence of a run")
         break
-    for name, method in (
-        ("serial.log", "add_serial_log"),
-        ("serial.txt", "add_serial_log"),
-        ("guest.log", "add_guest_log"),
-        ("guest-log.txt", "add_guest_log"),
-    ):
-        target = run_dir / name
-        if not target.is_file():
-            continue
-        # copy=False: the log already lives inside the run directory.
-        getattr(bundle, method)(target, copy=False)
-        collected.append(name)
-        break
+    # Serial and guest logs are separate evidence items (PRD 7.4: serial text
+    # alone is not proof), so each gets its own loop.  copy=False because the
+    # logs already live inside the run directory.
+    for field_name, method in (("serial_log", "add_serial_log"), ("guest_log", "add_guest_log")):
+        for name in _EVIDENCE_FILES[field_name]:
+            target = run_dir / name
+            if not target.is_file():
+                continue
+            getattr(bundle, method)(target, copy=False)
+            collected.append(name)
+            break
     qmp_log = run_dir / "qmp.log"
     if qmp_log.is_file():
         bundle.add_qmp_log(qmp_log.read_text(encoding="utf-8", errors="replace"))
@@ -1514,9 +1536,16 @@ def cmd_restore(args: argparse.Namespace) -> CommandOutcome:
                 entry_index=index,
                 entry=entry,
             )
-        backup_path = Path(str(backup))
-        if not backup_path.is_absolute():
-            backup_path = checkpoint_dir / backup_path
+        raw_backup = Path(str(backup))
+        if raw_backup.is_absolute():
+            backup_path = raw_backup
+        else:
+            # ImageManager.backup records whatever path it was handed, so a
+            # relative backup_path may resolve against the checkpoint directory
+            # or against the working directory.  Prefer the one that exists and
+            # keep the first candidate for the error message otherwise.
+            options = [checkpoint_dir / raw_backup, Path.cwd() / raw_backup, raw_backup]
+            backup_path = next((option for option in options if option.is_file()), options[0])
         if not backup_path.is_file():
             raise UniPadError(
                 ErrorCode.IMAGE_NOT_FOUND,
@@ -1606,7 +1635,13 @@ class _HelpRequested(Exception):
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser that reports errors as structured UniPadErrors."""
+    """ArgumentParser that reports errors as structured UniPadErrors.
+
+    ``print_help`` is suppressed: argparse writes it straight to stdout before
+    raising, which would put a second document on the command's stdout.  The
+    help text travels inside the JSON envelope instead (PRD 9.1: exactly one
+    JSON object per command).
+    """
 
     def error(self, message: str) -> None:  # type: ignore[override]
         raise UniPadError(
@@ -1619,6 +1654,14 @@ class _JsonArgumentParser(argparse.ArgumentParser):
         if message:
             raise UniPadError(ErrorCode.CONFIG_INVALID, message.strip())
         raise _HelpRequested(self.format_help())
+
+    def print_help(self, file: Any = None) -> None:  # type: ignore[override]
+        """Never write help to stdout; :meth:`exit` carries it in the envelope."""
+        return None
+
+    def print_usage(self, file: Any = None) -> None:  # type: ignore[override]
+        """Never write usage to stdout; it is part of the error details."""
+        return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1779,7 +1822,8 @@ def main(argv: Sequence[str] | None = None, stream: Any = None) -> int:
             )
         outcome = args.handler(args)
     except _HelpRequested as exc:
-        outcome = _ok("<help>", {"help": exc.text})
+        name = getattr(args, "command", None) or command or "<help>"
+        outcome = _ok(str(name), {"help": exc.text})
     except UniPadError as exc:
         name = getattr(args, "command", None) or command or "<none>"
         outcome = _from_error(str(name), exc)
