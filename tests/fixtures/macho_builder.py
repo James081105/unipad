@@ -34,17 +34,20 @@ from typing import Sequence
 
 from unipad.ipa.macho import (
     CPU_SUBTYPE_ARM64E,
+    CPU_TYPE_ARM,
     CPU_TYPE_ARM64,
     CPU_TYPE_X86_64,
     FAT_MAGIC,
     LC_BUILD_VERSION,
     LC_CODE_SIGNATURE,
+    LC_ENCRYPTION_INFO,
     LC_ENCRYPTION_INFO_64,
     LC_ID_DYLIB,
     LC_LOAD_DYLIB,
     LC_RPATH,
     MH_DYLIB,
     MH_EXECUTE,
+    MH_MAGIC,
     MH_MAGIC_64,
     PLATFORM_IOS,
     PLATFORM_IOSSIMULATOR,
@@ -54,9 +57,11 @@ from unipad.ipa.macho import (
 __all__ = [
     # re-exported so tests never hard-code a magic/arch/platform number
     "ARM64",
+    "ARM32",
     "ARM64E_SUBTYPE",
     "X86_64",
     "FAT_MAGIC",
+    "MH_MAGIC",
     "MH_MAGIC_64",
     "MH_EXECUTE",
     "MH_DYLIB",
@@ -73,6 +78,7 @@ __all__ = [
     "simulator_slice",
     "x86_64_ios_slice",
     "arm64e_slice",
+    "arm32_ios_slice",
     "dylib_slice",
     "device_fat",
     "mixed_platform_fat",
@@ -81,6 +87,7 @@ __all__ = [
 #: Architecture / platform aliases used by the fixtures.  These are the
 #: authoritative values from :mod:`unipad.ipa.macho`; do not re-derive them.
 ARM64 = CPU_TYPE_ARM64                  # 0x0100000C
+ARM32 = CPU_TYPE_ARM                    # 0x0000000C (32-bit armv7/armv7s)
 ARM64E_SUBTYPE = CPU_SUBTYPE_ARM64E     # 2 (low subtype bits of arm64e)
 X86_64 = CPU_TYPE_X86_64                # 0x01000007
 
@@ -133,16 +140,23 @@ def _lc_build_version(
     platform: int,
     minos: int | Sequence[int],
     sdk: int | Sequence[int],
+    endian: str = "<",
 ) -> bytes:
     """``LC_BUILD_VERSION`` (0x32): platform + minos + sdk + ntools."""
-    body = struct.pack("<IIII", platform, pack_version(minos), pack_version(sdk), 0)
-    return struct.pack("<II", LC_BUILD_VERSION, 8 + len(body)) + body
+    body = struct.pack(endian + "IIII", platform, pack_version(minos), pack_version(sdk), 0)
+    return struct.pack(endian + "II", LC_BUILD_VERSION, 8 + len(body)) + body
 
 
-def _lc_encryption_info_64(cryptoff: int, cryptsize: int, cryptid: int) -> bytes:
+def _lc_encryption_info_64(cryptoff: int, cryptsize: int, cryptid: int, endian: str = "<") -> bytes:
     """``LC_ENCRYPTION_INFO_64`` (0x2C): cryptoff/cryptsize/cryptid/pad."""
-    body = struct.pack("<IIII", cryptoff, cryptsize, cryptid, 0)
-    return struct.pack("<II", LC_ENCRYPTION_INFO_64, 8 + len(body)) + body
+    body = struct.pack(endian + "IIII", cryptoff, cryptsize, cryptid, 0)
+    return struct.pack(endian + "II", LC_ENCRYPTION_INFO_64, 8 + len(body)) + body
+
+
+def _lc_encryption_info_32(cryptoff: int, cryptsize: int, cryptid: int, endian: str = "<") -> bytes:
+    """``LC_ENCRYPTION_INFO`` (0x21): the 32-bit variant (no ``pad`` field)."""
+    body = struct.pack(endian + "III", cryptoff, cryptsize, cryptid)
+    return struct.pack(endian + "II", LC_ENCRYPTION_INFO, 8 + len(body)) + body
 
 
 def _lc_dylib(
@@ -152,6 +166,7 @@ def _lc_dylib(
     timestamp: int = 2,
     current_version: int = 0x00010000,
     compatibility_version: int = 0x00010000,
+    endian: str = "<",
 ) -> bytes:
     """``LC_LOAD_DYLIB`` / ``LC_ID_DYLIB`` with a NUL-terminated install name.
 
@@ -161,24 +176,24 @@ def _lc_dylib(
     """
     name_offset = 24
     body = struct.pack(
-        "<IIII", name_offset, timestamp, current_version, compatibility_version
+        endian + "IIII", name_offset, timestamp, current_version, compatibility_version
     ) + name.encode("utf-8") + b"\x00"
     body += b"\x00" * ((-len(body)) % 8)  # 64-bit commands are 8-byte aligned
-    return struct.pack("<II", command, 8 + len(body)) + body
+    return struct.pack(endian + "II", command, 8 + len(body)) + body
 
 
-def _lc_rpath(path: str) -> bytes:
+def _lc_rpath(path: str, endian: str = "<") -> bytes:
     """``LC_RPATH`` (0x1C) with a NUL-terminated path string."""
     path_offset = 12
-    body = struct.pack("<I", path_offset) + path.encode("utf-8") + b"\x00"
+    body = struct.pack(endian + "I", path_offset) + path.encode("utf-8") + b"\x00"
     body += b"\x00" * ((-len(body)) % 8)
-    return struct.pack("<II", LC_RPATH, 8 + len(body)) + body
+    return struct.pack(endian + "II", LC_RPATH, 8 + len(body)) + body
 
 
-def _lc_code_signature(dataoff: int, datasize: int) -> bytes:
+def _lc_code_signature(dataoff: int, datasize: int, endian: str = "<") -> bytes:
     """``LC_CODE_SIGNATURE`` (0x1D): dataoff/datasize placeholder."""
-    body = struct.pack("<II", dataoff, datasize)
-    return struct.pack("<II", LC_CODE_SIGNATURE, 8 + len(body)) + body
+    body = struct.pack(endian + "II", dataoff, datasize)
+    return struct.pack(endian + "II", LC_CODE_SIGNATURE, 8 + len(body)) + body
 
 
 def build_thin_macho(
@@ -197,6 +212,8 @@ def build_thin_macho(
     filetype: int = MH_EXECUTE,
     flags: int = _DEFAULT_FLAGS,
     body_size: int = _DEFAULT_BODY_SIZE,
+    is_64: bool = True,
+    endian: str = "<",
 ) -> bytes:
     """Build a structurally valid thin 64-bit Mach-O image.
 
@@ -220,10 +237,15 @@ def build_thin_macho(
         filetype: ``MH_EXECUTE`` (default) or ``MH_DYLIB``.
         flags: Mach-O header flags.
         body_size: Trailing body bytes after the load commands.
+        is_64: Emit a 64-bit image (``MH_MAGIC_64``, 32-byte header) or a
+            32-bit one (``MH_MAGIC``, 28-byte header, ``LC_ENCRYPTION_INFO``).
+        endian: ``"<"`` (little-endian, every platform Apple still ships) or
+            ``">"`` for the byte-swapped ``MH_CIGAM_64`` spelling the parser
+            must still decode instead of rejecting as garbage.
 
     Returns:
-        The complete image bytes: 32-byte 64-bit header, load commands with
-        consistent ``ncmds``/``sizeofcmds``, body, optional signature blob.
+        The complete image bytes: header, load commands with consistent
+        ``ncmds``/``sizeofcmds``, body, optional signature blob.
     """
     if encrypted and int(cryptid) == 0:
         resolved_cryptid = 1
@@ -235,37 +257,54 @@ def build_thin_macho(
     else:
         resolved_cryptid = int(cryptid)
 
-    commands: list[bytes] = [_lc_build_version(platform, minos, sdk)]
+    commands: list[bytes] = [_lc_build_version(platform, minos, sdk, endian)]
     # The encryption command is always emitted: an unencrypted image then
     # carries an explicit ``cryptid == 0`` instead of merely omitting the
     # evidence, which is what the precheck reports on either way.
-    commands.append(_lc_encryption_info_64(0, 0, resolved_cryptid))
+    if is_64:
+        commands.append(_lc_encryption_info_64(0, 0, resolved_cryptid, endian))
+    else:
+        commands.append(_lc_encryption_info_32(0, 0, resolved_cryptid, endian))
     if install_name:
-        commands.append(_lc_dylib(install_name, LC_ID_DYLIB))
-    commands.extend(_lc_dylib(name, LC_LOAD_DYLIB) for name in dylibs)
-    commands.extend(_lc_rpath(path) for path in rpaths)
+        commands.append(_lc_dylib(install_name, LC_ID_DYLIB, endian=endian))
+    commands.extend(_lc_dylib(name, LC_LOAD_DYLIB, endian=endian) for name in dylibs)
+    commands.extend(_lc_rpath(path, endian) for path in rpaths)
 
     sizeofcmds = sum(len(cmd) for cmd in commands)
     # ``LC_CODE_SIGNATURE`` is a fixed 16 bytes, so the signature offset can
     # be computed before the command itself is serialised.
-    signature_offset = 32 + sizeofcmds + 16 + body_size
+    header_size = 32 if is_64 else 28
+    signature_offset = header_size + sizeofcmds + 16 + body_size
     if has_code_signature:
-        commands.append(_lc_code_signature(signature_offset, _SIGNATURE_SIZE))
+        commands.append(_lc_code_signature(signature_offset, _SIGNATURE_SIZE, endian))
         sizeofcmds += len(commands[-1])
 
-    header = struct.pack(
-        "<8I",
-        MH_MAGIC_64,
-        cputype,
-        cpusubtype,
-        filetype,
-        len(commands),
-        sizeofcmds,
-        flags,
-        0,  # reserved
-    )
+    magic = (MH_MAGIC_64 if is_64 else MH_MAGIC)
+    if is_64:
+        header = struct.pack(
+            endian + "8I",
+            magic,
+            cputype,
+            cpusubtype,
+            filetype,
+            len(commands),
+            sizeofcmds,
+            flags,
+            0,  # reserved
+        )
+    else:
+        header = struct.pack(
+            endian + "7I",
+            magic,
+            cputype,
+            cpusubtype,
+            filetype,
+            len(commands),
+            sizeofcmds,
+            flags,
+        )
     prefix = header + b"".join(commands)
-    if len(prefix) != 32 + sizeofcmds:  # pragma: no cover - builder self-check
+    if len(prefix) != header_size + sizeofcmds:  # pragma: no cover - builder self-check
         raise AssertionError("sizeofcmds must match the serialised load commands")
     image = bytearray(prefix + b"\x00" * body_size)
     if has_code_signature:
@@ -370,6 +409,11 @@ def x86_64_ios_slice() -> bytes:
 def arm64e_slice() -> bytes:
     """An arm64e Device slice (still ARM64, still acceptable)."""
     return build_thin_macho(cpusubtype=ARM64E_SUBTYPE)
+
+
+def arm32_ios_slice() -> bytes:
+    """A 32-bit ``armv7`` Device slice (``MH_MAGIC``, not ``MH_MAGIC_64``)."""
+    return build_thin_macho(cputype=ARM32, cpusubtype=9, is_64=False)
 
 
 def dylib_slice(name: str = FRAMEWORK_INSTALL_NAME) -> bytes:

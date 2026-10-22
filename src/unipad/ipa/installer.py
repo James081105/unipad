@@ -27,7 +27,7 @@ the installer reports ``blocked`` instead of pretending a channel exists.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
@@ -464,15 +464,22 @@ class IpaInstaller:
             return
 
     def _record_in_store(self, result: InstallResult) -> None:
-        """Hand the transition to the experiment store, if it accepts one."""
+        """Hand the transition to the experiment store, if it accepts one.
+
+        A *snapshot* is passed, not the live result: the installer advances one
+        mutable ``InstallResult`` through every stage, so handing the object
+        itself would leave a journal store with N references to the final
+        state and no record of the transitions (PRD 7.3).
+        """
         store = self._store
         if store is None:
             return
+        snapshot = replace(result)
         for method_name in ("record_install", "record"):
             method = getattr(store, method_name, None)
             if callable(method):
                 try:
-                    method(result)
+                    method(snapshot)
                 except Exception:
                     return
                 return

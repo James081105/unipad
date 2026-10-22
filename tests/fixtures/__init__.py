@@ -8,10 +8,13 @@ self-check is run by ``tests/`` owners as a scratch script, see
 What lives here
 ---------------
 * :mod:`fixtures.macho_builder` -- structurally valid thin Mach-O images and
-  FAT/universal containers (``LC_BUILD_VERSION``, ``LC_ENCRYPTION_INFO_64``,
-  ``LC_LOAD_DYLIB``, ``LC_RPATH``, ``LC_CODE_SIGNATURE``).
+  FAT/universal containers (``LC_BUILD_VERSION``, ``LC_ENCRYPTION_INFO(_64)``,
+  ``LC_LOAD_DYLIB``, ``LC_RPATH``, ``LC_CODE_SIGNATURE``), little-endian,
+  byte-swapped and 32-bit spellings included.
 * :mod:`fixtures.ipa_builder` -- real ``.ipa`` zip archives (valid Device
   build plus the six corrupt variants the precheck must reject).
+* :mod:`fixtures.fake_guest_channel` -- a duck-typed guest install channel
+  double (scripted replies, recorded requests) for the installer stages.
 
 Import contract
 ---------------
@@ -69,17 +72,20 @@ from .ipa_builder import (
     valid_device_ipa,
 )
 from .macho_builder import (
+    ARM32,
     ARM64,
     ARM64E_SUBTYPE,
     FAT_MAGIC,
     MH_DYLIB,
     MH_EXECUTE,
+    MH_MAGIC,
     MH_MAGIC_64,
     PLATFORM_IOS,
     PLATFORM_IOSSIMULATOR,
     PLATFORM_MACOS,
     X86_64,
     align_up,
+    arm32_ios_slice,
     arm64e_slice,
     build_fat,
     build_thin_macho,
@@ -91,13 +97,16 @@ from .macho_builder import (
     simulator_slice,
     x86_64_ios_slice,
 )
+from .fake_guest_channel import RecordingGuestChannel
 
 __all__ = [
     # macho_builder
+    "ARM32",
     "ARM64",
     "ARM64E_SUBTYPE",
     "X86_64",
     "FAT_MAGIC",
+    "MH_MAGIC",
     "MH_MAGIC_64",
     "MH_EXECUTE",
     "MH_DYLIB",
@@ -112,6 +121,7 @@ __all__ = [
     "simulator_slice",
     "x86_64_ios_slice",
     "arm64e_slice",
+    "arm32_ios_slice",
     "dylib_slice",
     "device_fat",
     "mixed_platform_fat",
@@ -131,4 +141,6 @@ __all__ = [
     "valid_device_ipa",
     "hello_ipa",
     "notes_ipa",
+    # fake_guest_channel
+    "RecordingGuestChannel",
 ]

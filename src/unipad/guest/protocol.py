@@ -11,6 +11,8 @@ Design rules enforced here:
   encode/decode helpers never raise bare ``ValueError`` for guest data -- a
   malformed reply is surfaced as :class:`unipad.errors.UniPadError` with a
   stable code by the caller (``unipad.guest.client``).
+- The wire vocabulary is closed (:data:`KNOWN_TYPES`): :func:`decode` reports
+  an unknown message type as ``unsupported_command`` instead of dropping it.
 - No secrets in any message (PRD 9.2): package bytes, hashes and derived
   challenge values only -- never tokens, keys or user documents.
 - Guest-reported ``error_code`` values are already stable taxonomy codes
@@ -45,6 +47,21 @@ MSG_ERROR = "error"
 #: Stage vocabulary shared with :class:`unipad.models.InstallResult`.
 #: ``registered`` is the furthest stage a successful install reaches.
 STAGES = ("received", "checked", "transferred", "installed", "registered", "failed")
+
+#: Closed vocabulary of message types on the wire.  Anything else is not part
+#: of the contract and must be reported, never silently dropped (PRD 9.1).
+KNOWN_TYPES: frozenset[str] = frozenset(
+    {
+        MSG_INSTALL_REQUEST,
+        MSG_INSTALL_PROGRESS,
+        MSG_INSTALL_RESPONSE,
+        MSG_CHALLENGE_REQUEST,
+        MSG_CHALLENGE_RESPONSE,
+        MSG_STATUS_REQUEST,
+        MSG_STATUS_RESPONSE,
+        MSG_ERROR,
+    }
+)
 
 #: Injected failure point (PRD section 10 taxonomy) -> stable error code.
 FAILURE_CODES: dict[str, str] = {
@@ -322,10 +339,28 @@ def encode(message: Message) -> bytes:
 def decode(line: bytes | str) -> Message:
     """Decode one JSON line into a :class:`Message`.
 
+    The wire vocabulary is closed (:data:`KNOWN_TYPES`): an envelope naming any
+    other type is rejected here so a guest or a stale peer cannot inject a
+    message the host would otherwise ignore without noticing.
+
     Raises:
         UniPadError: ``qmp_protocol_error`` for malformed JSON or a
-            non-conforming envelope.
+            non-conforming envelope; ``unsupported_command`` for an envelope
+            whose ``type`` is outside the contract.
     """
+    message = Message.from_dict(_decode_object(line))
+    if message.type not in KNOWN_TYPES:
+        raise UniPadError(
+            ErrorCode.UNSUPPORTED_COMMAND,
+            f"unknown guest message type '{message.type}'",
+            message_type=message.type,
+            known_types=sorted(KNOWN_TYPES),
+        )
+    return message
+
+
+def _decode_object(line: bytes | str) -> Any:
+    """Parse one JSON line into the object it carries (envelope-agnostic)."""
     if isinstance(line, bytes | bytearray):
         try:
             text = bytes(line).decode("utf-8")
@@ -337,10 +372,9 @@ def decode(line: bytes | str) -> Message:
     if not text:
         raise UniPadError(ErrorCode.QMP_PROTOCOL_ERROR, "empty message line")
     try:
-        data = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError as exc:
         raise UniPadError(ErrorCode.QMP_PROTOCOL_ERROR, f"message line is not valid JSON: {exc}") from exc
-    return Message.from_dict(data)
 
 
 def error_message(code: str, message: str, message_id: Optional[str] = None) -> Message:
@@ -359,6 +393,7 @@ __all__ = [
     "MSG_STATUS_RESPONSE",
     "MSG_ERROR",
     "STAGES",
+    "KNOWN_TYPES",
     "FAILURE_CODES",
     "new_message_id",
     "DictView",

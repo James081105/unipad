@@ -24,6 +24,7 @@ records that evidence (PRD 7.4, FR08).
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -50,6 +51,27 @@ _QEMU_PATH_SEP = "/"
 def _qemu_path(path: Path | str) -> str:
     """Render ``path`` for a QEMU command line using forward slashes."""
     return Path(path).as_posix()
+
+
+def _unquote(token: str) -> str:
+    """Strip one layer of matching double quotes (Windows command-line style)."""
+    if len(token) >= 2 and token[0] == token[-1] == '"':
+        return token[1:-1]
+    return token
+
+
+def _split_command_line(text: str) -> list[str]:
+    """Split a Windows command line into tokens.
+
+    ``posix=False`` keeps backslashes intact, which is the only correct reading
+    of a Windows path (``C:\\Program Files\\...``).  An unbalanced quote yields
+    no tokens so the caller reports the attempted path instead of guessing.
+    """
+    try:
+        return [_unquote(token) for token in shlex.split(text, posix=False)]
+    except ValueError:
+        return []
+
 
 
 def _parse_drive_file(spec: str) -> Optional[str]:
@@ -339,7 +361,7 @@ class QemuLauncher:
 
     def launch(
         self,
-        qemu_binary: str,
+        qemu_binary: str | Sequence[str],
         args: Optional[Sequence[str]] = None,
         *,
         workdir: Optional[Path] = None,
@@ -348,7 +370,13 @@ class QemuLauncher:
         """Start the QEMU child process.
 
         Args:
-            qemu_binary: Executable name (resolved on ``PATH``) or absolute path.
+            qemu_binary: Executable name (resolved on ``PATH``) or absolute path
+                -- **or** a complete command: a sequence such as
+                ``[sys.executable, script, ...]`` or a spaced command line.
+                Tokens after the executable are prepended to ``args``; when
+                ``args`` is omitted they *are* the argv, so a command the caller
+                already assembled is never duplicated with a remembered
+                :meth:`build_args` list.
             args: Argv list; defaults to the list produced by the last
                 :meth:`build_args` call.
             workdir: Overrides the remembered work directory.
@@ -364,7 +392,14 @@ class QemuLauncher:
                 ``image_not_found`` when ``-bios`` / ``-drive file=`` targets do
                 not exist, ``config_invalid`` when no arguments are available.
         """
-        resolved_args = list(args) if args is not None else list(self._last_args)
+        command_prefix, binary_name = self._split_command(qemu_binary)
+        if args is not None:
+            resolved_args = [*command_prefix, *list(args)]
+        else:
+            # No explicit argv: the command line the caller handed over *is* the
+            # argv.  Falling back to a remembered build_args() list here would
+            # start QEMU with every argument twice.
+            resolved_args = list(command_prefix) if command_prefix else list(self._last_args)
         if not resolved_args:
             raise UniPadError(
                 ErrorCode.CONFIG_INVALID,
@@ -378,7 +413,7 @@ class QemuLauncher:
                 missing=missing,
             )
 
-        binary = self._resolve_binary(qemu_binary)
+        binary = self._resolve_binary(binary_name)
         self._adopt_args(resolved_args)
         work = Path(workdir) if workdir is not None else (self._last_workdir or Path.cwd())
         work.mkdir(parents=True, exist_ok=True)
@@ -731,6 +766,47 @@ class QemuLauncher:
                 "ensure it is on PATH (PRD 2.2 / M0 open item)."
             ),
         )
+
+    @staticmethod
+    def _split_command(command: str | Sequence[str]) -> tuple[list[str], str]:
+        """Split ``command`` into ``(argv_prefix, executable)``.
+
+        A sequence is taken verbatim, so ``[sys.executable, script, *args]`` --
+        what a launcher adapter (or the fake-QEMU command builder) has in hand --
+        needs no unpicking by the caller.
+
+        A string that names an existing file or resolves on ``PATH`` is used
+        as-is: a Windows path may legitimately contain spaces
+        (``C:\\Program Files\\QEMU\\qemu-system-aarch64.exe``), and splitting it
+        would look for an executable that does not exist.  Only a spaced string
+        whose *head* resolves to a real executable is treated as a command line.
+
+        Anything else is returned unchanged so the caller still gets the
+        documented ``qemu_launch_failed`` naming the attempted path.
+        """
+        if isinstance(command, os.PathLike):
+            # A Path is a plain executable name, never a command line to split.
+            command = os.fspath(command)
+        if isinstance(command, (list, tuple)):
+            tokens = [str(token) for token in command]
+            if not tokens:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "qemu command is empty",
+                )
+            return tokens[1:], tokens[0]
+        if not isinstance(command, str) or not command.strip():
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "qemu binary must be a path or a command line",
+                received_type=type(command).__name__,
+            )
+        if Path(command).exists() or shutil.which(command):
+            return [], command
+        tokens = _split_command_line(command)
+        if len(tokens) > 1 and (Path(tokens[0]).exists() or shutil.which(tokens[0])):
+            return tokens[1:], tokens[0]
+        return [], command
 
     @staticmethod
     def _missing_paths(args: Sequence[str]) -> list[str]:

@@ -363,6 +363,13 @@ class Verifier:
     def conditions_for(gate_id: str) -> tuple[Condition, ...]:
         """Return the conditions for ``gate_id`` (``default`` + gate specific).
 
+        Every gate entry in :data:`CONDITIONS` already starts with the ``_CORE``
+        group, and the ``default`` entry is that same group, so concatenating
+        them naively evaluates each core condition twice and reports a gate as
+        having more conditions than it defines.  Duplicates are collapsed by
+        ``condition_id``, first occurrence wins: a condition is a named rule,
+        and evaluating it twice cannot make it stricter (PRD 7.4).
+
         Raises
         ------
         UniPadError
@@ -376,7 +383,14 @@ class Verifier:
                 gate_id=gate_id,
                 known_gates=Verifier.known_gates(),
             )
-        return CONDITIONS["default"] + CONDITIONS[gate_id]
+        merged: list[Condition] = []
+        seen: set[str] = set()
+        for condition in (*CONDITIONS["default"], *CONDITIONS[gate_id]):
+            if condition.condition_id in seen:
+                continue
+            seen.add(condition.condition_id)
+            merged.append(condition)
+        return tuple(merged)
 
     # --- evaluation --------------------------------------------------------
     def evaluate(

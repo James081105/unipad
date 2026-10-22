@@ -827,13 +827,10 @@ def cmd_start(args: argparse.Namespace) -> CommandOutcome:
             command="start",
             accel=configured,
         )
-    if shutil.which("qemu-system-aarch64") is None:
-        raise blocked(
-            "qemu-system-aarch64 is not on PATH; cannot start the guest",
-            command="start",
-            expected="qemu-system-aarch64",
-        )
 
+    # Caller input is validated before the host is probed: a missing or invalid
+    # manifest is a usage-class error (artifact_missing / artifact_manifest_invalid)
+    # and must not be masked by the environment report below.
     manifest_path = Path(args.artifact)
     if not manifest_path.is_file():
         raise UniPadError(
@@ -855,6 +852,13 @@ def cmd_start(args: argparse.Namespace) -> CommandOutcome:
             "artifact manifest targets a non-TCG payload; PRD 8.3 forbids running it here",
             command="start",
             target=manifest.get("target"),
+        )
+
+    if shutil.which("qemu-system-aarch64") is None:
+        raise blocked(
+            "qemu-system-aarch64 is not on PATH; cannot start the guest",
+            command="start",
+            expected="qemu-system-aarch64",
         )
 
     store = _store(args)
@@ -1047,6 +1051,7 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
                 "stage": "checked",
                 "trust_mode": None,
                 "error_code": ErrorCode.BLOCKED,
+                "error_message": "no guest channel available; cannot transfer the package into the guest",
                 "log_path": log_path.as_posix(),
             },
         )
@@ -1069,6 +1074,7 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
                 "stage": "checked",
                 "trust_mode": None,
                 "error_code": ErrorCode.BLOCKED,
+                "error_message": f"guest channel could not be established: {type(exc).__name__}: {exc}",
                 "log_path": log_path.as_posix(),
             },
         ) from exc
@@ -1098,6 +1104,7 @@ def cmd_install(args: argparse.Namespace) -> CommandOutcome:
                 "stage": "checked",
                 "trust_mode": None,
                 "error_code": exc.code,
+                "error_message": exc.message,
                 "log_path": log_path.as_posix(),
             },
         ) from exc

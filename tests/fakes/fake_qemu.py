@@ -35,12 +35,24 @@ Determinism
 Same argv -> same bytes on the wire and in the evidence files.  No wall-clock
 or random values are written into the journals, so a test can diff them.
 
+Signals
+-------
+``SIGINT``/``SIGBREAK`` (delivered as a console control event) and ``SIGTERM``
+on POSIX make the process exit 0 promptly.  On Windows
+:meth:`subprocess.Popen.terminate` is ``TerminateProcess``: no handler runs and
+the exit code is 1 -- the same for real QEMU -- so a test that wants the
+graceful path must use ``proc.send_signal(signal.CTRL_BREAK_EVENT)`` (the child
+is created with ``CREATE_NEW_PROCESS_GROUP`` by :mod:`unipad.host.qemu`).
+
 Evidence written into the working directory (QEMU's ``cwd``)
 -----------------------------------------------------------
 - ``fake-qemu-args.json`` -- one JSON line with the complete argv plus the
   parsed QMP/serial/accelerator view;
 - ``fake-input-events.jsonl`` -- one JSON line per input command;
-- the ``-serial file:`` target -- the staged boot markers.
+- the ``-serial file:`` target -- the staged boot markers;
+- ``fake-qemu-error.log`` -- traceback of an unexpected internal error inside
+  the QMP connection thread (absent when nothing went wrong).  The connection
+  itself never dies silently: the client gets a structured QMP error instead.
 
 Environment knobs
 -----------------
@@ -72,35 +84,48 @@ host, so ``import tests.fakes.fake_qemu`` is not reliable.  Use one of::
     spec.loader.exec_module(module)
 
 The subprocess side needs no import at all: :func:`fake_qemu_command` only
-builds the argv, and the child runs this file as a script.
+builds the argv, and the child runs this file as a script.  When a test would
+rather not manage the child itself, :func:`fake_qemu_process` is a context
+manager that starts the fake on a free port, waits for QMP and always reaps the
+child (including when the ``with`` block raises).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 __all__ = [
     "ARGS_FILENAME",
     "BOOT_MARKERS",
     "DEFAULT_SCREEN_HEIGHT",
     "DEFAULT_SCREEN_WIDTH",
+    "ERROR_LOG_FILENAME",
     "FAKE_NAME",
+    "FakeQemuProcess",
     "INPUT_EVENTS_FILENAME",
     "PARTIAL_BOOT_MARKERS",
     "QMP_GREETING",
     "QMP_VERSION",
     "fake_qemu_command",
+    "fake_qemu_launcher",
+    "fake_qemu_process",
     "free_tcp_port",
     "main",
+    "parse_argv",
+    "read_jsonl",
 ]
 
 #: Name reported by ``query-name`` (and the fallback for ``-name``).
@@ -150,6 +175,10 @@ _VALUE_OPTIONS = ("-qmp", "-serial", "-chardev", "-accel", "-machine", "-name")
 
 #: How long a stop request waits for the socket to drain before the process goes.
 _SOCKET_DRAIN_SECONDS = 0.05
+
+#: Note recorded by :func:`parse_argv` when the argv asks for usage output.
+#: ``run()`` looks for exactly this string, so the two must stay in sync.
+_HELP_NOTE = "help requested"
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +333,19 @@ def _parse_qmp_spec(spec: str, parsed: _ParsedArgs) -> None:
 
 
 def _parse_chardev(value: str, parsed: _ParsedArgs) -> None:
-    """Remember ``-chardev file,id=x,path=y`` so ``-serial chardev:x`` resolves."""
+    """Remember ``-chardev file,id=x,path=y`` so ``-serial chardev:x`` resolves.
+
+    QEMU accepts the backend either positionally (``file,id=x,path=y``) or as an
+    option (``backend=file,id=x,path=y``); both spellings must resolve, otherwise
+    a ``-serial chardev:x`` that follows would silently lose its log file.
+    """
+    parts = value.split(",")
     fields: dict[str, str] = {}
-    for part in value.split(","):
+    for part in parts:
         key, _, item = part.partition("=")
         fields[key.strip()] = item.strip()
-    backend = fields.get("backend", "")
+    positional_backend = parts[0].strip() if "=" not in parts[0] else ""
+    backend = fields.get("backend", "") or positional_backend
     identifier = fields.get("id")
     path = fields.get("path")
     if backend.startswith("file") and path:
@@ -366,7 +402,7 @@ def parse_argv(argv: Sequence[str]) -> _ParsedArgs:
                 parsed.kvm_flag = True
                 consumed.add(flag_index)
             elif token in ("-help", "--help", "-h"):
-                parsed.notes.append("help requested")
+                parsed.notes.append(_HELP_NOTE)
                 consumed.add(flag_index)
             index += 1
             continue
@@ -513,15 +549,17 @@ class _FakeQemu:
             sys.stderr.flush()
             return 2
 
-        self._write_args()
-
         if self.mode == "exit-early":
+            # Record the argv before bailing out so the launcher's stderr tail
+            # has matching evidence on disk.
+            self._write_args()
             sys.stderr.write(
                 "fake-qemu: exit-early fault: bailing out before qmp/serial setup\n"
             )
             sys.stderr.flush()
             return 3
-        if "-help" in self.parsed.notes:
+        if _HELP_NOTE in self.parsed.notes:
+            self._write_args()
             sys.stdout.write(
                 "fake-qemu 1.0 (simulation fixture; not a real QEMU build)\n"
                 "usage: fake_qemu.py <qemu args...>\n"
@@ -530,7 +568,11 @@ class _FakeQemu:
             return 0
 
         self._open_serial()
-        if not self._start_qmp_server():
+        qmp_ok = self._start_qmp_server()
+        # Written *after* the QMP decision so ``parsed.notes`` in the evidence
+        # includes "qmp listener suppressed by fail mode" when it applies.
+        self._write_args()
+        if not qmp_ok:
             return 1
         self._start_serial_writer()
         self._install_signal_handlers()
@@ -902,6 +944,10 @@ class _FakeQemu:
             return reply({"error": {"class": "GenericError", "desc": "missing command"}}), [], False
 
         if command == "qmp_capabilities":
+            if self.mode == "no-capabilities":
+                # The banner was delivered but negotiation never completes, so
+                # QmpClient.connect() must fail instead of reporting readiness.
+                return None, [], False
             return reply({"return": {}}), [], False
         if command == "query-status":
             return (
@@ -1032,7 +1078,17 @@ class _FakeQemu:
     # -- signals ----------------------------------------------------------
 
     def _install_signal_handlers(self) -> None:
-        """Exit 0 promptly on SIGTERM/SIGINT (Windows: also SIGBREAK)."""
+        """Exit 0 promptly on SIGTERM/SIGINT (Windows: also SIGBREAK).
+
+        Windows caveat, recorded because it changes what a test can assert:
+        :meth:`subprocess.Popen.terminate` calls ``TerminateProcess``, which the
+        OS applies without ever running a handler -- every process, real QEMU
+        included, dies with exit code 1 and no Python code runs.  To exercise
+        the graceful-signal path on Windows, deliver a console control event
+        with ``proc.send_signal(signal.CTRL_BREAK_EVENT)``; that requires the
+        child to be in its own process group, which is what
+        :mod:`unipad.host.qemu` does with ``CREATE_NEW_PROCESS_GROUP``.
+        """
         candidates = [
             signal.SIGTERM,
             signal.SIGINT,
@@ -1047,9 +1103,11 @@ class _FakeQemu:
                 pass
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
-        name = {int(signal.SIGTERM): "sigterm", int(signal.SIGINT): "sigint"}.get(
-            int(signum), f"signal-{signum}"
-        )
+        names = {
+            int(signal.SIGTERM): "sigterm",
+            int(signal.SIGINT): "sigint",
+        }
+        name = names.get(int(signum), f"signal-{signum}")
         self._request_stop(name)
 
 
@@ -1070,6 +1128,275 @@ def _coerce_int(value: Any) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# subprocess driver
+#
+# Three host-side test modules (QMP client, QEMU launcher, evidence bundle and
+# input sink) all need the *same* thing: a real child process speaking the real
+# protocol.  Spawning it three times over would be duplication (CLAUDE.md 15),
+# so the spawn/wait/teardown dance lives here next to the fake itself.
+# ---------------------------------------------------------------------------
+
+#: Windows flag that keeps the fake from flashing a console window.
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def read_jsonl(path: Path | str) -> list[dict[str, Any]]:
+    """Parse a JSONL file into a list of objects.
+
+    Returns ``[]`` when the file is absent, unreadable, or holds a line that is
+    not a JSON object.  Evidence readers must never raise on a half-written
+    journal: a missing journal means "no input was recorded", which is itself
+    the assertion most callers want to make.
+    """
+    target = Path(path)
+    if not target.is_file():
+        return []
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+class FakeQemuProcess:
+    """One running fake QEMU child process plus its evidence files.
+
+    Deliberately a plain class rather than a dataclass: tests may load
+    :mod:`fake_qemu` by file path with :func:`importlib.util.spec_from_file_location`,
+    and a dataclass under ``from __future__ import annotations`` needs its module
+    registered in ``sys.modules`` to resolve its string annotations (same
+    rationale as :class:`_ParsedArgs`).
+    """
+
+    def __init__(
+        self,
+        process: Any,
+        argv: Sequence[str],
+        port: int,
+        workdir: Path | str,
+        serial_path: Optional[Path | str] = None,
+        stderr_path: Optional[Path | str] = None,
+    ) -> None:
+        self.process = process
+        self.argv = list(argv)
+        self.port = int(port)
+        self.workdir = Path(workdir)
+        self.serial_path = Path(serial_path) if serial_path is not None else None
+        self.stderr_path = Path(stderr_path) if stderr_path is not None else None
+
+    # -- evidence locations ---------------------------------------------
+
+    @property
+    def args_path(self) -> Path:
+        """``fake-qemu-args.json`` written by the child into its cwd."""
+        return self.workdir / ARGS_FILENAME
+
+    @property
+    def input_journal(self) -> Path:
+        """``fake-input-events.jsonl`` written by the child into its cwd."""
+        return self.workdir / INPUT_EVENTS_FILENAME
+
+    def args_record(self) -> Optional[dict[str, Any]]:
+        """The child's recorded argv view, or ``None`` before it is written."""
+        records = read_jsonl(self.args_path)
+        return records[0] if records else None
+
+    def input_events(self) -> list[dict[str, Any]]:
+        """Every input command the fake journaled over QMP, in order."""
+        return read_jsonl(self.input_journal)
+
+    def serial_text(self) -> str:
+        """The staged boot serial log (``""`` when ``-serial`` was not given)."""
+        if self.serial_path is None or not self.serial_path.is_file():
+            return ""
+        try:
+            return self.serial_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def stderr_text(self) -> str:
+        """The child's stderr, used as failure evidence."""
+        if self.stderr_path is None or not self.stderr_path.is_file():
+            return ""
+        try:
+            return self.stderr_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    # -- lifecycle ------------------------------------------------------
+
+    def wait_for_port(self, timeout: float = 15.0) -> bool:
+        """Block until the QMP port accepts a TCP connection.
+
+        Returns ``False`` as soon as the child dies (an ``exit-early`` fault) or
+        when the budget expires.  A caller that needs "never became ready"
+        semantics should pass ``wait_for_port=False`` to
+        :func:`fake_qemu_process` and drive :class:`QmpClient` directly.
+        """
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        while True:
+            if self.process.poll() is not None:
+                return False
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
+                    return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
+
+    def stop(self, timeout: float = 5.0) -> Optional[int]:
+        """Terminate the child (kill if it refuses) and return its exit code."""
+        process = self.process
+        if process.poll() is not None:
+            return process.returncode
+        try:
+            process.terminate()
+        except OSError:  # pragma: no cover - already gone
+            pass
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                return process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return None
+
+
+@contextmanager
+def fake_qemu_process(
+    extra_args: Optional[Sequence[str]] = None,
+    *,
+    fail_mode: Optional[str] = None,
+    boot_ms: int = 0,
+    exit_code: Optional[int] = None,
+    screen: Optional[tuple[int, int]] = None,
+    workdir: Optional[Path | str] = None,
+    qmp_port: Optional[int] = None,
+    serial_path: Optional[Path | str] = None,
+    env: Optional[dict[str, str]] = None,
+    wait_for_port: bool = True,
+    wait_timeout: float = 15.0,
+) -> Iterator[FakeQemuProcess]:
+    """Run the fake as a child process for the duration of a ``with`` block.
+
+    The child is started exactly like the binary it stands in for, so the real
+    :class:`unipad.host.qmp.QmpClient` and
+    :class:`unipad.host.qemu.QemuLauncher` can be driven against it
+    (docs/testing-strategy.md D3, "Fake QEMU" row).
+
+    Args:
+        extra_args: Additional QEMU arguments, appended verbatim.
+        fail_mode: Injected fault (``exit-early``, ``no-qmp``, ``bad-greeting``,
+            ``ignore-quit``, ``partial-boot``, ``no-serial``, ``stall``,
+            ``exit-after-boot``).
+        boot_ms: Total time spent emitting the boot markers.  ``0`` writes them
+            back to back, which keeps the suite fast and deterministic.
+        exit_code: Exit code used for a clean stop.
+        screen: ``(width, height)`` used when a screendump carries no size.
+        workdir: Child cwd; all evidence files land here.  Defaults to a
+            per-port temporary directory that is removed on exit.
+        qmp_port: Reuse a specific port instead of reserving a free one.
+        serial_path: Add ``-serial file:<path>`` so the staged log is written.
+        env: Extra child environment variables (applied last).
+        wait_for_port: Wait for the QMP port before yielding.
+        wait_timeout: Budget for :meth:`FakeQemuProcess.wait_for_port`.
+
+    Yields:
+        A :class:`FakeQemuProcess` handle.  The child is always terminated (and
+        killed if it refuses) on exit, including on test failure.
+    """
+    created_workdir = workdir is None
+    if created_workdir:
+        port_for_dir = int(qmp_port) if qmp_port is not None else free_tcp_port()
+        work = Path(tempfile.gettempdir()) / f"unipad-fake-qemu-{port_for_dir}"
+    else:
+        work = Path(workdir)  # type: ignore[arg-type]
+    port = int(qmp_port) if qmp_port is not None else free_tcp_port()
+
+    args = [
+        "-accel",
+        "tcg",  # the fake mirrors the launcher's explicit-TCG guard (PRD 2.2-1)
+        "-monitor",
+        "none",
+        "-display",
+        "none",
+        "-qmp",
+        f"tcp:127.0.0.1:{port},server=on,wait=off",
+    ]
+    if serial_path is not None:
+        args.extend(["-serial", f"file:{Path(serial_path).as_posix()}"])
+    args.extend(str(arg) for arg in (extra_args or ()))
+    argv = [sys.executable, _script_path().as_posix(), *args]
+
+    child_env = dict(os.environ)
+    child_env["UNIPAD_FAKE_BOOT_MS"] = str(int(boot_ms))
+    if fail_mode:
+        child_env["UNIPAD_FAKE_FAIL_MODE"] = str(fail_mode)
+    if exit_code is not None:
+        child_env["UNIPAD_FAKE_EXIT_CODE"] = str(int(exit_code))
+    if screen is not None:
+        child_env["UNIPAD_FAKE_SCREEN_W"] = str(int(screen[0]))
+        child_env["UNIPAD_FAKE_SCREEN_H"] = str(int(screen[1]))
+    if env:
+        child_env.update({str(k): str(v) for k, v in env.items()})
+
+    work.mkdir(parents=True, exist_ok=True)
+    stderr_path = work / "fake-stderr.log"
+    with open(stderr_path, "wb") as stderr_handle:
+        process = subprocess.Popen(
+            argv,
+            cwd=str(work),
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_handle,
+            close_fds=True,
+            creationflags=_CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    handle = FakeQemuProcess(process, argv, port, work, serial_path, stderr_path)
+    try:
+        if wait_for_port:
+            handle.wait_for_port(timeout=wait_timeout)
+        yield handle
+    finally:
+        try:
+            handle.stop()
+        finally:
+            if created_workdir:
+                shutil.rmtree(work, ignore_errors=True)
+
+
+def fake_qemu_launcher() -> tuple[str, list[str]]:
+    """Return ``(binary, argv_prefix)`` for :meth:`QemuLauncher.launch`.
+
+    The launcher takes one executable path plus an argv list, so the fake is
+    started as ``[sys.executable, <this file>, *qemu_args]``::
+
+        binary, prefix = fake_qemu_launcher()
+        launcher.launch(binary, [*prefix, *args], workdir=tmp_path)
+
+    Nothing is spawned and no port is bound.
+    """
+    return sys.executable, [_script_path().as_posix()]
+
+
+# ---------------------------------------------------------------------------
 # entry points
 # ---------------------------------------------------------------------------
 
@@ -1082,19 +1409,25 @@ def fake_qemu_command(
 ) -> list[str]:
     """Return the argv that launches this fake through the real launcher.
 
-    The result is ``[sys.executable, <this file>, *args]`` so it can be handed
-    to :meth:`unipad.host.qemu.QemuLauncher.launch` as ``command[0]`` plus
-    ``command[1:]`` (the launcher takes one binary string and an argv list).
+    The result is exactly ``[sys.executable, <this file>, *args]`` -- no flags
+    are injected, so ``command[1:]`` is verbatim what the caller asked for and
+    the recorded ``fake-qemu-args.json`` evidence is not polluted with
+    duplicated ``-accel`` tokens when a caller passes the argv produced by
+    :meth:`unipad.host.qemu.QemuLauncher.build_args`.
+
+    Hand it to the launcher as ``command[0]`` plus ``command[1:]`` (the launcher
+    takes one binary string and an argv list, not a single joined command).
 
     Args:
-        extra_args: Additional QEMU arguments, appended verbatim.
+        extra_args: QEMU arguments, appended verbatim.  Pass ``["-accel", "tcg"]``
+            yourself when a test needs the explicit-TCG guard to be exercised.
         qmp_port: When given, append the standard loopback QMP spec.
         serial_path: When given, append ``-serial file:<path>``.
 
     Returns:
         The argv list.  Nothing is spawned and no port is bound.
     """
-    args: list[str] = ["-accel", "tcg", "-monitor", "none", "-display", "none"]
+    args: list[str] = []
     if qmp_port is not None:
         args.extend(["-qmp", f"tcp:127.0.0.1:{int(qmp_port)},server=on,wait=off"])
     if serial_path is not None:

@@ -79,6 +79,15 @@ INSTALL_FAILURE_POINTS: tuple[str, ...] = (
     "dyld",
 )
 
+#: PRD 10 taxonomy name -> the install-chain point that reports it.  Only the
+#: package-structure fault has no point of the same name; without this alias a
+#: caller injecting ``invalid_package`` would validate cleanly and then never
+#: fire, i.e. a test that believes it injected a failure would exercise the
+#: happy path instead.
+FAILURE_POINT_ALIASES: dict[str, str] = {
+    ErrorCode.INVALID_PACKAGE: "structure",
+}
+
 
 def derive_challenge_value(bundle_id: str, nonce: str) -> str:
     """Deterministically derive an app's challenge value.
@@ -152,7 +161,12 @@ class FakeGuestService:
 
     @staticmethod
     def _normalize_failures(failures: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-        """Validate the injection config, rejecting unknown failure points."""
+        """Validate the injection config, rejecting unknown failure points.
+
+        A PRD 10 taxonomy name is accepted (see :data:`FAILURE_POINT_ALIASES`)
+        and resolved to the chain point that reports it, so an injected fault
+        can never validate cleanly and then silently never fire.
+        """
         if not failures:
             return {}
         cfg = dict(failures)
@@ -166,6 +180,7 @@ class FakeGuestService:
                 fail_at=point,
                 known_points=list(INSTALL_FAILURE_POINTS) + sorted(FAILURE_CODES),
             )
+        cfg["fail_at"] = FAILURE_POINT_ALIASES.get(point, point)
         mode = cfg.get("mode", "always")
         if mode not in ("always", "once"):
             raise UniPadError(ErrorCode.CONFIG_INVALID, "failure mode must be 'always' or 'once'", mode=mode)
@@ -238,7 +253,10 @@ class FakeGuestService:
             package_name: file name of the package (used to derive the bundle id
                 when the metadata does not carry one).
             data: staged package bytes, or ``None`` when the caller did not
-                stage any (structure validation is then skipped).
+                stage any.  With ``None`` there is nothing to validate and
+                nothing to verify the declared digest against, so the chain
+                stops at the transfer step with ``transfer_failed`` -- it never
+                reaches a success stage.
             meta: install metadata (:class:`~unipad.guest.protocol.InstallRequest`
                 fields).
 
@@ -270,7 +288,18 @@ class FakeGuestService:
 
             # 2. transfer verification against the declared digest
             code = self._injected("transfer")
-            if code is None and data is not None:
+            if code is None:
+                if data is None:
+                    # The byte channel never delivered this package, so the
+                    # declared digest cannot be verified.  A guest that never
+                    # received the bytes must not report a registration:
+                    # PRD 9.1 forbids claiming a stage the transfer did not
+                    # earn, and PRD 10 assigns this fault to 主客体传输.
+                    return self._fail(
+                        bundle_id,
+                        ErrorCode.TRANSFER_FAILED,
+                        "package bytes were never delivered for transfer verification",
+                    )
                 code = self._check_transfer(data, request)
             if code is not None:
                 return self._fail(bundle_id, code, "package transfer verification failed")
@@ -873,6 +902,7 @@ __all__ = [
     "DEFAULT_TRUST_MODE",
     "STATE_SCHEMA_VERSION",
     "INSTALL_FAILURE_POINTS",
+    "FAILURE_POINT_ALIASES",
     "derive_challenge_value",
     "FakeGuestService",
     "FakeTransport",
