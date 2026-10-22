@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# UniPad: 运行证据与产物（PRD §9：不入 Git）
+runs/*/
+!runs/.gitkeep
+!runs/README.md
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+
+# UniPad: 私有素材（PRD §12：绝不入 Git）
+local-private/
+*.ipsw
+*.dmg
+*.img
+*.qcow2
+*.vmdk
+*.raw
+*.sparseimage
+
+# 密钥与凭证
+*.pem
+*.key
+*.p12
+*.mobileprovision
+secrets.json
+
+# 编辑器 / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
