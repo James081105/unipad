@@ -38,3 +38,7 @@ secrets.json
 .idea/
 Thumbs.db
 desktop.ini
+
+# 测试运行残留物
+.pytest-refute.tmp
+fake-qemu-args.json
