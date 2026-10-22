@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "ipad-tcg",
+  "accel": "tcg",
+  "accel_note": "Intel Windows host: TCG is mandatory. The launcher refuses any other accelerator (accelerator_not_tcg).",
+  "cpu_model": "cortex-a57",
+  "cpu_model_note": "Candidate only; M0/M4 resolves against the pinned board.toml (PRD 6 WP04).",
+  "cores": 4,
+  "memory_mb": 3072,
+  "memory_note": "Host has 15.8GB total with ~3.4GB free at inventory; keep guest RAM conservative and record peak RSS.",
+  "machine_type": "virt",
+  "clock": {
+    "rtc": "utc",
+    "note": "Clock/interrupt behaviour verified at M4."
+  },
+  "display": {
+    "width": 1112,
+    "height": 834,
+    "format": "ramfb",
+    "note": "ramfb/GOP path first (PRD 4.2); VirtIO GPU software path probed at M9a."
+  },
+  "devices": {
+    "system_disk": {"if": "virtio-blk", "readonly": true, "note": "RootFS/SystemOS via VirtIO Block (M6/M7)"},
+    "data_disk": {"if": "virtio-blk", "readonly": false, "note": "Persistent Data volume; route decided by H04 (M9b)"},
+    "input": {"pointer": "virtio-tablet", "home": "virtio", "keyboard": "pending", "note": "Text input may start on the guest on-screen keyboard (FR04)"},
+    "net": {"enabled": false, "model": "virtio-net", "note": "M13; disabled for MVP boot gates"},
+    "control": {"qmp": true, "serial": true, "note": "QMP over Windows socket; serial and control must not contend"}
+  },
+  "disks": {
+    "artifact_root": "F:/iosvirtual/artifacts",
+    "artifact_root_note": "C: has 0.6GB free; never place images there.",
+    "system_image": null,
+    "data_image": null,
+    "known_good_pointer": "artifacts/known-good.json"
+  }
+}

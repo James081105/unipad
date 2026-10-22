@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unipad"
+version = "0.1.0"
+description = "Windows controller for running real iPadOS userland under QEMU AArch64 TCG (UniXNU), with DRM-free ARM64 Device IPA install/run support"
+requires-python = ">=3.12"
+dependencies = [
+    # Zero hard runtime dependencies: the controller must run on a bare Windows host.
+]
+
+[project.optional-dependencies]
+inventory = ["psutil>=5.9"]  # optional richer host inventory; stdlib fallback exists
+dev = ["pytest>=8.0", "pytest-timeout>=2.2"]
+
+[project.scripts]
+unipad = "unipad.controller.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --timeout=120"
+markers = [
+    "slow: long-running simulation tests",
+    "acceptance: milestone gate simulation tests (no real hardware)",
+]

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "description": "Experiment and cost budgets (PRD 7.5). Absent or zero values disable the corresponding paid loop; unlimited paid retries are never the default.",
+  "per_hypothesis_max_experiments": 3,
+  "same_failure_signature_max": 3,
+  "max_actions_minutes_per_week": 0,
+  "max_actions_minutes_note": "0 = Actions budget not yet authorized; macOS builds stay BLOCKED until the user confirms account billing (PRD 8.4).",
+  "max_model_tokens_per_session": null,
+  "max_local_run_minutes_per_experiment": 45,
+  "notes": [
+    "Budget is cumulative across sessions and recorded per experiment.",
+    "A BLOCKED budget must stop the paid path, not silently continue."
+  ]
+}

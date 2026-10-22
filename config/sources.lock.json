@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
+  "unixnu": {
+    "repo": "https://github.com/UniXNU/UniXNU",
+    "commit": null,
+    "commit_note": "M0 must pin an actual commit; null = not yet frozen. Do not build from a moving branch."
+  },
+  "device_repo": {
+    "repo": "https://github.com/xVanTuring/UniXNU-qemu",
+    "commit": null,
+    "commit_note": "M0 must pin an actual commit; null = not yet frozen."
+  },
+  "submodules": [],
+  "feeds": [],
+  "system_identity": {
+    "board": "iPad7,1",
+    "system": "iPadOS 17.7.11",
+    "build_candidates": ["21H161", "21H461"],
+    "discrepancy": "PRD cites both build 21H161 (appendix A) and 21H461 (section 2.1 E04). M0 must resolve the exact build from the pinned board.toml / actual IPSW and update this field with evidence."
+  },
+  "ipsw": {
+    "name": null,
+    "sha256": null,
+    "source": null,
+    "note": "Apple IPSW stays in local-private/ and is never committed (PRD 12)."
+  },
+  "tools": {
+    "qemu": {"version": null, "build": "native Windows", "accel": "tcg", "note": "M0 must record the exact qemu-system-aarch64 build and version; accelerator must be explicitly TCG on this Intel host."},
+    "xcode": {"version": null, "note": "macOS runner only; recorded from the Actions job."},
+    "python": {"version": "3.12.9", "note": "host inventory 2026-10-22"}
+  },
+  "frozen": false,
+  "frozen_note": "Set frozen=true only when every null above is filled with evidence."
+}
