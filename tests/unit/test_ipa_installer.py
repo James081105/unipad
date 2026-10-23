@@ -785,3 +785,37 @@ def test_guest_client_channel_reports_an_unverified_receipt():
     assert receipt.verified is False
     assert receipt.sha256 == ""
     assert receipt.size_bytes == len(b"package bytes")
+
+
+class BrokenStore:
+    """A store that cannot record -- the realistic failure is a full disk."""
+
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.attempts = 0
+
+    def record_install(self, result: InstallResult) -> None:
+        self.attempts += 1
+        raise OSError("No space left on device")
+
+
+def test_a_store_that_cannot_record_makes_the_failure_visible(tmp_path):
+    """A silently dropped history entry is a lost audit trail (PRD 3.2 P1 (3)).
+
+    The install itself has already happened, so the run must not be reported as
+    a failure; but the record that the history is incomplete has to survive
+    somewhere the evidence bundle and the verifier read.
+    """
+    # arrange
+    ipa = hello_ipa(tmp_path / "HelloUniPad.ipa")
+    store = BrokenStore(tmp_path / "run")
+
+    # act
+    result = IpaInstaller(RecordingGuestChannel(REGISTERED_REPLY), store=store).install(ipa)
+
+    # assert: the install still succeeded, and the gap is recorded
+    assert result.stage == "registered"
+    assert result.error_code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert "install history could not be recorded" in result.error_message
+    assert "OSError" in result.error_message
+    assert store.attempts >= 1

@@ -470,6 +470,13 @@ class IpaInstaller:
         mutable ``InstallResult`` through every stage, so handing the object
         itself would leave a journal store with N references to the final
         state and no record of the transitions (PRD 7.3).
+
+        A store that raises is *not* swallowed.  The install itself has already
+        happened by the time this runs, so failing the whole run would report a
+        success as a failure; but discarding the record would mean the history
+        PRD 3.2 P1 (3) asks for silently loses an entry, and nothing anywhere
+        would say so.  The failure is therefore recorded on the result, where
+        the evidence bundle and the verifier both read it.
         """
         store = self._store
         if store is None:
@@ -480,8 +487,14 @@ class IpaInstaller:
             if callable(method):
                 try:
                     method(snapshot)
-                except Exception:
-                    return
+                except Exception as exc:
+                    # Only the first failure is recorded: a store that raises
+                    # once will raise again, and one note is the signal.
+                    if result.error_code is None:
+                        result.error_code = ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+                        result.error_message = (
+                            f"install history could not be recorded: {type(exc).__name__}"
+                        )
                 return
 
     def _resolve_run_dir(self) -> Path | None:
