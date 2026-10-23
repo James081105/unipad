@@ -98,6 +98,15 @@ def _finding_codes(document: dict) -> set[str]:
     return {str(finding.get("code")) for finding in document["data"]["findings"]}
 
 
+def _is_dotted_version(value: object) -> bool:
+    """True for ``11.1.0`` / ``1.2.3-rc1`` -- a measured version, not a label."""
+    if not isinstance(value, str):
+        return False
+    head = value.split("-", 1)[0]
+    parts = head.split(".")
+    return bool(parts) and all(part.isdigit() and part != "" for part in parts)
+
+
 # ---------------------------------------------------------------------------
 # doctor: one machine-readable envelope (PRD 9.1)
 # ---------------------------------------------------------------------------
@@ -252,10 +261,19 @@ def test_sources_lock_is_present_and_records_frozen_false_as_an_open_item():
     assert lock["ipsw"]["sha256"] is not None
     assert lock["ipsw"]["size"] > 0
 
-    # tools pinned for M0: Python is recorded, QEMU/Xcode are not yet
+    # tools pinned for M0.  Python is recorded from the live host; QEMU was
+    # installed during the real-boot investigation, so it is no longer null --
+    # a null here would mean the lock regressed to "we never measured it".
     assert lock["tools"]["python"]["version"] == platform.python_version()
-    assert lock["tools"]["qemu"]["accel"] == "tcg"
-    assert lock["tools"]["qemu"]["version"] is None
+    qemu = lock["tools"]["qemu"]
+    assert qemu["accel"] == "tcg"
+    assert qemu["version"], "QEMU is installed; the lock must record its version"
+    assert _is_dotted_version(qemu["version"]), qemu["version"]
+    # an identity claim needs a digest, not just a label
+    digest = qemu.get("sha256")
+    assert isinstance(digest, str) and len(digest) == 64, digest
+    int(digest, 16)
+    assert qemu["note"]
 
 
 def test_sources_lock_carries_the_build_number_discrepancy_field():
