@@ -29,7 +29,14 @@ from typing import Any, Callable, Optional, Union
 
 from unipad.errors import ErrorCode, UniPadError, blocked
 
-__all__ = ["ImageManager", "KnownGoodPointer", "sha256_file"]
+__all__ = [
+    "ImageManager",
+    "KnownGoodPointer",
+    "ScopeRequired",
+    "declare_scope",
+    "read_scope",
+    "sha256_file",
+]
 
 #: Default chunk size for hashing (1 MiB): small enough to report progress,
 #: large enough to keep the syscall count low on multi-GiB images.
@@ -40,6 +47,136 @@ KNOWN_GOOD_FILENAME = "known-good.json"
 
 #: Schema version of ``known-good.json``.
 KNOWN_GOOD_SCHEMA_VERSION = 1
+
+#: Schema version of a checkpoint ``manifest.json``.  2 adds the mandatory
+#: scope declaration (PRD 3.2 P1 (5)); 1 predates it, so a reader that meets a
+#: version-1 manifest knows it cannot state what it covers.
+CHECKPOINT_SCHEMA_VERSION = 2
+
+
+# ---------------------------------------------------------------------------
+# checkpoint scope (PRD 3.2 P1 (5))
+#
+# P1 (5) reads: 真正经过验证的快照/恢复；**必须说明保存的是磁盘还是整机状态**.
+#
+# The second clause is the requirement, and it is the one that is easy to miss.
+# A restore that silently covers one disk file looks identical to a restore
+# that covers the whole machine until someone relies on it: an operator who
+# believes a checkpoint captured the machine and gets only a disk back has lost
+# state they were told was safe.
+#
+# So the scope is a *declared field*, not something a reader infers from the
+# entry list, and an absent scope is refused rather than defaulted -- assuming
+# the narrow reading would let an operator believe they restored less than they
+# did, and assuming the wide one would let them believe they restored more.
+# ---------------------------------------------------------------------------
+
+
+class ScopeRequired:
+    """The closed vocabulary of checkpoint scopes."""
+
+    #: These image files, and nothing else.
+    DISK = "disk"
+    #: The whole runnable state, which is strictly more.
+    MACHINE = "machine"
+
+    ALL = (DISK, MACHINE)
+
+
+#: What a ``disk`` checkpoint does *not* cover.  Naming the exclusions is the
+#: useful half of the declaration: it is what tells an operator that guest RAM,
+#: device state and the install history are not in here.
+DISK_SCOPE_EXCLUDES: tuple[str, ...] = (
+    "guest_ram",
+    "device_state",
+    "fw_cfg",
+    "install_history",
+    "network_state",
+)
+
+
+def declare_scope(scope: str, *, covered: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
+    """Return the manifest fields that declare what a checkpoint covers.
+
+    A ``machine`` scope must name what it covers: a manifest that claims the
+    whole machine while listing one image file is a lie the reader cannot
+    detect, which is worse than claiming ``disk``.
+
+    Raises:
+        ValueError: for a scope outside the vocabulary, or a ``machine`` scope
+            with no ``covered`` list.
+    """
+    if scope not in ScopeRequired.ALL:
+        raise ValueError(
+            f"unknown checkpoint scope {scope!r}; expected one of {list(ScopeRequired.ALL)}"
+        )
+    if scope == ScopeRequired.MACHINE and not covered:
+        raise ValueError(
+            "machine scope requires the list of state it covers "
+            "(e.g. images, guest_ram, device_state, install_history)"
+        )
+    declaration: dict[str, Any] = {
+        "scope": scope,
+        "scope_note": (
+            "This checkpoint covers disk images only. Guest RAM, device state, "
+            "the fw_cfg geometry, network state and the install history are NOT "
+            "in it; restoring it does not roll those back."
+            if scope == ScopeRequired.DISK
+            else "This checkpoint covers the whole runnable machine state named "
+            "in scope_includes."
+        ),
+    }
+    if scope == ScopeRequired.DISK:
+        declaration["scope_excludes"] = list(DISK_SCOPE_EXCLUDES)
+    else:
+        declaration["scope_includes"] = list(covered)
+    return declaration
+
+
+def read_scope(document: Any) -> Optional[dict[str, Any]]:
+    """Return the scope declaration of a checkpoint manifest.
+
+    ``None`` means *there is no manifest to read* -- which is not the same as a
+    manifest that failed to declare.  A checkpoint directory holding images but
+    no manifest is restored and reported unverified (PRD 9.2: an unverifiable
+    restore is reported, never passed off as ok); a manifest that exists and
+    does not say what it covers is refused, because that is a claim someone
+    made and got wrong.
+
+    Raises:
+        UniPadError: ``artifact_manifest_invalid`` when a manifest is present
+            but its scope is absent or outside the vocabulary.
+    """
+    if document is None:
+        return None
+    if not isinstance(document, dict):
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MANIFEST_INVALID,
+            "checkpoint manifest must be a JSON object",
+            manifest_type=type(document).__name__,
+        )
+    scope = document.get("scope")
+    if not scope:
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MANIFEST_INVALID,
+            "checkpoint manifest does not declare its scope; PRD 3.2 P1 (5) "
+            "requires a checkpoint to state whether it saved disk or "
+            "whole-machine state",
+            expected=list(ScopeRequired.ALL),
+        )
+    if scope not in ScopeRequired.ALL:
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MANIFEST_INVALID,
+            "checkpoint manifest declares an unknown scope",
+            scope=scope,
+            expected=list(ScopeRequired.ALL),
+        )
+    return {
+        "scope": scope,
+        "scope_note": str(document.get("scope_note", "")),
+        "scope_excludes": list(document.get("scope_excludes", [])),
+        "scope_includes": list(document.get("scope_includes", [])),
+    }
 
 #: Progress callback signature: ``(bytes_done, bytes_total)``.
 ProgressCallback = Callable[[int, int], None]
@@ -448,8 +585,12 @@ class ImageManager:
         digest = self.sha256_file(destination)
         stamp = timestamp or _utc_now_iso()
         manifest_path = destination_dir / "manifest.json"
+        # PRD 3.2 P1 (5): a checkpoint must say what it covers.  backup() copies
+        # files, so the honest declaration is ``disk`` -- and the exclusions are
+        # named, because that is the half an operator needs.
+        scope_fields = declare_scope(ScopeRequired.DISK)
         manifest = {
-            "schema_version": KNOWN_GOOD_SCHEMA_VERSION,
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "created_at": stamp,
             "note": note,
             "entries": [
@@ -460,8 +601,9 @@ class ImageManager:
                     "size_bytes": destination.stat().st_size,
                 }
             ],
+            **scope_fields,
         }
-        _merge_manifest(manifest_path, manifest["entries"], stamp, note)
+        _merge_manifest(manifest_path, manifest["entries"], stamp, note, scope_fields)
         return {
             "path": str(source),
             "backup_path": str(destination),
@@ -469,6 +611,7 @@ class ImageManager:
             "size_bytes": destination.stat().st_size,
             "manifest": str(manifest_path),
             "timestamp": stamp,
+            **scope_fields,
         }
 
     def restore_checkpoint(
@@ -524,8 +667,35 @@ class ImageManager:
                 )
         destination.mkdir(parents=True, exist_ok=True)
 
-        entries = _read_manifest_entries(source_dir / "manifest.json")
+        manifest_path = source_dir / "manifest.json"
+        entries = _read_manifest_entries(manifest_path)
         expected = {Path(e["backup_path"]).name: e for e in entries if isinstance(e, dict)}
+        # PRD 3.2 P1 (5): refuse to restore a checkpoint that does not say what
+        # it covers.  This is the gate that stops an operator from believing
+        # they got the machine back when they got a disk.
+        manifest_document, manifest_error = _read_manifest_document(manifest_path)
+        if manifest_error is not None:
+            raise UniPadError(
+                ErrorCode.ARTIFACT_MANIFEST_INVALID,
+                "checkpoint manifest is unreadable; refusing to restore from a "
+                "checkpoint whose contents cannot be verified",
+                path=str(manifest_path),
+                reason=manifest_error,
+            )
+        scope = read_scope(manifest_document)
+        if scope is None:
+            # No manifest at all: PRD 9.2 says report it, do not refuse it and
+            # do not call it verified.  The scope is explicitly unknown rather
+            # than silently assumed to be the narrow one.
+            scope = {
+                "scope": "unknown",
+                "scope_note": (
+                    "This checkpoint has no manifest, so what it covers cannot "
+                    "be determined; every restored file is reported unverified."
+                ),
+                "scope_excludes": [],
+                "scope_includes": [],
+            }
 
         restored: list[dict[str, Any]] = []
         skipped: list[str] = []
@@ -565,6 +735,7 @@ class ImageManager:
         if not restored:
             skipped.append(f"no image files found in {source_dir}")
         return {
+            **scope,
             "backup_dir": str(source_dir),
             "target_dir": str(destination),
             "restored": restored,
@@ -606,6 +777,23 @@ def _slug(value: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in value).strip("-") or "restore"
 
 
+def _read_manifest_document(manifest_path: Path) -> tuple[Optional[Any], Optional[str]]:
+    """Read the whole backup manifest.
+
+    Returns ``(document, error)``.  ``document`` is ``None`` when there is no
+    manifest to read; ``error`` names *why* it could not be read when the file
+    exists but is broken.  The two are deliberately distinguished: an absent
+    manifest means "nothing was claimed", while an unreadable one means "a claim
+    was made and cannot be checked" -- the second must not pass as the first.
+    """
+    if not manifest_path.is_file():
+        return None, None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8")), None
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, type(exc).__name__
+
+
 def _read_manifest_entries(manifest_path: Path) -> list[dict[str, Any]]:
     """Read the ``entries`` list of a backup manifest (empty when absent)."""
     if not manifest_path.is_file():
@@ -621,9 +809,19 @@ def _read_manifest_entries(manifest_path: Path) -> list[dict[str, Any]]:
 
 
 def _merge_manifest(
-    manifest_path: Path, entries: list[dict[str, Any]], stamp: str, note: str
+    manifest_path: Path,
+    entries: list[dict[str, Any]],
+    stamp: str,
+    note: str,
+    scope_fields: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Append ``entries`` to an existing manifest, keeping history."""
+    """Append ``entries`` to an existing manifest, keeping history.
+
+    ``scope_fields`` is re-applied on every merge rather than inherited from
+    what is already on disk: a manifest written before the scope existed would
+    otherwise keep a *new* checkpoint undeclared, and the checkpoint being
+    written now is the one an operator will rely on.
+    """
     document: dict[str, Any] = {}
     if manifest_path.is_file():
         try:
@@ -635,11 +833,13 @@ def _merge_manifest(
     history = document.get("entries")
     if not isinstance(history, list):
         history = []
-    document["schema_version"] = KNOWN_GOOD_SCHEMA_VERSION
+    document["schema_version"] = CHECKPOINT_SCHEMA_VERSION
     document["updated_at"] = stamp
     if note:
         document["note"] = note
     document["entries"] = [*history, *entries]
+    if scope_fields is not None:
+        document.update(scope_fields)
     manifest_path.write_text(
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
