@@ -18,6 +18,7 @@
 | R6 | Workflow#4 + #5：Windows 真实启动关键路径（工具链 / IPSW 抽取 / LZFSE 解码器 / XNU 可移植性 / QEMU argv / prelink / EFI / ESP / OS-root） | ✅ 已推送（97d40f6 / 2353718） |
 | R6b | launcher 与板级对齐：pflash 固件、board 一致的内存/CPU/屏幕、`-no-reboot`、`-fw_cfg` ramfb-size、修 `fat:` 误判缺失 | ✅ 已推送（2353718，12/12 变异被抓） |
 | R6c | **真实启动**：`-kernel` 启动模式 + AArch64 裸机固件（本机 clang 交叉编译）+ 真 QEMU 端到端验收 + 修 ANSI 代码页路径缺陷 | ✅ 已提交（4451826，6/6 变异被抓；推送待网络恢复） |
+| R7a | P1(3) 安装生命周期：append-only 历史、卸载/更新为转移、封闭错误分类表；并修掉 store 失败被静默吞掉的缺陷 | ✅ 已提交（86de33c / 3ff2314，8/8 + 1/1 变异被抓） |
 | R7 | P1 剩余代码实现（Windows 可编码部分）+ 全量测试 + 审计 | 进行中 |
 | R8 | 终验、推送、审计验收报告（含现场未验证项清单） | 待 |
 
