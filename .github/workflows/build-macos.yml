@@ -84,10 +84,18 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - name: Checkout (with submodules)
+      # This repository declares NO submodules: there is no .gitmodules and
+      # `git submodule status` is empty, so `submodules: recursive` fetches
+      # nothing and reads as though the sources had been handled.  They have
+      # not.  The two pinned upstreams are placed under vendor/ by the
+      # acquisition step below, at the commits recorded in
+      # config/sources.lock.json.  They are deliberately NOT .gitmodules
+      # entries: that would make every pin exist twice, once as a gitlink in
+      # the index and once in the lock -- exactly the divergence this project
+      # has already been bitten by (call-chain 7.4, standards R-1).
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 1
           persist-credentials: false
 
@@ -275,12 +283,695 @@ jobs:
           echo "artifact_name=$name" >> "$GITHUB_OUTPUT"
           echo "artifact name: $name"
 
+      # PRD 8.1 inputs: obtain the sources BEFORE the build, and prove they are
+      # the ones the lock promised.  Three phases, all inside one step so that
+      # "read the lock", "fetch" and "compare" cannot drift apart:
+      #
+      #   1. acquire    -- the two checkouts the upstream driver cannot fetch
+      #                    for itself, at the commits in sources.lock.json.
+      #   2. assemble   -- the driver fetches everything else: the module
+      #                    submodules (DarwinBoot, the Native* drivers, the
+      #                    kits) and the feeds.toml references (xnu,
+      #                    libplatform, libdispatch, AvailabilityVersions,
+      #                    edk2, libpthread, corecrypto-2023, IOStorageFamily,
+      #                    dyld).  The workflow does not hand-roll this: a
+      #                    second implementation of the fetcher is the exact
+      #                    divergence class this project keeps hitting.
+      #   3. cross-check-- `unixnu status` and the driver's own unixnu.lock are
+      #                    compared with sources.lock.json, and a disagreement
+      #                    fails the job.  A build that silently compiles
+      #                    different bytes than the lock promised is the
+      #                    failure this prevents.
+      - name: Acquire and verify the pinned sources (vendor/ + unixnu fetch/tree + pin cross-check)
+        id: sources
+        env:
+          LOCK_PATH: config/sources.lock.json
+          VENDOR_DIR: vendor
+          REPORT_DIR: build
+          UNIXNU_DRIVER: vendor/UniXNU/unixnu
+          DEVICE_REPO: vendor/UniXNU-qemu
+          # ONE out root, shared with the build step below.  The driver keeps
+          # its feed clones under <out>/feeds and assembles the tree under
+          # <out>/<board>/tree (config.py:83-84, tree.py:41), and
+          # scripts/macos/build-macos.sh derives its own UNIXNU_OUT as
+          # "$OUT_DIR/unixnu-out" and then proves every feed clone is already
+          # on disk at the locked commit by scanning "$FEEDS_DIR"/*.  If the
+          # two halves name different roots, this step populates one directory
+          # while prepare-sources scans another, finds nothing, and refuses
+          # with artifact_missing -- the build never reaches a build stage at
+          # all, which is the defect this step exists to remove.
+          OUT_ROOT: build-output/unixnu-out
+          GIT_FETCH_DEPTH: '1'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          """Obtain the pinned sources and prove they are the locked ones (PRD 8.1).
+
+          Every commit comes from config/sources.lock.json and from nowhere
+          else.  A second place that knows a sha is the divergence class this
+          project keeps hitting (call-chain 7.4: 18 helper names across 5
+          scripts, 11 diverged; standards R-1: three port validators, three
+          ranges), so nothing here is hardcoded and nothing is re-derived by
+          parsing feeds.toml: `unixnu status` already prints every git source
+          as `git pinned <sha12>` or `NOT LOCKED` (scripts/unixnu/cli.py
+          cmd_status) and `unixnu fetch` writes the device repository's
+          unixnu.lock, so both are the driver's own output rather than a
+          second implementation of it.
+
+          Only the two repositories the driver cannot clone are cloned here:
+          scripts/unixnu/config.py Context.__init__ raises "no device
+          repository" without -D, and cli.py has no subcommand that clones
+          either the device repository or its own root.
+
+          HONESTY: a real clone from github.com cannot be exercised on the
+          Windows code-stage host (github.com over the git protocol is blocked;
+          only api.github.com answers), and the driver's kernel step needs
+          xcodebuild.  What is proven here is the pin resolution, the argument
+          construction, the refusals and the manifest shape.  The network half
+          is recorded as UNVERIFIED and can only be proven on a macOS runner.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          LOCK_PATH = os.environ.get("LOCK_PATH", "config/sources.lock.json")
+          VENDOR_DIR = os.environ.get("VENDOR_DIR", "vendor")
+          REPORT_DIR = os.environ.get("REPORT_DIR", "build")
+          DRIVER = os.environ.get("UNIXNU_DRIVER", "vendor/UniXNU/unixnu")
+          DEVICE_REPO = os.environ.get("DEVICE_REPO", "vendor/UniXNU-qemu")
+          OUT_ROOT = os.environ.get("OUT_ROOT", "build-output/unixnu-out")
+          REPO_ROOT = os.environ.get("REPO_ROOT", ".")
+          PRIVATE_COMPONENT = "local-private"
+
+          # (key in sources.lock.json, directory under vendor/)
+          ACQUISITIONS = (("unixnu", "UniXNU"), ("device_repo", "UniXNU-qemu"))
+
+          # The module kinds scripts/unixnu/config.py KINDS knows about; the
+          # status header lines ("device", "output", "config") are not among
+          # them, which is what keeps them from being read as modules.
+          KINDS = ("driver", "kit", "patch", "script", "package", "refer")
+          STATUS_LINE = re.compile(
+              r"^(?P<kind>\S+)\s+(?P<name>\S+)\s+(?P<origin>\S+)(?:\s+(?P<extra>.*))?$"
+          )
+          SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+          URL_RE = re.compile(r"^\s*url\s*=\s*(\S+)", re.MULTILINE)
+
+          UNVERIFIED = (
+              "a real clone from github.com cannot be exercised on the Windows code-stage host: "
+              "github.com over the git protocol is blocked and only api.github.com answers, so the "
+              "network half of the acquire phase -- and of the driver's own fetch -- is UNVERIFIED "
+              "until a macOS runner performs it",
+              "the upstream driver's kernel step builds with the Xcode iphoneos SDK, so no part of "
+              "the build itself is claimed by this step",
+          )
+
+
+          class SourcePinError(Exception):
+              """A refusal to obtain or trust the sources.
+
+              The lock is unreadable, a pin is not a pin, what was fetched is
+              not what the lock promised, or the fetched material is not
+              ignorable.  Every one of them fails the job rather than
+              defaulting to something plausible.
+              """
+
+
+          def _announce(problems, message):
+              print(f"::error::{message}")
+              problems.append(message)
+
+
+          def _warn(warnings, message):
+              print(f"::warning::{message}")
+              warnings.append(message)
+
+
+          def _refuse_private(path):
+              """PRD 12: nothing under local-private/ is fetched, built or published."""
+              resolved = Path(path).resolve()
+              for part in resolved.parts:
+                  if part.lower() == PRIVATE_COMPONENT:
+                      raise SourcePinError(
+                          f"{Path(path).as_posix()} is under {PRIVATE_COMPONENT}/ (PRD 12): "
+                          "private material is never fetched or built here"
+                      )
+
+
+          def _write_report(name, payload):
+              directory = Path(REPORT_DIR)
+              directory.mkdir(parents=True, exist_ok=True)
+              path = directory / name
+              path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(f"report: {path.as_posix()}")
+
+
+          def _publish_outputs(pins, lock_sha, frozen):
+              """Publish the commits the LOCK pinned as this step's outputs.
+
+              The dispatch inputs are what a human asked for; the lock is what
+              this step fetched and what the driver assembled.  Downstream steps
+              -- the manifest, the summary, the cache key -- must quote the
+              second, or a manifest can attest to a commit that was never built
+              while the build quietly used another one.  That is the same
+              silent-divergence class the cross-check exists to catch, one layer
+              further down.
+
+              ``frozen`` is published for the same reason.  The lock's sha256
+              lets a reader re-read the lock, but only if they still have this
+              repository at this commit; the manifest should say outright
+              whether the build ran against a frozen baseline rather than
+              making every consumer derive it.  An unfrozen build is a
+              legitimate one -- build-macos.sh treats the pins as the freeze
+              candidates -- so this is a fact to record, not a failure to
+              propagate.
+              """
+              path = os.environ.get("GITHUB_OUTPUT")
+              if not path:
+                  return
+              lines = [
+                  f"unixnu_commit={pins['unixnu']['commit']}",
+                  f"device_commit={pins['device_repo']['commit']}",
+                  f"unixnu_repo={pins['unixnu']['repo']}",
+                  f"device_repo={pins['device_repo']['repo']}",
+                  f"lock_sha256={lock_sha}",
+                  f"lock_frozen={'true' if frozen else 'false'}",
+              ]
+              with open(path, "a", encoding="utf-8") as handle:
+                  handle.write("\n".join(lines) + "\n")
+              print(f"outputs: {path}")
+
+
+          def load_pins(lock_path=None):
+              """(pins, feeds, frozen, sha256) read from the source lock.
+
+              A missing, empty or malformed pin is a refusal.  It is never
+              coerced to an empty string: a checkout made from "" is a
+              checkout of whatever HEAD happened to be, which is precisely the
+              silent divergence this step exists to prevent.
+              """
+              path = Path(LOCK_PATH if lock_path is None else lock_path)
+              try:
+                  raw = path.read_bytes()
+              except OSError as exc:
+                  raise SourcePinError(
+                      f"cannot read {path.as_posix()}: {exc.__class__.__name__}"
+                  ) from None
+              try:
+                  lock = json.loads(raw.decode("utf-8"))
+              except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                  raise SourcePinError(
+                      f"{path.as_posix()} is not valid JSON: {exc.__class__.__name__}"
+                  ) from None
+              if not isinstance(lock, dict):
+                  raise SourcePinError(f"{path.as_posix()}: the root is not an object")
+              pins = {}
+              for key, directory in ACQUISITIONS:
+                  section = lock.get(key)
+                  if not isinstance(section, dict):
+                      raise SourcePinError(
+                          f"{path.as_posix()}: '{key}' is missing or is not an object; it pins {directory}"
+                      )
+                  for field in ("repo", "commit"):
+                      value = section.get(field)
+                      if not isinstance(value, str) or not value.strip():
+                          raise SourcePinError(
+                              f"{path.as_posix()}: {key}.{field} is {value!r}; an empty pin is not a pin "
+                              "(it would fetch whatever HEAD is)"
+                          )
+                  commit = section["commit"].strip()
+                  if not SHA_RE.match(commit):
+                      raise SourcePinError(f"{path.as_posix()}: {key}.commit {commit!r} is not a git sha")
+                  pins[key] = {
+                      "repo": section["repo"].strip(),
+                      "commit": commit,
+                      "directory": directory,
+                  }
+              feeds = lock.get("feeds")
+              if feeds is None:
+                  feeds = []
+              if not isinstance(feeds, list):
+                  raise SourcePinError(f"{path.as_posix()}: 'feeds' is not an array")
+              return pins, feeds, bool(lock.get("frozen")), hashlib.sha256(raw).hexdigest()
+
+
+          def _run_git(args, *, check=True):
+              """Run git, echoing it the way scripts/unixnu/util.py run() does."""
+              command = ["git", *[str(part) for part in args]]
+              print("+ " + " ".join(command), flush=True)
+              result = subprocess.run(command, capture_output=True, text=True)
+              if check and result.returncode:
+                  raise SourcePinError(
+                      f"git failed ({result.returncode}): {' '.join(command)}\n{result.stderr.strip()}"
+                  )
+              return result
+
+
+          def _head_of(directory):
+              directory = Path(directory)
+              if not directory.joinpath(".git").exists():
+                  return None
+              result = _run_git(["-C", directory, "rev-parse", "HEAD"], check=False)
+              if result.returncode or not result.stdout.strip():
+                  return None
+              return result.stdout.strip()
+
+
+          def acquire_one(url, commit, destination, *, depth=None):
+              """Place one pinned checkout at destination and prove it is at that commit.
+
+              The shape mirrors scripts/unixnu/feeds.py fetch(): init, point the
+              remote, fetch the wanted commit BY SHA, detach onto FETCH_HEAD.
+              Never a branch name -- a branch is a moving target and the lock
+              pins a commit.
+              """
+              url, commit = str(url or "").strip(), str(commit or "").strip()
+              if not url:
+                  raise SourcePinError("no repository URL: refusing to fetch from an empty remote")
+              if not SHA_RE.match(commit):
+                  raise SourcePinError(
+                      f"{commit!r} is not a git sha: refusing to fetch it (an empty ref is not a pin)"
+                  )
+              if depth is None:
+                  depth = int(os.environ.get("GIT_FETCH_DEPTH", "1"))
+              destination = Path(destination)
+              head = _head_of(destination)
+              if head is not None and head.lower() == commit.lower():
+                  return {"status": "present", "head": head, "fetched": False}
+              destination.mkdir(parents=True, exist_ok=True)
+              _run_git(["-C", destination, "init", "-q"])
+              probe = _run_git(["-C", destination, "remote", "get-url", "origin"], check=False)
+              if probe.returncode == 0:
+                  _run_git(["-C", destination, "remote", "set-url", "origin", url])
+              else:
+                  _run_git(["-C", destination, "remote", "add", "origin", url])
+              _run_git(["-C", destination, "fetch", "-q", "--depth", str(depth), "origin", commit])
+              _run_git(["-C", destination, "checkout", "-q", "--detach", "FETCH_HEAD"])
+              head = _head_of(destination)
+              if head is None:
+                  raise SourcePinError(
+                      f"{destination.as_posix()}: no HEAD after checkout; the acquisition produced no checkout"
+                  )
+              if head.lower() != commit.lower():
+                  raise SourcePinError(
+                      f"{destination.as_posix()}: the lock pins {commit} but the checkout is at {head}; "
+                      "refusing to build bytes the lock did not promise"
+                  )
+              return {"status": "acquired", "head": head, "fetched": True}
+
+
+          def ensure_vendor_ignored(repo_root=None, vendor=None, locked_urls=()):
+              """vendor/ is fetched material: it must never be committable.
+
+              The rule goes to .git/info/exclude, which is local to the
+              checkout and never committed, so the ignore rule cannot itself
+              become a second source of truth that diverges between clones.
+              A tracked file under vendor/, or a .gitmodules entry pointing at
+              a repository the lock already pins, is a refusal: either one
+              makes the pin exist twice.
+              """
+              root = Path(REPO_ROOT if repo_root is None else repo_root)
+              vendor = VENDOR_DIR if vendor is None else vendor
+              tracked = _run_git(["-C", root, "ls-files", "--", vendor], check=False)
+              if tracked.returncode == 0 and tracked.stdout.strip():
+                  names = ", ".join(sorted(tracked.stdout.split())[:5])
+                  raise SourcePinError(
+                      f"{vendor}/ has tracked files ({names}...): fetched material must not be committed"
+                  )
+              modules = root / ".gitmodules"
+              if modules.is_file():
+                  try:
+                      text = modules.read_text(encoding="utf-8", errors="replace")
+                  except OSError:
+                      text = ""
+                  for url in URL_RE.findall(text):
+                      if url in set(locked_urls):
+                          raise SourcePinError(
+                              f".gitmodules points at {url}, which the source lock already pins: the pin "
+                              "would exist twice, once as a gitlink in the index and once in the lock. "
+                              "vendor/ is the single place the pins live."
+                          )
+              # The rule is "/vendor" without a trailing slash on purpose: a
+              # pattern ending in "/" only matches directories, and git answers
+              # check-ignore 1 for a bare pathname that it has not been told is
+              # a directory, so "/vendor/" would never satisfy the probe below.
+              # Both the probe and the re-verification ask about the bare name.
+              #
+              # It is anchored, so it must be spelled *relative to the root*:
+              # str() on a Windows absolute path keeps the backslashes and the
+              # drive letter, which would write a rule matching nothing and then
+              # fail the re-verification below on a caller that passes one.
+              # relpath also normalises the separators, which str() does not.
+              ignored = _run_git(["-C", root, "check-ignore", "-q", vendor], check=False)
+              if ignored.returncode == 1:
+                  exclude = root / ".git" / "info" / "exclude"
+                  exclude.parent.mkdir(parents=True, exist_ok=True)
+                  existing = exclude.read_text(encoding="utf-8", errors="replace") if exclude.is_file() else ""
+                  try:
+                      relative = Path(os.path.relpath(root / vendor, root)).as_posix()
+                  except ValueError:  # a different drive: relpath cannot help
+                      relative = Path(vendor).as_posix()
+                  rule = "/" + relative.strip("/")
+                  if rule not in existing.splitlines():
+                      with exclude.open("a", encoding="utf-8") as handle:
+                          if existing and not existing.endswith("\n"):
+                              handle.write("\n")
+                          handle.write(
+                              "# Fetched upstream sources; never committed "
+                              "(see .github/workflows/build-macos.yml).\n" + rule + "\n"
+                          )
+              elif ignored.returncode != 0:
+                  raise SourcePinError(
+                      f"cannot ask git whether {vendor}/ is ignored (exit {ignored.returncode})"
+                  )
+              again = _run_git(["-C", root, "check-ignore", "-q", vendor], check=False)
+              if again.returncode != 0:
+                  raise SourcePinError(
+                      f"{vendor}/ is still not ignored; fetched material could be committed"
+                  )
+              return True
+
+
+          def driver_argv(subcommand, *, driver=None, device=None, out_root=None, extra=()):
+              """The upstream driver's command line.
+
+              Common arguments such as -D come AFTER the subcommand: cli.py
+              attaches the shared parser to every subparser (parents=[c]), so
+              `unixnu -D DIR fetch` is not a command line argparse accepts.
+              """
+              argv = [
+                  sys.executable,
+                  str(DRIVER if driver is None else driver),
+                  str(subcommand),
+              ]
+              argv += ["-D", str(DEVICE_REPO if device is None else device)]
+              argv += ["--out", str(OUT_ROOT if out_root is None else out_root)]
+              argv += [str(part) for part in extra]
+              return argv
+
+
+          def run_driver(subcommand, **kwargs):
+              argv = driver_argv(subcommand, **kwargs)
+              print("+ " + " ".join(argv), flush=True)
+              result = subprocess.run(argv)
+              if result.returncode:
+                  raise SourcePinError(
+                      f"unixnu {subcommand} failed ({result.returncode}); see the log above"
+                  )
+
+
+          def parse_status(text):
+              """(git pins, unpinned, not_reproducible) from `unixnu status` output.
+
+              cli.py cmd_status prints one line per module as
+              f'{kind:8} {name:24} {origin}{extra}' where extra is
+              ' pinned <sha12>' or ' NOT LOCKED'.  Only lines whose kind is a
+              real module kind are read, so the header lines cannot be
+              mistaken for a module.
+              """
+              pins, unpinned, not_reproducible = {}, [], False
+              for line in text.splitlines():
+                  match = STATUS_LINE.match(line.strip())
+                  if not match:
+                      continue
+                  kind, name, origin, extra = match.group("kind", "name", "origin", "extra")
+                  if origin != "git":
+                      continue
+                  extra = (extra or "").strip()
+                  if extra.startswith("pinned "):
+                      pins[name] = extra[len("pinned "):].strip()
+                  else:
+                      pins[name] = None
+                      unpinned.append(f"{kind}:{name}")
+              if "not reproducible:" in text:
+                  not_reproducible = True
+              return pins, unpinned, not_reproducible
+
+
+          def parse_driver_lock(path):
+              """{source name: commit} from the unixnu.lock the driver itself wrote."""
+              path = Path(path)
+              if not path.is_file():
+                  return {}
+              try:
+                  data = tomllib.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+                  raise SourcePinError(
+                      f"{path.as_posix()} is unreadable: {exc.__class__.__name__}"
+                  ) from None
+              resolved = {}
+              for name, values in (data.get("source") or {}).items():
+                  commit = values.get("commit") if isinstance(values, dict) else None
+                  if isinstance(commit, str) and commit.strip():
+                      resolved[name] = commit.strip()
+              return resolved
+
+
+          def cross_check(feeds, driver_lock, status_text, heads):
+              """Compare what the driver resolved with what the lock promised."""
+              problems, warnings = [], []
+              pinned_feeds = {
+                  entry["name"]: entry
+                  for entry in feeds
+                  if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
+              }
+              # 1. the lock's feeds against the unixnu.lock the driver wrote
+              #    (full 40-character commits, not the 12 the status prints).
+              for name in sorted(set(pinned_feeds) - set(driver_lock)):
+                  _announce(
+                      problems,
+                      f"{name}: the source lock pins it but the driver's unixnu.lock does not record it "
+                      "(unixnu fetch did not resolve it)",
+                  )
+              for name in sorted(set(driver_lock) - set(pinned_feeds)):
+                  _announce(
+                      problems,
+                      f"{name}: the driver's unixnu.lock records it but the source lock does not pin it; "
+                      "the lock is missing a feed",
+                  )
+              for name in sorted(set(pinned_feeds) & set(driver_lock)):
+                  want = str(pinned_feeds[name].get("commit") or "")
+                  got = driver_lock[name]
+                  if want.lower() != got.lower():
+                      _announce(problems, f"{name}: the driver resolved {got} but the source lock pins {want}")
+              # 2. the status report
+              pins, unpinned, not_reproducible = parse_status(status_text)
+              for name in sorted(unpinned):
+                  _announce(problems, f"{name} is NOT LOCKED: the driver resolved no commit for it")
+              for name, resolved in sorted(pins.items()):
+                  entry = pinned_feeds.get(name)
+                  if entry is None:
+                      _announce(
+                          problems,
+                          f"{name}: the driver reports a git source the source lock does not pin",
+                      )
+                      continue
+                  if not resolved:
+                      continue
+                  want = str(entry.get("commit") or "")
+                  if want and not want.lower().startswith(resolved.lower()):
+                      _announce(
+                          problems,
+                          f"{name}: the driver resolved {resolved} but the source lock pins {want}",
+                      )
+              for name in sorted(set(pinned_feeds) - set(pins)):
+                  _announce(
+                      problems,
+                      f"{name}: the source lock pins it but `unixnu status` does not report it as a git source",
+                  )
+              if not_reproducible:
+                  _announce(
+                      problems,
+                      "`unixnu status` reports 'not reproducible': at least one local source is not "
+                      "pinned by unixnu.lock",
+                  )
+              if not pinned_feeds and (driver_lock or pins):
+                  _announce(
+                      problems,
+                      "the source lock declares no feeds, so nothing the driver resolves can be "
+                      "cross-checked against it",
+                  )
+              # 3. the two checkouts this step placed
+              for label, pair in sorted(heads.items()):
+                  want, got = pair.get("want"), pair.get("got")
+                  if not want:
+                      _announce(problems, f"{label}: no pin in the source lock to compare the checkout against")
+                  elif not got:
+                      _announce(problems, f"{label}: no HEAD in the checkout; the acquisition produced none")
+                  elif want.lower() != got.lower():
+                      _announce(problems, f"{label}: the checkout is at {got} but the source lock pins {want}")
+              return problems, warnings
+
+
+          def main():
+              problems, warnings = [], []
+              try:
+                  pins, feeds, frozen, lock_sha = load_pins()
+              except SourcePinError as error:
+                  _announce(problems, str(error))
+                  _write_report(
+                      "source-acquisition.json",
+                      {
+                          "schema_version": 1,
+                          "check": "source-acquisition",
+                          "lock": {"path": Path(LOCK_PATH).as_posix(), "sha256": None},
+                          "status": "fail",
+                          "problems": problems,
+                          "warnings": warnings,
+                          "unverified": list(UNVERIFIED),
+                      },
+                  )
+                  return 1
+              print(f"== lock {Path(LOCK_PATH).as_posix()} sha256={lock_sha} frozen={frozen}")
+              for key, pin in pins.items():
+                  print(f"== pin  {pin['directory']:<12} {pin['repo']} {pin['commit']}")
+              _publish_outputs(pins, lock_sha, frozen)
+
+              # ---- phase 1: acquire -------------------------------------------
+              print("== phase 1/3 acquire the pinned checkouts")
+              heads, acquisitions = {}, []
+              try:
+                  _refuse_private(VENDOR_DIR)
+                  _refuse_private(OUT_ROOT)
+                  ensure_vendor_ignored(
+                      REPO_ROOT, VENDOR_DIR, [pin["repo"] for pin in pins.values()]
+                  )
+                  for key, pin in pins.items():
+                      destination = Path(VENDOR_DIR) / pin["directory"]
+                      _refuse_private(destination)
+                      outcome = acquire_one(pin["repo"], pin["commit"], destination)
+                      heads[destination.as_posix()] = {"want": pin["commit"], "got": outcome["head"]}
+                      acquisitions.append(
+                          {
+                              "lock_key": key,
+                              "directory": pin["directory"],
+                              "repo": pin["repo"],
+                              "commit": pin["commit"],
+                              **outcome,
+                          }
+                      )
+                      print(f"== {pin['directory']} {outcome['status']} at {outcome['head']}")
+              except SourcePinError as error:
+                  _announce(problems, str(error))
+                  _write_report(
+                      "source-acquisition.json",
+                      {
+                          "schema_version": 1,
+                          "check": "source-acquisition",
+                          "lock": {"path": Path(LOCK_PATH).as_posix(), "sha256": lock_sha, "frozen": frozen},
+                          "vendor_ignored": None,
+                          "acquisitions": acquisitions,
+                          "status": "fail",
+                          "problems": problems,
+                          "warnings": warnings,
+                          "unverified": list(UNVERIFIED),
+                      },
+                  )
+                  return 1
+              _write_report(
+                  "source-acquisition.json",
+                  {
+                      "schema_version": 1,
+                      "check": "source-acquisition",
+                      "lock": {"path": Path(LOCK_PATH).as_posix(), "sha256": lock_sha, "frozen": frozen},
+                      "vendor_ignored": True,
+                      "acquisitions": acquisitions,
+                      "status": "pass",
+                      "problems": [],
+                      "warnings": [],
+                      "unverified": list(UNVERIFIED),
+                  },
+              )
+
+              # ---- phase 2: assemble with the driver --------------------------
+              print("== phase 2/3 assemble with the upstream driver (fetch, tree)")
+              try:
+                  run_driver("fetch")
+                  run_driver("tree")
+              except SourcePinError as error:
+                  _announce(problems, str(error))
+                  _write_report(
+                      "pin-crosscheck.json",
+                      {
+                          "schema_version": 1,
+                          "check": "pin-crosscheck",
+                          "status": "fail",
+                          "problems": problems,
+                          "warnings": warnings,
+                          "unverified": list(UNVERIFIED),
+                      },
+                  )
+                  return 1
+
+              # ---- phase 3: cross-check ---------------------------------------
+              print("== phase 3/3 cross-check the resolved pins against the source lock")
+              status_text, status_error = "", ""
+              try:
+                  status = subprocess.run(driver_argv("status"), capture_output=True, text=True)
+                  status_text = status.stdout
+                  if status.returncode:
+                      status_error = f"unixnu status failed ({status.returncode}): {status.stderr.strip()}"
+                      _announce(problems, status_error)
+              except OSError as error:
+                  status_error = f"cannot run unixnu status: {error.__class__.__name__}"
+                  _announce(problems, status_error)
+              try:
+                  driver_lock = parse_driver_lock(Path(DEVICE_REPO) / "unixnu.lock")
+              except SourcePinError as error:
+                  driver_lock = {}
+                  _announce(problems, str(error))
+              check_problems, check_warnings = cross_check(feeds, driver_lock, status_text, heads)
+              problems += check_problems
+              warnings += check_warnings
+              if not check_problems:
+                  print(f"== cross-check: {len(driver_lock)} feed pin(s) and 2 checkout(s) agree with the lock")
+              _write_report(
+                  "pin-crosscheck.json",
+                  {
+                      "schema_version": 1,
+                      "check": "pin-crosscheck",
+                      "lock": {"path": Path(LOCK_PATH).as_posix(), "sha256": lock_sha, "frozen": frozen},
+                      "driver_lock_path": (Path(DEVICE_REPO) / "unixnu.lock").as_posix(),
+                      "driver_lock": driver_lock,
+                      "lock_feeds": {
+                          entry["name"]: entry.get("commit")
+                          for entry in feeds
+                          if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                      },
+                      "status_error": status_error or None,
+                      "heads": heads,
+                      "problems": check_problems,
+                      "warnings": check_warnings,
+                      "unverified": list(UNVERIFIED),
+                      "status": "fail" if check_problems else "pass",
+                  },
+              )
+              for message in UNVERIFIED:
+                  _warn(warnings, f"unverified: {message}")
+              if problems:
+                  print(f"== sources: FAIL ({len(problems)} problem(s))")
+                  return 1
+              print("== sources: PASS (acquired, assembled and cross-checked)")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:
           EXPERIMENT_ID: ${{ inputs.experiment_id }}
-          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
-          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          # The pins the lock resolved, for the record the build script keeps.
+          UNIXNU_COMMIT: ${{ steps.sources.outputs.unixnu_commit || inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ steps.sources.outputs.device_commit || inputs.device_commit }}
           STAGE: ${{ inputs.stage }}
           SYSTEM_BUILD: ${{ inputs.system_build }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
@@ -297,7 +988,20 @@ jobs:
           mkdir -p "$BUILD_OUTPUT_DIR"
           started=$(date -u +%s)
           echo "started_at=$started" >> "$GITHUB_OUTPUT"
-          bash scripts/macos/build-macos.sh 2>&1 | tee "$BUILD_LOG"
+          # --out must be passed, not defaulted: build-macos.sh defaults OUT_DIR
+          # to scripts/macos/build-out/<run-id>, which would put its UNIXNU_OUT
+          # -- and therefore the "$FEEDS_DIR"/* scan its prepare-sources step
+          # uses to prove every feed clone is already on disk -- somewhere the
+          # acquisition step never wrote.  Pointing it at the same directory the
+          # staging step scans keeps one out root for the whole job.
+          bash scripts/macos/build-macos.sh \
+            --experiment "$EXPERIMENT_ID" \
+            --stage "$STAGE" \
+            --target "$PAYLOAD_TARGET" \
+            --out "$BUILD_OUTPUT_DIR" \
+            --unixnu vendor/UniXNU \
+            --device vendor/UniXNU-qemu \
+            2>&1 | tee "$BUILD_LOG"
           finished=$(date -u +%s)
           echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
           echo "build duration: $((finished - started))s"
@@ -313,8 +1017,16 @@ jobs:
           BUILD_LOG: macos-build.log
           REPORT_DIR: build
           EXPERIMENT_ID: ${{ inputs.experiment_id }}
-          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
-          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          # The commits the LOCK pinned and the acquisition step fetched, not the
+          # ones typed into the dispatch form: the manifest attests to what was
+          # built (PRD 8.1).  The inputs stay the fallback for a run whose
+          # acquisition step produced no outputs -- which is a failed run.
+          UNIXNU_COMMIT: ${{ steps.sources.outputs.unixnu_commit || inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ steps.sources.outputs.device_commit || inputs.device_commit }}
+          UNIXNU_REPO: ${{ steps.sources.outputs.unixnu_repo || '' }}
+          DEVICE_REPO: ${{ steps.sources.outputs.device_repo || '' }}
+          LOCK_SHA256: ${{ steps.sources.outputs.lock_sha256 || '' }}
+          LOCK_FROZEN: ${{ steps.sources.outputs.lock_frozen || '' }}
           STAGE: ${{ inputs.stage }}
           SYSTEM_BUILD: ${{ inputs.system_build }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
@@ -345,6 +1057,7 @@ jobs:
           import hashlib
           import json
           import os
+          import shutil
           import sys
           from datetime import datetime, timezone
           from pathlib import Path
@@ -381,6 +1094,51 @@ jobs:
                   for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                       digest.update(chunk)
               return digest.hexdigest()
+
+          #: The one buffer size this step ever allocates for a copy.  The staging
+          #: path can be handed a multi-GB kernel or disk image -- MAX_FILE_BYTES
+          #: is 2 GiB -- so a staged copy is streamed in chunks and never held
+          #: whole, whatever the file turns out to be.
+          COPY_CHUNK_BYTES = 1024 * 1024
+
+          class _HashingWriter:
+              """A binary writer that digests what it is handed, as it is handed it.
+
+              ``shutil.copyfileobj`` only ever calls ``write``, so this is the
+              whole file interface a streaming copy needs.  It exists so the
+              digest of a staged copy comes from the bytes that were written,
+              rather than from opening the copy again and reading it back: the
+              staged file is evidence, and reading it a second time to check it
+              is the whole file twice on a path that can carry a kernel image.
+              """
+
+              def __init__(self, handle):
+                  self._handle = handle
+                  self.digest = hashlib.sha256()
+                  self.written = 0
+
+              def write(self, chunk):
+                  self.digest.update(chunk)
+                  self.written += len(chunk)
+                  return self._handle.write(chunk)
+
+              def __enter__(self):
+                  return self
+
+              def __exit__(self, *exc_info):
+                  self._handle.close()
+                  return False
+
+          def copy_and_hash(src, dst):
+              """Stream ``src`` into ``dst``; return ``(sha256, bytes written)``.
+
+              The chunk length is passed positionally on purpose: the parameter
+              has been renamed between Python versions, and a runner's python3
+              is not this repository's to pin.
+              """
+              with src.open("rb") as reader, _HashingWriter(dst.open("wb")) as writer:
+                  shutil.copyfileobj(reader, writer, COPY_CHUNK_BYTES)
+              return writer.digest.hexdigest(), writer.written
 
           def role_from_table(rel):
               low = rel.lower()
@@ -481,10 +1239,14 @@ jobs:
               src = BUILD_LOG if entry["name"] == log_name else OUT / entry["path"]
               dst = STAGE / entry["path"]
               dst.parent.mkdir(parents=True, exist_ok=True)
-              dst.write_bytes(src.read_bytes())
-              if sha256_of(dst) != entry["sha256"] or dst.stat().st_size != entry["size_bytes"]:
+              # Copied in chunks and hashed from the bytes as they were written.
+              # ``dst.write_bytes(src.read_bytes())`` held the whole file in
+              # memory to move it and then re-read the copy to hash it, which is
+              # the file three times over -- and this step runs on every build.
+              staged_sha256, staged_bytes = copy_and_hash(src, dst)
+              if staged_sha256 != entry["sha256"] or staged_bytes != entry["size_bytes"]:
                   problems.append(f"staged copy of {entry['path']} does not match its hash/size")
-              if dst.stat().st_size == 0:
+              if staged_bytes == 0:
                   problems.append(f"staged copy of {entry['path']} is zero bytes")
 
           started = os.environ.get("BUILD_STARTED_AT", "")
@@ -511,6 +1273,16 @@ jobs:
               "accel": TARGET,
               "unixnu_commit": os.environ.get("UNIXNU_COMMIT", ""),
               "device_repo_commit": os.environ.get("DEVICE_COMMIT", ""),
+              "unixnu_repo": os.environ.get("UNIXNU_REPO", "") or None,
+              "device_repo": os.environ.get("DEVICE_REPO", "") or None,
+              # The digest of the lock these commits were READ FROM, so a reader
+              # can tell whether the lock moved after the run (PRD 8.1).
+              "sources_lock_sha256": os.environ.get("LOCK_SHA256", "") or None,
+              # Whether that lock declared itself frozen.  Recorded rather than
+              # derived: an unfrozen build is legitimate (build-macos.sh treats
+              # the pins as the freeze candidates) but a reader must be able to
+              # tell the two apart without re-reading the lock at this commit.
+              "sources_lock_frozen": os.environ.get("LOCK_FROZEN", "").strip().lower() == "true",
               "system_build": os.environ.get("SYSTEM_BUILD", "") or None,
               "repository": os.environ.get("REPO", ""),
               "ref": os.environ.get("REF", ""),
@@ -572,8 +1344,12 @@ jobs:
           EXPERIMENT_ID: ${{ inputs.experiment_id }}
           STAGE: ${{ inputs.stage }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
-          UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
-          DEVICE_COMMIT: ${{ inputs.device_commit }}
+          # The pins the lock resolved, not the dispatch request: a summary that
+          # quotes the request is evidence about a build that did not happen.
+          UNIXNU_COMMIT: ${{ steps.sources.outputs.unixnu_commit || inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ steps.sources.outputs.device_commit || inputs.device_commit }}
+          REQUESTED_UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
+          REQUESTED_DEVICE_COMMIT: ${{ inputs.device_commit }}
         run: |
           python3 - <<'PY'
           """Write the GitHub step summary from build/staging-report.json (evidence, PRD 9.2)."""
@@ -590,8 +1366,23 @@ jobs:
               f"- unixnu: {os.environ.get('UNIXNU_COMMIT', '')}",
               f"- device repo: {os.environ.get('DEVICE_COMMIT', '')}",
               f"- artifact: `{os.environ.get('ARTIFACT_NAME', '')}` (retention 30 days)",
-              "",
           ]
+          # When the dispatch form asked for something other than the lock, say
+          # so: the build used the lock, and a silent difference between the two
+          # is the divergence this whole step exists to surface.
+          requested = (
+              os.environ.get("REQUESTED_UNIXNU_COMMIT", ""),
+              os.environ.get("REQUESTED_DEVICE_COMMIT", ""),
+          )
+          used = (
+              os.environ.get("UNIXNU_COMMIT", ""),
+              os.environ.get("DEVICE_COMMIT", ""),
+          )
+          if any(a and a != b for a, b in zip(requested, used)):
+              lines.append(
+                  f"- WARNING: the dispatch inputs {requested[0]} / {requested[1]} differ from the "
+                  f"pins {used[0]} / {used[1]} the lock resolved and this build used"
+              )
           if report_path.is_file():
               data = json.loads(report_path.read_text(encoding="utf-8"))
               lines += [
@@ -603,6 +1394,26 @@ jobs:
               ]
           else:
               lines.append("- staging report unavailable: the build failed before staging, so no artifact was uploaded")
+
+          # The source acquisition and the pin cross-check are evidence about
+          # what was built, not products of it, so they are reported here
+          # rather than staged.  What could NOT be proven on a Windows
+          # code-stage host is listed verbatim: a reader of the summary must
+          # not be able to mistake a Windows-side proof for a field proof.
+          for name, label in (
+              ("source-acquisition.json", "sources"),
+              ("pin-crosscheck.json", "pin cross-check"),
+          ):
+              path = Path(os.environ.get("REPORT_DIR", "build")) / name
+              if not path.is_file():
+                  lines.append(f"- {label}: no report (the step did not run)")
+                  continue
+              data = json.loads(path.read_text(encoding="utf-8"))
+              lines.append(f"- {label}: {data.get('status')}")
+              for problem in data.get("problems") or []:
+                  lines.append(f"  - problem: {problem}")
+              for note in data.get("unverified") or []:
+                  lines.append(f"  - unverified: {note}")
           text = "\n".join(lines) + "\n"
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:

@@ -12,7 +12,8 @@
     "vendor": "GenuineIntel",
     "cores_physical": 8,
     "threads_logical": 16,
-    "vt_x": "present (Intel VT-x capable; verify enabled in firmware)",
+    "vt_x": "present_disabled_in_firmware",
+    "vt_x_note": "Measured 2026-10-23 from Win32_Processor.VirtualizationFirmwareEnabled: VT-x is present in the CPU but DISABLED in firmware. Consequence for PRD 2.2-1: WHPX cannot be used on this host, so -accel tcg is not a preference but the only option. Not yet confirmed by reading CPUID inside the real UEFI shell (tests/acceptance/test_real_boot_edk2.py reaches one) -- the OS-reported firmware flag is what this record rests on.",
     "hypervisor_present": true,
     "hypervisor_note": "Hyper-V is enabled on this host. WHPX availability must be probed; QEMU must run with explicit TCG (-accel tcg) and must not silently fall back to WHPX/HVF. Record the actual accelerator at runtime."
   },
@@ -23,8 +24,16 @@
   },
   "gpu": {
     "model": "NVIDIA GeForce RTX 3060 Laptop GPU",
-    "vram_gb": "to be measured",
+    "vram_gb": 4.0,
+    "vram_measured_at": "2026-10-23",
+    "vram_evidence": "unipad.host.inventory collect_host_inventory() -> Win32_VideoController.AdapterRAM of the primary non-virtual adapter, rounded to 0.1 GiB. Measured on this host, not carried over from a spec sheet.",
     "virtual_displays": ["OrayIddDriver Device", "Todesk Virtual Display Adapter", "GameViewer Virtual Display Adapter"],
+    "adapters": [
+      {"name": "OrayIddDriver Device", "driver_version": "17.50.19.949", "vram_gb": null},
+      {"name": "Todesk Virtual Display Adapter", "driver_version": "16.44.2.509", "vram_gb": null},
+      {"name": "GameViewer Virtual Display Adapter", "driver_version": "15.6.5.199", "vram_gb": null},
+      {"name": "NVIDIA GeForce RTX 3060 Laptop GPU", "driver_version": "32.0.15.9621", "vram_gb": 4.0}
+    ],
     "note": "P2 scope only. Virtual display adapters may interfere with window enumeration; launcher must target the QEMU window by title/pid, not by adapter."
   },
   "disks": [
@@ -51,9 +60,28 @@
     "Disk pressure: keep artifacts on F: until IPSW/RootFS sizes are known."
   ],
   "open_items": [
-    "QEMU native Windows build availability and version (M0)",
-    "IPSW size for iPad7,1 / iPadOS 17.7.11 / build 21H461",
-    "CPU model string confirmation via firmware (VT-x enabled?)",
-    "GPU VRAM measurement (P2)"
+    "Clean build artifact and hash for the patched XNU kernel (M0 pass evidence): still BLOCKED. No kernel.macho exists on this host. Six build blockers remain (docs/kernel-build-windows.md) and two required XNU patches must be applied in the build tree. The Apple kernelcache is ruled out as a donor by four independent gates plus emit_prelink.py:157."
+  ],
+  "closed_items": [
+    {
+      "item": "QEMU native Windows build availability and version (M0)",
+      "closed_at": "2026-10-23",
+      "evidence": "QEMU 11.1.0 (v11.1.0-12130-ge470268ff4), native Windows, accel=tcg, sha256 952f897511177803722efed6fefe79bc3e7e5a51a026112dfc40f9a37fb0dad2, recorded in config/sources.lock.json tools.qemu. The pinned edk2-aarch64-code.fd additionally boots to a real UEFI Shell under this QEMU (tools.firmware_boot)."
+    },
+    {
+      "item": "IPSW size for iPad7,1 / iPadOS 17.7.11 / build 21H461",
+      "closed_at": "2026-10-22",
+      "evidence": "6835124840 bytes, sha256 c84ad24b6981a859eec499b1802be9ac593acfd3dc0a185a76d06e4d767a1451, with two component pins, recorded in config/sources.lock.json ipsw."
+    },
+    {
+      "item": "CPU model string confirmation via firmware (VT-x enabled?)",
+      "closed_at": "2026-10-23",
+      "evidence": "Model string confirmed from Win32_Processor.Name (11th Gen Intel Core i7-11800H @ 2.30GHz, GenuineIntel, 8C/16T). VT-x answered: present but DISABLED in firmware (see cpu.vt_x_note), which is why TCG is mandatory rather than preferred."
+    },
+    {
+      "item": "GPU VRAM measurement (P2)",
+      "closed_at": "2026-10-23",
+      "evidence": "4.0 GB on the NVIDIA GeForce RTX 3060 Laptop GPU, measured from Win32_VideoController.AdapterRAM via unipad.host.inventory. See gpu.vram_gb / gpu.vram_evidence. This closes the 'gpu.vram_gb is still unmeasured' clause in config/sources.lock.json frozen_note."
+    }
   ]
 }

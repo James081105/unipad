@@ -16,6 +16,8 @@ controller, the verifier, and tests share one vocabulary.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Optional
@@ -286,6 +288,52 @@ def read_json(path: str | Path) -> Any:
 
 
 def write_json(path: str | Path, data: Any) -> None:
+    """Write ``data`` as JSON so the target is either complete or unchanged.
+
+    The document is serialised first, written to a temporary file in the *same*
+    directory, flushed and ``fsync``-ed, then moved onto ``path`` with
+    :func:`os.replace`.  A reader therefore never observes a half-written file,
+    and a write that fails part-way leaves any previous file intact rather than
+    truncated.  That is the property the install chain relies on: a crash while
+    writing a run record must not leave evidence describing a state the run
+    never reached (callchain-5).  The directory is ``fsync``-ed best-effort
+    afterwards so the rename itself survives a power loss where the platform
+    supports it.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=p.parent, prefix=p.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        # Never leave a partial temp file behind, and never touch the target:
+        # the previous file (if any) stays exactly as it was.
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_dir(p.parent)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """``fsync`` a directory so the rename is durable (best-effort).
+
+    Not every platform allows a directory to be opened read-only or flushed
+    (Windows refuses the flush), so any :class:`OSError` is swallowed: the file
+    contents are already durable, and a missing directory fsync weakens only
+    the power-loss guarantee, never the atomicity the caller depends on.
+    """
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)

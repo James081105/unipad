@@ -18,14 +18,34 @@
     "width": 1376,
     "height": 1024,
     "format": "ramfb",
-    "note": "ramfb/GOP path first (PRD 4.2); VirtIO GPU software path probed at M9a. Geometry is run-qemu.py:39-43 and reaches the guest driver via fw_cfg opt/org.unixnu/ramfb-size -- width must be a multiple of 16 and rows a multiple of 64 bytes, which the real 1366-wide panel is not."
+    "rotation": 0,
+    "audio": "none",
+    "resolution_catalogue": [
+      {"name": "ramfb-pinned", "width": 1376, "height": 1024, "pinned": true, "provenance": "Pinned board geometry: this file's display and run-qemu.py:39-43. The real 1366-wide panel rounded up to the 16-pixel width multiple. This is the geometry this project boots."},
+      {"name": "ipad-4-3-standard", "width": 2048, "height": 1536, "pinned": false, "provenance": "4:3 iPad-class reference panel (2048x1536). Already a multiple of 16 on both axes, so the framebuffer constraint needs no rounding."},
+      {"name": "ipad-pro-12-9", "width": 2736, "height": 2048, "pinned": false, "provenance": "iPad Pro 12.9-inch reference panel (2732x2048) rounded up: 2732 is not a multiple of 16, the framebuffer width is 2736."},
+      {"name": "ipad-pro-11", "width": 2400, "height": 1680, "pinned": false, "provenance": "iPad Pro 11-inch reference panel (2388x1668) rounded up on both axes to 2400x1680."},
+      {"name": "ipad-mini-8-3", "width": 2288, "height": 1488, "pinned": false, "provenance": "iPad mini (8.3-inch) reference panel (2266x1488) rounded up: 2266 is not a multiple of 16, the framebuffer width is 2288."}
+    ],
+    "resolution_catalogue_note": "The five geometries the launcher accepts, listed here so an operator can choose one without reading src/. Exactly one entry carries pinned: true -- the geometry this project boots. The other four are iPad-class reference panel sizes offered so an operator can ASK for a different framebuffer; their panel dimensions are published device specifications, not measurements from this host, and no resolution other than the pinned one has been shown to render on a real iPadOS guest. Whether the guest renders correctly at one is a field question this configuration cannot answer. Editing this list does NOT add a resolution: unipad.host.display.DISPLAY_MODES is the enforcer and must be changed too, or the launcher refuses the pair with config_invalid rather than accepting it. This list is the readable surface, not the validator, and tests/unit/test_host_display_route.py fails if the two ever disagree.",
+    "note": "ramfb/GOP path first (PRD 4.2); VirtIO GPU software path probed at M9a. Geometry is run-qemu.py:39-43 and reaches the guest driver via fw_cfg opt/org.unixnu/ramfb-size -- width must be a multiple of 16 and rows a multiple of 64 bytes, which the real 1366-wide panel is not.",
+    "resolution_note": "PRD 3.2 P1 (4). One of the five catalogue geometries listed in resolution_catalogue above; a pair outside that catalogue is REFUSED with config_invalid, never snapped to a neighbour, because a framebuffer that is not the one asked for makes the recorded geometry disagree with the pixels in the screenshot. Only the pinned entry is a geometry this project boots. On the virtio-gpu route the resolution does NOT reach the guest: that route negotiates its own geometry (ADR-0004) and emits no fw_cfg item, so the request is validated, recorded and then dropped. This is the same limitation rotation_note describes, stated for resolution because the two used to be documented asymmetrically. The drop has a closed machine-readable vocabulary -- DisplayDecision.route_limitations, key resolution_not_configured -- and it is unit-pinned in tests/unit/test_host_display_route.py. It is NOT yet in any evidence bundle, and this note will not claim otherwise: no run path calls DisplayDecision.to_dict(), and cmd_start builds launch.json from LaunchResult.to_dict(), which carries no display block. The only current trace of the drop is the absence of the -fw_cfg item in the argv. Naming the gap here rather than promising the evidence is deliberate -- a promise nothing keeps is the same defect this note was written to correct.",
+    "rotation_note": "PRD 3.2 P1 (4). Quarter turn in degrees, one of 0/90/180/270; 0 is the board orientation. Rotation is applied to the framebuffer, so the fw_cfg item carries the rotated geometry. On the virtio-gpu route rotation does NOT reach the guest -- that route negotiates its own geometry (ADR-0004).",
+    "audio_note": "PRD 3.2 P1 (4). 'none' emits no audio device; 'hda' emits intel-hda with a null host driver, so a guest driver has something to bind to while no host sound hardware is opened. Guest audio has never been heard on this host and no configuration here can claim otherwise."
   },
   "devices": {
     "firmware": {"attach": "pflash", "note": "UEFI variables live in a writable second flash device; -bios cannot express that and the two spellings are mutually exclusive in qemu-virt.c:1907-1916. vars.fd is created per run at the code drive's size (67108864 here)."},
     "system_disk": {"if": "virtio-blk", "readonly": true, "note": "RootFS/SystemOS via VirtIO Block (M6/M7)"},
     "data_disk": {"if": "virtio-blk", "readonly": false, "note": "Persistent Data volume; route decided by H04 (M9b)"},
     "input": {"pointer": "virtio-tablet", "home": "virtio", "keyboard": "pending", "note": "Text input may start on the guest on-screen keyboard (FR04)"},
-    "net": {"enabled": false, "model": "virtio-net", "note": "M13; disabled for MVP boot gates"},
+    "net": {
+      "enabled": false,
+      "model": "virtio-net",
+      "note": "M13; disabled for MVP boot gates",
+      "enabled_note": "PRD 3.2 P1 (1). Enabling it turns on QEMU's user-mode (SLIRP) stack with restrict=on by default, which is loopback-only: the guest can reach the host's package service at 10.0.2.2 and cannot reach the public internet. Setting restrict=off is the one change that gives the guest public egress and needs explicit operator authorisation. Two further conditions, because a reader who misses either gets a refusal or a silent no-op rather than the network described above: (a) enabling the device is NOT sufficient on its own -- a mode key is REQUIRED, and an enabled flag alone is refused with config_invalid 'mode is required when the network is enabled'; (b) the package service at 10.0.2.2 exists only on the install/update --transport https route -- the default transport is channel, which starts no service (ADR-0008), so with the default an enabled network reaches no package.",
+      "host_forwards": [],
+      "host_forwards_note": "PRD 3.2 P1 (1). One object per rule: {\"host_port\": 9443, \"guest_port\": 8443} emits hostfwd=tcp:127.0.0.1:9443-10.0.2.15:8443. hostfwd maps a HOST port INTO the guest; it is not how the package service is reached (the guest connects out to 10.0.2.2, which needs no -nic change). Empty by default, so no mapping is opened that nobody asked for."
+    },
     "control": {"qmp": true, "serial": true, "note": "QMP over Windows socket; serial and control must not contend"}
   },
   "disks": {

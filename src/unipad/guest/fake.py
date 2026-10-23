@@ -630,10 +630,19 @@ class FakeGuestService:
         notion of the app.
 
         Note that the *message* path cannot carry it: :class:`InstallRequest`
-        is a frozen five-field contract, so a request arriving over a transport
-        has no ``bundle_id`` and falls back to the package file name
-        (``Foo.ipa`` -> ``Foo``).  That fallback is a simulation stand-in; the
-        authoritative bundle id stays with the host's ``ipa`` layer.
+        is a five-field contract plus the optional package-source fields
+        ADR-0008 adds, so a request arriving over a transport has no
+        ``bundle_id`` and falls back to the package file name (``Foo.ipa`` ->
+        ``Foo``).  That fallback is a simulation stand-in; the authoritative
+        bundle id stays with the host's ``ipa`` layer.
+
+        The two optional fields are accepted and ignored.  Nothing on the guest
+        side implements an HTTPS package fetch, so a request naming a
+        ``package_url`` changes nothing about the verdict: the bytes that
+        arrived over the channel are still the bytes that are checked.  A guest
+        that ignored them silently would be indistinguishable from one that
+        never received them, which is why ADR-0008 keeps ``channel`` as the
+        default transport and records the ``https`` route as unverified.
         """
         declared = meta.get("bundle_id") if isinstance(meta, Mapping) else None
         if isinstance(declared, str) and declared.strip():

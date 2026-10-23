@@ -28,6 +28,7 @@ from typing import Mapping
 import pytest
 
 from unipad.errors import ErrorCode, UniPadError
+from unipad.guest import create_install_channel
 from unipad.guest.client import DEFAULT_ATTEMPTS, GuestClient
 from unipad.guest.fake import (
     DEFAULT_TRUST_MODE,
@@ -811,3 +812,126 @@ def test_challenge_and_status_use_their_own_message_types(staged_service):
     assert [call["type"] for call in transport.calls] == [
         MSG_INSTALL_REQUEST, MSG_CHALLENGE_REQUEST, MSG_STATUS_REQUEST,
     ]
+
+
+def test_install_package_carries_a_named_source_onto_the_wire(staged_service):
+    """ADR-0008: the client forwards the optional source fields it is given.
+
+    The client moves messages; it does not fetch packages.  So the source a
+    caller names must reach the guest untouched, and the delivery evidence must
+    stay a digest record -- a URL is not something to log as though it had been
+    fetched.
+    """
+    from unipad.guest.protocol import InstallRequest
+
+    service, data, meta = staged_service
+    transport = FakeTransport(service)
+    client = _client(transport)
+    request = InstallRequest.from_dict(meta)
+    named = InstallRequest(
+        package_name=request.package_name,
+        package_sha256=request.package_sha256,
+        size_bytes=request.size_bytes,
+        declared_min_os=request.declared_min_os,
+        signature_mode=request.signature_mode,
+        package_url="https://10.0.2.2:8443/index.json",
+        cert_fingerprint="f1" * 32,
+    )
+
+    response = client.install_package(data, named)
+
+    assert response.stage == "registered"
+    sent = transport.calls[0]
+    assert sent["payload"]["package_url"] == "https://10.0.2.2:8443/index.json"
+    assert sent["payload"]["cert_fingerprint"] == "f1" * 32
+    # The delivery record is unchanged: digests only, never the source.
+    assert set(client.last_delivery) == {
+        "size_bytes",
+        "sha256",
+        "declared_sha256",
+        "declared_size_bytes",
+        "matches_declared",
+    }
+
+
+def test_install_package_without_a_source_leaves_the_wire_shape_alone(staged_service):
+    """A caller that names no source gets the frame it always got.
+
+    This is the other half of ADR-0008 decision 6: the default must be
+    byte-identical, or every existing peer would see a contract that changed
+    for a request that changed nothing.
+    """
+    service, data, meta = staged_service
+    transport = FakeTransport(service)
+    client = _client(transport)
+
+    client.install_package(data, meta)
+
+    sent = transport.calls[0]
+    assert set(sent["payload"]) == {
+        "package_name",
+        "package_sha256",
+        "size_bytes",
+        "declared_min_os",
+        "signature_mode",
+    }
+
+
+# ---------------------------------------------------------------------------
+# create_install_channel: the factory the controller builds a channel from
+# (ADR-0003 install channel, ADR-0008; callchain-5 guest-channel-factory)
+# ---------------------------------------------------------------------------
+
+
+def test_create_install_channel_takes_no_required_arguments() -> None:
+    """``cli._call_capability`` invokes the resolved factory with no arguments.
+
+    This is the exact defect ADR-0008 recorded and deferred: ``GuestClient``'s
+    first positional ``transport`` has no caller that can supply it, so a bare
+    ``GuestClient()`` raised ``TypeError``.  The factory the controller resolves
+    must be callable with zero arguments -- so it may not carry a required
+    positional parameter of its own.
+    """
+    import inspect
+
+    required = [
+        name
+        for name, parameter in inspect.signature(create_install_channel).parameters.items()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+    ]
+
+    assert required == []
+
+
+def test_create_install_channel_builds_a_working_client(staged_service) -> None:
+    """Given a transport the factory returns a real, driving ``GuestClient``.
+
+    This is the positive half of "the channel cannot be built": with a transport
+    in hand the factory produces a client that completes an install for real,
+    not a stub that only looks like one.
+    """
+    service, data, meta = staged_service
+
+    client = create_install_channel(FakeTransport(service))
+
+    assert isinstance(client, GuestClient)
+    assert client.install_package(data, meta).stage == "registered"
+
+
+def test_create_install_channel_with_no_transport_refuses_rather_than_guessing() -> None:
+    """The controller's zero-argument call must refuse cleanly, not crash.
+
+    :mod:`unipad.guest` ships the client, the protocol and in-memory fakes, but
+    no transport to a *real* guest.  Building one from a fake would report an
+    install that never happened (PRD 9.1 / appendix A), so the factory refuses
+    with a stable ``install_service_unavailable`` -- which the controller turns
+    into ``guest_channel_unavailable`` -- rather than fabricating a channel or
+    leaking a bare ``TypeError`` from the constructor signature.
+    """
+    with pytest.raises(UniPadError) as excinfo:
+        create_install_channel()
+
+    error = excinfo.value
+    assert error.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert error.details["reason"] == "no_guest_transport"

@@ -398,6 +398,16 @@ function Get-ControllerVerdict {
     param([Parameter(Mandatory = $true)]$Payload)
     if (Test-PayloadError -Payload $Payload) { return 'failure' }
 
+    # The property names this payload actually carries.  Without this line
+    # $names is $null here -- PowerShell has no block scope for it, and the
+    # assignment at :381 belongs to Test-PayloadError -- so both loops below
+    # are always False and this function returned 'indeterminate' for every
+    # payload, success included.  UniPad-Launcher.ps1:436 has always had it;
+    # the two scripts disagreed about the same JSON because this copy lacked
+    # one line.  Failing closed meant the success branch at :562 was dead
+    # code rather than a false claim, which is why this survived review.
+    $names = @($Payload.PSObject.Properties.Name)
+
     foreach ($key in @('ok', 'success')) {
         if ($names -contains $key) {
             $value = $Payload.$key

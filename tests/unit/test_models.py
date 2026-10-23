@@ -510,6 +510,72 @@ def test_write_json_output_is_sorted_and_newline_terminated(tmp_path: Path) -> N
     assert text.index('"a"') < text.index('"b"')
 
 
+def test_write_json_fsyncs_the_file_before_the_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bytes reach the platter before the target is swapped in.
+
+    callchain-5: a crash while writing a run record must not leave a truncated
+    file behind.  The guarantee comes from fsyncing the temporary file *before*
+    the rename, so this asserts the fsync actually happens.  A plain
+    ``write_text`` never fsyncs, so reverting to it makes this fail.
+    """
+    import os
+
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    target = tmp_path / "out.json"
+
+    write_json(target, {"a": 1})
+
+    assert target.is_file()
+    assert synced, "write_json must fsync so the file's contents are durable before the rename"
+
+
+def test_write_json_a_failed_rename_leaves_the_previous_file_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Atomicity: a write that cannot be swapped in changes nothing on disk.
+
+    The rename is the commit point.  If it fails, the previous file must be
+    exactly as it was and no partial temporary file may survive.  A direct
+    ``write_text`` has no rename to fail, so forcing :func:`os.replace` to raise
+    leaves it happily overwriting the target -- reverting to it makes this fail
+    at ``pytest.raises`` and again on the unchanged-content assertion.
+    """
+    import os
+
+    target = tmp_path / "out.json"
+    write_json(target, {"version": 1})
+    original = target.read_text(encoding="utf-8")
+
+    def exploding_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(os, "replace", exploding_replace)
+
+    with pytest.raises(OSError):
+        write_json(target, {"version": 2})
+
+    assert target.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("*.tmp")) == [], "a failed write must not leave a temp file behind"
+
+
+def test_write_json_leaves_no_temp_file_behind_on_success(tmp_path: Path) -> None:
+    # The temporary file is renamed onto the target, so nothing lingers.
+    target = tmp_path / "nested" / "out.json"
+
+    write_json(target, {"a": 1})
+
+    assert target.is_file()
+    assert list((tmp_path / "nested").glob("*.tmp")) == []
+    assert list((tmp_path / "nested").glob("out.json.*")) == []
+
+
 # ---------------------------------------------------------------------------
 # milestone vocabulary
 # ---------------------------------------------------------------------------

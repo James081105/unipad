@@ -35,6 +35,9 @@ from typing import Any, Mapping, Optional, Sequence
 
 from unipad import models
 from unipad.errors import ErrorCode, UniPadError
+from unipad.host import httpsvc
+from unipad.host.display import decide as decide_display
+from unipad.host.paths import safe_location
 from unipad.host.qmp import QmpClient
 
 __all__ = ["QemuLauncher", "LaunchResult", "QmpReadiness", "StopResult"]
@@ -67,6 +70,29 @@ NETWORK_MODES: tuple[str, ...] = ("none", "user")
 #: that persists settings across boots cannot be expressed with ``-bios`` alone.
 #: qemu-virt.c:1907-1916 exits(1) when both forms appear, so the choice is
 #: exclusive by construction -- never both, never neither.
+FIRMWARE_ATTACHMENTS: tuple[str, ...] = ("bios", "pflash")
+
+#: The form used when a machine configuration says nothing about firmware.
+#: ``pflash``, because that is the pair the UniXNU board boots and the one
+#: :class:`unipad.models.MachineConfig`'s own default already carries: two
+#: different defaults for one decision is a second, silently different machine.
+DEFAULT_FIRMWARE_ATTACHMENT = "pflash"
+
+#: The TCP port range every endpoint on a QEMU command line must sit in.  One
+#: range, one message, one place.  There were three copies of this check -- the
+#: QMP socket here, a ``host_forwards`` rule here, and
+#: :func:`unipad.host.httpsvc._validate_port` -- and they had already drifted
+#: into two ranges and three messages, which is how ``host_port: 99999`` came
+#: back from the fragment builder as an error that could not name the rule it
+#: came from (standards-review R-1).
+MIN_TCP_PORT = 1
+MAX_TCP_PORT = 65535
+
+#: The RTC base values QEMU accepts for ``-rtc base=``.  A closed vocabulary,
+#: so a typo is a usage error here rather than a QEMU exit whose message names
+#: the option and not the value the operator typed.
+RTC_BASES: tuple[str, ...] = ("utc", "localtime")
+
 #: Why a non-ASCII path cannot be used, and what to do about it.  A named
 #: constant so the message is testable rather than paraphrased.
 NON_ASCII_PATH_REASON = (
@@ -75,22 +101,175 @@ NON_ASCII_PATH_REASON = (
     "under a non-ASCII user directory."
 )
 
-FIRMWARE_ATTACHMENTS: tuple[str, ...] = ("bios", "pflash")
+
+def _devices_section(machine: "models.MachineConfig") -> dict[str, Any]:
+    """Return the ``devices`` mapping, refusing a section that is not one.
+
+    ``dict(machine.devices or {})`` answered ``{}`` for every falsy value, so
+    ``"devices": false``, ``0``, ``""`` and ``[]`` each looked like "no devices
+    configured" and fell through to the defaults -- while ``"devices": "net"``
+    was refused.  The guard fired for the values an operator is least likely to
+    type and was bypassed for the ones they are.
+    """
+    devices = machine.devices
+    if devices is None:
+        return {}
+    if not isinstance(devices, Mapping):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices must be an object",
+            devices_type=type(devices).__name__,
+        )
+    return dict(devices)
+
+
+def _validate_tcp_port(value: Any, label: str, *, index: Optional[int] = None) -> int:
+    """Return ``value`` when it is a fixed TCP port, else refuse it.
+
+    One range and one message for every port this module puts on a QEMU command
+    line (``-qmp`` and a ``hostfwd`` rule).  ``index`` is the rule position when
+    the port came from a ``host_forwards`` list, so the refusal can name the
+    rule the operator has to fix instead of the one the fragment builder
+    happened to reach.
+    """
+    where = f"host_forwards rule {index}: " if index is not None else ""
+    details: dict[str, Any] = {label: repr(value)}
+    if index is not None:
+        details["index"] = index
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"{where}{label} must be an integer in {MIN_TCP_PORT}..{MAX_TCP_PORT}",
+            **details,
+        )
+    if not (MIN_TCP_PORT <= value <= MAX_TCP_PORT):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"{where}{label} must be a TCP port in {MIN_TCP_PORT}..{MAX_TCP_PORT}",
+            **details,
+        )
+    return value
+
+
+def _rtc_base(machine: "models.MachineConfig") -> Optional[str]:
+    """Return the RTC base to spell in the argv, or ``None`` for no decision.
+
+    The value is pinned to :data:`RTC_BASES`.  ``(machine.clock or {}).get("rtc")``
+    used to forward *any* truthy value verbatim, so a typo became a QEMU exit
+    whose message names the option and not the value -- and a ``clock`` section
+    that was not an object at all dropped ``-rtc`` from the argv silently,
+    because the same ``or {}`` swallowed it.
+    """
+    clock = machine.clock
+    if clock is None:
+        return None
+    if not isinstance(clock, Mapping):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine clock must be an object",
+            clock_type=type(clock).__name__,
+        )
+    rtc = clock.get("rtc")
+    if rtc is None:
+        return None
+    if not isinstance(rtc, str) or rtc not in RTC_BASES:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "unknown rtc base",
+            rtc=repr(rtc),
+            known_rtc_bases=list(RTC_BASES),
+        )
+    return rtc
+
+
+def _is_substitute_binary(binary: str) -> bool:
+    """``True`` when ``binary`` is the interpreter running this process.
+
+    A substitute binary is a script the caller runs in place of QEMU -- the test
+    fake is ``[sys.executable, fake_qemu.py, ...]``.  It has no ANSI code-page
+    file backend, so refusing a run on its behalf would block a path that works.
+    The exemption is decided by *identity*, not by a name: a QEMU build
+    installed or wrapped under any other name keeps the limitation (and the
+    diagnosis), and a renamed fake keeps the exemption.
+    """
+    try:
+        return Path(binary).resolve() == Path(sys.executable).resolve()
+    except OSError:  # pragma: no cover - an unresolvable path is not the fake
+        return False
+
+
+def _argv_option(args: Sequence[str], flag: str) -> Optional[str]:
+    """Return the value that follows ``flag`` in an argv list, or ``None``.
+
+    This is the *only* way the launcher is allowed to learn what a run states.
+    ``launch()`` takes either the argv :meth:`QemuLauncher.build_args` produced
+    or one the caller assembled, so the ``MachineConfig`` the launcher was
+    constructed with is not a description of the run -- the argv is.  Reading a
+    machine fact back out of the argv is what keeps the recorded evidence and
+    the started command line describing the same machine (PRD 9.2).
+    """
+    for index, value in enumerate(args):
+        if value == flag and index + 1 < len(args):
+            return args[index + 1]
+    return None
+
+
+def _argv_accel(args: Sequence[str]) -> str:
+    """Return the ``-accel`` value an argv states, refusing anything but TCG.
+
+    PRD 2.2-1 is a property of the **command line**, not of the configuration.
+    The constructor already refuses a non-TCG ``MachineConfig``, but
+    ``launch(args=...)`` accepts an argv the caller assembled and QEMU reads
+    that argv, not the config.  An argv that names no accelerator at all leaves
+    the choice to QEMU -- on a Windows host that can be WHPX -- which is exactly
+    the run the guard exists to prevent; and an argv naming another one would
+    start it while the launch record still said ``tcg``.
+
+    Raises:
+        UniPadError: ``accelerator_not_tcg`` when the argv does not state
+            ``-accel tcg``.
+    """
+    stated = _argv_option(args, "-accel")
+    if stated is None or stated.strip().lower() != "tcg":
+        raise UniPadError(
+            ErrorCode.ACCELERATOR_NOT_TCG,
+            "the qemu command line must state -accel tcg explicitly",
+            received_accel=stated,
+            required_accel="tcg",
+            reason=(
+                "PRD 2.2-1: Intel VT-x/Hyper-V cannot execute ARM64 iPadOS "
+                "instructions. The command line QEMU reads is the authority, "
+                "so an accelerator it does not name is refused rather than "
+                "left to QEMU's own default."
+            ),
+        )
+    return stated
 
 
 def _firmware_attachment(machine: "models.MachineConfig") -> str:
-    """Return the validated firmware attachment spelling for ``machine``."""
-    devices = dict(machine.devices or {})
-    firmware = devices.get("firmware")
-    if firmware is None:
-        return "bios"
-    if not isinstance(firmware, dict):
+    """Return the validated firmware attachment spelling for ``machine``.
+
+    A section that is *present* but names no usable attachment is refused: it is
+    an unfinished configuration, and the two spellings are mutually exclusive,
+    so guessing one of them changes which firmware form the guest boots.  A
+    section that is absent falls back to the same default
+    :class:`unipad.models.MachineConfig` carries, which is ``pflash`` -- the form
+    the board we boot needs.  Answering ``bios`` here gave the module a second,
+    different definition of "the machine" than the one in ``models.py:199-201``,
+    whose comment says exactly that an empty default must not mean ``-bios``.
+    """
+    devices = _devices_section(machine)
+    if "firmware" not in devices:
+        return DEFAULT_FIRMWARE_ATTACHMENT
+    firmware = devices["firmware"]
+    if not isinstance(firmware, Mapping) or "attach" not in firmware:
         raise UniPadError(
             ErrorCode.CONFIG_INVALID,
-            "machine devices.firmware must be an object",
+            "machine devices.firmware must be an object with an attach",
             firmware_type=type(firmware).__name__,
+            known_attachments=list(FIRMWARE_ATTACHMENTS),
         )
-    attach = firmware.get("attach", "bios")
+    attach = firmware["attach"]
     if attach not in FIRMWARE_ATTACHMENTS:
         raise UniPadError(
             ErrorCode.CONFIG_INVALID,
@@ -99,6 +278,68 @@ def _firmware_attachment(machine: "models.MachineConfig") -> str:
             known_attachments=list(FIRMWARE_ATTACHMENTS),
         )
     return attach
+
+
+def _host_forwards(net: Mapping[str, Any]) -> list[str]:
+    """Return the ``hostfwd=`` fragments for the configured guest network.
+
+    ``hostfwd`` maps a *host* port into the guest, so it is the right tool for
+    reaching something that lives inside the guest.  It is deliberately **not**
+    how the package service is reached: QEMU's user-mode stack relays a guest
+    connection to ``10.0.2.2`` straight to the host's own loopback
+    (:func:`unipad.host.httpsvc.guest_fetch_url`), which needs no ``-nic``
+    change at all.  A forward is therefore an explicit operator request, and an
+    absent one emits nothing rather than a default mapping nobody asked for.
+
+    Raises:
+        UniPadError: ``config_invalid`` when the rules are not a sequence of
+            ``{"host_port": int, "guest_port": int}`` objects, when a rule omits
+            either key, or when a port is not a fixed TCP port.  Every rule is
+            validated before any fragment is produced, so a half-valid list is
+            never split across a rejected and an accepted half.
+    """
+    raw = net.get("host_forwards", ())
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.net.host_forwards must be a list of rules",
+            received_type=type(raw).__name__,
+        )
+
+    # Two passes, and the order is deliberate.  A rule that is not an object
+    # cannot be asked for its keys, so the shape of the whole list is settled
+    # first: ``[{"host_port": 9443}, "oops"]`` reports the rule that is not a
+    # rule at all rather than the one that is merely incomplete.  Only then is
+    # each rule's content checked.
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, Mapping):
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "each host_forwards rule must be an object with host_port and guest_port",
+                index=index,
+                received_type=type(entry).__name__,
+            )
+
+    rules: list[tuple[int, int]] = []
+    for index, entry in enumerate(raw):
+        if "guest_port" not in entry or "host_port" not in entry:
+            # A half-written rule used to be completed with the package
+            # service's default port, so an operator who typed only host_port
+            # got a mapping into the guest they never asked for.  Everything
+            # else in this chain refuses an unfinished configuration.
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                f"host_forwards rule {index}: host_port and guest_port are both required",
+                index=index,
+                required_keys=["host_port", "guest_port"],
+            )
+        host_port = _validate_tcp_port(entry.get("host_port"), "host_port", index=index)
+        guest_port = _validate_tcp_port(entry.get("guest_port"), "guest_port", index=index)
+        rules.append((host_port, guest_port))
+
+    return [httpsvc.hostfwd_spec(host_port, guest_port) for host_port, guest_port in rules]
 
 
 def _network_argument(net: Mapping[str, Any]) -> str:
@@ -173,7 +414,10 @@ def _network_argument(net: Mapping[str, Any]) -> str:
             "machine devices.net.restrict must be a boolean or on/off",
             restrict=repr(restrict),
         )
-    return f"user,id=unipad-net,model={model},restrict={'on' if restrict else 'off'}"
+    return (
+        f"user,id=unipad-net,model={model},restrict={'on' if restrict else 'off'}"
+        + ("".join(f",{fragment}" for fragment in _host_forwards(net)))
+    )
 
 
 def _unquote(token: str) -> str:
@@ -204,20 +448,65 @@ def _split_command_line(text: str) -> list[str]:
 #: can answer for.  All three mean the value is not a plain path.
 BLOCK_DRIVER_PREFIXES: tuple[str, ...] = ("fat:", "json:", "host_device:")
 
+#: What each :data:`BLOCK_DRIVER_PREFIXES` entry means and why the existence
+#: check treats it the way it does.  The catalogue is only discoverable by
+#: reading this module -- ``json:`` in particular appeared in no document and in
+#: no configuration file -- so the definitions live beside the tuple and a test
+#: asserts the two cannot drift: a prefix added without one fails.
+BLOCK_DRIVER_PREFIX_MEANINGS: dict[str, str] = {
+    "fat:": (
+        "a directory QEMU presents as a read-only FAT volume; the only ESP form "
+        "that boots UniXNU, so the directory is what exists on disk"
+    ),
+    "json:": (
+        "an inline blockdev description (``file=json:{\"driver\": ...}``); the "
+        "value is JSON text, not a path, so nothing on disk corresponds to it "
+        "and QEMU judges it"
+    ),
+    "host_device:": (
+        "a host device node such as /dev/rdiskN, whose existence only the host "
+        "OS can answer for; never present on Windows"
+    ),
+}
+
+#: Prefixes whose value is not a path at all.  ``host_device:`` names a device
+#: node and ``json:`` names a JSON document; both are returned with an empty
+#: path so the existence check leaves them for QEMU to judge.  Treating the
+#: ``json:`` text as a path reported a valid inline blockdev as a missing image.
+NON_PATH_PREFIXES: tuple[str, ...] = ("json:", "host_device:")
+
 
 def _strip_block_driver(value: str) -> tuple[str, str]:
     """Split a leading block-driver prefix off a ``file=`` value.
 
     Returns ``(prefix, path)`` where ``prefix`` is ``""`` for a plain path and
-    ``path`` is always the part to check on disk.  ``host_device:`` is returned
-    with its prefix intact and an empty path: the value names a host device
-    node, which only the host OS can answer for.
+    ``path`` is always the part to check on disk.  ``host_device:`` and
+    ``json:`` are returned with their prefix intact and an empty path: the value
+    names a host device node, which only the host OS can answer for, or a JSON
+    blockdev description, which is not a path at all.
     """
     for prefix in BLOCK_DRIVER_PREFIXES:
         if value.startswith(prefix):
             remainder = value[len(prefix):]
-            return prefix, "" if prefix == "host_device:" else remainder
+            return prefix, "" if prefix in NON_PATH_PREFIXES else remainder
     return "", value
+
+
+def _is_pflash_vars_drive(spec: str) -> bool:
+    """``True`` for the writable pflash vars drive in a ``-drive`` spec.
+
+    That file is created by the launcher itself, so it is the one drive target
+    whose absence is not a missing image.
+    """
+    return "if=pflash" in spec and "readonly=off" in spec
+
+
+def _file_size(path: Path) -> Optional[int]:
+    """Return ``path``'s size in bytes, or ``None`` when it does not exist."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
 
 
 def _raw_drive_file(spec: str) -> Optional[str]:
@@ -247,7 +536,14 @@ def _parse_drive_file(spec: str) -> Optional[str]:
 
 @dataclass
 class LaunchResult:
-    """Structured outcome of :meth:`QemuLauncher.launch`."""
+    """Structured outcome of :meth:`QemuLauncher.launch`.
+
+    Every field is read back out of the command line the launcher started, not
+    out of the ``MachineConfig`` it was constructed with: ``launch()`` accepts an
+    argv the caller assembled, so the configuration is not a description of the
+    run.  ``serial_path`` is ``""`` when the argv names no serial log -- absent,
+    which is not the same as a path.
+    """
 
     ok: bool
     binary: str
@@ -455,14 +751,12 @@ class QemuLauncher:
         Raises:
             UniPadError: ``accelerator_not_tcg`` if the machine accelerator is
                 not ``tcg`` (also enforced in the constructor);
-                ``config_invalid`` for an unusable ``qmp_port``.
+                ``config_invalid`` for an unusable ``qmp_port``, an unusable
+                ``clock``/``rtc``, a ``devices`` section that is not an object,
+                a ``devices.net`` value that is not an object, or a firmware
+                section that names no usable attachment.
         """
-        if not isinstance(qmp_port, int) or not (0 < qmp_port < 65536):
-            raise UniPadError(
-                ErrorCode.CONFIG_INVALID,
-                "qmp_port must be an integer in 1..65535",
-                qmp_port=qmp_port,
-            )
+        _validate_tcp_port(qmp_port, "qmp_port")
 
         machine = self.machine
         work = Path(workdir)
@@ -515,8 +809,8 @@ class QemuLauncher:
             ]
         )
 
-        rtc = (machine.clock or {}).get("rtc")
-        if rtc:
+        rtc = _rtc_base(machine)
+        if rtc is not None:
             args.extend(["-rtc", f"base={rtc}"])
 
         # A -kernel boot has no disks: the image is loaded at the reset vector
@@ -541,25 +835,24 @@ class QemuLauncher:
                     ]
                 )
 
-        display = dict(machine.display or {})
-        display_format = str(display.get("format", "ramfb")).lower()
-        if display_format.startswith("virtio"):
-            args.extend(["-device", "virtio-gpu-pci"])
-        else:
-            # ramfb/GOP path first (PRD 4.2).  The guest keeps its display;
-            # -display is only disabled for explicit headless runs.
-            args.extend(["-device", "ramfb"])
-            # The guest driver reads the frame-buffer geometry out of fw_cfg
-            # (package/QemuRamfbPkg/QemuRamfb.c:125), so a size that is only in
-            # our config never reaches it: without this item the framebuffer
-            # keeps the EDK2 default and every row is misaligned.
-            args.extend(
-                [
-                    "-fw_cfg",
-                    "name=opt/org.unixnu/ramfb-size,string="
-                    f"{int(display.get('width', 0))}x{int(display.get('height', 0))}",
-                ]
-            )
+        # Display, audio and rotation are one decision, not three: a rotated
+        # 1024x1366 request is a different framebuffer from an unrotated one,
+        # and the fw_cfg item has to carry the *rotated* geometry or every row
+        # the guest draws lands in the wrong place.  So the whole block comes
+        # from unipad.host.display, which owns that arithmetic, and it
+        # *replaces* this block rather than adding to it (emitting ``-device
+        # ramfb`` twice is an argv QEMU rejects outright).
+        #
+        # ``-display none`` stays here, below: it is a window decision the
+        # launcher owns, and two modules able to hide the guest display is one
+        # too many.
+        display_mapping = dict(machine.display or {})
+        display_decision = decide_display(
+            machine,
+            rotation=display_mapping.get("rotation", 0),
+            audio=display_mapping.get("audio", "none"),
+        )
+        args.extend(display_decision.to_qemu_fragments())
         if headless:
             args.extend(["-display", "none"])
 
@@ -567,7 +860,13 @@ class QemuLauncher:
         # "off" is spelled ``-nic none`` rather than left to QEMU's default, and
         # "on" must name its backend.  A configuration that cannot be turned
         # into exactly one decision is a usage error, not a default.
-        args.extend(["-nic", _network_argument(dict(machine.devices or {}).get("net") or {})])
+        #
+        # ``net`` reaches the guard as-is: a trailing ``or {}`` here used to turn
+        # every *falsy* non-object (``false``, ``0``, ``""``, ``[]``) into an
+        # empty mapping, so the network was silently switched off by a typo
+        # while ``"net": "user"`` was correctly refused.
+        net = _devices_section(machine).get("net")
+        args.extend(["-nic", _network_argument({} if net is None else net)])
 
         # QMP over TCP: Windows has no AF_UNIX QMP socket.
         args.extend(["-qmp", f"tcp:{self.qmp_host}:{qmp_port},server=on,wait=off"])
@@ -617,7 +916,10 @@ class QemuLauncher:
             readiness is established separately by :meth:`wait_for_qmp`.
 
         Raises:
-            UniPadError: ``qemu_launch_failed`` when the binary cannot be found
+            UniPadError: ``accelerator_not_tcg`` when the argv about to be
+                started does not state ``-accel tcg`` (PRD 2.2-1: the command
+                line is the authority, so a caller-supplied argv is judged too);
+                ``qemu_launch_failed`` when the binary cannot be found
                 or ``Popen`` fails (the attempted path is in ``details``),
                 ``image_not_found`` when ``-bios`` / ``-drive file=`` targets do
                 not exist, ``config_invalid`` when no arguments are available.
@@ -635,13 +937,19 @@ class QemuLauncher:
                 ErrorCode.CONFIG_INVALID,
                 "no qemu arguments available: call build_args() first or pass args=",
             )
-        # The work directory is resolved before the pre-flight check because the
-        # pflash vars file lives there and has to exist by the time the check
-        # runs -- otherwise a correctly configured run is refused for a file the
-        # launcher itself was supposed to create.
+        # The accelerator is judged against the argv, and first: the command
+        # line is the authority (PRD 2.2-1), and this is the module's one guard
+        # that must never be relaxed, so a refusal here must not be masked by a
+        # later, more incidental one.  It costs nothing on disk either.
+        _argv_accel(resolved_args)
+        # The work directory is resolved first because both pre-flight checks
+        # and the pflash vars file live in it.  Everything that can refuse the
+        # run runs *before* anything is written: the vars file is 64 MiB on this
+        # board, and a launch refused for a missing image or a non-ASCII path
+        # used to leave one behind with nothing to clean it up and nothing in
+        # the error message saying so.
         work = Path(workdir) if workdir is not None else (self._last_workdir or Path.cwd())
         work.mkdir(parents=True, exist_ok=True)
-        self._materialise_pflash_vars(resolved_args, work)
         missing = self._missing_paths(resolved_args)
         if missing:
             raise UniPadError(
@@ -651,13 +959,15 @@ class QemuLauncher:
             )
 
         binary = self._resolve_binary(binary_name)
-        # Only the real QEMU has this limitation: the ANSI code page is how its
+        # Only a real QEMU has this limitation: the ANSI code page is how its
         # file backends resolve paths.  A substitute binary -- the test fake is
         # a Python script -- has no such constraint, so refusing a run on its
         # behalf would block a path that works.  It runs after the binary is
-        # resolved so "the binary is missing" stays the more fundamental error.
-        if "qemu-system" in Path(binary).name.lower():
+        # resolved so "the binary is missing" stays the more fundamental error,
+        # and before anything is written so a refusal costs nothing on disk.
+        if not _is_substitute_binary(binary):
             self._check_ascii_paths(resolved_args)
+        self._materialise_pflash_vars(resolved_args, work)
         self._adopt_args(resolved_args)
 
         stdout_path = work / "qemu-stdout.log"
@@ -713,13 +1023,35 @@ class QemuLauncher:
             qmp_port=self._last_qmp_port or 0,
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
-            serial_path=str(self._last_serial_path or work / "serial.log"),
-            evidence={
-                "accel": "tcg",
-                "machine": self.machine.name,
-                "started_at_epoch": round(time.time(), 3),
-            },
+            # ``_adopt_args`` derived this from the argv, so an argv that names
+            # no serial log records none rather than the path an earlier
+            # ``build_args()`` happened to remember.
+            serial_path=str(self._last_serial_path) if self._last_serial_path else "",
+            evidence=self._launch_evidence(resolved_args),
         )
+
+    @staticmethod
+    def _launch_evidence(args: Sequence[str]) -> dict[str, Any]:
+        """Return the machine facts the argv about to be started states.
+
+        Every value is transcribed out of the command line, never taken from
+        :attr:`machine`: ``launch()`` accepts an argv the caller assembled, so
+        the configuration is not a description of the run -- the argv is.  A
+        record naming a machine the command line does not describe is worse
+        than no record at all, because it looks like evidence for reproducing
+        the run while reproducing something else (PRD 9.2).
+
+        A key is ``None`` when the argv does not state it, which is the same
+        convention :attr:`QmpReadiness.status` uses: absent is not the same as
+        a value.  ``accel`` cannot be ``None`` -- :func:`_argv_accel` has
+        already refused an argv that does not state explicit TCG.
+        """
+        return {
+            "accel": _argv_option(args, "-accel"),
+            "machine": _argv_option(args, "-machine"),
+            "name": _argv_option(args, "-name"),
+            "started_at_epoch": round(time.time(), 3),
+        }
 
     def wait_for_qmp(self, timeout: Optional[float] = None) -> QmpReadiness:
         """Block until QMP answers, then return the evidence that proves it.
@@ -986,8 +1318,17 @@ class QemuLauncher:
         caller-supplied one; either way the launcher must remember *the argv it
         actually started* so :meth:`wait_for_qmp` and :meth:`stop` target the
         right endpoints.
+
+        Each remembered slot is *replaced*, not merged: a caller-supplied argv
+        that carries no ``-qmp`` or no ``-serial`` leaves the slot empty rather
+        than keeping whatever an earlier ``build_args()`` put there.  A slot that
+        outlived the argv it came from would make ``launch.json`` name endpoints
+        the started command line never mentioned -- and would send
+        :meth:`wait_for_qmp` probing a port nothing is listening on.
         """
         self._last_args = list(args)
+        self._last_qmp_port = None
+        self._last_serial_path = None
         for index, value in enumerate(args):
             if value == "-qmp" and index + 1 < len(args):
                 host, port = self._parse_qmp_spec(args[index + 1])
@@ -1112,8 +1453,15 @@ class QemuLauncher:
         persists settings needs a *writable* file where ``-bios`` alone would
         have none.  Upstream sizes it to the code drive exactly
         (``run-qemu.py:151-152``); a shorter file makes QEMU truncate writes and
-        a longer one wastes 64 MiB per run.  An existing file is left alone --
-        it holds the variables from the previous run, which is the whole point.
+        a longer one wastes 64 MiB per run.
+
+        A file that is already the right size is left alone -- it holds the
+        variables from a previous run, which is the whole point.  A file that is
+        *short* is extended rather than reused: a 0-byte one is the residue of a
+        launch that was refused after this file was created, and handing it to
+        the next boot gives UEFI a 0-length writable pflash to keep its
+        variables in.  Extending keeps the leading bytes, which are the
+        variables, and only adds the zeros the device needs.
 
         A missing *code* drive is not repaired here: that is a real missing
         image and :meth:`_missing_paths` must report it.
@@ -1122,24 +1470,33 @@ class QemuLauncher:
             if value != "-drive" or index + 1 >= len(args):
                 continue
             spec = args[index + 1]
-            if "if=pflash" not in spec or "readonly=off" not in spec:
+            if not _is_pflash_vars_drive(spec):
                 continue
             target = _parse_drive_file(spec)
             if not target:
                 continue
             path = Path(target)
-            if path.exists():
-                continue
             size = self._pflash_code_size(args)
+            if size <= 0:
+                raise UniPadError(
+                    ErrorCode.IMAGE_NOT_FOUND,
+                    "could not size the pflash vars drive: the read-only code "
+                    "drive is not a file",
+                    path=safe_location(path),
+                )
+            existing = _file_size(path)
+            if existing is not None and existing >= size:
+                continue
             try:
-                with open(path, "wb") as handle:
-                    if size:
-                        handle.truncate(size)
+                # "r+b" extends an existing short file in place, so the
+                # variables it already holds survive; "wb" creates a fresh one.
+                with open(path, "r+b" if existing is not None else "wb") as handle:
+                    handle.truncate(size)
             except OSError as exc:
                 raise UniPadError(
                     ErrorCode.IMAGE_NOT_FOUND,
                     "could not create the pflash vars drive",
-                    path=str(path),
+                    path=safe_location(path),
                     reason=type(exc).__name__,
                 ) from exc
 
@@ -1161,12 +1518,14 @@ class QemuLauncher:
     def _missing_paths(args: Sequence[str]) -> list[str]:
         """Return the ``-bios`` / ``-drive file=`` targets that do not exist.
 
-        A ``host_device:`` value is deliberately *not* judged: ``/dev/rdiskN``
-        exists on macOS and never on Windows, and the launcher has no way to
-        tell a valid host device from a stale one.  Reporting it missing would
-        block a legitimate run; leaving it to QEMU produces an error that names
-        the device.  Everything else is checked, including the directory behind
-        a ``fat:`` prefix.
+        A ``host_device:`` or ``json:`` value is deliberately *not* judged:
+        ``/dev/rdiskN`` exists on macOS and never on Windows, and an inline
+        blockdev description is JSON rather than a path.  In both cases the
+        launcher has no way to tell a valid value from a stale one, and
+        reporting it missing would block a legitimate run -- leaving it to QEMU
+        produces an error that names the value.  Everything else is checked,
+        including the directory behind a ``fat:`` prefix and the writable pflash
+        vars file the launcher itself creates.
         """
         missing: list[str] = []
         for index, value in enumerate(args):
@@ -1180,6 +1539,13 @@ class QemuLauncher:
                     missing.append(f"-kernel {target}")
             elif value == "-drive" and index + 1 < len(args):
                 spec = args[index + 1]
+                if _is_pflash_vars_drive(spec):
+                    # The launcher creates this file itself (launch() sizes it
+                    # to the code drive), so it is not a missing image.  Judging
+                    # it here would refuse a correctly configured run for a file
+                    # we were supposed to write -- and would force the write to
+                    # happen before the refusal.
+                    continue
                 prefix, path = _strip_block_driver(_raw_drive_file(spec) or "")
                 if not path:
                     continue

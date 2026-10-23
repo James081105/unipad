@@ -38,6 +38,9 @@ from unipad.controller.experiments import ExperimentStore
 from unipad.errors import ErrorCode, ExitCode
 from tests.fixtures.ipa_builder import DEFAULT_BUNDLE_ID, build_ipa
 
+#: Repository root, so a test can read the config this repository actually ships.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 #: The shipped budget configuration (PRD 7.5 initial recommendations).
 BUDGET_CONFIG: dict[str, object] = {
     "schema_version": 1,
@@ -147,6 +150,32 @@ def run_cli(argv: list[str], workspace: dict[str, Path]) -> CliResult:
     buffer = io.StringIO()
     exit_code = cli.main(full, buffer)
     return CliResult(exit_code, _decode_one_object(buffer.getvalue()), buffer.getvalue())
+
+
+def run_dir_of(workspace: dict[str, Path], result: "CliResult") -> Path:
+    """The run directory this invocation created, found without parsing the envelope.
+
+    ``_emit`` redacts every string in the envelope (PRD 9.2: an absolute path
+    embeds the Windows account name), so ``Path(result.data["log_path"])`` is no
+    longer a path -- it is ``<redacted:user_path>/AppData/...``.  That is the
+    point of the redaction, and it means a test that wants to look at the evidence
+    has to find the directory the way an operator would: it is the one directory
+    this invocation created under the runs root.
+
+    Raises if there is not exactly one, rather than picking one: a silent pick
+    would make a test that inspects the wrong run's evidence pass.
+    """
+    created = [path for path in sorted(workspace["runs"].iterdir()) if path.is_dir()]
+    assert len(created) == 1, (
+        "expected exactly one run directory under the runs root, found "
+        f"{[p.name for p in created]}: the test cannot tell which run's evidence "
+        "it is inspecting"
+    )
+    expected = created[0]
+    # The envelope must still NAME the file it wrote, redacted or not.
+    assert Path(result.data["log_path"]).name == "install.log", result.data["log_path"]
+    assert "install.log" in result.data["log_path"], result.data["log_path"]
+    return expected
 
 
 @pytest.fixture()
@@ -301,7 +330,14 @@ def test_an_unknown_command_is_unsupported_command_with_exit_2(
     assert result.exit_code == int(ExitCode.USAGE)
     assert result.error_code == ErrorCode.UNSUPPORTED_COMMAND
     assert result.details["command"] == "frobnicate"
-    assert set(result.details["known_commands"]) == set(PRD_9_1_COMMANDS)
+    # PRD 9.1's nine are still a subset of what the CLI accepts, so a caller
+    # that learned the documented list keeps working.  PRD 3.2 P1 (3) adds the
+    # lifecycle commands and P1 (2) the matrix command on top, and the error
+    # names those too -- a "known commands" list that omitted `history` or
+    # `matrix` would send an operator looking for it back to the documentation.
+    known = set(result.details["known_commands"])
+    assert set(PRD_9_1_COMMANDS) <= known
+    assert known == set(cli.SUPPORTED_COMMANDS)
 
 
 def test_no_command_is_a_usage_error(workspace: dict[str, Path]) -> None:
@@ -394,6 +430,76 @@ def test_doctor_flags_a_non_tcg_machine_config(
 
 
 # ---------------------------------------------------------------------------
+# a machine config typo cannot silently change the machine
+# ---------------------------------------------------------------------------
+def test_a_misspelled_machine_config_key_is_refused(workspace: dict[str, Path]) -> None:
+    """``cpu_modle`` must not be dropped in favour of the ``cpu_model`` default.
+
+    ``MachineConfig.from_dict`` drops keys it does not model, which is right for
+    a caller holding a superset dict and wrong for a caller reading
+    ``config/machine.json``: there, a dropped key is a typo, or a key from a
+    newer schema, or a feature the operator believes is configured and is not.
+    In every one of those cases the file describes one machine while the launch
+    builds another, so the controller has to ask the question and refuse.
+
+    Driven through ``start`` because that is the command that builds a
+    :class:`QemuLauncher` from the config -- the one place a dropped key would
+    reach a QEMU command line.
+    """
+    workspace["machine"].write_text(
+        json.dumps({"accel": "tcg", "cpu_modle": "cortex-a57"}), encoding="utf-8"
+    )
+
+    result = run_cli(["start", "--profile", "tcg", "--artifact", "manifest.json"], workspace)
+
+    assert result.exit_code == int(ExitCode.USAGE)
+    assert result.error_code == ErrorCode.CONFIG_INVALID
+    # The offending name is listed so the operator knows exactly what to fix...
+    assert result.details["unknown_keys"] == ["cpu_modle"]
+    assert "cpu_modle" in result.document["error"]["message"]
+    # ... and only the name: PRD 9.2 forbids values in any output.
+    assert "cortex-a57" not in json.dumps(result.document)
+
+
+def test_a_documented_machine_config_key_is_tolerated(workspace: dict[str, Path]) -> None:
+    """``*_note`` prose and the sections the controller reads directly are fine."""
+    workspace["machine"].write_text(
+        json.dumps(
+            {
+                "accel": "tcg",
+                "cpu_model_note": "pinned to the board we boot",
+                "schema_version": 1,
+                "disks": {"system_image": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli(["start", "--profile", "tcg", "--artifact", "manifest.json"], workspace)
+
+    # Past the config gate, and stopped by the missing manifest instead: that is
+    # what "the config was accepted" looks like from the outside.
+    assert result.error_code == ErrorCode.ARTIFACT_MISSING
+
+
+def test_the_shipped_machine_config_still_loads(workspace: dict[str, Path]) -> None:
+    """The gate must not reject the config this repository actually ships.
+
+    ``config/machine.json`` is full of ``*_note`` prose and has a ``disks``
+    section the controller reads directly; a gate that tolerated neither would
+    fail on the real file and teach everyone to disable it.
+    """
+    shipped = REPO_ROOT / "config" / "machine.json"
+    assert shipped.is_file(), "the repository must ship config/machine.json"
+    workspace["machine"].write_text(shipped.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = run_cli(["start", "--profile", "tcg", "--artifact", "manifest.json"], workspace)
+
+    assert result.error_code == ErrorCode.ARTIFACT_MISSING
+    assert "config_invalid" not in json.dumps(result.document["error"])
+
+
+# ---------------------------------------------------------------------------
 # PRD 9.1 / appendix A: install without a guest channel
 # ---------------------------------------------------------------------------
 
@@ -404,17 +510,28 @@ def ipa(workspace: dict[str, Path]) -> Path:
     return build_ipa(workspace["root"] / "HelloUniPad.ipa")
 
 
-def test_install_without_a_guest_channel_is_blocked_never_a_success(
+def test_install_without_a_usable_guest_channel_is_blocked_never_a_success(
     workspace: dict[str, Path], ipa: Path
 ) -> None:
+    """An install with no *usable* guest channel is ``blocked``, never a success.
+
+    The reason changed when ``unipad.guest.GuestClient`` was added to the probe
+    list: the factory this host ships is now found, and the refusal names the
+    real state -- a channel that exists but cannot be constructed without a
+    transport this host has no guest to provide.  ``guest_channel_missing``
+    would have sent the operator looking for an implementation that is already
+    installed.  What this test pins is the part that must never move: the
+    command stays ``blocked`` and never reports a stage it did not reach.
+    """
     result = run_cli(["install", str(ipa)], workspace)
 
     assert result.exit_code == int(ExitCode.BLOCKED)
     assert result.status == "blocked"
     assert result.error_code == ErrorCode.BLOCKED
-    assert result.details["blocked_reason"] == "guest_channel_missing"
-    # The probe list is reported so the missing implementation is visible.
+    assert result.details["blocked_reason"] == "guest_channel_unavailable"
+    # The probe list is reported so the resolved factory stays visible.
     assert any("unipad.guest" in probe for probe in result.details["probed"])
+    assert "unipad.guest.GuestClient" in result.details["probed"]
 
 
 def test_install_never_reports_an_installed_stage_it_did_not_reach(
@@ -439,8 +556,9 @@ def test_install_reports_the_prd_9_1_contract_fields(
 
     assert len(data["package_sha256"]) == 64
     assert data["bundle_id"] == DEFAULT_BUNDLE_ID
-    # The named log file must exist: evidence, not a promise (PRD 9.2).
-    log_path = Path(data["log_path"])
+    # The named log file must exist: evidence, not a promise (PRD 9.2).  It is
+    # found through the runs root, because the envelope carries the path redacted.
+    log_path = run_dir_of(workspace, result) / "install.log"
     assert log_path.is_file()
     text = log_path.read_text(encoding="utf-8")
     assert "install requested" in text
@@ -451,7 +569,7 @@ def test_a_blocked_install_still_leaves_its_journal_behind(
     workspace: dict[str, Path], ipa: Path
 ) -> None:
     result = run_cli(["install", str(ipa)], workspace)
-    run_dir = Path(result.data["log_path"]).parent
+    run_dir = run_dir_of(workspace, result)
 
     assert (run_dir / "experiment.json").is_file()
     assert (run_dir / "install.log").is_file()
@@ -605,3 +723,348 @@ def test_build_is_blocked_while_the_sources_are_not_frozen(
     # The lock file exists but is not frozen: the reason is named, not implied.
     assert result.details["present"] is True
     assert "not frozen" in result.document["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# the guest-channel probe list must describe the channels this host models
+# ---------------------------------------------------------------------------
+
+
+def test_the_guest_channel_probe_list_resolves_the_factory_unipad_guest_exports() -> None:
+    """``unipad install`` must be able to *find* a guest channel on this host.
+
+    ``_CAPABILITIES["guest_channel"]`` is the controller's only route to the
+    guest.  ``unipad.guest`` exports :class:`GuestClient` as its client, and
+    ``unipad.ipa.installer._default_channel`` searches for exactly that name,
+    so a probe list that omits it makes every install report
+    ``guest_channel_missing`` -- a false statement about a host that ships the
+    channel.  The probe list has to name the channel the controller models.
+    """
+    import unipad.guest as guest
+
+    assert callable(getattr(guest, "GuestClient", None)), (
+        "unipad.guest must export a GuestClient factory for this assertion to mean anything"
+    )
+    probed = set(cli._probed("guest_channel"))
+    assert "unipad.guest.GuestClient" in probed, (
+        "the probe list must name the channel unipad.guest actually exports"
+    )
+    # The load-bearing half: with the module present the capability resolves.
+    assert cli._resolve_capability("guest_channel") is not None
+
+
+def test_install_does_not_claim_the_guest_channel_is_missing_when_one_is_exported(
+    workspace: dict[str, Path], ipa: Path
+) -> None:
+    """A channel that exists but needs a transport is *unavailable*, not missing.
+
+    ``GuestClient`` requires a transport, and this host has no guest to give it
+    one, so the install is still ``blocked`` -- but the reason must name the
+    real state.  ``guest_channel_missing`` would tell the operator to go and
+    implement a channel that is already there.
+    """
+    result = run_cli(["install", str(ipa)], workspace)
+
+    assert result.exit_code == int(ExitCode.BLOCKED)
+    assert result.status == "blocked"
+    assert result.error_code == ErrorCode.BLOCKED
+    assert result.details["blocked_reason"] == "guest_channel_unavailable"
+    # The probe list is still reported, so the resolved factory is visible.
+    assert "unipad.guest.GuestClient" in result.details["probed"]
+    # PRD 9.1: a blocked install never reports an install stage it did not reach.
+    assert result.data["stage"] == "checked"
+    assert result.data["stage"] not in ("installed", "registered")
+
+
+# ---------------------------------------------------------------------------
+# PRD 9.1: an installer result the controller cannot classify
+# ---------------------------------------------------------------------------
+
+
+def _patch_install_chain(monkeypatch: pytest.MonkeyPatch, installer: Any) -> None:
+    """Resolve the guest channel and installer capabilities to ``installer``.
+
+    Only the two capabilities that need a real guest are replaced; the precheck
+    stays the real one, so a rejected package still fails for the real reason.
+    """
+    real = cli._resolve_capability
+
+    def fake(name: str) -> Any:
+        if name == "guest_channel":
+            return lambda: object()
+        if name == "ipa_install":
+            return installer
+        return real(name)
+
+    monkeypatch.setattr(cli, "_resolve_capability", fake)
+
+
+class _RecordingInstaller:
+    """A duck-typed installer that records the stage it was asked to report."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    def install(self, path: Any, *, name: Any = None, precheck: Any = None, **kwargs: Any) -> Any:
+        return "not-an-install-result"
+
+
+def test_an_unrecognised_installer_result_is_blocked_not_an_internal_error(
+    workspace: dict[str, Path], ipa: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An installer returning an unclassifiable value must not crash the CLI.
+
+    ``_coerce_install_result`` promises "the controller never synthesises an
+    install stage it did not observe".  Reaching ``main``'s catch-all instead
+    turns that promise into ``internal_error`` (exit 1) -- a code outside the
+    PRD 10 taxonomy -- and the operator loses the ``blocked`` classification
+    that says the host is not the problem.
+    """
+    _patch_install_chain(monkeypatch, _RecordingInstaller)
+
+    result = run_cli(["install", str(ipa)], workspace)
+
+    assert result.exit_code == int(ExitCode.BLOCKED)
+    assert result.error_code == ErrorCode.BLOCKED
+    assert result.details["returned_type"] == "str"
+    assert "NameError" not in json.dumps(result.document)
+    # PRD 9.2: the value itself is never reported, only its type.
+    assert "not-an-install-result" not in json.dumps(result.document)
+
+
+def test_a_refused_install_leaves_its_log_behind(
+    workspace: dict[str, Path], ipa: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every refusal in the chain must leave the evidence the envelope names.
+
+    ``_persist_install_log`` exists precisely so a blocked install still leaves
+    its log ("the envelope names this file, so writing it must not depend on
+    reaching the end of the chain").  A refusal that raises before any writer
+    records nothing anywhere: the run directory holds only the journal the
+    command created before the chain started.
+    """
+    _patch_install_chain(monkeypatch, _RecordingInstaller)
+
+    result = run_cli(["install", str(ipa)], workspace)
+
+    assert result.exit_code == int(ExitCode.BLOCKED)
+    log_path = run_dir_of(workspace, result) / "install.log"
+    assert log_path.is_file(), "the envelope names this file, so it must exist"
+    text = log_path.read_text(encoding="utf-8")
+    assert "install requested" in text
+    assert result.data["package_sha256"] in text
+    # The refusal itself is recorded, not just the request.
+    assert "installer returned no structured result" in text
+
+
+# ---------------------------------------------------------------------------
+# PRD 3.2 P1 (3): the lifecycle surface must not contradict its own entry
+# ---------------------------------------------------------------------------
+
+
+class _InstalledInstaller:
+    """An installer that reports a completed install."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def install(self, path: Any, *, name: Any = None, precheck: Any = None, **kwargs: Any) -> Any:
+        from unipad.models import InstallResult
+
+        return InstallResult(
+            package_sha256="",
+            bundle_id=DEFAULT_BUNDLE_ID,
+            stage="installed",
+            trust_mode="development-signed",
+        )
+
+
+def _seed_installed(
+    workspace: dict[str, Path], ipa: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Record one successful install in the default ledger."""
+    _patch_install_chain(monkeypatch, _InstalledInstaller)
+    result = run_cli(["install", str(ipa)], workspace)
+    assert result.exit_code == int(ExitCode.OK), result.raw
+
+
+def test_uninstall_reports_the_bundle_ids_installed_after_the_removal(
+    workspace: dict[str, Path], ipa: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``installed_bundle_ids`` must describe the host *after* the transition.
+
+    The list is what an operator reads to decide what to uninstall next.  A
+    value captured before ``record_uninstall`` still names the bundle the same
+    envelope has just reported as ``removed`` with ``installed: false`` -- the
+    envelope contradicts its own entry, and the next ``uninstall`` of that id
+    is refused for a reason the previous answer denied.
+    """
+    _seed_installed(workspace, ipa, monkeypatch)
+    before = run_cli(["uninstall", DEFAULT_BUNDLE_ID], workspace)
+
+    assert before.exit_code == int(ExitCode.OK)
+    assert before.data["installed"] is False
+    assert before.data["entry"]["stage"] == "removed"
+    assert before.data["installed_bundle_ids"] == [], (
+        "a bundle this envelope just removed must not be listed as installed"
+    )
+
+    after = run_cli(["history", "--all"], workspace)
+    assert after.data["installed_bundle_ids"] == []
+    assert before.data["installed_bundle_ids"] == after.data["installed_bundle_ids"]
+
+
+def test_prior_install_check_names_the_check_that_actually_ran(
+    workspace: dict[str, Path], ipa: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``prior_install_check`` is evidence, so it may only claim a real check.
+
+    A first install runs no prior-install check -- the whole point of
+    ``install`` is that there is nothing to check against.  Reporting
+    ``performed_by_controller`` there claims work the controller never did
+    (PRD 9.2: evidence missing is unverified, not filled in with model text),
+    and the value an operator would use to tell ``install`` from ``update``
+    is gone.
+    """
+    _patch_install_chain(monkeypatch, _InstalledInstaller)
+    first = run_cli(["install", str(ipa)], workspace)
+    assert first.exit_code == int(ExitCode.OK)
+    assert first.data["prior_install_check"] == "not_applicable_first_install"
+
+    second = run_cli(["update", str(ipa)], workspace)
+    assert second.exit_code == int(ExitCode.OK)
+    assert second.data["prior_install_check"] == "performed_by_controller"
+
+
+def test_prior_install_check_is_reported_on_a_precheck_rejection_too(
+    workspace: dict[str, Path],
+) -> None:
+    """The precheck-rejection path reports the same field as the others.
+
+    ``_finish_install`` is the one place that builds the PRD 9.1 envelope, so
+    dropping the keyword on one call site makes the field silently default and
+    a script that branches on it sees a third value for the same question.
+    """
+    package = build_ipa(workspace["root"] / "Sim.ipa", corrupt="simulator")
+
+    result = run_cli(["install", str(package)], workspace)
+
+    assert result.exit_code == int(ExitCode.FAILURE)
+    assert result.data["stage"] == "failed"
+    assert result.data["prior_install_check"] == "not_applicable_first_install"
+
+
+# ---------------------------------------------------------------------------
+# PRD 9.1: a malformed launch record is a usage-class error, not a crash
+# ---------------------------------------------------------------------------
+
+
+def test_a_launch_record_with_a_non_integer_pid_is_a_usage_error(
+    workspace: dict[str, Path],
+) -> None:
+    """``launch.json`` is a manifest; a bad ``pid`` is a bad manifest.
+
+    ``int(record["pid"])`` is unguarded, so a launch record whose ``pid`` is a
+    string, a list or a mapping raises out of ``cmd_stop`` into ``main``'s
+    catch-all and comes back as ``internal_error`` -- a code outside the PRD 10
+    taxonomy that says "the controller is broken" when the truth is "this
+    record is not one I can read".
+    """
+    store = ExperimentStore(workspace["runs"])
+    store.create("exp-stop-bad-pid", "M4", "a launch record with a broken pid")
+    record = workspace["runs"] / "exp-stop-bad-pid" / "launch.json"
+    record.write_text(json.dumps({"pid": "not-a-number", "qmp_port": 4444}), encoding="utf-8")
+
+    result = run_cli(["stop", "--run", "exp-stop-bad-pid"], workspace)
+
+    assert result.exit_code == int(ExitCode.FAILURE)
+    assert result.error_code == ErrorCode.ARTIFACT_MANIFEST_INVALID
+    assert "ValueError" not in json.dumps(result.document)
+
+
+# ---------------------------------------------------------------------------
+# PRD 8.3 / FR02: a refused start must not leave state behind
+# ---------------------------------------------------------------------------
+
+
+def test_a_refused_start_leaves_no_empty_run_directory(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run directory is created only once the launch is going to happen.
+
+    ``run_dir.mkdir`` runs before the launch images are validated, so a start
+    that is refused for ``image_not_found`` leaves an empty directory behind:
+    no journal, no launch record, nothing.  ``ExperimentStore.scan`` skips a
+    directory without ``experiment.json``, so it is invisible to
+    ``_latest_run`` and nothing ever removes it -- retrying with a different
+    experiment id each time fills the runs root with directories that describe
+    nothing.
+    """
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: "C:/qemu/qemu-system-aarch64"
+        if name == "qemu-system-aarch64"
+        else None,
+    )
+    manifest = workspace["root"] / "manifest.json"
+    manifest.write_text(json.dumps({"target": "tcg"}), encoding="utf-8")
+
+    result = run_cli(
+        ["start", "--profile", "tcg", "--artifact", str(manifest), "--experiment", "exp-never-started"],
+        workspace,
+    )
+
+    assert result.exit_code == int(ExitCode.FAILURE)
+    assert result.error_code == ErrorCode.IMAGE_NOT_FOUND
+    assert not (workspace["runs"] / "exp-never-started").exists(), (
+        "a refused start must not leave an empty run directory behind"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PRD 9.1: one "known commands" answer, and a help text that names the split
+# ---------------------------------------------------------------------------
+
+
+def test_both_usage_errors_name_the_same_known_commands(workspace: dict[str, Path]) -> None:
+    """An unknown command and a missing command must answer the same question.
+
+    The two envelopes are the only place the CLI tells an operator what it
+    accepts.  Reporting thirteen names in one and nine in the other means a
+    caller that learned the list from a typo is told a different set when it
+    simply forgets the command -- and neither answer says which of the three
+    surfaces the nine belong to.
+    """
+    unknown = run_cli(["frobnicate"], workspace)
+    missing = run_cli([], workspace)
+
+    assert unknown.details["known_commands"] == missing.details["known_commands"]
+    assert set(unknown.details["known_commands"]) == set(cli.SUPPORTED_COMMANDS)
+    assert set(missing.details["known_commands"]) == set(cli.SUPPORTED_COMMANDS)
+
+
+def test_help_names_the_prd_9_1_contract_and_the_lifecycle_surface_separately(
+    workspace: dict[str, Path],
+) -> None:
+    """``--help`` must say which commands are the PRD 9.1 contract.
+
+    Thirteen subcommands print under a description that still reads "(PRD 9.1)",
+    so an operator cannot tell the documented nine from the four the lifecycle
+    and matrix surfaces add.  The help text is the operator-facing half of the
+    same disagreement the two error envelopes carry.
+    """
+    result = run_cli(["--help"], workspace)
+
+    assert result.exit_code == int(ExitCode.OK)
+    help_text = result.data["help"]
+    assert "PRD 9.1" in help_text
+    assert "PRD 3.2 P1 (3)" in help_text
+    for name in PRD_9_1_COMMANDS:
+        assert name in help_text
+    for name in cli.LIFECYCLE_COMMANDS:
+        assert name in help_text
+    for name in cli.MATRIX_COMMANDS:
+        assert name in help_text
+    # The nine are named as a list of their own, not only as subparser headings.
+    assert ", ".join(PRD_9_1_COMMANDS) in help_text

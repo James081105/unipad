@@ -14,23 +14,109 @@
 #   form of unipad.models.ArtifactManifest (sort_keys=True, indent=2, trailing
 #   newline) so the Windows verifier consumes it without translation.
 #
+#   The four build stages call the upstream build driver that ships inside the
+#   pinned UniXNU checkout (scripts/unixnu/cli.py).  The mapping, and the line
+#   of upstream code each command comes from, is written next to each stage
+#   below; nothing here is invented:
+#
+#     build-kernel      unixnu defconfig <[kernel] defconfig>   cli.py:89-101
+#                       unixnu build kernel                     cli.py:123-129
+#                         -> kernel.build() then kernel.prelink(); prelink writes
+#                            out/<device>/kernel/kernel.macho and logs its sha256
+#                            (kernel.py:105-137)
+#     build-bootloader  unixnu build package                    cli.py:134
+#                         -> package.build(): the EDK II build of package/, which
+#                            also leaves the CLANGPDB tool links the device's
+#                            DarwinBoot builder needs (package.py:21-31)
+#                       python3 <tree>/scripts/build-darwinboot-efi.py
+#                         -> the device repository's own bootloader.  This board
+#                            declares no [firmware] (board.toml:85-86), so there
+#                            is no Mu-Silicium firmware volume to take it from.
+#     build-devicetree  unixnu ipsw fetch DeviceTree            cli.py:156-171
+#                         -> the board's own device tree out of the pinned IPSW,
+#                            checked against board.toml [ipsw.sha256]
+#                       python3 <tree>/scripts/make-qemu-adt.py
+#                         -> the device tree this machine actually boots with
+#                            (board.toml [payload.adt])
+#     assemble-image    unixnu bootimg --fd ... --dtb ...       cli.py:142-153
+#                         -> bootimg.build(): gzip(BootShim + firmware volume)
+#                            with the device tree appended (bootimg.py:71-114)
+#
 # WHAT IT REFUSES TO DO
-#   * build from a lock file that is not frozen, or whose commits are null
-#     (PRD 8.1: "Every run must be reproducible from this file plus the
-#     recorded hashes");
+#   * build from a lock file whose commits are null, empty, short or a branch
+#     name (PRD 8.1: "Every run must be reproducible from this file plus the
+#     recorded hashes").  `frozen: false` is NOT such a refusal: it is recorded
+#     verbatim in artifact-manifest.json and announced on every log line, and the
+#     pins are what actually prevent building from a moving branch.  Refusing it
+#     deadlocked the pipeline against a workflow whose own preflight only warns
+#     -- see the long comment in validate_lock();
 #   * mix HVF and TCG: an HVF-targeted payload must never be produced for, or
 #     downloaded by, this Intel Windows host (PRD 8.3);
 #   * fetch anything over the network.  No curl, no wget, no git fetch, no
 #     package manager.  Pinned sources are verified locally or reported absent;
+#   * let the upstream driver fetch on its behalf.  prepare() fetches whatever
+#     the driver's feeds root is missing (cli.py:79-86, feeds.py:173-216) and
+#     initialises module submodules (feeds.py:159-165); both reach the network,
+#     so this script proves they are already on disk at the pinned commit
+#     before it runs anything, and refuses when they are not;
+#   * take the https default of board.toml [ipsw].  The kernel step decodes the
+#     original kernelcache out of the IPSW (kernel.py:111-114) and a URL there
+#     is a download; --ipsw must name a local file and --kernelcache a local
+#     file, or the step records not_run;
 #   * depend on qemu-system-aarch64.  QEMU is a *native Windows* build
 #     (config/sources.lock.json tools.qemu.build) and is deliberately not a
 #     macOS build input;
 #   * report success without evidence: a step that did not run is recorded as
-#     not_run with a reason (PRD 7.4).
+#     not_run with a reason (PRD 7.4), a step that ran and failed is recorded
+#     failed, and a stage in which anything is not_run or failed reports
+#     ok=false.
 #
-# STATUS: the Apple-tool invocations are TODO(macos-verified-only) stubs.  The
-#   contract around them (inputs, tools, hashes, target, paths, exit codes,
-#   manifest shape) is real and enforced here, and is verifiable on any host.
+# STATUS -- WHAT IS AND IS NOT PROVEN HERE, AND BY WHICH TEST
+#   Proven on this Windows host, by tests that execute the real thing rather
+#   than grep for it:
+#     tests/acceptance/test_shell_script_syntax.py
+#       -- that this script parses at all (`bash -n`);
+#     tests/acceptance/test_build_script_gates.py
+#       -- the lock gate: a lock whose pins are complete full SHAs is not
+#          refused merely for being unfrozen, and a null, empty, short or
+#          branch-name pin still is, named in the message;
+#     tests/acceptance/test_macos_pipeline_gates.py
+#       -- the --ipsw network refusal: an http(s) URL is network_refused and a
+#          local file is not;
+#     tests/acceptance/test_p0p1_gate_main.py
+#       -- the workflow's own steps: the source-acquisition pins and
+#          cross-check, the argument construction the build step hands this
+#          script, and the out root the two halves share;
+#       -- this script RUN, not grepped, against a scratch repository: the exact
+#          argv each stage hands the driver (read out of the driver's own
+#          argv.log), the canonical bytes of artifact-manifest.json and the real
+#          hashes of the files it names, that a step which cannot run is recorded
+#          not_run with its reason while the run reports ok=false, and the
+#          refusals (network, wrong accelerator, malformed input, absent pinned
+#          source).  Section 6 of that file.
+#     tests/acceptance/test_workflow_python_syntax.py
+#       -- that every Python block the workflow ships compiles.
+#
+#   NOT proven here, and not provable here: the Apple toolchain itself.
+#   kernel.build() requires xcodebuild ("the kernel step builds with the Xcode
+#   iphoneos SDK", kernel.py:75), and the driver itself prints "developed and
+#   tested on macOS only" on every other host (cli.py:206-207).  A Homebrew LLVM
+#   keg is NOT required: util.tool() (util.py:33-38) looks on PATH and then in the
+#   keg, and toolchain_path() (kernel.py:40-44) only prepends the kegs that exist,
+#   so an absent keg is something the driver names precisely rather than
+#   something this entry point refuses up front.  No kernel, no DarwinBoot, no
+#   firmware volume and no boot image has ever been produced by this script.
+#   On a non-Darwin host each of the four stages records not_run with that
+#   reason and the manifest is still written, unchanged in shape.
+#
+#   Also not producible for THIS device repository at all, macOS or not:
+#   board.toml of the pinned device repo declares no [firmware]
+#   (F:/iosvirtual/local-private/upstream/UniXNU-qemu/board.toml:85-86 --
+#   "QEMU runs its own EDK II AARCH64 firmware, which has no DarwinBoot"), so
+#   `unixnu build firmware` refuses and `unixnu bootimg` cannot resolve a
+#   firmware volume.  Measured: with a valid --uefi and no --fd, bootimg dies
+#   with KeyError: 'firmware' at firmware.py:18.  assemble-image therefore
+#   records not_run naming that reason rather than inventing a boot image.
 #
 # Exit codes mirror unipad.errors.ExitCode: 0 ok, 1 failure, 2 usage, 3 blocked.
 set -euo pipefail
@@ -61,43 +147,113 @@ readonly DEFAULT_MIN_FREE_GB=8
 readonly FIELD_SEP=$'\037'
 
 # Resolve a Python interpreter: python3 on macOS, python on Windows/Git Bash.
-# The Apple-tool build steps are macOS-only stubs; the contract around them
-# (inputs, hashes, manifest bytes) is verifiable on any host with Python.
+# The upstream driver needs 3.11 or newer (cli.py:204-205) and is invoked
+# through this interpreter rather than through its own shebang, because the
+# interpreter is not called python3 on every host that runs this script.
 if command -v python3 >/dev/null 2>&1; then PY='python3'
 elif command -v python  >/dev/null 2>&1; then PY='python'
 else PY=''; fi
+
+# The two pinned checkouts this entry drives.  They are the same two the lock
+# file names (unixnu, device_repo) and the same two prepare-sources looks for;
+# --unixnu / --device override the location, never the pin.
+readonly UNIXNU_DIR_DEFAULT='vendor/UniXNU'
+readonly DEVICE_DIR_DEFAULT='vendor/UniXNU-qemu'
+
+# Where a Homebrew LLVM keg would live.  NOT a requirement of any step: the
+# driver resolves it itself.  util.tool() (util.py:33-38) looks on PATH first and
+# then in these kegs, so llvm-objcopy, llvm-nm, llvm-lib and lld-link are found
+# there even when the keg is not on PATH; kernel.py:40-44 toolchain_path() only
+# *prepends* the kegs that exist.  This script therefore reports which keg it
+# sees (log_keg) and lets the driver name whatever it cannot find, instead of
+# refusing a build on a macOS runner that has Apple clang and no Homebrew LLVM
+# -- which upstream builds happily.
+readonly HOMEBREW_LLVM_DIRS=('/opt/homebrew/opt/llvm' '/usr/local/opt/llvm')
 
 # ---------------------------------------------------------------------------
 # small utilities
 # ---------------------------------------------------------------------------
 
-log()  { printf '%s %s\n' "$(utc_stamp)" "$*"; }
+# stamp_var VARNAME -- put the ISO-8601 UTC timestamp in VARNAME.
+# The assigning form exists so log() costs no subshell at all: `$(utc_stamp)`
+# forks once per log line even when the timestamp itself is a builtin.
+STAMP_BUILTIN=0
+_stamp_probe=''
+if TZ=UTC printf -v _stamp_probe '%(%Y-%m-%dT%H:%M:%SZ)T' -1 2>/dev/null \
+        && [[ "$_stamp_probe" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    STAMP_BUILTIN=1
+fi
+stamp_var() {
+    if (( STAMP_BUILTIN )); then
+        TZ=UTC printf -v "$1" '%(%Y-%m-%dT%H:%M:%SZ)T' -1
+    else
+        # bash 4.2+ formats the clock itself; macOS ships /bin/bash 3.2, where
+        # '%(..)T' is not a thing at all, so the fallback is portable `date`.
+        printf -v "$1" '%s' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+}
+
+log() {
+    local stamp=''
+    stamp_var stamp
+    printf '%s %s\n' "$stamp" "$*"
+}
 step() { printf '\n=== %s ===\n' "$*"; }
 
-utc_stamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+# warn MESSAGE -- a non-fatal condition the operator must still see.
+#
+# Deliberately NOT `die`: a warning that stops the run is a refusal, and the
+# unfrozen-lock condition below is not one (see validate_lock).  The message goes
+# to stderr so it cannot be lost in a `| tee` and cannot be mistaken for a build
+# step's own output.
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 
-# json_escape TEXT -- emit TEXT as a JSON string body (RFC 8259).
-# Pure bash on purpose: the error path must work even when python3 is missing.
-json_escape() {
-    local text="$1" out='' ch i code
-    for (( i = 0; i < ${#text}; i++ )); do
-        ch="${text:i:1}"
-        case "$ch" in
-            '\')   out+='\\' ;;
-            '"')   out+='\"' ;;
-            $'\n') out+='\n' ;;
-            $'\r') out+='\r' ;;
-            $'\t') out+='\t' ;;
+utc_stamp() {
+    local stamp=''
+    stamp_var stamp
+    printf '%s' "$stamp"
+}
+
+# json_escape_var VARNAME TEXT -- json_escape, assigning instead of printing.
+#
+# Two `printf -v`s are the whole point of the shape below.  The obvious
+# spellings, code=$(printf '%d' "'$ch") and out+=$(printf '\\u%04x' ...), fork a
+# subshell PER CHARACTER -- measured on this host at ~0.85 s per fork, which
+# turned a 135-character refusal message into a two-minute hang inside the very
+# code path that is supposed to report a failure quickly.  `printf -v` assigns
+# to a variable without forking at all.
+#
+# The assigning form exists as well as the printing one because a caller that
+# needs the escaped text inside a printf argument list otherwise pays a subshell
+# fork of its own: write_outputs alone had ~25 of those, which after the
+# per-character fix was still the largest single cost in a run.
+json_escape_var() {
+    local __var="$1" __text="$2" __out='' __ch __i __code __esc
+    for (( __i = 0; __i < ${#__text}; __i++ )); do
+        __ch="${__text:__i:1}"
+        case "$__ch" in
+            '\')   __out+='\\' ;;
+            '"')   __out+='\"' ;;
+            $'\n') __out+='\n' ;;
+            $'\r') __out+='\r' ;;
+            $'\t') __out+='\t' ;;
             *)
-                code=$(printf '%d' "'$ch")
-                if (( code < 32 )); then
-                    out+=$(printf '\\u%04x' "$code")
+                printf -v __code '%d' "'$__ch"
+                if (( __code < 32 )); then
+                    printf -v __esc '\\u%04x' "$__code"
+                    __out+="$__esc"
                 else
-                    out+="$ch"
+                    __out+="$__ch"
                 fi
                 ;;
         esac
     done
+    printf -v "$__var" '%s' "$__out"
+}
+
+json_escape() {
+    local out=''
+    json_escape_var out "$1"
     printf '%s' "$out"
 }
 
@@ -156,7 +312,26 @@ Options:
   --out <dir>              Output directory for artifacts and manifests.
                            Default <repo>/scripts/macos/build-out/<run-id>.
   --run-id <id>            Override the generated run id.
-  --include <path[::role[::arch]]]
+  --unixnu <dir>           The pinned UniXNU checkout that carries the build
+                           driver (its root 'unixnu' script and
+                           scripts/unixnu/).  Default <repo>/vendor/UniXNU.
+  --device <dir>           The pinned device repository (its board.toml).
+                           Default <repo>/vendor/UniXNU-qemu.
+  --uefi <dir>             Mu-Silicium checkout, for the firmware volume and
+                           the boot image (--uefi of the driver, cli.py:24).
+  --ipsw <file>            The LOCAL IPSW.  An https:// URL is refused: the
+                           driver's default is board.toml [ipsw] url and this
+                           script performs no network access.
+  --kernelcache <file>     The original decompressed kernelcache the prelink
+                           step needs (--kernelcache of the driver).
+  --dtb <file>             A compiled device tree for the boot image.
+  --fd <file>              A firmware volume for the boot image.
+  --unique-chip-id <hex>   The platform seed the device tree carries.  It is
+                           not stored in any repository (board.toml
+                           [payload.adt] unique_chip_id = "required"), so the
+                           device-tree step records not_run without it.
+  --jobs <n>               Parallel jobs for the driver (default: CPU count).
+  --include <path[::role[::arch]]>
                            Declare a deliverable that must exist and be hashed
                            into the manifest.  Repeatable.  '::' separates the
                            optional role and arch, so a Windows drive letter
@@ -173,9 +348,13 @@ Options:
   -h, --help               This text.
 
 Notes:
-  * No network access of any kind: nothing is fetched, cloned or pulled.
+  * No network access of any kind: nothing is fetched, cloned or pulled.  The
+    upstream driver fetches on its own when its feeds are missing, so the
+    script proves the feeds are already on disk first and refuses otherwise.
   * qemu-system-aarch64 is not required and not used (native Windows build).
-  * Apple tool invocations are TODO(macos-verified-only) stubs.
+  * The four build stages are real invocations of the upstream driver.  The
+    Apple toolchain they need exists on macOS only, so on any other host they
+    record not_run with that reason; see STATUS at the top of this file.
 EOF
 }
 
@@ -192,6 +371,15 @@ MIN_FREE_GB="$DEFAULT_MIN_FREE_GB"
 SKIP_SOURCES=0
 DRY_RUN=0
 INCLUDES=()
+UNIXNU_DIR=''
+DEVICE_DIR=''
+UEFI_DIR=''
+IPSW_PATH=''
+KERNELCACHE_PATH=''
+DTB_PATH=''
+FD_PATH_IN=''
+UNIQUE_CHIP_ID=''
+JOBS=''
 
 while (( $# > 0 )); do
     case "$1" in
@@ -207,6 +395,24 @@ while (( $# > 0 )); do
         --out=*)          OUT_DIR="${1#*=}"; shift ;;
         --run-id)         RUN_ID="${2:-}"; shift 2 ;;
         --run-id=*)       RUN_ID="${1#*=}"; shift ;;
+        --unixnu)         UNIXNU_DIR="${2:-}"; shift 2 ;;
+        --unixnu=*)       UNIXNU_DIR="${1#*=}"; shift ;;
+        --device)         DEVICE_DIR="${2:-}"; shift 2 ;;
+        --device=*)       DEVICE_DIR="${1#*=}"; shift ;;
+        --uefi)           UEFI_DIR="${2:-}"; shift 2 ;;
+        --uefi=*)         UEFI_DIR="${1#*=}"; shift ;;
+        --ipsw)           IPSW_PATH="${2:-}"; shift 2 ;;
+        --ipsw=*)         IPSW_PATH="${1#*=}"; shift ;;
+        --kernelcache)    KERNELCACHE_PATH="${2:-}"; shift 2 ;;
+        --kernelcache=*)  KERNELCACHE_PATH="${1#*=}"; shift ;;
+        --dtb)            DTB_PATH="${2:-}"; shift 2 ;;
+        --dtb=*)          DTB_PATH="${1#*=}"; shift ;;
+        --fd)             FD_PATH_IN="${2:-}"; shift 2 ;;
+        --fd=*)           FD_PATH_IN="${1#*=}"; shift ;;
+        --unique-chip-id) UNIQUE_CHIP_ID="${2:-}"; shift 2 ;;
+        --unique-chip-id=*) UNIQUE_CHIP_ID="${1#*=}"; shift ;;
+        --jobs)           JOBS="${2:-}"; shift 2 ;;
+        --jobs=*)         JOBS="${1#*=}"; shift ;;
         --include)        INCLUDES+=("${2:-}"); shift 2 ;;
         --include=*)      INCLUDES+=("${1#*=}"); shift ;;
         --min-free-gb)    MIN_FREE_GB="${2:-}"; shift 2 ;;
@@ -244,6 +450,37 @@ if [[ ! "$MIN_FREE_GB" =~ ^[0-9]+$ ]]; then
         '{}' "$EXIT_USAGE"
 fi
 
+# --ipsw must name a local file.  The driver's own default is the https URL of
+# board.toml [ipsw] (ipsw.py:88-93) and a URL there is a download over HTTP
+# range requests (ipsw.py:27-74); this script performs no network access, so a
+# URL is a usage error rather than something to silently allow.
+if [[ "$IPSW_PATH" =~ ^https?:// ]]; then
+    die 'network_refused' \
+        "--ipsw must name a local file; '$IPSW_PATH' is a URL and this script performs no network access (PRD 8.1)." \
+        "{\"ipsw\":\"$(json_escape "$IPSW_PATH")\"}" "$EXIT_USAGE"
+fi
+# A declared file input that is not a file is a usage error, refused here rather
+# than discovered by the driver halfway through a build.
+for pair in 'kernelcache:'"$KERNELCACHE_PATH" 'ipsw:'"$IPSW_PATH" 'dtb:'"$DTB_PATH" 'fd:'"$FD_PATH_IN"; do
+    label="${pair%%:*}"
+    value="${pair#*:}"
+    if [[ -n "$value" && ! -f "$value" ]]; then
+        die 'config_invalid' "--$label is not a file: $value" \
+            "{\"$label\":\"$(json_escape "$value")\"}" "$EXIT_USAGE"
+    fi
+done
+if [[ -n "$JOBS" && ! "$JOBS" =~ ^[0-9]+$ ]]; then
+    die 'config_invalid' "--jobs must be an integer (got '$JOBS')." '{}' "$EXIT_USAGE"
+fi
+# The platform seed is a hex value the driver parses with int(value, 16)
+# (cli.py:35, make-qemu-adt.py:67); a non-hex string is refused here rather than
+# by a traceback inside the board tool.
+if [[ -n "$UNIQUE_CHIP_ID" && ! "$UNIQUE_CHIP_ID" =~ ^[0-9a-fA-F]{1,16}$ ]]; then
+    die 'config_invalid' \
+        "--unique-chip-id must be 1-16 hex digits (got '$UNIQUE_CHIP_ID')." \
+        "{\"unique_chip_id\":\"$(json_escape "$UNIQUE_CHIP_ID")\"}" "$EXIT_USAGE"
+fi
+
 # ---------------------------------------------------------------------------
 # repository layout
 # ---------------------------------------------------------------------------
@@ -258,6 +495,26 @@ fi
 if [[ -z "$LOCK_PATH" ]]; then
     LOCK_PATH="$REPO_ROOT/config/sources.lock.json"
 fi
+
+# The pinned checkouts.  A relative override is resolved against the repository
+# root, exactly like --include, so "--unixnu local-private/upstream/UniXNU"
+# works from a checkout that keeps its sources out of vendor/.
+if [[ -z "$UNIXNU_DIR" ]]; then
+    UNIXNU_DIR="$REPO_ROOT/$UNIXNU_DIR_DEFAULT"
+elif [[ "$UNIXNU_DIR" != /* && ! "$UNIXNU_DIR" =~ ^[A-Za-z]:[/\\] ]]; then
+    UNIXNU_DIR="$REPO_ROOT/$UNIXNU_DIR"
+fi
+if [[ -z "$DEVICE_DIR" ]]; then
+    DEVICE_DIR="$REPO_ROOT/$DEVICE_DIR_DEFAULT"
+elif [[ "$DEVICE_DIR" != /* && ! "$DEVICE_DIR" =~ ^[A-Za-z]:[/\\] ]]; then
+    DEVICE_DIR="$REPO_ROOT/$DEVICE_DIR"
+fi
+if [[ -n "$UEFI_DIR" && "$UEFI_DIR" != /* && ! "$UEFI_DIR" =~ ^[A-Za-z]:[/\\] ]]; then
+    UEFI_DIR="$REPO_ROOT/$UEFI_DIR"
+fi
+# Strip a trailing slash so "$DIR/..." never doubles up.
+while [[ "$UNIXNU_DIR" == */ && ${#UNIXNU_DIR} -gt 1 ]]; do UNIXNU_DIR="${UNIXNU_DIR%/}"; done
+while [[ "$DEVICE_DIR" == */ && ${#DEVICE_DIR} -gt 1 ]]; do DEVICE_DIR="${DEVICE_DIR%/}"; done
 
 STAGE_NUMBER="${STAGE#M}"
 if [[ -z "$RUN_ID" ]]; then
@@ -338,6 +595,9 @@ PY
 }
 
 LOCK_FROZEN=''
+#: 1 when the lock's pins are complete but the lock does not declare itself
+#: frozen.  Recorded in the manifest and announced in the log; never a refusal.
+LOCK_UNFROZEN=0
 LOCK_UNIXNU_COMMIT=''
 LOCK_DEVICE_COMMIT=''
 LOCK_QEMU_ACCEL=''
@@ -383,11 +643,31 @@ validate_lock() {
         esac
     done < <(read_lock_fields)
 
+    # `frozen` is a DECLARATION; the pins are the GUARANTEE.  The only thing this
+    # gate exists to prevent is building from a moving branch, and a pin that is
+    # a full 40-hex commit already prevents that -- there is no branch to move.
+    # Refusing an unfrozen-but-fully-pinned lock therefore adds no safety, and it
+    # deadlocked the pipeline it was written to serve:
+    #
+    #   * build-macos.yml's "Validate inputs" step treats frozen=false as a
+    #     WARNING -- "the dispatch inputs are the freeze candidates".
+    #   * the acquisition step then fetches those pinned commits and publishes
+    #     them as step outputs.
+    #   * this gate then treated the same false as a HARD FAILURE, exit 2.
+    #
+    # so the workflow spent macOS minutes on preflight and acquisition and could
+    # never reach a build.  Measured, not theorised:
+    # tests/acceptance/test_build_script_gates.py::
+    # test_the_frozen_gate_does_not_deadlock_the_pipeline.
+    #
+    # What an unfrozen lock still costs the run: it is recorded verbatim in
+    # artifact-manifest.json and announced on every log line below, so no reader
+    # can mistake it for a frozen baseline.  A pin that is NOT a full commit is
+    # still refused, loudly -- that is the check with teeth, and it is the one
+    # that follows.
     if [[ "$LOCK_FROZEN" != 'true' ]]; then
-        die 'config_invalid' \
-            "sources lock is not frozen (frozen=$LOCK_FROZEN). Fill every null with evidence and set frozen=true before building (PRD 8.1)." \
-            "{\"lock\":\"$(json_escape "$LOCK_PATH")\",\"frozen\":\"$(json_escape "$LOCK_FROZEN")\"}" \
-            "$EXIT_USAGE"
+        LOCK_UNFROZEN=1
+        warn "sources lock is not frozen (frozen=$LOCK_FROZEN): the pinned commits are the freeze candidates for this run and are recorded verbatim in the manifest. A missing or short pin is still a refusal."
     fi
 
     if [[ ! "$LOCK_UNIXNU_COMMIT" =~ $COMMIT_PATTERN ]]; then
@@ -508,13 +788,26 @@ check_free_space() {
 # ---------------------------------------------------------------------------
 # step ledger
 # ---------------------------------------------------------------------------
-# Each entry: name|status|reason   (status: ran | not_run | skipped)
+# Each entry: name|status|reason   (status: ran | not_run | skipped | failed)
 LEDGER=()
+
+# Artifacts the build stages actually produced, in the same record shape the
+# manifest writer consumes (see write_manifest).  A stage that produced nothing
+# appends nothing, so the manifest can never carry a hash of a file that is not
+# there.
+BUILT_RECORDS=()
+BUILT_PATHS=()
+BUILT_SHAS=()
+
+# Set when the pinned sources are absent and --skip-sources was given: the
+# stages then stay not_run instead of letting the driver fetch on our behalf.
+SOURCES_INCOMPLETE=0
 
 ledger_add() { LEDGER+=("$1|$2|$3"); }
 
 ledger_json() {
     local first=1 entry name status reason
+    local j_name j_status j_reason
     printf '['
     for entry in ${LEDGER[@]+"${LEDGER[@]}"}; do
         name="${entry%%|*}"
@@ -522,8 +815,67 @@ ledger_json() {
         reason="${entry##*|}"
         (( first )) || printf ','
         first=0
+        json_escape_var j_name   "$name"
+        json_escape_var j_status "$status"
+        json_escape_var j_reason "$reason"
         printf '{"name":"%s","status":"%s","reason":"%s"}' \
-            "$(json_escape "$name")" "$(json_escape "$status")" "$(json_escape "$reason")"
+            "$j_name" "$j_status" "$j_reason"
+    done
+    printf ']'
+}
+
+# ledger_has_not_run -- true when any entry did not run or failed.  A stage
+# result may only report success when this is false.
+ledger_has_not_run() {
+    local entry status
+    for entry in ${LEDGER[@]+"${LEDGER[@]}"}; do
+        status="${entry#*|}"; status="${status%%|*}"
+        case "$status" in
+            not_run|failed) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# ledger_summary -- "ran=N not_run=N failed=N skipped=N", for the console.
+ledger_summary() {
+    local entry status ran=0 not_run=0 failed=0 skipped=0
+    for entry in ${LEDGER[@]+"${LEDGER[@]}"}; do
+        status="${entry#*|}"; status="${status%%|*}"
+        case "$status" in
+            ran)     ran=$(( ran + 1 )) ;;
+            not_run) not_run=$(( not_run + 1 )) ;;
+            failed)  failed=$(( failed + 1 )) ;;
+            skipped) skipped=$(( skipped + 1 )) ;;
+        esac
+    done
+    printf 'ran=%d not_run=%d failed=%d skipped=%d' "$ran" "$not_run" "$failed" "$skipped"
+}
+
+# not_run_reasons_json -- the distinct "name: reason" of every entry that did
+# not run or failed, as a JSON array.  Derived from the ledger rather than
+# hardcoded, so a new refusal shows up here without anyone remembering to.
+not_run_reasons_json() {
+    local first=1 entry name status reason seen=''
+    local j_name j_reason
+    printf '['
+    for entry in ${LEDGER[@]+"${LEDGER[@]}"}; do
+        name="${entry%%|*}"
+        status="${entry#*|}"; status="${status%%|*}"
+        reason="${entry##*|}"
+        case "$status" in
+            not_run|failed) ;;
+            *) continue ;;
+        esac
+        case "$seen" in
+            *"|$name|$reason|"*) continue ;;
+        esac
+        seen+="|$name|$reason|"
+        (( first )) || printf ','
+        first=0
+        json_escape_var j_name   "$name"
+        json_escape_var j_reason "$reason"
+        printf '"%s: %s"' "$j_name" "$j_reason"
     done
     printf ']'
 }
@@ -545,6 +897,529 @@ plan_steps() {
 }
 
 # ---------------------------------------------------------------------------
+# the upstream build driver
+# ---------------------------------------------------------------------------
+# Everything the four build stages run comes out of the pinned UniXNU checkout:
+# its root 'unixnu' script is the entry point (it inserts scripts/ on sys.path
+# and calls unixnu.cli.main) and scripts/unixnu/ holds the steps.  The driver's
+# --out is redirected into this run's own directory: left alone it writes
+# out/ inside the pinned checkout (config.py:64), which would mutate a source
+# tree this script is supposed to only read.
+UNIXNU_OUT="$OUT_DIR/unixnu-out"
+FEEDS_DIR="$UNIXNU_OUT/feeds"
+DRIVER="$UNIXNU_DIR/unixnu"
+BOARD_NAME=''
+DEFCONFIG=''
+BOARD_HAS_FIRMWARE='no'
+ADT_TOOL=''
+
+# read_board_fields -- NAME<TAB>VALUE per line, read from board.toml of the
+# device repository with the interpreter the manifest writer already requires.
+# board.toml is TOML and its comments mention section names, so a grep would
+# match prose; tomllib is the only honest reader.
+read_board_fields() {
+    "$PY" - "$DEVICE_DIR/board.toml" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - the driver itself needs 3.11 (cli.py:204)
+    sys.stderr.write('python 3.11 or newer is required to read board.toml (tomllib)\n')
+    sys.exit(3)
+try:
+    with open(sys.argv[1], 'rb') as handle:
+        board = tomllib.load(handle)
+except FileNotFoundError:
+    board = {}
+except tomllib.TOMLDecodeError as error:
+    sys.stderr.write('board.toml: %s\n' % error)
+    sys.exit(1)
+fields = (
+    ('board_name', board.get('board', {}).get('name', '')),
+    ('defconfig', board.get('kernel', {}).get('defconfig', '')),
+    ('has_firmware', 'yes' if board.get('firmware') else 'no'),
+    ('adt_tool', board.get('payload', {}).get('adt', {}).get('tool', '')),
+)
+for name, value in fields:
+    print('%s\t%s' % (name, '' if value is None else value))
+PY
+}
+
+resolve_board() {
+    [[ -n "$PY" ]] || die 'blocked' 'no Python interpreter to read board.toml.' \
+        '{}' "$EXIT_BLOCKED"
+    local key value
+    while IFS="$(printf '\t')" read -r key value; do
+        value="${value%$'\r'}"
+        case "$key" in
+            board_name)    BOARD_NAME="$value" ;;
+            defconfig)     DEFCONFIG="$value" ;;
+            has_firmware)  BOARD_HAS_FIRMWARE="$value" ;;
+            adt_tool)      ADT_TOOL="$value" ;;
+        esac
+    done < <(read_board_fields)
+    if [[ -z "$BOARD_NAME" ]]; then
+        die 'config_invalid' \
+            "board.toml of $DEVICE_DIR has no [board] name; the driver cannot place its output (config.py:76-78)." \
+            "{\"device\":\"$(json_escape "$DEVICE_DIR")\"}" "$EXIT_USAGE"
+    fi
+    log "driver:  $DRIVER"
+    log "device:  $DEVICE_DIR (board $BOARD_NAME)"
+    log "out:     $UNIXNU_OUT"
+}
+
+# Where the driver puts a step's output.  ctx.work is out/<board name> and
+# ctx.tree is out/<board name>/tree (config.py:80-82), so these are the paths
+# kernel.prelink, package.build and tree.assemble write to.
+work_dir()  { printf '%s' "$UNIXNU_OUT/$BOARD_NAME"; }
+tree_dir()  { printf '%s' "$UNIXNU_OUT/$BOARD_NAME/tree"; }
+logs_dir()  { printf '%s' "$UNIXNU_OUT/$BOARD_NAME/logs"; }
+
+head_of() { # head_of DIR -> the commit DIR sits on, or nothing
+    local out
+    if out="$(git -C "$1" rev-parse HEAD 2>/dev/null)"; then
+        printf '%s' "${out%$'\r'}"
+    else
+        printf ''
+    fi
+}
+
+# lock_entries -- 'submodule<TAB>path<TAB>commit' and 'feed<TAB>name<TAB>commit'
+# for every source the lock file pins.  The lock, not the repositories, is the
+# authority (PRD 8.1).
+lock_entries() {
+    "$PY" - "$LOCK_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    root = json.load(handle)
+for entry in root.get('submodules') or []:
+    print('submodule\t%s\t%s' % (entry.get('path') or '', entry.get('commit') or ''))
+for entry in root.get('feeds') or []:
+    print('feed\t%s\t%s' % (entry.get('name') or '', entry.get('commit') or ''))
+PY
+}
+
+# offline_missing -- 'kind<TAB>name' for every pinned source the driver would
+# have to fetch.  prepare() fetches any git feed whose clone is absent or at the
+# wrong commit (cli.py:79-86, feeds.py:173-216) and initialises module
+# submodules (feeds.py:159-165); both reach the network, so this script proves
+# they are already on disk at the pinned commit before it runs anything.
+# Measured on this host: without this guard `unixnu build kernel` reaches
+# `git fetch https://github.com/apple-oss-distributions/xnu.git` and fails.
+offline_missing() {
+    local kind name commit dir found
+    while IFS="$(printf '\t')" read -r kind name commit; do
+        # A Windows interpreter writes CRLF on a pipe, so the last field of
+        # every line arrives with a trailing \r.  validate_lock() strips it for
+        # the same reason (see the comment there); without the strip here the
+        # pinned commit never equals the one git reports and EVERY source reads
+        # as absent -- measured: a feed clone sitting on disk at exactly the
+        # locked commit was still reported as "the driver would have to fetch".
+        name="${name%$'\r'}"
+        commit="${commit%$'\r'}"
+        [[ -n "$commit" ]] || continue
+        found=0
+        case "$kind" in
+            submodule)
+                for dir in "$UNIXNU_DIR/$name" "$DEVICE_DIR/$name"; do
+                    if [[ -d "$dir" && "$(head_of "$dir")" == "$commit" ]]; then
+                        found=1
+                        break
+                    fi
+                done
+                ;;
+            feed)
+                for dir in "$FEEDS_DIR"/*; do
+                    if [[ -d "$dir" && "$(head_of "$dir")" == "$commit" ]]; then
+                        found=1
+                        break
+                    fi
+                done
+                ;;
+        esac
+        if (( found == 0 )); then
+            printf '%s\t%s\n' "$kind" "$name"
+        fi
+    done < <(lock_entries)
+}
+
+# apple_step_gate NAME REQUIREMENT...
+# Returns 0 when the stage may run.  Otherwise records NAME as not_run with
+# every reason found at once -- the host and the missing tools together, so the
+# ledger never has to be read twice to learn why a stage did not run -- and
+# returns 1.  A requirement that looks like a path is checked as a directory
+# (the Homebrew LLVM keg), anything else with command -v.
+apple_step_gate() {
+    local name="$1"; shift
+    local host requirement reason
+    host="$(uname -s 2>/dev/null || printf '%s' 'unknown')"
+    local -a missing=()
+    for requirement in "$@"; do
+        case "$requirement" in
+            /*) if [[ ! -d "$requirement" ]]; then missing+=("$requirement"); fi ;;
+            *)  if ! command -v "$requirement" >/dev/null 2>&1; then
+                    missing+=("$requirement")
+                fi ;;
+        esac
+    done
+    if [[ "$host" == 'Darwin' ]] && (( ${#missing[@]} == 0 )); then
+        return 0
+    fi
+    reason=''
+    if [[ "$host" != 'Darwin' ]]; then
+        reason="host is $host and the Apple toolchain exists on macOS only (PRD 8.1)"
+    fi
+    if (( ${#missing[@]} > 0 )); then
+        if [[ -n "$reason" ]]; then reason+='; '; fi
+        reason+="missing: ${missing[*]}"
+    fi
+    ledger_add "$name" 'not_run' "$reason"
+    return 1
+}
+
+# log_keg -- report which Homebrew LLVM keg, if any, is on disk.
+# Informational only.  See the HOMEBREW_LLVM_DIRS comment: util.tool() finds keg
+# tools without the keg being on PATH, so an absent keg is something the driver
+# reports precisely ("llvm-lib not found on PATH (brew install llvm lld)"), not
+# something this script refuses up front.
+log_keg() {
+    local keg found=''
+    for keg in "${HOMEBREW_LLVM_DIRS[@]}"; do
+        if [[ -d "$keg" ]]; then found="$keg"; break; fi
+    done
+    if [[ -n "$found" ]]; then
+        log "llvm keg: $found (util.tool() also finds keg-only tools when it is not on PATH)"
+    else
+        log "llvm keg: none of ${HOMEBREW_LLVM_DIRS[*]} on disk; the driver looks there and names what it cannot find"
+    fi
+}
+
+# run_driver STEP SUBCOMMAND ARGS...
+# Echoes the command, runs it with its output in OUT_DIR/<step>.driver.log, and
+# returns the driver's exit status.  A nonzero status is a stage failure and is
+# recorded as one; it is never folded into "ran".
+run_driver() {
+    local step="$1"; shift
+    local sub="$1"; shift
+    local -a cmd=("$PY" "$DRIVER" "$sub" -D "$DEVICE_DIR" --out "$UNIXNU_OUT" -j "$JOBS" "$@")
+    local log_file="$OUT_DIR/${step}.driver.log"
+    log "+ ${cmd[*]}"
+    if "${cmd[@]}" 2>&1 | tee "$log_file"; then
+        return 0
+    fi
+    return 1
+}
+
+# shown_path PATH -- how the manifest records PATH.
+# A path inside this run's output directory is recorded relative to it, so the
+# manifest is portable; anything else keeps the path it was given.  One helper,
+# used by both the built artifacts and the declared ones, so the two cannot
+# disagree about what a path means.
+shown_path() {
+    local path="$1"
+    case "$path" in
+        "$OUT_DIR"/*) printf '%s' "${path#"$OUT_DIR"/}" ;;
+        *)            printf '%s' "$path" ;;
+    esac
+}
+
+# record_artifact PATH ROLE [ARCH]
+# One manifest record for a file a stage actually produced.  A stage that
+# produced nothing records nothing: the manifest never carries a hash of a file
+# that is not there.
+record_artifact() {
+    local path="$1" role="$2" arch="${3:-aarch64}" sha size leaf
+    if [[ ! -f "$path" ]]; then
+        die 'evidence_incomplete' \
+            "a stage reported $path but the file does not exist." \
+            "{\"path\":\"$(json_escape "$path")\"}" "$EXIT_FAILURE"
+    fi
+    sha="$(sha256_of "$path")"
+    if [[ ! "$sha" =~ $SHA256_PATTERN ]]; then
+        die 'verification_failed' "could not compute the SHA-256 of $path." \
+            "{\"path\":\"$(json_escape "$path")\"}" "$EXIT_FAILURE"
+    fi
+    size="$(wc -c <"$path" | tr -d ' ')"
+    leaf="$(basename -- "$path")"
+    local shown
+    shown="$(shown_path "$path")"
+    BUILT_RECORDS+=("${leaf}${FIELD_SEP}${sha}${FIELD_SEP}${size}${FIELD_SEP}${role}${FIELD_SEP}${arch}${FIELD_SEP}${shown}")
+    BUILT_PATHS+=("$path")
+    BUILT_SHAS+=("$sha")
+    log "artifact: $leaf sha256=$sha bytes=$size role=$role arch=$arch path=$shown"
+    BUILT_NAMES+=("$leaf")
+}
+
+# ---------------------------------------------------------------------------
+# the four build stages
+# ---------------------------------------------------------------------------
+# Each one: (1) refuses a declared input that is absent, with a code, before
+# anything runs; (2) records not_run with the exact reason when the host, a
+# tool or an input this script will not go and get is missing; (3) runs the
+# upstream driver with the arguments its own code expects; (4) records the
+# artifact it produced and its sha256.
+
+# build-kernel -- 'unixnu defconfig <name>' then 'unixnu build kernel'.
+#   cli.py:89-101  cmd_defconfig copies configs/<name> to out/<device>/.config
+#   cli.py:123-129 cmd_build runs kernel.build() then kernel.prelink()
+#   kernel.py:71-102 kernel.build(): git, make, clang, cmake, ninja, unifdef and
+#                  xcodebuild, then scripts/build-xnu-4k-baseline.sh
+#   kernel.py:105-137 kernel.prelink(): out/<device>/kernel/kernel.macho, and it
+#                  logs the sha256 of what it wrote
+step_build_kernel() {
+    local name='build-kernel'
+
+    # (1) inputs.  The defconfig is named by board.toml [kernel] and must exist
+    # in the device repository; the driver refuses a build without it
+    # (cli.py:123-124, config.py:105-108).
+    if [[ -z "$DEFCONFIG" ]]; then
+        die 'config_invalid' \
+            "board.toml of $DEVICE_DIR has no [kernel] defconfig." \
+            "{\"device\":\"$(json_escape "$DEVICE_DIR")\"}" "$EXIT_USAGE"
+    fi
+    if [[ ! -f "$DEVICE_DIR/configs/$DEFCONFIG" ]]; then
+        die 'artifact_missing' \
+            "defconfig not found: $DEVICE_DIR/configs/$DEFCONFIG" \
+            "{\"defconfig\":\"$(json_escape "$DEFCONFIG")\",\"expected\":\"$(json_escape "$DEVICE_DIR/configs/$DEFCONFIG")\"}" \
+            "$EXIT_FAILURE"
+    fi
+    # kernel.prelink() takes the original kernelcache from --kernelcache, from
+    # board.toml [kernel.prelink] kernelcache, or out of the IPSW
+    # (kernel.py:111-114).  This board names no kernelcache file and its
+    # [ipsw] default is an https URL, so without a local input the step would
+    # have to download one.  It records not_run instead.
+    if [[ -z "$KERNELCACHE_PATH" && -z "$IPSW_PATH" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the prelink step needs the original kernelcache: pass --kernelcache FILE or --ipsw FILE (board.toml [ipsw] url is https and this script performs no network access, PRD 8.1)'
+        return 0
+    fi
+
+    # (2) host and tools, exactly the list kernel.py:73-75 checks.
+    local -a need=('git' 'make' 'clang' 'cmake' 'ninja' 'unifdef' 'xcodebuild')
+    log_keg
+    apple_step_gate "$name" "${need[@]}" || return 0
+
+    # (3) run.  The defconfig first, because build kernel refuses without it.
+    local -a extra=()
+    if [[ -n "$KERNELCACHE_PATH" ]]; then extra+=(--kernelcache "$KERNELCACHE_PATH"); fi
+    if [[ -n "$IPSW_PATH" ]]; then extra+=(--ipsw "$IPSW_PATH"); fi
+    if ! run_driver "$name" 'defconfig' "$DEFCONFIG" ${extra[@]+"${extra[@]}"}; then
+        ledger_add "$name" 'failed' "unixnu defconfig $DEFCONFIG failed; see $OUT_DIR/${name}.driver.log"
+        return 1
+    fi
+    if ! run_driver "$name" 'build' 'kernel' ${extra[@]+"${extra[@]}"}; then
+        ledger_add "$name" 'failed' "unixnu build kernel failed; see $OUT_DIR/${name}.driver.log"
+        return 1
+    fi
+
+    # (4) the artifact prelink writes, and the sha256 it logged.
+    local macho
+    macho="$(work_dir)/kernel/kernel.macho"
+    record_artifact "$macho" 'kernel' 'aarch64'
+    ledger_add "$name" 'ran' \
+        "unixnu build kernel; $(logs_dir)/prelink.log carries the sha256 prelink logged"
+    return 0
+}
+
+# build-bootloader -- 'unixnu build package', then the device repository's own
+# DarwinBoot builder.
+#   cli.py:133-134  cmd_build runs package.build() for the package step
+#   package.py:21-31 package.build(): the EDK II build of package/ under
+#                  out/<device>/package, which also leaves the CLANGPDB tool
+#                  links under out/<device>/toolchain
+#   board.toml:85-86 of the pinned device repository: "No [firmware]: QEMU runs
+#                  its own EDK II AARCH64 firmware, which has no DarwinBoot", so
+#                  the bootloader is built by the device repository's
+#                  scripts/build-darwinboot-efi.py, which run-qemu.py:83-96
+#                  calls before it boots anything.
+step_build_bootloader() {
+    local name='build-bootloader'
+
+    if [[ ! -f "$DRIVER" ]]; then
+        die 'artifact_missing' "the build driver is missing: $DRIVER" \
+            "{\"driver\":\"$(json_escape "$DRIVER")\"}" "$EXIT_FAILURE"
+    fi
+
+    # (2) host and tools.  package.py:24 checks clang; the EDK II build of the
+    # device's DarwinBoot additionally needs python3 and make, and the driver's
+    # own prepare() needs git.
+    local -a need=('git' 'clang' 'make' 'python3')
+    log_keg
+    apple_step_gate "$name" "${need[@]}" || return 0
+
+    # (3) the package first: it assembles the build tree (tree.py:40-76) and
+    # leaves the CLANGPDB tool links build-darwinboot-efi.py requires.
+    if ! run_driver "$name" 'build' 'package'; then
+        ledger_add "$name" 'failed' "unixnu build package failed; see $OUT_DIR/${name}.driver.log"
+        return 1
+    fi
+    local script
+    script="$(tree_dir)/scripts/build-darwinboot-efi.py"
+    if [[ ! -f "$script" ]]; then
+        die 'artifact_missing' \
+            "the device repository's DarwinBoot builder is not in the build tree: $script" \
+            "{\"script\":\"$(json_escape "$script")\"}" "$EXIT_FAILURE"
+    fi
+    log "+ $PY $script"
+    if ! "$PY" "$script" >"$OUT_DIR/${name}.darwinboot.log" 2>&1; then
+        ledger_add "$name" 'failed' \
+            "build-darwinboot-efi.py failed; see $OUT_DIR/${name}.darwinboot.log"
+        return 1
+    fi
+    tail -n 3 "$OUT_DIR/${name}.darwinboot.log" >&2 || true
+
+    # (4) the driver image the payload loads (board.toml [payload] loader).
+    record_artifact "$(tree_dir)/build/darwinboot-efi/DarwinBoot.efi" 'bootloader' 'aarch64'
+    ledger_add "$name" 'ran' \
+        'unixnu build package + build-darwinboot-efi.py (this board declares no [firmware], board.toml:85-86)'
+    return 0
+}
+
+# build-devicetree -- the board's own device tree out of the pinned IPSW, then
+# the Apple-format tree this machine boots with.
+#   cli.py:156-171  cmd_ipsw extracts a component and checks it against
+#                   board.toml [ipsw.sha256] (ipsw.py:140-171)
+#   board.toml [payload.adt] tool = scripts/make-qemu-adt.py, which the payload
+#                   step runs (payload.py:149-171)
+step_build_devicetree() {
+    local name='build-devicetree'
+
+    # (1) the IPSW must be local; the driver's default is the https URL of
+    # board.toml [ipsw] (ipsw.py:88-93).
+    if [[ -z "$IPSW_PATH" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the device tree comes out of the pinned IPSW: pass --ipsw FILE (the default of board.toml [ipsw] is an https URL and this script performs no network access, PRD 8.1)'
+        return 0
+    fi
+
+    # (2) host and tools.  ipsw.kernelcache() is not on this path, but the
+    # extraction is the driver's own code and needs the interpreter and git.
+    local -a need=('git' 'python3')
+    apple_step_gate "$name" "${need[@]}" || return 0
+
+    # (3) the board's original device tree, extracted and checked against the
+    # board's own pin.  Measured on this host with the local IPSW: it works, so
+    # this is the one sub-step that is genuinely exercisable off macOS.
+    if ! run_driver "$name" 'ipsw' 'fetch' 'DeviceTree' --ipsw "$IPSW_PATH"; then
+        ledger_add "$name" 'failed' \
+            "unixnu ipsw fetch DeviceTree failed; see $OUT_DIR/${name}.driver.log"
+        return 1
+    fi
+    # The driver prints the path it extracted as its last line (ipsw.py:171);
+    # that is the driver's own answer, so it is used rather than re-derived from
+    # the IPSW's member naming.
+    local extracted
+    extracted="$(tail -n 1 "$OUT_DIR/${name}.driver.log" 2>/dev/null | tr -d '\r')"
+    if [[ ! -f "$extracted" ]]; then
+        ledger_add "$name" 'failed' \
+            "unixnu ipsw fetch DeviceTree printed no extractable path (last line: ${extracted:-<empty>})"
+        return 1
+    fi
+    record_artifact "$extracted" 'devicetree' 'aarch64'
+    ledger_add "$name" 'ran' \
+        'unixnu ipsw fetch DeviceTree, checked against board.toml [ipsw.sha256] (ipsw.py:161-163)'
+
+    # (3b) the Apple-format tree the payload actually boots with.  Its own
+    # ledger entry, because it has its own fate: it cannot be produced by this
+    # script for two independent reasons, and both are recorded rather than
+    # worked around.
+    local adt_name='build-devicetree/adt'
+    if [[ -z "$ADT_TOOL" ]]; then
+        ledger_add "$adt_name" 'not_run' \
+            "board.toml of $DEVICE_DIR declares no [payload.adt] tool, so the Apple-format device tree is not produced for this board"
+        return 0
+    fi
+    if [[ -z "$UNIQUE_CHIP_ID" ]]; then
+        ledger_add "$adt_name" 'not_run' \
+            'the Apple-format device tree needs the platform seed: pass --unique-chip-id HEX (it is not stored in any repository, board.toml [payload.adt] unique_chip_id = "required")'
+        return 0
+    fi
+    if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
+        # Not a missing tool to install: QEMU is a native Windows build
+        # (config/sources.lock.json tools.qemu.build) and is deliberately not a
+        # macOS build input, so this step refuses rather than depend on it.
+        ledger_add "$adt_name" 'not_run' \
+            'the Apple-format device tree is generated by a script that shells out to qemu-system-aarch64 (make-qemu-adt.py:96-97); QEMU is a native Windows build and is not a macOS build input (PRD 8.1)'
+        return 0
+    fi
+    local adt
+    adt="$(work_dir)/kernel/kernel.macho.adt"
+    log "+ $PY $(tree_dir)/$ADT_TOOL --output $adt --unique-chip-id $UNIQUE_CHIP_ID"
+    if ! "$PY" "$(tree_dir)/$ADT_TOOL" --output "$adt" --unique-chip-id "$UNIQUE_CHIP_ID" \
+            >"$OUT_DIR/${adt_name//\//-}.adt.log" 2>&1; then
+        ledger_add "$adt_name" 'failed' "make-qemu-adt.py failed; see $OUT_DIR/${adt_name//\//-}.adt.log"
+        return 1
+    fi
+    record_artifact "$adt" 'devicetree' 'aarch64'
+    ledger_add "$adt_name" 'ran' "$ADT_TOOL"
+    return 0
+}
+
+# assemble-image -- 'unixnu bootimg'.
+#   cli.py:142-153  cmd_bootimg: need_uefi() first (cli.py:67-73), then the
+#                   firmware volume, the device tree and the optional ramdisk
+#   bootimg.py:71-114 bootimg.build(): gzip(BootShim + firmware volume) with the
+#                   device tree appended, then unpacked again and compared
+step_assemble_image() {
+    local name='assemble-image'
+
+    # (1) the inputs, refused with a code before anything runs.  need_uefi()
+    # requires a Mu-Silicium checkout carrying Resources/Scripts/mkbootimg.py
+    # (cli.py:67-73) and fd_path() reads board.toml [firmware] fd
+    # (firmware.py:17-19).
+    if [[ "$BOARD_HAS_FIRMWARE" != 'yes' ]]; then
+        ledger_add "$name" 'not_run' \
+            "board.toml of $DEVICE_DIR declares no [firmware], so there is no firmware volume to pack: measured on this host, 'unixnu bootimg --uefi DIR' on this board dies with KeyError: 'firmware' at firmware.py:18 (QEMU runs its own EDK II AARCH64 firmware, board.toml:85-86)"
+        return 0
+    fi
+    if [[ -z "$UEFI_DIR" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the boot image is packed from a Mu-Silicium checkout: pass --uefi DIR (cli.py:67-73 need_uefi)'
+        return 0
+    fi
+    if [[ ! -f "$UEFI_DIR/Resources/Scripts/mkbootimg.py" ]]; then
+        die 'config_invalid' \
+            "$UEFI_DIR is not a Mu-Silicium checkout (no Resources/Scripts/mkbootimg.py)." \
+            "{\"uefi\":\"$(json_escape "$UEFI_DIR")\"}" "$EXIT_USAGE"
+    fi
+    if [[ -z "$DTB_PATH" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the boot image needs a compiled device tree: pass --dtb FILE (or UNIXNU_DTB); bootimg.build() refuses a missing one (bootimg.py:77-79)'
+        return 0
+    fi
+    if [[ -z "$FD_PATH_IN" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the boot image needs a firmware volume: pass --fd FILE, or run the firmware step that produces board.toml [firmware] fd'
+        return 0
+    fi
+    local fd="$FD_PATH_IN"
+
+    # (2) host and tools.  bootimg.py:24 compiles the shim with clang,
+    # llvm-objcopy and llvm-nm; bootimg.py:46 patches the tree with fdtput and
+    # fdtget.
+    local -a need=('clang' 'llvm-objcopy' 'llvm-nm' 'fdtput' 'fdtget' 'python3')
+    log_keg
+    apple_step_gate "$name" "${need[@]}" || return 0
+
+    # (3) run.  The output is out/<device>/boot/boot.img unless -o says
+    # otherwise (bootimg.py:85).
+    local out
+    out="$(work_dir)/boot/boot.img"
+    if ! run_driver "$name" 'bootimg' --uefi "$UEFI_DIR" --fd "$fd" --dtb "$DTB_PATH" \
+            -o "$out"; then
+        ledger_add "$name" 'failed' "unixnu bootimg failed; see $OUT_DIR/${name}.driver.log"
+        return 1
+    fi
+
+    # (4) bootimg.build() writes boot.json next to the image with the sha256 of
+    # every part (bootimg.py:110-112); the image itself is the artifact.
+    record_artifact "$out" 'firmware' 'aarch64'
+    ledger_add "$name" 'ran' "unixnu bootimg; $(dirname -- "$out")/boot.json records the per-part hashes"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 main() {
@@ -558,7 +1433,14 @@ main() {
     if (( DRY_RUN )); then log 'mode:      dry-run (nothing written, nothing built)'; fi
 
     validate_lock
-    log "lock: frozen=true unixnu=$LOCK_UNIXNU_COMMIT device_repo=$LOCK_DEVICE_COMMIT"
+    # The frozen state is the lock's own, never a literal.  This line used to
+    # read `frozen=true` unconditionally, so an unfrozen run's log claimed the
+    # opposite of what its own manifest recorded -- the one place an operator
+    # would look to find out which baseline was built.
+    log "lock: frozen=$LOCK_FROZEN unixnu=$LOCK_UNIXNU_COMMIT device_repo=$LOCK_DEVICE_COMMIT"
+    if (( LOCK_UNFROZEN )); then
+        log 'lock: NOT FROZEN -- the pinned commits above are this run'"'"'s freeze candidates, recorded verbatim in artifact-manifest.json'
+    fi
     log "lock: qemu accel=$LOCK_QEMU_ACCEL ipsw.sha256=${LOCK_IPSW_SHA256:-<empty>}"
 
     require_tools
@@ -566,6 +1448,15 @@ main() {
     log "tools: $TOOL_CLANG"
     log "tools: $TOOL_PYTHON"
     log "tools: $TOOL_GIT"
+
+    # Parallel jobs for the driver (cli.py:19, config.py:86).  Counted with the
+    # interpreter this script already requires, because nproc is not on macOS.
+    if [[ -z "$JOBS" ]]; then
+        JOBS="$("$PY" -c 'import os; print(os.cpu_count() or 4)' 2>/dev/null || printf '4')"
+    fi
+    if [[ ! "$JOBS" =~ ^[0-9]+$ ]] || (( JOBS < 1 )); then
+        die 'config_invalid' "jobs must be a positive integer (got '$JOBS')." '{}' "$EXIT_USAGE"
+    fi
 
     detect_sha
 
@@ -647,6 +1538,7 @@ main() {
 
     # --- run the plan ------------------------------------------------------
     local sources_present=0
+    local stage_failed=0
     for (( idx = 0; idx < ${#steps[@]}; idx++ )); do
         s="${steps[$idx]}"
         case "$s" in
@@ -658,20 +1550,20 @@ main() {
                 # No network access, ever.  The pinned checkouts are verified
                 # locally; an absent one is a missing input unless the caller
                 # explicitly opts out.
-                local vendor_dir
-                for vendor_dir in "$REPO_ROOT/vendor/UniXNU" "$REPO_ROOT/vendor/UniXNU-qemu"; do
-                    if [[ -d "$vendor_dir/.git" ]]; then
-                        log "source present: $vendor_dir"
+                local checkout
+                for checkout in "$UNIXNU_DIR" "$DEVICE_DIR"; do
+                    if [[ -d "$checkout/.git" ]]; then
+                        log "source present: $checkout"
                         sources_present=1
                     else
-                        log "source absent:  $vendor_dir"
+                        log "source absent:  $checkout"
                     fi
                 done
                 if (( sources_present == 0 )) && (( SKIP_SOURCES == 0 )); then
                     ledger_add "$s" 'not_run' 'pinned source checkout absent'
                     emit_error 'artifact_missing' \
-                        'no pinned source checkout found under vendor/; nothing was fetched (no network access by policy).' \
-                        "{\"expected\":[\"vendor/UniXNU\",\"vendor/UniXNU-qemu\"],\"hint\":\"pass --skip-sources to validate the contract only\"}"
+                        'no pinned source checkout found; nothing was fetched (no network access by policy).' \
+                        "{\"expected\":[\"$(json_escape "$UNIXNU_DIR")\",\"$(json_escape "$DEVICE_DIR")\"],\"hint\":\"pass --unixnu/--device to point at the checkouts, or --skip-sources to validate the contract only\"}"
                     write_outputs 0 0
                     exit "$EXIT_FAILURE"
                 fi
@@ -679,29 +1571,114 @@ main() {
                     log 'note: --skip-sources given; build steps will stay not_run.'
                     ledger_add "$s" 'not_run' 'pinned source checkout absent (--skip-sources)'
                 else
-                    ledger_add "$s" 'ran' 'pinned source checkouts verified locally'
+                    # The driver fetches whatever its feeds root is missing and
+                    # initialises module submodules (cli.py:79-86), so prove
+                    # both are already on disk at the pinned commit first.
+                    resolve_board
+                    local -a missing=()
+                    local line
+                    while IFS="$(printf '\t')" read -r kind name; do
+                        missing+=("$kind:$name")
+                    done < <(offline_missing)
+                    if (( ${#missing[@]} > 0 )); then
+                        log "sources the driver would have to fetch: ${missing[*]}"
+                        if (( SKIP_SOURCES == 0 )); then
+                            ledger_add "$s" 'not_run' \
+                                "pinned sources are not on disk at the locked commits: ${missing[*]}"
+                            emit_error 'artifact_missing' \
+                                "pinned sources are missing and this script performs no network access, so the upstream driver cannot be allowed to fetch them: ${missing[*]}" \
+                                "{\"missing\":$(json_string_array ${missing[@]+"${missing[@]}"}),\"hint\":\"restore the pinned sources, or pass --skip-sources to validate the contract only\"}"
+                            write_outputs 0 0
+                            exit "$EXIT_FAILURE"
+                        fi
+                        log 'note: --skip-sources given; build steps will stay not_run.'
+                        ledger_add "$s" 'not_run' \
+                            "pinned sources absent, the driver would fetch them and this script performs no network access (--skip-sources): ${missing[*]}"
+                        SOURCES_INCOMPLETE=1
+                    else
+                        ledger_add "$s" 'ran' \
+                            'pinned repositories, module submodules and feed clones verified locally at the locked commits; nothing was fetched'
+                    fi
                 fi
                 ;;
-            build-kernel|build-bootloader|build-devicetree|assemble-image)
+            build-kernel)
                 step "$s"
-                log 'TODO(macos-verified-only): the Apple toolchain invocation for this'
-                log 'step can only be written and verified on a real macOS runner.'
-                log 'Nothing was built and no artifact was produced here.'
-                ledger_add "$s" 'not_run' 'TODO(macos-verified-only)'
+                if (( SOURCES_INCOMPLETE )); then
+                    ledger_add "$s" 'not_run' 'pinned sources absent (--skip-sources); the driver would have to fetch them'
+                elif step_build_kernel; then
+                    :
+                else
+                    stage_failed=1
+                fi
+                ;;
+            build-bootloader)
+                step "$s"
+                if (( SOURCES_INCOMPLETE )); then
+                    ledger_add "$s" 'not_run' 'pinned sources absent (--skip-sources); the driver would have to fetch them'
+                elif step_build_bootloader; then
+                    :
+                else
+                    stage_failed=1
+                fi
+                ;;
+            build-devicetree)
+                step "$s"
+                if (( SOURCES_INCOMPLETE )); then
+                    ledger_add "$s" 'not_run' 'pinned sources absent (--skip-sources); the driver would have to fetch them'
+                elif step_build_devicetree; then
+                    :
+                else
+                    stage_failed=1
+                fi
+                ;;
+            assemble-image)
+                step "$s"
+                if (( SOURCES_INCOMPLETE )); then
+                    ledger_add "$s" 'not_run' 'pinned sources absent (--skip-sources); the driver would have to fetch them'
+                elif step_assemble_image; then
+                    :
+                else
+                    stage_failed=1
+                fi
                 ;;
             verify-artifacts)
                 step 'verify-artifacts'
-                if (( ${#inc_paths[@]} == 0 )); then
-                    log 'no declared deliverables; the manifest will list only'
-                    log 'the metadata files this script itself writes.'
+                if (( ${#inc_paths[@]} == 0 )) && (( ${#BUILT_RECORDS[@]} == 0 )); then
+                    log 'no declared deliverables and nothing built; the manifest will'
+                    log 'list only the metadata files this script itself writes.'
                 fi
-                ledger_add "$s" 'ran' 'declared deliverables checked for existence'
+                # Re-hash every artifact the manifest is about to carry, so a
+                # hash a stage recorded is checked again before it is published.
+                # A mismatch here is a verification failure, not a warning.
+                local i again
+                for (( i = 0; i < ${#BUILT_PATHS[@]}; i++ )); do
+                    again="$(sha256_of "${BUILT_PATHS[$i]}")"
+                    if [[ "$again" != "${BUILT_SHAS[$i]}" ]]; then
+                        die 'verification_failed' \
+                            "${BUILT_PATHS[$i]} changed between the stage that built it and verification." \
+                            "{\"path\":\"$(json_escape "${BUILT_PATHS[$i]}")\",\"recorded\":\"${BUILT_SHAS[$i]}\",\"now\":\"$again\"}" \
+                            "$EXIT_FAILURE"
+                    fi
+                done
+                ledger_add "$s" 'ran' \
+                    "every artifact the manifest carries was re-hashed (${#inc_paths[@]} declared, ${#BUILT_RECORDS[@]} built)"
                 ;;
             write-manifest)
                 step 'write-manifest'
                 ledger_add "$s" 'ran' 'artifact-manifest.json written'
                 ;;
         esac
+        # A stage that failed stops the plan: the next stage's inputs come out
+        # of it.  The outputs are still written, so the evidence of what did and
+        # did not happen is on disk.
+        if (( stage_failed )); then
+            log "stage $s failed; the remaining stages are not_run."
+            local rest
+            for (( rest = idx + 1; rest < ${#steps[@]}; rest++ )); do
+                ledger_add "${steps[$rest]}" 'not_run' "an earlier stage failed: $s"
+            done
+            break
+        fi
     done
 
     # "$sources_present" and not a literal 1: with --skip-sources the ledger
@@ -714,8 +1691,16 @@ main() {
     log "log:     $LOG_PATH"
     log "report:  $REPORT_PATH"
     log "manifest:$MANIFEST_PATH"
-    log 'NOTE: this is a stubbed build.  No firmware, bootloader, kernel or'
-    log '      device tree was produced.  Do not treat it as a build result.'
+    log "stages:  $(ledger_summary)"
+    if (( stage_failed )); then
+        log 'A stage FAILED.  Nothing here may be read as a build result.'
+        exit "$EXIT_FAILURE"
+    fi
+    if ledger_has_not_run; then
+        log 'NOTE: not every stage ran.  A stage that did not run is recorded'
+        log '      not_run with its reason in build-report.json; missing evidence'
+        log '      is unverified, never success (PRD 7.4).'
+    fi
 
     exit "$EXIT_OK"
 }
@@ -729,7 +1714,9 @@ write_outputs() {
 
     # --- artifact entries --------------------------------------------------
     # Declared deliverables are hashed here, one record per file, so the
-    # manifest writer only has to serialise them.
+    # manifest writer only has to serialise them.  Artifacts the build stages
+    # produced were hashed where they were produced (record_artifact) and are
+    # appended after them, so one manifest carries both.
     local -a records=()
     for (( i = 0; i < ${#inc_paths[@]}; i++ )); do
         sha="$(sha256_of "${inc_paths[$i]}")"
@@ -740,55 +1727,112 @@ write_outputs() {
         fi
         size="$(wc -c <"${inc_paths[$i]}" | tr -d ' ')"
         leaf="$(basename -- "${inc_paths[$i]}")"
-        records+=("${leaf}${FIELD_SEP}${sha}${FIELD_SEP}${size}${FIELD_SEP}${inc_roles[$i]}${FIELD_SEP}${inc_archs[$i]}${FIELD_SEP}${leaf}")
+        # The path is recorded the same way record_artifact records a built one:
+        # relative to this run's output directory when it is inside it, and the
+        # path as given otherwise.  Recording only the leaf -- which is what this
+        # line did -- made two declared inputs with the same basename
+        # indistinguishable and left a consumer with a path that locates nothing.
+        records+=("${leaf}${FIELD_SEP}${sha}${FIELD_SEP}${size}${FIELD_SEP}${inc_roles[$i]}${FIELD_SEP}${inc_archs[$i]}${FIELD_SEP}$(shown_path "${inc_paths[$i]}")")
         log "artifact: $leaf sha256=$sha bytes=$size role=${inc_roles[$i]} arch=${inc_archs[$i]}"
+    done
+    local rec
+    for rec in ${BUILT_RECORDS[@]+"${BUILT_RECORDS[@]}"}; do
+        records+=("$rec")
     done
 
     # --- build-report.json -------------------------------------------------
+    # Every escaped value goes through json_escape_var into a local first.  The
+    # printing form costs a subshell per call and there are two dozen here; on a
+    # host where a fork is ~0.85 s that dominated the run.
+    local j_run_id j_stage j_experiment j_target j_generated j_driver j_device
+    local j_driver_out j_lock_path j_lock_unixnu j_lock_device j_lock_accel
+    local j_xcode j_clang j_python j_git
+    json_escape_var j_run_id      "$RUN_ID"
+    json_escape_var j_stage       "$STAGE"
+    json_escape_var j_experiment  "$EXPERIMENT"
+    json_escape_var j_target      "$TARGET"
+    json_escape_var j_driver      "$DRIVER"
+    json_escape_var j_device      "$DEVICE_DIR"
+    json_escape_var j_driver_out  "$UNIXNU_OUT"
+    json_escape_var j_lock_path   "$LOCK_PATH"
+    json_escape_var j_lock_unixnu "$LOCK_UNIXNU_COMMIT"
+    json_escape_var j_lock_device "$LOCK_DEVICE_COMMIT"
+    json_escape_var j_lock_accel  "$LOCK_QEMU_ACCEL"
+    json_escape_var j_xcode       "$TOOL_XCODEBUILD"
+    json_escape_var j_clang       "$TOOL_CLANG"
+    json_escape_var j_python      "$TOOL_PYTHON"
+    json_escape_var j_git         "$TOOL_GIT"
+    stamp_var j_generated
     {
         printf '{\n'
         printf '  "command": "build-macos",\n'
-        printf '  "run_id": "%s",\n'        "$(json_escape "$RUN_ID")"
-        printf '  "stage": "%s",\n'         "$(json_escape "$STAGE")"
-        printf '  "experiment": "%s",\n'    "$(json_escape "$EXPERIMENT")"
-        printf '  "target": "%s",\n'        "$(json_escape "$TARGET")"
-        printf '  "generated_at": "%s",\n'  "$(utc_stamp)"
-        printf '  "build_mode": "stubbed",\n'
-        printf '  "stubbed_steps_are_macos_verified_only": true,\n'
+        printf '  "run_id": "%s",\n'        "$j_run_id"
+        printf '  "stage": "%s",\n'         "$j_stage"
+        printf '  "experiment": "%s",\n'    "$j_experiment"
+        printf '  "target": "%s",\n'        "$j_target"
+        printf '  "generated_at": "%s",\n'  "$j_generated"
+        printf '  "build_mode": "upstream-driver",\n'
+        printf '  "driver": "%s",\n'        "$j_driver"
+        printf '  "device_repo": "%s",\n'   "$j_device"
+        printf '  "driver_out": "%s",\n'    "$j_driver_out"
         printf '  "network_access": "none",\n'
+        printf '  "sources_incomplete": %s,\n' \
+            "$([[ "$SOURCES_INCOMPLETE" == '1' ]] && printf 'true' || printf 'false')"
         printf '  "lock": {\n'
-        printf '    "path": "%s",\n'        "$(json_escape "$LOCK_PATH")"
+        printf '    "path": "%s",\n'        "$j_lock_path"
         printf '    "frozen": %s,\n'        "$([[ "$LOCK_FROZEN" == 'true' ]] && printf 'true' || printf 'false')"
-        printf '    "unixnu_commit": "%s",\n'    "$(json_escape "$LOCK_UNIXNU_COMMIT")"
-        printf '    "device_repo_commit": "%s",\n' "$(json_escape "$LOCK_DEVICE_COMMIT")"
-        printf '    "qemu_accel": "%s"\n'        "$(json_escape "$LOCK_QEMU_ACCEL")"
+        # A run against an unfrozen lock says so in machine-readable form, so no
+        # downstream consumer can read `frozen: false` as a frozen baseline by
+        # ignoring it.  The commits below are what was built, whatever the flag
+        # says, and they are the freeze candidates for the next lock.
+        #
+        # The whole conditional goes inside ONE command substitution.  Spelled
+        # `$(( LOCK_UNFROZEN )) && printf ...` instead, the arithmetic expansion
+        # is evaluated inside the double quotes and the rest of the line is
+        # literal text: the file then carries `"unfrozen_build": 0 && printf
+        # 'true' || printf 'false',` and is not JSON at all.  Measured.
+        printf '    "unfrozen_build": %s,\n' \
+            "$([[ "$LOCK_UNFROZEN" == '1' ]] && printf 'true' || printf 'false')"
+        printf '    "unixnu_commit": "%s",\n'    "$j_lock_unixnu"
+        printf '    "device_repo_commit": "%s",\n' "$j_lock_device"
+        printf '    "qemu_accel": "%s"\n'        "$j_lock_accel"
         printf '  },\n'
         printf '  "toolchain": {\n'
-        printf '    "xcodebuild": "%s",\n'  "$(json_escape "$TOOL_XCODEBUILD")"
-        printf '    "clang": "%s",\n'       "$(json_escape "$TOOL_CLANG")"
-        printf '    "python3": "%s",\n'     "$(json_escape "$TOOL_PYTHON")"
-        printf '    "git": "%s",\n'         "$(json_escape "$TOOL_GIT")"
+        printf '    "xcodebuild": "%s",\n'  "$j_xcode"
+        printf '    "clang": "%s",\n'       "$j_clang"
+        printf '    "python3": "%s",\n'     "$j_python"
+        printf '    "git": "%s",\n'         "$j_git"
         printf '    "qemu": "not a macOS build input (native Windows build)"\n'
         printf '  },\n'
         printf '  "steps": %s,\n' "$(ledger_json)"
         printf '  "declared_artifacts": %s,\n' "$declared_count"
+        printf '  "built_artifacts": %s,\n'   "${#BUILT_RECORDS[@]}"
         printf '  "sources_present": %s,\n' "$([[ "$sources_ok" == '1' ]] && printf 'true' || printf 'false')"
-        printf '  "evidence_note": "steps with status not_run produced nothing; missing evidence is unverified, not success (PRD 7.4)."\n'
+        printf '  "evidence_note": "steps with status not_run or failed produced nothing; missing evidence is unverified, not success (PRD 7.4)."\n'
         printf '}\n'
     } >"$REPORT_PATH"
 
     # --- stage-result.json -------------------------------------------------
-    # One machine-readable stage result, as PRD 8.1 "报告" requires.
+    # One machine-readable stage result, as PRD 8.1 "报告" requires.  ok is
+    # derived from the ledger, never asserted: a stage in which anything is
+    # not_run or failed cannot report success.
+    local ok='false' status='incomplete'
+    if ! ledger_has_not_run; then
+        ok='true'
+        status='complete'
+    fi
+    stamp_var j_generated
     {
         printf '{\n'
-        printf '  "stage": "%s",\n'      "$(json_escape "$STAGE")"
-        printf '  "run_id": "%s",\n'     "$(json_escape "$RUN_ID")"
-        printf '  "status": "stubbed",\n'
-        printf '  "ok": false,\n'
-        printf '  "generated_at": "%s",\n' "$(utc_stamp)"
+        printf '  "stage": "%s",\n'      "$j_stage"
+        printf '  "run_id": "%s",\n'     "$j_run_id"
+        printf '  "status": "%s",\n'     "$status"
+        printf '  "ok": %s,\n'           "$ok"
+        printf '  "generated_at": "%s",\n' "$j_generated"
         printf '  "steps": %s,\n' "$(ledger_json)"
-        printf '  "not_run_reasons": ["TODO(macos-verified-only)", "pinned source checkout absent (--skip-sources)"],\n'
-        printf '  "note": "A stubbed stage never reports success. Real Apple-tool work is UNVERIFIED from Windows."\n'
+        printf '  "step_summary": "%s",\n' "$(ledger_summary)"
+        printf '  "not_run_reasons": %s,\n' "$(not_run_reasons_json)"
+        printf '  "note": "A stage in which anything is not_run or failed never reports success. Real Apple-tool work is UNVERIFIED off macOS (PRD 7.4)."\n'
         printf '}\n'
     } >"$STAGE_RESULT_PATH"
 

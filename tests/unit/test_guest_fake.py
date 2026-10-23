@@ -45,6 +45,7 @@ from unipad.guest.protocol import (
     MSG_INSTALL_REQUEST,
     MSG_INSTALL_RESPONSE,
     MSG_STATUS_REQUEST,
+    InstallRequest,
     Message,
 )
 from tests.fixtures.ipa_builder import build_ipa, hello_ipa, notes_ipa
@@ -1103,3 +1104,79 @@ def test_tcp_pair_close_is_idempotent_and_drops_the_link(service):
 
     with pytest.raises(OSError):
         pair.transport.request(Message(type=MSG_STATUS_REQUEST, id="corr-1", payload={}).to_dict())
+
+
+# ---------------------------------------------------------------------------
+# the optional package source (ADR-0008)
+# ---------------------------------------------------------------------------
+
+
+def test_a_named_package_source_is_accepted_and_changes_nothing(service):
+    """ADR-0008 decision 6: the fake guest and the message path are unaffected.
+
+    Nothing on the guest side implements an HTTPS package fetch, so a request
+    naming a ``package_url`` must not change the verdict: the bytes that arrived
+    over the channel are still the bytes that are checked.  Recording a source
+    the guest cannot use would be a claim the guest never made.
+    """
+    guest, data, meta = service
+    named = dict(meta)
+    named["package_url"] = "https://10.0.2.2:8443/index.json"
+    named["cert_fingerprint"] = "f1" * 32
+
+    response = guest.install(named["package_name"], data, named)
+
+    assert response.stage == "registered"
+    assert response.bundle_id == "com.unipad.hello"
+    assert response.error_code is None
+    # The registry entry is the one it always was: no source was fetched, so
+    # nothing about the install record grows a field nobody filled.
+    assert guest.installed["com.unipad.hello"]["package_sha256"] == meta["package_sha256"]
+
+
+def test_a_named_source_does_not_rescue_bytes_that_never_arrived(service):
+    """The source record is not a byte path.
+
+    A request that names a package URL and stages no bytes still fails the
+    transfer step: if the URL were treated as an alternative delivery, this
+    would silently become a success with nothing having been verified.
+    """
+    guest, _data, meta = service
+    named = dict(meta)
+    named["package_url"] = "https://10.0.2.2:8443/index.json"
+    named["cert_fingerprint"] = "f1" * 32
+
+    response = guest.install(named["package_name"], None, named)
+
+    assert response.stage == "failed"
+    assert response.error_code == ErrorCode.TRANSFER_FAILED
+    assert guest.installed == {}
+
+
+def test_the_message_path_carries_a_named_source_without_rejecting_it(service):
+    """A request arriving over the wire with a source still decodes and installs."""
+    from unipad.guest.protocol import Message, MSG_INSTALL_REQUEST
+
+    guest, data, meta = service
+    request = InstallRequest.from_dict(meta)
+    named = InstallRequest(
+        package_name=request.package_name,
+        package_sha256=request.package_sha256,
+        size_bytes=request.size_bytes,
+        declared_min_os=request.declared_min_os,
+        signature_mode=request.signature_mode,
+        package_url="https://10.0.2.2:8443/index.json",
+        cert_fingerprint="f1" * 32,
+    )
+    guest.stage_package(data, meta)
+
+    with start_tcp_server(guest, timeout_s=5.0) as pair:
+        envelope = Message(type=MSG_INSTALL_REQUEST, id="corr-src", payload=named.to_dict())
+        reply = pair.transport.request(envelope.to_dict())
+
+    assert reply["type"] == "install.response"
+    assert reply["payload"]["stage"] == "registered"
+    assert reply["payload"]["error_code"] is None
+    # ... and the source fields rode along on the wire without widening it for
+    # a peer that does not know them.
+    assert named.to_dict()["package_url"] == "https://10.0.2.2:8443/index.json"

@@ -26,14 +26,20 @@ here is evidence that a guest, a display or a disk exists
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from unipad.errors import ErrorCode, UniPadError
-from unipad.host.qemu import QemuLauncher, _parse_drive_file
+from unipad.host.qemu import (
+    NON_ASCII_PATH_REASON,
+    QemuLauncher,
+    _parse_drive_file,
+)
 from unipad.models import MachineConfig, read_json
 from tests.fakes import fake_qemu as fq
 from tests.fakes.fake_qemu import BOOT_MARKERS, PARTIAL_BOOT_MARKERS
@@ -302,8 +308,13 @@ def test_build_args_headless_disables_the_display(launcher, images, tmp_path):
 
 
 def test_build_args_selects_virtio_gpu_when_configured(tmp_path):
-    """PRD 4.3: the GPU route is a config choice, not a silent default."""
-    machine = MachineConfig(display={"width": 1112, "height": 834, "format": "virtio-gpu"})
+    """PRD 4.3: the GPU route is a config choice, not a silent default.
+
+    The geometry is deliberately *not* the pinned one: the route is chosen by
+    ``format`` alone, and a test that happened to use the pinned numbers would
+    pass even if the route were chosen by geometry.
+    """
+    machine = MachineConfig(display={"width": 2048, "height": 1536, "format": "virtio-gpu"})
     launcher = QemuLauncher(machine)
     firmware = tmp_path / "fw.bin"
     firmware.write_bytes(b"fw")
@@ -313,6 +324,31 @@ def test_build_args_selects_virtio_gpu_when_configured(tmp_path):
     args = launcher.build_args(firmware, system, None, tmp_path, 4444)
 
     assert _option_value(args, "-device") == "virtio-gpu-pci"
+
+
+def test_build_args_refuses_a_resolution_outside_the_catalogue(tmp_path, images):
+    """A framebuffer nobody designed must fail, not silently get built.
+
+    ``build_args`` delegates the geometry to :mod:`unipad.host.display`, whose
+    catalogue is closed on purpose: an unsupported resolution is refused rather
+    than snapped to a neighbour, because a snapped framebuffer makes the
+    recorded geometry disagree with what the guest draws and every screenshot
+    taken from it worthless as PRD 9.2 evidence.
+
+    1112x834 is what this test used to configure.  It was accepted, because the
+    old inline block forwarded whatever numbers the config carried straight into
+    ``-fw_cfg``.
+    """
+    machine = MachineConfig(display={"width": 1112, "height": 834, "format": "ramfb"})
+    launcher = QemuLauncher(machine)
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.build_args(
+            images["firmware"], images["system"], images["data"], tmp_path, 4444
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert "unsupported display resolution" in str(excinfo.value)
 
 
 def test_build_args_appends_extra_arguments_verbatim(launcher, images, tmp_path):
@@ -1371,3 +1407,1100 @@ def test_last_args_is_a_copy_not_the_live_list(launcher, images, tmp_path):
     returned[0] = "clobbered"
 
     assert launcher.last_args == args, "the recorded argv was mutated through the accessor"
+
+
+# ---------------------------------------------------------------------------
+# the display integration must not move the real-boot argv
+# ---------------------------------------------------------------------------
+
+#: The display block as it was spelled inline in ``build_args`` before the
+#: P1(4) integration (commit fd949b0) replaced it with
+#: ``DisplayDecision.to_qemu_fragments()``.  Transcribed verbatim so the test
+#: can compare against the behaviour that the real-boot acceptance tests were
+#: written against, rather than against a paraphrase of it.
+_LEGACY_DISPLAY_BLOCK = """\
+display = dict(machine.display or {})
+display_format = str(display.get("format", "ramfb")).lower()
+if display_format.startswith("virtio"):
+    args.extend(["-device", "virtio-gpu-pci"])
+else:
+    args.extend(["-device", "ramfb"])
+    args.extend(
+        [
+            "-fw_cfg",
+            "name=opt/org.unixnu/ramfb-size,string="
+            f"{int(display.get('width', 0))}x{int(display.get('height', 0))}",
+        ]
+    )
+if headless:
+    args.extend(["-display", "none"])
+"""
+
+
+def _legacy_display_block(display: dict, headless: bool) -> list[str]:
+    """Run the pre-integration display block and return what it would emit.
+
+    The source above is executed, not re-implemented, so this helper cannot
+    drift into paraphrasing the block it is supposed to be the witness for.
+    The namespace supplies exactly the three names the block reads.
+    """
+    args: list[str] = []
+    exec(  # noqa: S102 - the source is a module-level constant, not caller input
+        _LEGACY_DISPLAY_BLOCK,
+        {"machine": SimpleNamespace(display=display), "args": args, "headless": headless},
+    )
+    return args
+
+
+def _display_block_of(argv: list[str]) -> list[str]:
+    """The slice of ``argv`` the display decision owns.
+
+    It runs from the first ``-device`` to the ``-nic`` that follows it, which is
+    exactly the region the integration replaced.
+    """
+    start = argv.index("-device")
+    return argv[start : argv.index("-nic", start)]
+
+
+@pytest.mark.parametrize("headless", [False, True])
+def test_the_display_integration_did_not_move_the_real_boot_argv(tmp_path, headless):
+    """The shipped config's argv must be byte-identical to the pre-integration one.
+
+    ``build_args`` now delegates the display block to
+    :mod:`unipad.host.display`.  That refactor is only safe if it changed nothing
+    about the run the real-boot acceptance tests exercise -- and a refactor that
+    quietly adds, drops or reorders a display argument would not fail any
+    existing test, because every one of them asserts a property of the argv
+    rather than the argv itself.
+
+    So the old block is kept here verbatim and run side by side with the new
+    one.  If a future change to ``display.py`` alters what the shipped config
+    emits, this fails and names the difference.
+    """
+    config = read_json(MACHINE_CONFIG_PATH)
+    machine = MachineConfig.from_dict(config)
+    launcher = QemuLauncher(machine)
+
+    argv = launcher.build_args(
+        tmp_path / "fw.bin", tmp_path / "sys.img", None, tmp_path, 4444, headless=headless
+    )
+
+    assert _display_block_of(argv) == _legacy_display_block(dict(machine.display or {}), headless)
+
+
+def test_the_legacy_block_helper_actually_runs_the_legacy_source():
+    """The comparison above is only meaningful if the legacy source still runs.
+
+    A transcription that silently became a copy of the new behaviour would make
+    the previous test vacuous -- it would compare the code against itself.  This
+    pins the legacy block to the one thing it did that the new one does not:
+    forward an unsupported resolution straight into ``-fw_cfg``.
+    """
+    fragments = _legacy_display_block({"width": 1112, "height": 834}, False)
+
+    assert fragments == [
+        "-device",
+        "ramfb",
+        "-fw_cfg",
+        "name=opt/org.unixnu/ramfb-size,string=1112x834",
+    ]
+
+
+def test_a_rotated_framebuffer_reaches_fw_cfg_rotated(tmp_path):
+    """The fw_cfg geometry must be the *rotated* one, not the requested one.
+
+    This is the guard the parametrised legacy comparison above cannot be: the
+    pre-integration block had no rotation support at all, so for a rotated
+    config there is no legacy behaviour to diff against -- and rotation=0 makes
+    ``base`` and ``framebuffer`` identical, so a bug that emits ``base`` instead
+    of ``framebuffer`` is invisible in every unrotated case.
+
+    It is not invisible in practice.  The guest driver reads the framebuffer
+    geometry out of fw_cfg (QemuRamfbPkg), so a rotated 1376x1024 asked for as
+    1024x1376 and delivered as 1376x1024 gives the guest a framebuffer whose
+    rows are the wrong length -- every row misaligned, and no test asserting a
+    property of the argv would notice.
+    """
+    machine = MachineConfig(
+        display={"width": 1376, "height": 1024, "format": "ramfb", "rotation": 90}
+    )
+    launcher = QemuLauncher(machine)
+
+    argv = launcher.build_args(
+        tmp_path / "fw.bin", tmp_path / "sys.img", None, tmp_path, 4444
+    )
+
+    assert _option_value(argv, "-fw_cfg") == (
+        "name=opt/org.unixnu/ramfb-size,string=1024x1376"
+    ), "the framebuffer reached the guest unrotated"
+
+
+@pytest.mark.parametrize(
+    ("rotation", "expected"),
+    [(0, "1376x1024"), (90, "1024x1376"), (180, "1376x1024"), (270, "1024x1376")],
+)
+def test_every_quarter_turn_produces_the_geometry_it_should(tmp_path, rotation, expected):
+    """All four turns, so a swap between two of them cannot pass by symmetry.
+
+    90 and 270 produce the same pair, and 0 and 180 produce the same pair, so
+    any single pair is consistent with two different bugs.  Asserting the whole
+    table is what distinguishes "the axes are swapped" from "the turn is wrong".
+    """
+    machine = MachineConfig(
+        display={"width": 1376, "height": 1024, "format": "ramfb", "rotation": rotation}
+    )
+    launcher = QemuLauncher(machine)
+
+    argv = launcher.build_args(
+        tmp_path / "fw.bin", tmp_path / "sys.img", None, tmp_path, 4444
+    )
+
+    assert _option_value(argv, "-fw_cfg") == f"name=opt/org.unixnu/ramfb-size,string={expected}"
+
+
+# ---------------------------------------------------------------------------
+# the host_forwards rules (PRD 3.2 P1 (1)) -- refuted by mutation, so pinned here
+# ---------------------------------------------------------------------------
+
+
+def test_host_forwards_refuses_a_bare_string_instead_of_iterating_it():
+    """A string is a sequence of characters, so the type gate is load-bearing.
+
+    Without it ``"host_forwards": "tcp:1234"`` iterates into ``'t'``, ``'c'``,
+    ``'p'`` ... and each character is checked as a rule.  Whatever happens next,
+    the operator asked for one thing and got a per-character interpretation of
+    it.  Refusing the shape is the only reading that cannot be silently wrong.
+    """
+    from unipad.host.qemu import _host_forwards
+
+    for bad in ("tcp:1234", b"tcp:1234", 8443, True, {"host_port": 8443}):
+        with pytest.raises(UniPadError) as excinfo:
+            _host_forwards({"host_forwards": bad})
+        assert excinfo.value.code is ErrorCode.CONFIG_INVALID, bad
+
+
+def test_host_forwards_refuses_a_non_mapping_rule_without_partial_output():
+    """A half-valid rule list must be refused whole, not applied in part.
+
+    The docstring promises every rule is validated before any fragment is
+    produced.  If that is not true, a list whose *second* rule is malformed
+    still opens the first rule's forwarding -- the operator gets a port forward
+    they did not successfully ask for, and an error message about a rule they
+    may believe was never applied.
+    """
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards({"host_forwards": [{"host_port": 9443}, "not-a-rule"]})
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert excinfo.value.details.get("index") == 1, (
+        "the refusal did not name the offending rule, so it cannot be acted on"
+    )
+
+
+@pytest.mark.parametrize("bad_port", ["8443", 8443.0, None, True, [8443]])
+def test_host_forwards_refuses_a_non_integer_port(bad_port):
+    """A port that is not an integer is a configuration bug, never a default.
+
+    The refusal must also name *which* rule was wrong.  ``httpsvc.hostfwd_spec``
+    validates ports too, so a version of this check that was removed would still
+    raise -- one layer down, with a message that cannot tell the operator which
+    of their ten rules to fix.  Asserting the index is what distinguishes "the
+    rule was refused" from "the rule was refused somewhere else".
+    """
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards(
+            {
+                "host_forwards": [
+                    {"host_port": 9443, "guest_port": 8443},
+                    {"host_port": bad_port, "guest_port": 8443},
+                ]
+            }
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert excinfo.value.details.get("index") == 1, (
+        "the refusal did not name the offending rule, so it cannot be acted on"
+    )
+
+
+@pytest.mark.parametrize("rule", [{"host_port": 0}, {"host_port": 0, "guest_port": 8443},
+                                  {"host_port": 9443, "guest_port": 0}])
+def test_host_forwards_refuses_port_zero(rule):
+    """Port 0 is an ephemeral-port request, and ``hostfwd`` cannot honour one.
+
+    QEMU would pick the host port itself, so the forwarding the operator
+    configured is not the forwarding that exists -- and nothing in the argv says
+    which port was actually opened.
+    """
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards({"host_forwards": [rule]})
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+
+
+def test_host_forwards_produces_one_fragment_per_rule_in_order():
+    """The rules are applied in the order given, one fragment each."""
+    from unipad.host.qemu import _host_forwards
+
+    fragments = _host_forwards(
+        {
+            "host_forwards": [
+                {"host_port": 9443, "guest_port": 8443},
+                {"host_port": 9444, "guest_port": 8444},
+            ]
+        }
+    )
+
+    assert fragments == [
+        "hostfwd=tcp:127.0.0.1:9443-10.0.2.15:8443",
+        "hostfwd=tcp:127.0.0.1:9444-10.0.2.15:8444",
+    ]
+
+
+def test_an_omitted_restrict_is_confined_not_open():
+    """``restrict`` defaults to ON.  This is the default the whole design rests on.
+
+    A flipped default survives every test that spells ``restrict`` explicitly,
+    which is why it is pinned here against the *omitted* case.  If this ever
+    becomes ``off``, a configuration that never mentioned egress silently puts
+    the guest on the public internet -- the one change the project requires
+    explicit operator authorisation for.
+    """
+    from unipad.host.qemu import _network_argument
+
+    assert "restrict=on" in _network_argument({"enabled": True, "mode": "user"})
+    assert "restrict=off" not in _network_argument({"enabled": True, "mode": "user"})
+
+
+def test_the_display_decision_is_emitted_exactly_once(launcher, images, tmp_path):
+    """``-device ramfb`` appears once, never twice.
+
+    The integration replaced the inline display block rather than adding to it,
+    because QEMU rejects a duplicated device outright.  A regression that emits
+    both would produce an argv QEMU refuses -- but nothing asserts the count, so
+    the failure would surface as a boot that will not start rather than as a
+    failing test.
+    """
+    args = _args(launcher, images, tmp_path, fq.free_tcp_port())
+
+    assert args.count("ramfb") == 1
+    assert args.count("-device") == 1
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_fw_cfg", "expects_audio"),
+    [
+        ({"rotation": 90}, "name=opt/org.unixnu/ramfb-size,string=1024x1376", False),
+        ({"audio": "hda"}, "name=opt/org.unixnu/ramfb-size,string=1376x1024", True),
+    ],
+)
+def test_the_configured_rotation_and_audio_reach_the_argv(
+    tmp_path, configured, expected_fw_cfg, expects_audio
+):
+    """The delegation must forward what the config asked for, not the defaults.
+
+    ``decide_display`` is called with ``rotation`` and ``audio`` read out of
+    ``machine.display``.  If either is dropped, the run silently becomes an
+    unrotated, silent one -- and because the shipped config sets neither, no
+    test using the shipped config can see it.
+    """
+    display = {"width": 1376, "height": 1024, "format": "ramfb", **configured}
+    machine = MachineConfig(display=display)
+    launcher = QemuLauncher(machine)
+
+    args = launcher.build_args(tmp_path / "fw.bin", tmp_path / "sys.img", None, tmp_path, 4444)
+
+    assert _option_value(args, "-fw_cfg") == expected_fw_cfg
+    assert ("-audiodev" in args) is expects_audio
+    assert ("intel-hda" in args) is expects_audio
+
+
+# ---------------------------------------------------------------------------
+# the P1 review round's qemu findings, each closed by a test written first
+#
+# Every test below was run against the behaviour it replaces and shown to fail
+# there; the fix landed afterwards.  A test that passes both before and after
+# its fix is not evidence, so the ones that only guard the fix against a
+# future over-correction say so in their docstrings.
+# ---------------------------------------------------------------------------
+
+
+# -- D2: a host_forwards rule missing guest_port is not 8443 -----------------
+
+
+def test_a_host_forwards_rule_must_name_both_ports():
+    """``{"host_port": 9443}`` is an unfinished rule, not a mapping to 8443.
+
+    The docstring and ``config/machine.json``'s ``host_forwards_note`` both
+    document a rule as ``{"host_port": int, "guest_port": int}``.  Everything
+    else in this chain fails closed -- "an unfinished configuration is a usage
+    error, never a guess" -- and this one key silently invented the other half
+    of a port mapping the operator never asked for.
+    """
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards({"host_forwards": [{"host_port": 9443}]})
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert excinfo.value.details.get("index") == 0, (
+        "the refusal must name the rule it refused, or an operator with ten "
+        "rules cannot tell which one to fix"
+    )
+    assert "guest_port" in excinfo.value.message
+
+
+def test_a_host_port_without_a_guest_port_still_refuses_its_own_port_zero():
+    """The two keys are checked independently: a bad ``host_port`` is reported
+    as a bad port, not as a missing partner."""
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards({"host_forwards": [{"host_port": 0}]})
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert "host_port" in excinfo.value.message
+
+
+# -- D3: one port validator, one range, one message --------------------------
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"host_port": 99999, "guest_port": 8443},
+        {"host_port": -1, "guest_port": 8443},
+        {"host_port": 9443, "guest_port": 99999},
+        {"host_port": 9443, "guest_port": -1},
+    ],
+)
+def test_a_host_forwards_port_outside_the_tcp_range_is_refused_here(rule):
+    """A port above 65535 must be refused by *this* module, naming the rule.
+
+    ``host_port: 99999`` used to pass the check in ``_host_forwards`` and be
+    caught one layer down inside :func:`unipad.host.httpsvc.hostfwd_spec`,
+    whose message cannot say which of the operator's rules was wrong.  Two
+    implementations of one rule is how the range went missing from the one the
+    operator reads.
+    """
+    from unipad.host.qemu import _host_forwards
+
+    with pytest.raises(UniPadError) as excinfo:
+        _host_forwards(
+            {"host_forwards": [{"host_port": 9443, "guest_port": 8443}, rule]}
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert excinfo.value.details.get("index") == 1
+    assert "httpsvc" not in excinfo.value.message
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, "4444"])
+def test_the_qmp_socket_and_a_forward_share_one_port_validator(launcher, images, tmp_path, port):
+    """One range for every port this module puts on a QEMU command line.
+
+    The QMP check said "1..65535" and the forward check said nothing at all,
+    which is the drift a single validator exists to prevent.  Sharing a helper
+    is only real if the two refusals are the *same* refusal, so the QMP one is
+    compared against the helper's own output rather than against a paraphrase:
+    two implementations of one rule read alike until one of them is edited.
+    """
+    from unipad.host.qemu import _host_forwards, _validate_tcp_port
+
+    with pytest.raises(UniPadError) as first:
+        launcher.build_args(images["firmware"], images["system"], images["data"], tmp_path, port)  # type: ignore[arg-type]
+    with pytest.raises(UniPadError) as direct:
+        _validate_tcp_port(port, "qmp_port")
+    with pytest.raises(UniPadError) as second:
+        _host_forwards({"host_forwards": [{"host_port": port, "guest_port": 8443}]})
+
+    assert first.value.code is second.value.code is ErrorCode.CONFIG_INVALID
+    assert (first.value.message, first.value.details) == (
+        direct.value.message,
+        direct.value.details,
+    ), "the qmp_port refusal must be the shared validator's refusal, not a second copy of it"
+    assert "host_port" in second.value.message
+    assert second.value.details.get("index") == 0
+
+
+# -- D4: a falsy devices.net is a typo, not "network off" --------------------
+
+
+@pytest.mark.parametrize("net", [False, 0, "", [], "user", 5, {"enabled": True}])
+def test_a_net_value_that_is_not_an_object_is_refused_not_read_as_off(launcher, images, tmp_path, net):
+    """``"net": false`` must not silently disable the guest network.
+
+    ``_network_argument`` refuses every non-mapping, and the caller's trailing
+    ``or {}`` converted each *falsy* one into ``{}`` -- so the guard fired for
+    the values an operator is least likely to typo (``"user"``, ``5``) and was
+    bypassed for the ones they are (``false``, ``0``, ``""``, ``[]``).
+    """
+    machine = MachineConfig(devices={"net": net, "firmware": {"attach": "pflash"}})
+
+    with pytest.raises(UniPadError) as excinfo:
+        QemuLauncher(machine).build_args(
+            images["firmware"], images["system"], images["data"], tmp_path, 4444
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+
+
+@pytest.mark.parametrize("devices", [{}, {"net": None}, None])
+def test_only_an_absent_net_section_means_the_network_is_off(devices):
+    """The one reading that may stay silent is a section that is not there.
+
+    ``null`` is "not specified" rather than a typo, and an absent section is
+    the dataclass default; both must keep yielding ``-nic none`` without
+    becoming a refusal.
+    """
+    args = QemuLauncher(MachineConfig(devices=devices)).build_args(
+        Path("fw.bin"), Path("s.img"), None, Path("."), 4444
+    )
+
+    assert _option_value(args, "-nic") == "none"
+
+
+# -- D5: a firmware section that names no attachment is not -bios ------------
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        {"firmware": None},
+        {"firmware": {}},
+        {"firmware": []},
+        {"firmware": "pflash"},
+        False,
+        0,
+        "",
+        [],
+        "net",
+    ],
+)
+def test_a_devices_section_with_no_usable_firmware_is_refused(devices):
+    """``models.py:199-201`` exists so an empty default cannot mean ``-bios``.
+
+    That comment is about the *default*: ``MachineConfig.devices`` defaults to
+    ``{"firmware": {"attach": "pflash"}}`` because the board we boot cannot use
+    the single-blob spelling.  ``_firmware_attachment`` answered ``"bios"``
+    instead, so four config typos each silently changed the machine's firmware
+    form -- the exact failure the model comment was written to prevent,
+    re-introduced one layer up.
+    """
+    with pytest.raises(UniPadError) as excinfo:
+        QemuLauncher(MachineConfig(accel="tcg", devices=devices))
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+
+
+def test_the_firmware_default_is_the_one_the_model_defaults_to():
+    """Two definitions of "the machine" drift silently; this pins them together."""
+    launcher = QemuLauncher(MachineConfig(accel="tcg", devices={}))
+
+    assert launcher.firmware_attachment == MachineConfig().devices["firmware"]["attach"]
+
+
+def test_a_declared_attachment_still_wins_over_the_default():
+    """Refusing the unusable spellings must not make the default unreachable."""
+    for attach in ("bios", "pflash"):
+        launcher = QemuLauncher(
+            MachineConfig(accel="tcg", devices={"firmware": {"attach": attach}})
+        )
+        assert launcher.firmware_attachment == attach
+
+
+# -- D6: the rtc clock source is pinned to QEMU's vocabulary -----------------
+
+
+@pytest.mark.parametrize("rtc", ["utx", "UTC", "gmt", "", "localtime ", True, 0, 1])
+def test_an_unknown_rtc_base_is_refused_rather_than_forwarded(rtc):
+    """``-rtc base=<value>`` used to accept any truthy string verbatim.
+
+    QEMU answers a base it does not know by exiting, and the message names the
+    option and not the typo -- so the diagnosis belongs here, next to the
+    catalogue that defines what a clock source is.
+    """
+    with pytest.raises(UniPadError) as excinfo:
+        QemuLauncher(MachineConfig(clock={"rtc": rtc})).build_args(
+            Path("fw.bin"), Path("s.img"), None, Path("."), 4444
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+
+
+@pytest.mark.parametrize("clock", [False, 0, "", [], "utc", 5])
+def test_a_clock_section_that_is_not_an_object_is_refused_not_dropped(clock):
+    """``"clock": false`` used to drop ``-rtc`` from the argv entirely.
+
+    Same falsy-swallow shape as ``devices.net``: the guard exists, and the
+    caller's ``or {}`` made it unreachable for the value most likely to be
+    typed.
+    """
+    with pytest.raises(UniPadError) as excinfo:
+        QemuLauncher(MachineConfig(clock=clock)).build_args(
+            Path("fw.bin"), Path("s.img"), None, Path("."), 4444
+        )
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+
+
+def test_the_shipped_clock_source_still_reaches_the_argv():
+    """The pin must not move the real boot: ``config/machine.json`` says utc."""
+    machine = MachineConfig.from_dict(read_json(MACHINE_CONFIG_PATH))
+    args = QemuLauncher(machine).build_args(
+        Path("fw.bin"), Path("s.img"), None, Path("."), 4444
+    )
+
+    assert _option_value(args, "-rtc") == "base=utc"
+
+
+def test_an_absent_clock_section_emits_no_rtc_decision():
+    """An unspecified clock is a documented zero value, not a refusal."""
+    args = QemuLauncher(MachineConfig(clock={})).build_args(
+        Path("fw.bin"), Path("s.img"), None, Path("."), 4444
+    )
+
+    assert "-rtc" not in args
+
+
+# -- D7: a launch that is going to be refused writes nothing -----------------
+
+
+def test_a_refused_launch_writes_no_pflash_vars_file(tmp_path):
+    """``vars.fd`` is 64 MiB on this board; a refused run must not leave one.
+
+    ``launch()`` materialised the writable pflash file *before* checking that
+    the images exist, so a run refused for a missing image had already written
+    the file -- and the error message named the missing path without
+    mentioning the bytes it had just put on disk.
+
+    Two shapes of "missing", because only one of them is decided by the
+    ordering alone.  A missing *code* drive is caught twice over: the vars file
+    cannot be sized from a code drive that is not there, so it is refused
+    before it is created whichever way round the checks run.  A missing
+    *system* image is the one where the write used to happen first -- the code
+    drive is present and correctly sized, so nothing but the order stands
+    between the operator and an orphaned 64 MiB file.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    launcher = QemuLauncher(_pflash_config())
+
+    for firmware, system_image in (
+        (tmp_path / "absent.fd", system),
+        (code, tmp_path / "absent.img"),
+    ):
+        args = launcher.build_args(firmware, system_image, None, tmp_path, 4444)
+
+        with pytest.raises(UniPadError) as excinfo:
+            launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+
+        assert excinfo.value.code is ErrorCode.IMAGE_NOT_FOUND
+        assert not (tmp_path / "vars.fd").exists(), (
+            "the run was refused, so the writable pflash file it was going to "
+            "create must not exist"
+        )
+
+
+def test_a_pflash_refusal_names_the_file_without_naming_the_host(tmp_path):
+    """PRD 9.2: the vars-drive refusals name the file, not the account.
+
+    ``_materialise_pflash_vars`` put ``str(path)`` into the error detail, and on
+    this host an absolute path embeds the Windows username -- a run directory
+    under ``AppData\\Local\\Temp`` names the account twice.  The final component
+    is what tells two candidate files apart; the rest is what PRD 9.2 protects.
+
+    Both refusals are covered because only one of them was introduced by the
+    repair: the ``OSError`` branch carried the leak from the start, and the
+    ``size <= 0`` branch was added by the ordering fix.  A test that pins only
+    the new one leaves the old one free to regress.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, tmp_path / "sys.img", None, tmp_path, 4444)
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher._materialise_pflash_vars(
+            [
+                "-drive",
+                f"file={tmp_path / 'vars.fd'},if=pflash,format=raw,readonly=off",
+            ],
+            tmp_path,
+        )
+
+    details = excinfo.value.details
+    assert details["path"] == "vars.fd"
+    # The whole rendered document is what an operator or a log reader sees, so
+    # assert on that rather than on the one detail we happened to fix.
+    rendered = json.dumps(excinfo.value.to_dict())
+    assert str(tmp_path) not in rendered
+    assert "vars.fd" in rendered
+
+
+def test_the_two_path_redaction_helpers_agree():
+    """``httpsvc._safe_location`` and ``qemu``'s redaction are one behaviour.
+
+    Both modules had their own copy of "name only the final component"; they now
+    share :func:`unipad.host.paths.safe_location`.  This test is what stops a
+    future edit from making one of them leak again on its own -- the httpsvc
+    suite exercises the httpsvc copy, the qemu suite the qemu copy, and nothing
+    exercised the pair until now.
+    """
+    from unipad.host import httpsvc
+    from unipad.host.paths import safe_location
+
+    for candidate in (
+        Path("F:/iosvirtual/runs/exp-1/vars.fd"),
+        Path("vars.fd"),
+        Path("/"),
+        Path(""),
+    ):
+        assert httpsvc._safe_location(candidate) == safe_location(candidate)
+
+
+def test_a_non_ascii_refusal_writes_no_pflash_vars_file(images, tmp_path):
+    """The code-page guard fires before anything is written, not after.
+
+    The two refusals in ``launch()`` are independent, and only one of them ran
+    before the 64 MiB write.  This is the one the operator hits on this host,
+    where ``%TEMP%`` is under a non-ASCII user directory.
+    """
+    if str(tmp_path).isascii():
+        pytest.skip("this host's tmp_path is ASCII; the guard cannot be provoked here")
+    binary = _real_qemu_binary()
+    if binary is None:
+        pytest.skip("no qemu-system-aarch64 installed; the guard cannot be provoked")
+
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(
+        images["firmware"], images["system"], images["data"], tmp_path, 4444
+    )
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.launch(binary, args, workdir=tmp_path)
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert not (tmp_path / "vars.fd").exists()
+
+
+def test_a_viable_launch_still_writes_the_vars_file(tmp_path):
+    """Reordering the check must not stop the file being created at all."""
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 8192)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, system, None, tmp_path, 4444)
+
+    launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+    try:
+        assert (tmp_path / "vars.fd").stat().st_size == 8192
+    finally:
+        launcher.close()
+
+
+# -- D8: a stale vars.fd is repaired, not reused -----------------------------
+
+
+def test_a_zero_length_vars_file_is_repaired_not_reused(tmp_path):
+    """A 0-byte ``vars.fd`` is the residue of a failed launch, not variables.
+
+    ``_materialise_pflash_vars`` skipped any existing file, so the next boot
+    got a 0-length writable pflash for UEFI variables -- measured: attempt one
+    refused for a missing code drive leaves 0 bytes, attempt two with the code
+    drive present still finds 0 bytes.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    (tmp_path / "vars.fd").write_bytes(b"")
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, system, None, tmp_path, 4444)
+
+    launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+    try:
+        assert (tmp_path / "vars.fd").stat().st_size == 4096
+    finally:
+        launcher.close()
+
+
+def test_a_short_vars_file_is_extended_without_losing_what_it_holds(tmp_path):
+    """A short file is extended, not truncated: the variables survive.
+
+    QEMU cannot use a backing file shorter than the flash device, and simply
+    refusing would leave the operator with a run that cannot start and a file
+    they are told nothing about.  Extending keeps the leading bytes -- which
+    are the variables -- and makes the device usable.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    (tmp_path / "vars.fd").write_bytes(b"VARS")
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, system, None, tmp_path, 4444)
+
+    launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+    try:
+        repaired = (tmp_path / "vars.fd").read_bytes()
+        assert len(repaired) == 4096
+        assert repaired[:4] == b"VARS"
+    finally:
+        launcher.close()
+
+
+def test_a_correctly_sized_vars_file_is_left_alone(tmp_path):
+    """A guard, not a bug-catcher: persisting variables is the whole point.
+
+    This passes before and after the repair above.  It is here so a future
+    "repair" cannot quietly become "always truncate", which would destroy the
+    settings UEFI stored across boots -- the one thing the second flash device
+    exists for.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    (tmp_path / "vars.fd").write_bytes(b"V" * 4096)
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, system, None, tmp_path, 4444)
+
+    launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+    try:
+        assert (tmp_path / "vars.fd").read_bytes() == b"V" * 4096
+    finally:
+        launcher.close()
+
+
+# -- D9: the code-page guard is about the binary, not its name ---------------
+
+
+def test_the_ascii_guard_survives_renaming_the_binary(tmp_path):
+    """A renamed QEMU has the same code-page limitation as a named one.
+
+    The guard was keyed on ``"qemu-system" in Path(binary).name``, so a build
+    installed or wrapped under any other name silently lost the up-front
+    diagnosis and reproduced the opaque ``open <path> failed`` the check exists
+    to prevent.  The copy is never executed: the refusal happens before
+    ``Popen``, which is exactly what this test is proving.
+    """
+    if str(tmp_path).isascii():
+        pytest.skip("this host's tmp_path is ASCII; the guard cannot be provoked here")
+    source = _real_qemu_binary()
+    if source is None:
+        pytest.skip("no qemu-system-aarch64 installed; the guard cannot be provoked")
+
+    renamed = tmp_path / ("arm64-emulator" + Path(source).suffix)
+    shutil.copy2(source, renamed)
+    (tmp_path / "code.fd").write_bytes(b"c" * 4096)
+    (tmp_path / "sys.img").write_bytes(b"s")
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(
+        tmp_path / "code.fd", tmp_path / "sys.img", None, tmp_path, 4444
+    )
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.launch(str(renamed), args, workdir=tmp_path)
+
+    assert excinfo.value.code is ErrorCode.CONFIG_INVALID
+    assert excinfo.value.details["reason"] == NON_ASCII_PATH_REASON
+
+
+def test_the_interpreter_is_the_only_binary_exempt_from_the_guard():
+    """The exemption is identity, not a name we happen to recognise.
+
+    The test fake is ``[sys.executable, fake_qemu.py, ...]`` -- a Python script
+    with no ANSI file backend -- so refusing a run on its behalf would block a
+    path that works.  Naming that exemption by identity keeps it true when the
+    fake is renamed and keeps the guard on when QEMU is.
+    """
+    from unipad.host.qemu import _is_substitute_binary
+
+    assert _is_substitute_binary(sys.executable) is True
+    assert _is_substitute_binary("qemu-system-aarch64") is False
+    assert _is_substitute_binary("arm64-emulator.exe") is False
+    assert _is_substitute_binary("C:/QEMU/qemu-wrapper.bat") is False
+
+
+# -- D10: the block-driver catalogue is documented and it works --------------
+
+
+def test_every_block_driver_prefix_is_documented():
+    """``BLOCK_DRIVER_PREFIXES`` is only discoverable by reading this module.
+
+    ``fat:`` and ``host_device:`` at least appear in
+    ``docs/implementation-plan.md``; ``json:`` appeared nowhere at all -- not in
+    a doc, not in ``config/machine.json``, not in a note.  The catalogue is a
+    device vocabulary, so the vocabulary now carries its own definitions and a
+    prefix cannot be added without one.
+    """
+    from unipad.host import qemu as qemu_module
+
+    documented = set(qemu_module.BLOCK_DRIVER_PREFIX_MEANINGS)
+    assert documented == set(qemu_module.BLOCK_DRIVER_PREFIXES), (
+        "a block-driver prefix was added without documenting what it means"
+    )
+    assert all(meaning.strip() for meaning in qemu_module.BLOCK_DRIVER_PREFIX_MEANINGS.values())
+
+
+def test_a_json_drive_value_is_not_judged_as_a_missing_image():
+    """``json:`` is an inline blockdev description, not a path on disk.
+
+    ``_strip_block_driver`` returned the JSON text as the path to check, so
+    ``_missing_paths`` reported a perfectly valid ``json:`` drive as a missing
+    image and ``launch()`` refused the run.  The entry was in the catalogue,
+    undocumented, and did not work.
+    """
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    args = [
+        "-drive",
+        'if=none,id=os,format=raw,readonly=on,file=json:{"driver":"raw",'
+        '"file":{"filename":"os.img"}}',
+    ]
+
+    assert launcher._missing_paths(args) == []
+    assert _parse_drive_file(args[1]) is None
+
+
+def test_a_fat_directory_and_a_host_device_are_still_judged_the_same_way(tmp_path):
+    """The other two catalogue entries keep the behaviour they already had."""
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    esp = tmp_path / "esp"
+    esp.mkdir()
+
+    assert launcher._missing_paths(
+        ["-drive", f"if=none,id=esp,format=raw,readonly=on,file=fat:{esp.as_posix()}"]
+    ) == []
+    assert launcher._missing_paths(
+        ["-drive", f"if=none,id=esp,format=raw,readonly=on,file=fat:{tmp_path / 'nope'}"]
+    ) != []
+    assert launcher._missing_paths(
+        ["-drive", "if=none,id=os,format=raw,readonly=on,file=host_device:/dev/rdisk2"]
+    ) == []
+
+
+# ---------------------------------------------------------------------------
+# the launch evidence describes the command line that was started (PRD 9.2)
+# ---------------------------------------------------------------------------
+
+
+def _caller_argv(
+    port: int,
+    *,
+    accel: Optional[str] = "tcg",
+    machine: str = "other-board",
+    name: str = "unipad-other-board",
+    serial: bool = False,
+    qmp: bool = True,
+) -> list[str]:
+    """A complete, self-contained argv naming a *different* machine.
+
+    ``launch()`` accepts an argv the caller assembled -- :meth:`_adopt_args
+    <unipad.host.qemu.QemuLauncher._adopt_args>` exists for exactly that -- so
+    a run is not obliged to belong to the ``MachineConfig`` the launcher was
+    constructed with.  This helper is that case, spelled out.
+    """
+    argv: list[str] = []
+    if accel is not None:
+        argv.extend(["-accel", accel])
+    argv.extend(["-machine", machine, "-name", name, "-smp", "1", "-m", "1024"])
+    if serial:
+        argv.extend(["-serial", "file:serial.log"])
+    if qmp:
+        argv.extend(["-qmp", f"tcp:127.0.0.1:{port},server=on,wait=off"])
+    return argv
+
+
+def test_the_recorded_machine_is_the_one_the_argv_starts(launcher, images, tmp_path):
+    """PRD 9.2: ``launch.json`` must describe the command line that was started.
+
+    ``LaunchResult.evidence`` used to take ``machine`` from the
+    ``MachineConfig`` the launcher was built with and ``accel`` from a literal,
+    while ``qmp_port``/``serial_path`` were re-derived from the argv by
+    ``_adopt_args``.  So a caller-supplied argv belonging to another machine
+    produced a record naming *this* launcher's machine: the evidence and the
+    command line described two different machines, and a reader reproducing
+    the run from the evidence would reproduce the wrong one.
+    """
+    port = fq.free_tcp_port()
+    binary, prefix = _fake_launcher_command()
+    argv = _caller_argv(port)
+
+    result = launcher.launch(
+        binary, [*prefix, *argv], workdir=tmp_path, env={"UNIPAD_FAKE_BOOT_MS": "0"}
+    )
+    try:
+        evidence = result.to_dict()["evidence"]
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    # Every machine fact in the evidence is the argv's own value, not the
+    # launcher's configuration.
+    assert evidence["machine"] == _option_value(argv, "-machine") == "other-board"
+    assert evidence["name"] == _option_value(argv, "-name") == "unipad-other-board"
+    assert evidence["accel"] == _option_value(argv, "-accel") == "tcg"
+    # ...and the launcher's own machine is nowhere in the record.
+    assert launcher.machine.name not in (evidence["machine"], evidence["name"])
+
+
+def test_a_caller_supplied_argv_without_explicit_tcg_is_refused(launcher, images, tmp_path):
+    """PRD 2.2-1: the accelerator guard is on the command line, not the config.
+
+    The constructor refuses a non-TCG ``MachineConfig``, but ``launch(args=...)``
+    took a caller-supplied argv verbatim -- so an argv that stated no
+    accelerator at all (QEMU then picks its own, which on a Windows host can be
+    WHPX) started a guest while the recorded evidence still said ``tcg``.
+    """
+    port = fq.free_tcp_port()
+    binary, prefix = _fake_launcher_command()
+    argv = _caller_argv(port, accel=None)
+
+    try:
+        with pytest.raises(UniPadError) as excinfo:
+            launcher.launch(binary, [*prefix, *argv], workdir=tmp_path)
+    finally:
+        # The refusal is the fix; until it lands the child really does start, so
+        # the test must not leak one either way.
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    error = excinfo.value
+    assert error.code == ErrorCode.ACCELERATOR_NOT_TCG
+    # Nothing was started and nothing was written.
+    assert launcher.is_running() is False
+    assert not (tmp_path / "qemu-stdout.log").exists()
+
+
+@pytest.mark.parametrize("accel", ["whpx", "hvf", "kvm", "hax", "xen", "auto"])
+def test_a_caller_supplied_argv_with_a_non_tcg_accel_is_refused(launcher, images, tmp_path, accel):
+    """PRD 2.2-1: an argv naming another accelerator is refused, not started.
+
+    This is the same guard the constructor applies to the configuration.  It has
+    to apply to the argv too, because the argv is what QEMU reads: a record that
+    says ``tcg`` beside a command line that says ``whpx`` is the disagreement
+    this section exists to make impossible.
+    """
+    port = fq.free_tcp_port()
+    binary, prefix = _fake_launcher_command()
+    argv = _caller_argv(port, accel=accel)
+
+    try:
+        with pytest.raises(UniPadError) as excinfo:
+            launcher.launch(binary, [*prefix, *argv], workdir=tmp_path)
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    error = excinfo.value
+    assert error.code == ErrorCode.ACCELERATOR_NOT_TCG
+    assert error.details["received_accel"] == accel
+    assert launcher.is_running() is False
+
+
+def test_the_evidence_agrees_with_the_argv_for_a_built_launch(launcher, images, tmp_path):
+    """The control: for a ``build_args`` run the evidence still names the machine.
+
+    Deriving the evidence from the argv must not empty it.  A launcher that
+    reports nothing would satisfy every test above while recording no evidence
+    at all, which is the failure mode this pins.
+    """
+    port = fq.free_tcp_port()
+    args = _args(launcher, images, tmp_path, port)
+    binary, prefix = _fake_launcher_command()
+
+    result = launcher.launch(
+        binary, [*prefix, *args], workdir=tmp_path, env={"UNIPAD_FAKE_BOOT_MS": "0"}
+    )
+    try:
+        evidence = result.to_dict()["evidence"]
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    assert evidence["accel"] == "tcg"
+    assert evidence["machine"] == _option_value(args, "-machine")
+    assert evidence["name"] == f"unipad-{launcher.machine.name}"
+    assert evidence["started_at_epoch"] > 0
+
+
+def test_the_recorded_serial_path_is_the_one_the_argv_states(launcher, images, tmp_path):
+    """``serial_path`` is a path the command line names, or nothing.
+
+    ``_adopt_args`` re-derives the serial path only when the argv *carries* a
+    ``-serial file:`` token, so the value remembered by an earlier
+    ``build_args()`` survived into a run whose argv named no serial log at all.
+    A launch record that points at another run's serial file is the same defect
+    as a machine fact taken from the configuration instead of the argv.
+    """
+    built_dir = tmp_path / "built"
+    other_dir = tmp_path / "other"
+    built_dir.mkdir()
+    other_dir.mkdir()
+    port = fq.free_tcp_port()
+    # Remember a serial log in *built*.
+    _args(launcher, images, built_dir, port)
+
+    binary, prefix = _fake_launcher_command()
+    argv = _caller_argv(port, serial=False)
+    result = launcher.launch(
+        binary, [*prefix, *argv], workdir=other_dir, env={"UNIPAD_FAKE_BOOT_MS": "0"}
+    )
+    try:
+        record = result.to_dict()
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    # The argv names no serial log, so the record must not name one either --
+    # and in particular must not name the earlier run's.
+    assert record["serial_path"] == ""
+    assert str(built_dir) not in record["serial_path"]
+
+
+def test_the_recorded_qmp_port_is_the_one_the_argv_states(launcher, images, tmp_path):
+    """``qmp_port``/``wait_for_qmp`` follow the argv, not an earlier ``build_args``.
+
+    ``_adopt_args`` re-derived the serial path only when the argv carried a
+    ``-serial`` token; the QMP slot had the same shape and was left out.  A
+    caller-supplied argv with no ``-qmp`` therefore kept the port an earlier
+    ``build_args()`` had reserved, so the launch record named a control channel
+    the started command line never opened and ``wait_for_qmp`` probed it.
+    """
+    built_dir = tmp_path / "built"
+    other_dir = tmp_path / "other"
+    built_dir.mkdir()
+    other_dir.mkdir()
+    stale_port = fq.free_tcp_port()
+    # Reserve a port with build_args(), whose argv carries ``-qmp``.
+    _args(launcher, images, built_dir, stale_port)
+
+    binary, prefix = _fake_launcher_command()
+    argv = _caller_argv(fq.free_tcp_port(), serial=False, qmp=False)
+
+    result = launcher.launch(
+        binary, [*prefix, *argv], workdir=other_dir, env={"UNIPAD_FAKE_BOOT_MS": "0"}
+    )
+    try:
+        record = result.to_dict()
+        readiness = launcher.wait_for_qmp(timeout=0.2)
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+    # The record claims no control channel, and readiness says so rather than
+    # reporting on a port nothing is listening to.
+    assert record["qmp_port"] == 0
+    assert record["qmp_port"] != stale_port
+    assert readiness.ready is False
+    assert readiness.error_code == ErrorCode.CONFIG_INVALID

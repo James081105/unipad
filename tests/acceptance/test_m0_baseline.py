@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import json
+import getpass
 import platform
 from pathlib import Path
 
@@ -368,7 +369,35 @@ def test_repo_host_inventory_parses_and_matches_the_inventory_schema():
     # M0 open items are listed rather than silently dropped (PRD 6 M0).
     open_items = inventory["open_items"]
     assert isinstance(open_items, list) and open_items
-    assert any("QEMU" in item for item in open_items)
+    # ... and the ones that are closed must NOT still be listed as open.  An
+    # item that stays in this list after its evidence exists is a stale claim,
+    # which is worse than a missing one: it makes a measured fact look absent.
+    still_open = " ".join(open_items).lower()
+    for closed in ("qemu native windows build availability", "ipsw size",
+                   "cpu model string confirmation", "gpu vram"):
+        assert closed not in still_open, (
+            f"{closed!r} is closed with evidence (see closed_items) and must "
+            "not still be listed as open"
+        )
+
+    # Every closed item carries the evidence that closed it.  A closure with
+    # no citation is an assertion, not a measurement.
+    closed_items = inventory["closed_items"]
+    assert isinstance(closed_items, list) and closed_items
+    for entry in closed_items:
+        assert entry["item"] and entry["closed_at"] and entry["evidence"]
+    closed_text = " ".join(e["item"].lower() for e in closed_items)
+    for closed in ("qemu native windows build availability", "ipsw size",
+                   "cpu model string confirmation", "gpu vram"):
+        assert closed in closed_text, f"{closed!r} was closed but is not recorded"
+
+    # The VRAM measurement is a number now, not the placeholder string.
+    assert isinstance(gpu["vram_gb"], (int, float)) and gpu["vram_gb"] > 0
+    assert gpu["vram_evidence"]
+
+    # VT-x is answered, and the answer is the one that makes TCG mandatory.
+    assert cpu["vt_x"] == "present_disabled_in_firmware"
+    assert "tcg" in cpu["vt_x_note"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +432,37 @@ def test_live_inventory_matches_the_schema_and_never_fabricates(tmp_path):
     reloaded = read_json(written)
     assert reloaded["schema_version"] == 1
     assert reloaded["collector"] == inventory["collector"]
+
+
+def test_the_inventory_never_carries_the_windows_username():
+    """PRD 9.2: ``host-inventory.json`` is committed, so it must not name the
+    account.
+
+    ``sys.executable`` is an absolute path, and on this host that means the
+    profile directory -- the ``Users`` profile folder.  Emitting it put the
+    username into a tracked file, which is exactly what 9.2 forbids.  The
+    interpreter is therefore named by its final component, and this test walks
+    the whole live document rather than the one field that was wrong, because
+    the next leak will not be in the same place.
+    """
+    inventory = collect_host_inventory(probe_cim=False)
+    blob = json.dumps(inventory, ensure_ascii=False)
+
+    username = getpass.getuser()
+    assert username, "the test cannot prove anything without a username to look for"
+    assert username not in blob, "the live inventory names the Windows account"
+
+    # The shape of the leak, not just this host's spelling of it: any absolute
+    # path into a user profile would embed the account name the same way.
+    assert "Users\\" not in blob and "Users/" not in blob
+
+    # The information is withheld, not lost: the interpreter is still named,
+    # just by the part that identifies it without saying where it lives.
+    command = inventory["toolchain"]["python"]["command"]
+    assert command and "\\" not in command and "/" not in command
+    assert command.endswith(("python", "python.exe"))
+    assert any("final path component" in note for note in inventory["notes"])
+
+    # ... and the committed baseline obeys the same rule.
+    committed = read_json(HOST_INVENTORY)
+    assert username not in json.dumps(committed, ensure_ascii=False)

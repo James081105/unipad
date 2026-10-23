@@ -25,12 +25,22 @@ local-private/
 *.vmdk
 *.raw
 *.sparseimage
+# PRD 12 names these two explicitly as material that must never enter the
+# source tree.  They were missing while the workflow's PRIVATE_PATTERNS listed
+# them, so the runner would have refused to upload one and Git would have
+# accepted a commit of it -- two guards, one hole.
+*.trustcache
+*.seed
 
 # 密钥与凭证
 *.pem
 *.key
 *.p12
+*.pfx
 *.mobileprovision
+*.cer
+*.mobileconfig
+*.iso
 secrets.json
 
 # 编辑器 / OS
@@ -41,7 +51,10 @@ desktop.ini
 
 # 测试运行残留物
 .pytest-refute.tmp
+.pytest-launcher-scratch/
 fake-qemu-args.json
 
 # 编译探针残留物
 /a.out
+/a.o
+.suite-run.txt

@@ -77,6 +77,21 @@ from .precheck import (
     run_precheck,
     run_precheck_package,
 )
+from .matrix import (
+    AUTHORISATIONS,
+    ESTABLISHED_CONDITIONS,
+    POSITIVE_VERDICTS,
+    TRUST_CATEGORIES,
+    VERDICTS,
+    Authorisation,
+    CompatibilityMatrix,
+    EstablishedCondition,
+    MatrixEntry,
+    MatrixKey,
+    TrustCategory,
+    Verdict,
+    declared_signature_mode,
+)
 from .transfer import (
     DEFAULT_CHUNK_SIZE,
     GuestTransport,
@@ -134,6 +149,20 @@ __all__ = [
     "run_precheck_package",
     "VERDICT_ACCEPT",
     "VERDICT_REJECT",
+    # matrix
+    "Authorisation",
+    "TrustCategory",
+    "Verdict",
+    "EstablishedCondition",
+    "AUTHORISATIONS",
+    "TRUST_CATEGORIES",
+    "VERDICTS",
+    "ESTABLISHED_CONDITIONS",
+    "POSITIVE_VERDICTS",
+    "MatrixKey",
+    "MatrixEntry",
+    "CompatibilityMatrix",
+    "declared_signature_mode",
     # lifecycle
     "LifecycleAction",
     "LifecycleEntry",

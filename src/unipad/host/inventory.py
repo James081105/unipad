@@ -44,6 +44,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from unipad.host.paths import safe_location
+
 __all__ = [
     "INVENTORY_SCHEMA_VERSION",
     "collect_host_inventory",
@@ -510,13 +512,23 @@ def _toolchain_block(timeout: float, notes: list[str]) -> dict[str, Any]:
     """Report the toolchain versions relevant to M0 (PRD 6 WP00)."""
     toolchain: dict[str, Any] = {
         "python": {
-            "command": sys.executable,
+            # sys.executable is an absolute path, and on this host that means
+            # the profile directory -- i.e. the Windows username -- reaches a
+            # file that is committed to the repository.  PRD 9.2 forbids it,
+            # so the interpreter is named by its final component and the note
+            # records what was withheld and why.
+            "command": safe_location(sys.executable),
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
             "pytest": _distribution_version("pytest"),
             "pip": _distribution_version("pip"),
         }
     }
+    notes.append(
+        "toolchain.python.command is the interpreter's final path component; "
+        "the absolute path embeds the Windows username and this inventory is "
+        "committed (PRD 9.2)."
+    )
     for name, command in (("git", "git"), ("gh", "gh"), ("node", "node")):
         version = _command_version(command, timeout)
         if version is None:

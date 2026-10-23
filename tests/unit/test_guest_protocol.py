@@ -132,6 +132,101 @@ def test_install_request_ignores_extra_diagnostic_keys(tmp_path):
     assert "bundle_id" not in decoded.to_dict()
 
 
+# --- ADR-0008: the optional package source ---------------------------------
+#
+# ``package_url`` / ``cert_fingerprint`` are how the transfer stage tells the
+# guest where the host published the package.  They are optional, and the point
+# of the next three tests is that *optional* has to mean something on the wire:
+# a request that names no source must be the same frame a peer always received,
+# and a request that names one must survive the round trip.
+
+
+#: The frame a request carried before ADR-0008, pinned byte for byte.
+LEGACY_INSTALL_REQUEST_JSON = (
+    '{"declared_min_os":"17.0","package_name":"HelloUniPad.ipa",'
+    '"package_sha256":"SHA","signature_mode":"self","size_bytes":42}'
+)
+
+
+def test_an_absent_package_source_leaves_the_request_byte_identical():
+    """No source named == the frame this contract always carried.
+
+    Emitting ``"package_url": null`` would look harmless and would not be: every
+    peer that compares frames, and every test that pins the wire shape, would
+    see a contract that changed for a request that changed nothing.  So the
+    fields are omitted when unset, and this test pins the exact bytes.
+    """
+    request = InstallRequest(
+        package_name="HelloUniPad.ipa",
+        package_sha256="SHA",
+        size_bytes=42,
+        declared_min_os="17.0",
+        signature_mode="self",
+    )
+
+    assert set(request.to_dict()) == {
+        "package_name",
+        "package_sha256",
+        "size_bytes",
+        "declared_min_os",
+        "signature_mode",
+    }
+    # The separators are the wire encoder's (Message.to_json), not json.dumps' defaults.
+    assert (
+        json.dumps(request.to_dict(), sort_keys=True, separators=(",", ":"))
+        == LEGACY_INSTALL_REQUEST_JSON
+    )
+    # ... and the defaults really are "absent", not "empty".
+    assert request.package_url is None
+    assert request.cert_fingerprint is None
+
+
+def test_a_named_package_source_round_trips_through_json_lines():
+    """A request that names a source carries it across the wire unchanged."""
+    request = InstallRequest(
+        package_name="HelloUniPad.ipa",
+        package_sha256="SHA",
+        size_bytes=42,
+        declared_min_os="17.0",
+        signature_mode="self",
+        package_url="https://10.0.2.2:8443/index.json",
+        cert_fingerprint="f1" * 32,
+    )
+
+    decoded = InstallRequest.from_dict(_payload_round_trip(request.to_dict()).payload)
+
+    assert decoded == request
+    assert decoded.package_url == "https://10.0.2.2:8443/index.json"
+    assert decoded.cert_fingerprint == "f1" * 32
+    assert decoded["package_url"] == request.package_url
+
+
+def test_an_empty_package_source_is_absent_not_an_empty_string():
+    """An empty URL is not a source; it must not be invented into one.
+
+    ``_opt_package_str`` treats "set to nothing" as "not set" for these two
+    fields only -- ``_opt_str`` stays as it is for the response fields -- so a
+    caller that passes ``""`` gets a request that names nothing rather than one
+    that names an unreachable address or widens the frame for no information.
+    """
+    decoded = InstallRequest.from_dict(
+        {
+            "package_name": "HelloUniPad.ipa",
+            "package_sha256": "SHA",
+            "size_bytes": 42,
+            "declared_min_os": "17.0",
+            "signature_mode": "self",
+            "package_url": "",
+            "cert_fingerprint": "",
+        }
+    )
+
+    assert decoded.package_url is None
+    assert decoded.cert_fingerprint is None
+    assert "package_url" not in decoded.to_dict()
+    assert "cert_fingerprint" not in decoded.to_dict()
+
+
 def test_install_progress_round_trips_and_only_names_real_stages():
     """PRD 9.1: progress is informational; it may never claim a success stage."""
     progress = InstallProgress(stage="transferred", detail="4096 bytes verified")

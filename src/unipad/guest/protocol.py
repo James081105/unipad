@@ -17,6 +17,9 @@ Design rules enforced here:
   challenge values only -- never tokens, keys or user documents.
 - Guest-reported ``error_code`` values are already stable taxonomy codes
   (PRD section 10); they are passed through verbatim, never invented here.
+- An optional field is omitted from the frame when it is unset, never sent as
+  ``null``: a peer that predates the field receives exactly the frame it always
+  received (ADR-0008).
 
 Dependency direction: this module imports only :mod:`unipad.errors` and the
 standard library.  It must never import :mod:`unipad.ipa` or
@@ -163,22 +166,43 @@ class Message(DictView):
 
 @dataclass(eq=False)
 class InstallRequest(DictView):
-    """Host -> guest install request (package metadata only; bytes go via transfer)."""
+    """Host -> guest install request (package metadata only; bytes go via transfer).
+
+    ``package_url`` and ``cert_fingerprint`` are the optional package-source
+    fields ADR-0008 adds: they name the self-controlled HTTPS service the host
+    published for this transfer, and the SHA-256 of the DER
+    ``SubjectPublicKeyInfo`` a guest would pin it against.
+
+    They are *optional*, and :meth:`to_dict` omits them entirely when they are
+    unset rather than emitting ``null``.  A request that names no source is
+    byte-identical to the five-field contract this module had before ADR-0008,
+    so the message path and every existing peer keep working unchanged.  A
+    guest that does not implement the fetch simply ignores the two keys.
+    """
 
     package_name: str
     package_sha256: str
     size_bytes: int
     declared_min_os: str
     signature_mode: str
+    package_url: Optional[str] = None
+    cert_fingerprint: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "package_name": self.package_name,
             "package_sha256": self.package_sha256,
             "size_bytes": self.size_bytes,
             "declared_min_os": self.declared_min_os,
             "signature_mode": self.signature_mode,
         }
+        # Absent means absent on the wire too: an optional field the caller did
+        # not set must not widen the frame a peer receives.
+        if self.package_url is not None:
+            payload["package_url"] = self.package_url
+        if self.cert_fingerprint is not None:
+            payload["cert_fingerprint"] = self.cert_fingerprint
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "InstallRequest":
@@ -188,6 +212,8 @@ class InstallRequest(DictView):
             size_bytes=_req_int(data, "size_bytes"),
             declared_min_os=_req_str(data, "declared_min_os"),
             signature_mode=_req_str(data, "signature_mode"),
+            package_url=_opt_package_str(data.get("package_url")),
+            cert_fingerprint=_opt_package_str(data.get("cert_fingerprint")),
         )
 
 
@@ -327,6 +353,20 @@ def _req_int(data: Mapping[str, Any], key: str) -> int:
 
 def _opt_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
+
+
+def _opt_package_str(value: Any) -> Optional[str]:
+    """An optional package-source field: anything but a non-empty string is absent.
+
+    This is deliberately stricter than :func:`_opt_str`, which is shared with the
+    response fields (``bundle_id``, ``trust_mode``, ``error_message``) and must
+    keep an empty string as an empty string.  A package source is different: an
+    empty URL or fingerprint names nothing, and a frame that carries
+    ``"package_url": ""`` would both differ from the legacy five-field shape and
+    hand a guest an address it cannot fetch.  So "set to nothing" decodes to
+    "not set" and :meth:`InstallRequest.to_dict` omits it (ADR-0008).
+    """
+    return value if isinstance(value, str) and value else None
 
 
 # --- JSON Lines encode / decode ---

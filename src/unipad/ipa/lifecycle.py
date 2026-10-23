@@ -6,7 +6,7 @@ installed, what was it before, what happened in between, and why did something
 fail.  Answering them correctly is a host-side obligation, so it is implemented
 and proved here without a guest.
 
-Three rules shape the module:
+Four rules shape the module:
 
 **The ledger is append-only.**  A history that can be rewritten is not a
 history.  Entries are never edited or removed; the current state is *derived*
@@ -23,6 +23,16 @@ maps a stable :class:`unipad.errors.ErrorCode` onto a small set of classes.  A
 code it does not recognise becomes ``"unknown"`` -- never a guess at a
 neighbouring class, which would hide the real fault behind a plausible one.
 
+**A stage that never happened records nothing.**  An install that was blocked
+before the transfer -- no guest channel, or an ``update`` for a bundle the
+ledger does not have -- never touched any bundle, so there is no transition to
+record, and inventing one would put a state change in the history that did not
+happen.  This is the rule the controller documents, and it is pinned from the
+CLI side in ``tests/unit/test_cli_lifecycle.py``.  It is about the *ledger*
+only: every such refusal still writes ``install.log`` naming the reason, and
+the envelope reports that file, so "records nothing" never means "left no
+trace".
+
 Nothing here touches the guest.  It records what the host was told and what the
 host did, which is exactly the boundary PRD 9.2 draws: evidence may not be
 invented, and an entry is not a claim about the device.
@@ -31,12 +41,14 @@ invented, and an entry is not a claim about the device.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from unipad.errors import ErrorCode
 from unipad.models import InstallResult
 
 __all__ = [
@@ -45,6 +57,8 @@ __all__ = [
     "InstallLedger",
     "classify_failure",
     "FAILURE_CLASSES",
+    "UNCLASSIFIED_BY_DESIGN",
+    "LINE_WARN_THRESHOLD",
 ]
 
 
@@ -63,35 +77,76 @@ class LifecycleAction(str, Enum):
 
 #: Error classes, as a closed vocabulary.  A class is a *category* for an
 #: operator, not a diagnosis: which rule fired is ``FaultEntry.reason``.
+#:
+#: **Scope.**  The table classifies the IPA install chain -- the codes PRD
+#: section 10 names, plus the transport and trust codes the installer maps a
+#: guest reply onto.  Host, QEMU, image and verifier codes (``qemu_timeout``,
+#: ``image_not_found``, ``verification_failed``, ...) are deliberately absent:
+#: they surface through their own envelope, and forcing them into one of these
+#: five classes would claim a location in *this* chain for a fault that lives
+#: somewhere else.  They classify as ``"unknown"``, which for them is the
+#: truthful answer rather than a gap.
 FAILURE_CLASSES: tuple[str, ...] = (
     "package_rejected",       # the package itself is unacceptable
     "integrity_failed",       # bytes did not match what was declared
     "transfer_failed",        # the move to the guest failed
     "service_unavailable",    # the guest install service could not be reached
     "guest_refused",          # the guest looked at it and said no
+    "guest_runtime_failed",   # the guest ran the app and the app misbehaved
     "unknown",                # not classifiable -- reported, never guessed
 )
 
+#: How many entries a ledger may hold before :attr:`InstallLedger.growth_warning`
+#: says so.  The number is the measurement in the class docstring -- the point
+#: where a full re-parse stops being free -- and not a limit: nothing refuses to
+#: append, and nothing refuses to read.
+LINE_WARN_THRESHOLD = 100_000
+
 #: ``ErrorCode`` -> class.  Grouped by *where the failure lives* rather than by
 #: which command raised it, so an operator reading a class knows what to check.
+#: Every key is a member of :class:`unipad.errors.ErrorCode` -- a row for a
+#: string nobody declares is coverage that does not exist, and it reads as
+#: coverage, which is worse.
 _CLASS_BY_CODE: Mapping[str, str] = {
     # the package is unacceptable before anything is attempted
     "invalid_package": "package_rejected",
     "unsupported_platform": "package_rejected",
     "unsupported_arch": "package_rejected",
-    "encrypted_binary": "package_rejected",
     # the bytes are not what they claimed to be
     "image_hash_mismatch": "integrity_failed",
     # moving it failed
     "transfer_failed": "transfer_failed",
-    "guest_transport_error": "transfer_failed",
     # the guest could not be asked
     "install_service_unavailable": "service_unavailable",
-    "guest_unavailable": "service_unavailable",
-    # the guest answered and refused
-    "guest_refused": "guest_refused",
-    "trust_denied": "guest_refused",
-    "challenge_failed": "guest_refused",
+    # the guest answered and refused.  These four are what the installer maps
+    # the guest's own reply onto -- ``signature_rejected`` / ``policy_rejected``
+    # / ``untrusted`` / ``rejected`` / ``denied`` / ``forbidden`` and the
+    # container, dependency and launch failures -- so they are not "unknown":
+    # the guest answered, and the answer was no.
+    "signature_or_policy_rejected": "guest_refused",
+    "registration_failed": "guest_refused",
+    "missing_dependency": "guest_refused",
+    "dyld_failed": "guest_refused",
+    # ... and the last three rows of the same PRD section 10 table: 图形与输入
+    # and 持久化.  The install worked and the app did not, so neither
+    # ``package_rejected`` nor ``guest_refused`` is true of them.
+    "render_failed": "guest_runtime_failed",
+    "input_failed": "guest_runtime_failed",
+    "persistence_failed": "guest_runtime_failed",
+}
+
+#: Declared codes the table refuses to classify, with the reason.  A class says
+#: where a fault lives; these make no such statement, so classifying one would
+#: be the plausible-looking guess :func:`classify_failure` exists to avoid.
+#: Naming the refusal keeps it a decision instead of an accident of the default.
+UNCLASSIFIED_BY_DESIGN: Mapping[str, str] = {
+    ErrorCode.BLOCKED: (
+        "the generic marker: the controller raises it before any stage runs, "
+        "and those paths never reach the ledger at all; the installer maps a "
+        "guest reply it does not recognise onto it, which is precisely a fault "
+        "that cannot be placed.  Either way the actionable half is the "
+        "blocked_reason in details, not a class."
+    ),
 }
 
 
@@ -102,6 +157,9 @@ def classify_failure(error_code: Optional[str]) -> str:
     mapped onto a neighbouring class: a plausible-looking guess would send an
     operator to check the wrong thing, and the whole value of a class is that
     it can be acted on.
+
+    ``"unknown"`` is also the honest answer for a code the table refuses on
+    purpose -- :data:`UNCLASSIFIED_BY_DESIGN` names those, and why.
     """
     if not error_code:
         return "unknown"
@@ -111,6 +169,111 @@ def classify_failure(error_code: Optional[str]) -> str:
 def _now() -> str:
     """UTC timestamp, second resolution, always with an explicit offset."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _missing_ancestors(path: Path) -> tuple[Path, ...]:
+    """Ancestors of ``path`` that do not exist yet, outermost first.
+
+    ``mkdir(parents=True)`` creates a whole chain, and every link in it is a
+    new *name* in a directory that already exists.  The caller has to know
+    which ones those were, because a name is only durable once the directory
+    holding it has been flushed.
+    """
+    missing: list[Path] = []
+    for candidate in path.parents:
+        if candidate.exists():
+            break
+        missing.append(candidate)
+    missing.reverse()
+    return tuple(missing)
+
+
+def _flush_directory_win32(directory: Path) -> bool:
+    """Flush a directory's entries on Windows.
+
+    Win32 has no ``fsync`` for a directory and ``os.open`` refuses one
+    outright (``PermissionError``), so the handle has to be opened the
+    documented way for a directory at all: ``FILE_FLAG_BACKUP_SEMANTICS``.
+    ``FlushFileBuffers`` then needs write access to that handle, which is why
+    the desired access is read *and* write.  Measured on this host: the handle
+    opens and the flush returns true; with read-only access the flush fails.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    file_share_read = 1
+    file_share_write = 2
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    # Stated explicitly rather than left to ctypes' default ``int`` return:
+    # a 64-bit handle truncated to 32 bits is a handle to something else.
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        str(directory),
+        generic_read | generic_write,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    if not handle or handle == invalid_handle_value:
+        return False
+    try:
+        return bool(kernel32.FlushFileBuffers(handle))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _fsync_directory(directory: Path) -> bool:
+    """Force ``directory``'s own entries to the device.
+
+    Creating a file is two operations, and ``fsync`` on the file descriptor
+    only performs the first: the bytes reach the device, and the *name* that
+    maps to them inside the parent directory does not.  On a filesystem that
+    journals metadata the name is safe anyway; on one that does not, a power
+    cut leaves the bytes on the disk with nothing pointing at them -- the file
+    exists and cannot be found, which for an append-only ledger is the same as
+    never having been written.
+
+    Returns:
+        ``True`` when the flush was performed, ``False`` when the platform
+        refused it.  The caller must treat ``False`` as best effort and never
+        as a failed append: the entry *is* written, and losing a transition the
+        host really performed to chase a stronger guarantee would be the worse
+        of the two errors.
+    """
+    try:
+        if os.name == "nt":
+            return _flush_directory_win32(directory)
+        handle = os.open(os.fspath(directory), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(handle)
+    except OSError:
+        return False
+    finally:
+        os.close(handle)
+    return True
 
 
 @dataclass
@@ -185,6 +348,27 @@ class InstallLedger:
     The file is JSON Lines: one entry per line, appended.  A line that cannot
     be parsed is counted in :attr:`unreadable_lines` and skipped, so a
     truncated tail costs the last entry rather than the whole history.
+
+    **Cost, stated because it is a design choice and not an oversight.**  The
+    whole file is read and parsed on every construction: measured at roughly
+    5.4 us and ~610 bytes of RSS per entry, i.e. ~1 s and ~80 MB at 100 000
+    entries.  There is no index and no tail read, because there cannot be one
+    that answers :meth:`installed` in general -- an ``uninstall`` may sit
+    anywhere in the file, so the tail alone does not decide anything -- and
+    ``history --all`` genuinely needs every line.  The append-only contract is
+    worth that cost; it is documented here so nobody is surprised by it and
+    nobody "optimises" it into a cache that can go stale.
+
+    What the cost *does* earn is visibility: :attr:`growth_warning` says so
+    once the file passes :data:`LINE_WARN_THRESHOLD`, so growth is noticed
+    while it is still a second rather than after it is five.
+
+    Every append is flushed and ``fsync``-ed before it returns, and a file this
+    append creates has its directory entry forced too -- ``fsync`` on the
+    descriptor flushes the bytes, not the *name* that finds them.  A transition
+    the host performed but the ledger does not know about is a host that
+    disagrees with the guest about what is installed, and there is nothing
+    later that reconciles the two.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -196,6 +380,32 @@ class InstallLedger:
 
     # -- reading ---------------------------------------------------------
 
+    @property
+    def line_count(self) -> int:
+        """How many entries the file holds -- the lines ``_load`` parsed."""
+        return len(self._entries)
+
+    @property
+    def growth_warning(self) -> Optional[str]:
+        """A warning once the ledger passes :data:`LINE_WARN_THRESHOLD`.
+
+        A warning and not a failure: a long history is a *working* history, and
+        refusing to read one would make the ledger less useful the more it is
+        used.  The point is that the cost is linear and has no index, so the
+        only honest defence is to say so while the file is still small enough
+        to do something about it.
+
+        The message names the count and the measured per-entry cost and carries
+        no path: it is a fact an operator acts on, not a location (PRD 9.2).
+        """
+        if len(self._entries) <= LINE_WARN_THRESHOLD:
+            return None
+        return (
+            f"the install ledger holds {len(self._entries)} entries; every open "
+            f"re-parses the whole file (~5.4 us and ~610 bytes per entry, so "
+            f"~1 s and ~80 MB at {LINE_WARN_THRESHOLD})"
+        )
+
     def _load(self) -> None:
         self._entries = []
         self.unreadable_lines = 0
@@ -206,7 +416,17 @@ class InstallLedger:
                     continue
                 try:
                     self._entries.append(LifecycleEntry.from_dict(json.loads(line)))
-                except (ValueError, TypeError, json.JSONDecodeError):
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    # ``KeyError`` is the shape a line that is valid JSON but
+                    # not a complete entry produces: ``from_dict`` subscripts
+                    # ``action``, ``entry_id`` and ``bundle_id`` with no
+                    # default.  Catching only the other three let it out of
+                    # this *constructor*, so a damaged file made the ledger
+                    # impossible to open and ``unreadable_lines`` never rose --
+                    # the damage surfaced as a host fault instead of a reported
+                    # one, which is the worse of the two outcomes for a module
+                    # whose only job is not to lose data.  The sibling store
+                    # catches the same set; see ``CompatibilityMatrix._load``.
                     self.unreadable_lines += 1
 
     @property
@@ -218,16 +438,29 @@ class InstallLedger:
         """Entries for one bundle, oldest first."""
         return tuple(e for e in self._entries if e.bundle_id == bundle_id)
 
-    def installed(self, bundle_id: str) -> Optional[LifecycleEntry]:
+    def installed(
+        self,
+        bundle_id: str,
+        *,
+        from_history: Optional[Iterable[LifecycleEntry]] = None,
+    ) -> Optional[LifecycleEntry]:
         """The entry that describes ``bundle_id``'s current state, or ``None``.
 
         Derived, never stored: the last entry that *installed* it wins, and an
         uninstall after that removes it.  A failed install is not an install,
         so it never makes a bundle present -- and it does not evict a previous
         good install either, because it did not touch it.
+
+        Args:
+            from_history: this bundle's history, when the caller already holds
+                it.  A caller asking both questions about one bundle -- the
+                CLI's ``history`` wants the entries *and* the current state --
+                would otherwise pay for the same linear scan twice, and the
+                second pass answers a question the first one already knew.
         """
         current: Optional[LifecycleEntry] = None
-        for entry in self.history(bundle_id):
+        entries = self.history(bundle_id) if from_history is None else from_history
+        for entry in entries:
             if entry.action is LifecycleAction.INSTALL:
                 if entry.stage in ("installed", "registered"):
                     current = entry
@@ -251,10 +484,58 @@ class InstallLedger:
 
     # -- writing ---------------------------------------------------------
 
+    def _tail_is_unterminated(self) -> bool:
+        """True when the file exists, holds bytes, and does not end a line.
+
+        A writer that died mid-line leaves exactly this shape.  Reading the
+        last byte is the only way to see it: the line itself is not
+        distinguishable from a complete one until something is appended after
+        it, and by then the damage is done.
+        """
+        if not self.path.is_file():
+            return False
+        with self.path.open("rb") as handle:
+            if handle.seek(0, os.SEEK_END) == 0:
+                return False
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) != b"\n"
+
     def _append(self, entry: LifecycleEntry) -> LifecycleEntry:
+        # Every name this append creates -- the ledger file itself, and any
+        # directory ``mkdir`` has to make on the way to it -- lives in a
+        # directory, and only that directory's own flush makes the name survive
+        # a power cut.  ``fsync`` on the file descriptor does not, so the new
+        # directories are collected before they exist and flushed after the
+        # bytes are.  An append to a file that is already there creates no new
+        # name, so it pays nothing.
+        new_directories = _missing_ancestors(self.path)
+        fresh_file = not self.path.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # An unterminated tail is closed off with a newline before anything is
+        # written after it.  Without this the next entry is concatenated onto
+        # the corrupt line and both are lost -- and because the result is a
+        # single unreadable line, `unreadable_lines` does not rise, so the loss
+        # is silent.  The repair only *adds* a byte: an append-only file is
+        # never rewritten, not even to fix it.
+        prefix = "\n" if self._tail_is_unterminated() else ""
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+            handle.write(prefix + json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+            # The append is the only record that a transition happened, so it
+            # is not allowed to live in a page cache: flush to the OS and force
+            # it to the device before the call returns.  An OSError here is
+            # left to propagate -- a history that could not be written is a
+            # host fault, not something to report as a fine install.
+            handle.flush()
+            os.fsync(handle.fileno())
+        if fresh_file:
+            # Best effort, and deliberately not allowed to raise: the entry is
+            # written and the transition really happened, so a host that refuses
+            # a metadata flush must not cost the host its history.
+            try:
+                for directory in dict.fromkeys((*new_directories, self.path.parent)):
+                    _fsync_directory(directory)
+            except OSError:
+                pass
         self._entries.append(entry)
         return entry
 
@@ -262,10 +543,6 @@ class InstallLedger:
         # Monotonic within the file, so an entry cannot be forged to supersede
         # a different one: the id is derived from the position it will occupy.
         return f"le-{len(self._entries) + 1:08d}"
-
-    def _last_entry_for(self, bundle_id: str) -> Optional[LifecycleEntry]:
-        history = self.history(bundle_id)
-        return history[-1] if history else None
 
     def record_install(
         self,
@@ -279,15 +556,19 @@ class InstallLedger:
         An ``update`` supersedes the entry it replaces; a first install
         supersedes nothing.  An update with no predecessor keeps its action but
         claims no predecessor rather than inventing one.
+
+        "The entry it replaces" is the one :meth:`installed` derives -- an entry
+        that actually established the bundle at stage ``installed`` or
+        ``registered``.  A failed install, a bare transfer or a removal never
+        made the bundle present, so none of them can be what an update
+        replaced, and naming one would put the supersede chain at odds with the
+        derived state in the same file.
         """
         supersedes = None
         if action is LifecycleAction.UPDATE:
-            previous = self._last_entry_for(result.bundle_id or "")
-            if previous is not None and previous.action in (
-                LifecycleAction.INSTALL,
-                LifecycleAction.UPDATE,
-            ):
-                supersedes = previous.entry_id
+            current = self.installed(result.bundle_id or "")
+            if current is not None:
+                supersedes = current.entry_id
 
         return self._append(
             LifecycleEntry(
