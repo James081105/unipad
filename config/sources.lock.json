@@ -87,8 +87,21 @@
       },
       "note": "Measured 2026-10-23 from the installed QEMU under local-private/tools/qemu. sha256 is of qemu-system-aarch64.exe. The installer is an NSIS flat layout, so <exe>/share/qemu/ is the firmware dir, not <exe>/../share/qemu."
     },
+    "firmware_boot": {
+      "status": "VERIFIED-ON-HOST",
+      "verified": "2026-10-23",
+      "what": "The pinned edk2-aarch64-code.fd boots under the real QEMU 11.1.0 TCG with the pinned board parameters and reaches an interactive UEFI Shell prompt.",
+      "evidence": [
+        "tests/acceptance/test_real_boot_edk2.py",
+        "serial log carries: UEFI firmware (version edk2-stable202408-prebuilt.qemu.org ...)",
+        "BdsDxe: starting Boot0001 \"EFI Internal Shell\"",
+        "UEFI Interactive Shell v2.2 / EDK II / UEFI v2.70",
+        "Shell> prompt reached"
+      ],
+      "not_proved": "Nothing about XNU, UniXNU, iPadOS or any payload of ours. The shell is the firmware's own built-in firmware-volume option, not our image, and no ESP is attached."
+    },
     "xcode": {"version": null, "note": "macOS runner only; recorded from the Actions job. Not applicable to this Windows host."},
-    "python": {"version": "3.12.9", "note": "host inventory 2026-10-22"},
+    "python": {"version": "3.12.9", "note": "host inventory 2026-10-22. `python` only; `python3` does not exist on this host, which several upstream build scripts invoke by name."},
     "clang": {
       "version": "23.1.3",
       "path": "local-private/tools/msys64/ucrt64/bin/clang.exe",
@@ -100,11 +113,14 @@
         "cmake": "local-private/tools/msys64/ucrt64/bin/cmake.exe",
         "flex": "local-private/tools/msys64/usr/bin/flex.exe",
         "bison": "local-private/tools/msys64/usr/bin/bison.exe",
-        "zig": "local-private/out/xnu-port/toolchain/ziglang/zig.exe (ziglang 0.16.0)"
+        "zig": "local-private/out/xnu-port/toolchain/ziglang/zig.exe (ziglang 0.16.0)",
+        "unifdef": "local-private/tools/msys64/usr/bin/unifdef.exe (2.12)",
+        "mtools": "local-private/tools/msys64/usr/bin/mtools.exe (4.0.49)",
+        "mig": "local-private/tmp/kernel-macho/bootstrap_cmds-cross_platform/migcom.tproj/migcom.exe -- BUILT AND WORKING (bootstrap_cmds-138); runs and fails correctly on an empty input"
       },
-      "note": "Present on this host as a HOST compiler (x86_64-w64-windows-gnu). NOT yet proven to cross-compile AArch64/iOS: no aarch64 iOS sysroot, and availability.pl / mig / unifdef / mtools are still absent. Do not record this as a working XNU toolchain."
+      "note": "Present on this host as a HOST compiler (x86_64-w64-windows-gnu). NOT yet proven to cross-compile AArch64/iOS: no iOS sysroot. availability.pl is present and runs under the host Python (907 lines / 292 macros emitted), so it is not a blocker. mig IS built and working, contrary to an earlier note here; unifdef and mtools are present in the MSYS2 tree. The remaining unknown is the iOS sysroot and the Xcode-only steps of scripts/build-xnu-4k-baseline.sh. Do not record this as a working XNU toolchain."
     }
   },
   "frozen": false,
-  "frozen_note": "Not frozen: tools.clang has no proven AArch64/iOS cross-compilation capability (no iOS sysroot, and availability.pl, mig, unifdef and mtools are absent), so no clean build has been run against these pins. Every identity that was measurable is now recorded with a digest. Set frozen=true only after a clean build succeeds against these pins."
+  "frozen_note": "Not frozen: tools.clang has no proven AArch64/iOS cross-compilation capability (no iOS sysroot), so no clean XNU build has been run against these pins. The firmware layer IS verified on the host (see tools.firmware_boot). Set frozen=true only after a clean XNU build succeeds against these pins."
 }
