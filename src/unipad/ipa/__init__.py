@@ -26,6 +26,13 @@ Runtime dependencies: Python standard library only.
 
 from __future__ import annotations
 
+from .lifecycle import (
+    FAILURE_CLASSES,
+    InstallLedger,
+    LifecycleAction,
+    LifecycleEntry,
+    classify_failure,
+)
 from .faults import (
     SUCCESS_STAGES,
     TERMINAL_STAGES,
@@ -127,6 +134,12 @@ __all__ = [
     "run_precheck_package",
     "VERDICT_ACCEPT",
     "VERDICT_REJECT",
+    # lifecycle
+    "LifecycleAction",
+    "LifecycleEntry",
+    "InstallLedger",
+    "classify_failure",
+    "FAILURE_CLASSES",
     # faults
     "InstallStage",
     "FaultEntry",
