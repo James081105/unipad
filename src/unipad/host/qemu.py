@@ -61,6 +61,37 @@ def _qemu_path(path: Path | str) -> str:
 #: spelling that would put the guest on a real LAN must fail loudly.
 NETWORK_MODES: tuple[str, ...] = ("none", "user")
 
+#: How the firmware is handed to QEMU.  ``bios`` is the single-blob spelling
+#: (``-bios <file>``).  ``pflash`` is the code+vars pair the UniXNU board needs:
+#: UEFI keeps its variables in a *writable* second flash device, so a firmware
+#: that persists settings across boots cannot be expressed with ``-bios`` alone.
+#: qemu-virt.c:1907-1916 exits(1) when both forms appear, so the choice is
+#: exclusive by construction -- never both, never neither.
+FIRMWARE_ATTACHMENTS: tuple[str, ...] = ("bios", "pflash")
+
+
+def _firmware_attachment(machine: "models.MachineConfig") -> str:
+    """Return the validated firmware attachment spelling for ``machine``."""
+    devices = dict(machine.devices or {})
+    firmware = devices.get("firmware")
+    if firmware is None:
+        return "bios"
+    if not isinstance(firmware, dict):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "machine devices.firmware must be an object",
+            firmware_type=type(firmware).__name__,
+        )
+    attach = firmware.get("attach", "bios")
+    if attach not in FIRMWARE_ATTACHMENTS:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "unknown firmware attachment",
+            attach=repr(attach),
+            known_attachments=list(FIRMWARE_ATTACHMENTS),
+        )
+    return attach
+
 
 def _network_argument(net: Mapping[str, Any]) -> str:
     """Return the ``-nic`` value for the configured guest network.
@@ -158,12 +189,51 @@ def _split_command_line(text: str) -> list[str]:
 
 
 
-def _parse_drive_file(spec: str) -> Optional[str]:
-    """Extract the ``file=`` component of a ``-drive`` option string."""
+#: Block-driver prefixes QEMU accepts in a ``-drive file=`` value.  ``fat:``
+#: turns a *directory* into a read-only FAT volume, which is the only ESP form
+#: that boots UniXNU; ``json:`` is an inline blockdev description; and
+#: ``host_device:`` names a host device node whose existence only the host OS
+#: can answer for.  All three mean the value is not a plain path.
+BLOCK_DRIVER_PREFIXES: tuple[str, ...] = ("fat:", "json:", "host_device:")
+
+
+def _strip_block_driver(value: str) -> tuple[str, str]:
+    """Split a leading block-driver prefix off a ``file=`` value.
+
+    Returns ``(prefix, path)`` where ``prefix`` is ``""`` for a plain path and
+    ``path`` is always the part to check on disk.  ``host_device:`` is returned
+    with its prefix intact and an empty path: the value names a host device
+    node, which only the host OS can answer for.
+    """
+    for prefix in BLOCK_DRIVER_PREFIXES:
+        if value.startswith(prefix):
+            remainder = value[len(prefix):]
+            return prefix, "" if prefix == "host_device:" else remainder
+    return "", value
+
+
+def _raw_drive_file(spec: str) -> Optional[str]:
+    """Return the ``file=`` value verbatim, block-driver prefix included."""
     for part in spec.split(","):
         key, _, value = part.partition("=")
         if key.strip() == "file" and value.strip():
             return value.strip()
+    return None
+
+
+def _parse_drive_file(spec: str) -> Optional[str]:
+    """Extract the ``file=`` component of a ``-drive`` option string.
+
+    The block-driver prefix is stripped: ``file=fat:F:/esp`` describes the
+    directory ``F:/esp``, not a path literally called ``fat:F:/esp``.  Keeping
+    the prefix made the existence check in :meth:`QemuLauncher._missing_paths`
+    report the one disk layout the boot path needs as missing.
+    """
+    for part in spec.split(","):
+        key, _, value = part.partition("=")
+        if key.strip() == "file" and value.strip():
+            _, path = _strip_block_driver(value.strip())
+            return path or None
     return None
 
 
@@ -310,6 +380,11 @@ class QemuLauncher:
                     "silently attempted."
                 ),
             )
+        # Fail at construction, not at launch: an unbuildable firmware decision
+        # is a configuration error, and discovering it after QEMU has started
+        # means a process that dies immediately with a message that names
+        # neither form.
+        self.firmware_attachment = _firmware_attachment(machine)
         self.machine = machine
         self.qmp_host = qmp_host
         self.qmp_timeout = qmp_timeout
@@ -320,6 +395,7 @@ class QemuLauncher:
         self._last_workdir: Optional[Path] = None
         self._last_qmp_port: Optional[int] = None
         self._last_serial_path: Optional[Path] = None
+        self._last_pflash_vars: Optional[Path] = None
 
         self._process: Optional[subprocess.Popen] = None
         self._binary: Optional[str] = None
@@ -377,20 +453,48 @@ class QemuLauncher:
         work = Path(workdir)
         serial_target = Path(serial_log) if serial_log else work / "serial.log"
 
-        args: list[str] = [
-            "-accel",
-            "tcg",                                   # PRD 2.2-1: explicit, never inferred
-            "-cpu",
-            str(machine.cpu_model),
-            "-machine",
-            str(machine.machine_type),
-            "-smp",
-            str(int(machine.cores)),
-            "-m",
-            str(int(machine.memory_mb)),
-            "-bios",
-            _qemu_path(firmware),
-        ]
+        args: list[str] = []
+
+        # Firmware first: the two spellings are mutually exclusive, so the whole
+        # decision is made before anything else references the firmware.
+        if self.firmware_attachment == "pflash":
+            firmware_path = Path(firmware)
+            args.extend(
+                [
+                    "-drive",
+                    f"if=pflash,format=raw,readonly=on,file={_qemu_path(firmware_path)}",
+                ]
+            )
+            # The vars drive is created and truncated by launch() to exactly the
+            # code drive's size (run-qemu.py:151-152).  Its path is remembered so
+            # the rest of the class can find it without re-parsing the argv.
+            self._last_pflash_vars = work / "vars.fd"
+            args.extend(
+                [
+                    "-drive",
+                    f"if=pflash,format=raw,readonly=off,file={_qemu_path(self._last_pflash_vars)}",
+                ]
+            )
+        else:
+            args.extend(["-bios", _qemu_path(firmware)])
+
+        args.extend(
+            [
+                "-accel",
+                "tcg",                                   # PRD 2.2-1: explicit, never inferred
+                "-cpu",
+                str(machine.cpu_model),
+                "-machine",
+                str(machine.machine_type),
+                "-smp",
+                str(int(machine.cores)),
+                "-m",
+                str(int(machine.memory_mb)),
+                # A guest that triple-faults must end the run, not spin the host
+                # forever (PRD 4.2).
+                "-no-reboot",
+            ]
+        )
 
         rtc = (machine.clock or {}).get("rtc")
         if rtc:
@@ -420,6 +524,17 @@ class QemuLauncher:
             # ramfb/GOP path first (PRD 4.2).  The guest keeps its display;
             # -display is only disabled for explicit headless runs.
             args.extend(["-device", "ramfb"])
+            # The guest driver reads the frame-buffer geometry out of fw_cfg
+            # (package/QemuRamfbPkg/QemuRamfb.c:125), so a size that is only in
+            # our config never reaches it: without this item the framebuffer
+            # keeps the EDK2 default and every row is misaligned.
+            args.extend(
+                [
+                    "-fw_cfg",
+                    "name=opt/org.unixnu/ramfb-size,string="
+                    f"{int(display.get('width', 0))}x{int(display.get('height', 0))}",
+                ]
+            )
         if headless:
             args.extend(["-display", "none"])
 
@@ -495,6 +610,13 @@ class QemuLauncher:
                 ErrorCode.CONFIG_INVALID,
                 "no qemu arguments available: call build_args() first or pass args=",
             )
+        # The work directory is resolved before the pre-flight check because the
+        # pflash vars file lives there and has to exist by the time the check
+        # runs -- otherwise a correctly configured run is refused for a file the
+        # launcher itself was supposed to create.
+        work = Path(workdir) if workdir is not None else (self._last_workdir or Path.cwd())
+        work.mkdir(parents=True, exist_ok=True)
+        self._materialise_pflash_vars(resolved_args, work)
         missing = self._missing_paths(resolved_args)
         if missing:
             raise UniPadError(
@@ -505,8 +627,6 @@ class QemuLauncher:
 
         binary = self._resolve_binary(binary_name)
         self._adopt_args(resolved_args)
-        work = Path(workdir) if workdir is not None else (self._last_workdir or Path.cwd())
-        work.mkdir(parents=True, exist_ok=True)
 
         stdout_path = work / "qemu-stdout.log"
         stderr_path = work / "qemu-stderr.log"
@@ -898,9 +1018,69 @@ class QemuLauncher:
             return tokens[1:], tokens[0]
         return [], command
 
+    def _materialise_pflash_vars(self, args: Sequence[str], work: Path) -> None:
+        """Create any writable pflash vars file the argv asks for.
+
+        UEFI keeps its variables in the second flash device, so a firmware that
+        persists settings needs a *writable* file where ``-bios`` alone would
+        have none.  Upstream sizes it to the code drive exactly
+        (``run-qemu.py:151-152``); a shorter file makes QEMU truncate writes and
+        a longer one wastes 64 MiB per run.  An existing file is left alone --
+        it holds the variables from the previous run, which is the whole point.
+
+        A missing *code* drive is not repaired here: that is a real missing
+        image and :meth:`_missing_paths` must report it.
+        """
+        for index, value in enumerate(args):
+            if value != "-drive" or index + 1 >= len(args):
+                continue
+            spec = args[index + 1]
+            if "if=pflash" not in spec or "readonly=off" not in spec:
+                continue
+            target = _parse_drive_file(spec)
+            if not target:
+                continue
+            path = Path(target)
+            if path.exists():
+                continue
+            size = self._pflash_code_size(args)
+            try:
+                with open(path, "wb") as handle:
+                    if size:
+                        handle.truncate(size)
+            except OSError as exc:
+                raise UniPadError(
+                    ErrorCode.IMAGE_NOT_FOUND,
+                    "could not create the pflash vars drive",
+                    path=str(path),
+                    reason=type(exc).__name__,
+                ) from exc
+
+    @staticmethod
+    def _pflash_code_size(args: Sequence[str]) -> int:
+        """Return the byte size of the read-only pflash drive, or 0."""
+        for index, value in enumerate(args):
+            if value != "-drive" or index + 1 >= len(args):
+                continue
+            spec = args[index + 1]
+            if "if=pflash" not in spec or "readonly=on" not in spec:
+                continue
+            target = _parse_drive_file(spec)
+            if target and Path(target).is_file():
+                return Path(target).stat().st_size
+        return 0
+
     @staticmethod
     def _missing_paths(args: Sequence[str]) -> list[str]:
-        """Return the ``-bios`` / ``-drive file=`` targets that do not exist."""
+        """Return the ``-bios`` / ``-drive file=`` targets that do not exist.
+
+        A ``host_device:`` value is deliberately *not* judged: ``/dev/rdiskN``
+        exists on macOS and never on Windows, and the launcher has no way to
+        tell a valid host device from a stale one.  Reporting it missing would
+        block a legitimate run; leaving it to QEMU produces an error that names
+        the device.  Everything else is checked, including the directory behind
+        a ``fat:`` prefix.
+        """
         missing: list[str] = []
         for index, value in enumerate(args):
             if value == "-bios" and index + 1 < len(args):
@@ -908,9 +1088,12 @@ class QemuLauncher:
                 if not Path(target).exists():
                     missing.append(f"-bios {target}")
             elif value == "-drive" and index + 1 < len(args):
-                target = _parse_drive_file(args[index + 1])
-                if target and not Path(target).exists():
-                    missing.append(f"-drive file={target}")
+                spec = args[index + 1]
+                prefix, path = _strip_block_driver(_raw_drive_file(spec) or "")
+                if not path:
+                    continue
+                if not Path(path).exists():
+                    missing.append(f"-drive file={spec}")
         return missing
 
     def _early_exit_code(self) -> Optional[int]:

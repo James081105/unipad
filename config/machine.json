@@ -3,23 +3,25 @@
   "name": "ipad-tcg",
   "accel": "tcg",
   "accel_note": "Intel Windows host: TCG is mandatory. The launcher refuses any other accelerator (accelerator_not_tcg).",
-  "cpu_model": "cortex-a57",
-  "cpu_model_note": "Candidate only; M0/M4 resolves against the pinned board.toml (PRD 6 WP04).",
-  "cores": 4,
-  "memory_mb": 3072,
-  "memory_note": "Host has 15.8GB total with ~3.4GB free at inventory; keep guest RAM conservative and record peak RSS.",
-  "machine_type": "virt",
+  "cpu_model": "cortex-a710",
+  "cpu_model_note": "Pinned to the board we boot: run-qemu.py:155 selects cortex-a710 for TCG, and the ADT's cpu0 compatible is arm,cortex-a710 (make-dt.py:141). The earlier cortex-a57 guess was ARMv8.0 and is superseded.",
+  "cores": 1,
+  "memory_mb": 6144,
+  "memory_note": "board.toml:92 dram_size = 0x180000000 (6 GiB); make-qemu-adt.py is called with --dram-size 0x180000000, so a smaller guest would describe memory the ADT says does not exist. Host has 15.8GB total.",
+  "machine_type": "virt,virtualization=off,secure=off,gic-version=3",
+  "machine_type_note": "run-qemu.py:154. virtualization=off because TCG is not a virtualizer; secure=off because there is no TrustZone; gic-version=3 because board.toml describes GICv3.",
   "clock": {
     "rtc": "utc",
     "note": "Clock/interrupt behaviour verified at M4."
   },
   "display": {
-    "width": 1112,
-    "height": 834,
+    "width": 1376,
+    "height": 1024,
     "format": "ramfb",
-    "note": "ramfb/GOP path first (PRD 4.2); VirtIO GPU software path probed at M9a."
+    "note": "ramfb/GOP path first (PRD 4.2); VirtIO GPU software path probed at M9a. Geometry is run-qemu.py:39-43 and reaches the guest driver via fw_cfg opt/org.unixnu/ramfb-size -- width must be a multiple of 16 and rows a multiple of 64 bytes, which the real 1366-wide panel is not."
   },
   "devices": {
+    "firmware": {"attach": "pflash", "note": "UEFI variables live in a writable second flash device; -bios cannot express that and the two spellings are mutually exclusive in qemu-virt.c:1907-1916. vars.fd is created per run at the code drive's size (67108864 here)."},
     "system_disk": {"if": "virtio-blk", "readonly": true, "note": "RootFS/SystemOS via VirtIO Block (M6/M7)"},
     "data_disk": {"if": "virtio-blk", "readonly": false, "note": "Persistent Data volume; route decided by H04 (M9b)"},
     "input": {"pointer": "virtio-tablet", "home": "virtio", "keyboard": "pending", "note": "Text input may start on the guest on-screen keyboard (FR04)"},

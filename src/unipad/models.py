@@ -175,13 +175,20 @@ class MachineConfig:
 
     name: str = "ipad-tcg"
     accel: str = "tcg"
-    cpu_model: str = "cortex-a57"    # candidate; resolved against board.toml at M0
-    cores: int = 4
-    memory_mb: int = 3072
-    machine_type: str = "virt"
-    clock: dict[str, Any] = field(default_factory=dict)
-    display: dict[str, Any] = field(default_factory=lambda: {"width": 1112, "height": 834, "format": "ramfb"})
-    devices: dict[str, Any] = field(default_factory=dict)
+    # The defaults describe the board UniPad actually boots (the pinned
+    # UniXNU-qemu board.toml), not a generic AArch64 virt machine: a default
+    # that disagrees with config/machine.json is a second, silently different
+    # machine for any caller that builds one without reading the file.
+    cpu_model: str = "cortex-a710"    # run-qemu.py:155
+    cores: int = 1                    # board.toml:143 cpu_regs="0" -> make-qemu-adt.py:78
+    memory_mb: int = 6144             # board.toml:92 dram_size="0x180000000"
+    machine_type: str = "virt,virtualization=off,secure=off,gic-version=3"  # run-qemu.py:154
+    clock: dict[str, Any] = field(default_factory=lambda: {"rtc": "utc"})
+    display: dict[str, Any] = field(default_factory=lambda: {"width": 1376, "height": 1024, "format": "ramfb"})
+    #: ``firmware.attach`` is here rather than left empty because the default
+    #: decides which of two mutually exclusive QEMU spellings is used: an empty
+    #: default silently means ``-bios``, which the board we boot cannot use.
+    devices: dict[str, Any] = field(default_factory=lambda: {"firmware": {"attach": "pflash"}})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

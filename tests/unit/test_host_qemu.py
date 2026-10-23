@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from unipad.errors import ErrorCode, UniPadError
-from unipad.host.qemu import QemuLauncher
+from unipad.host.qemu import QemuLauncher, _parse_drive_file
 from unipad.models import MachineConfig, read_json
 from tests.fakes import fake_qemu as fq
 from tests.fakes.fake_qemu import BOOT_MARKERS, PARTIAL_BOOT_MARKERS
@@ -75,12 +75,17 @@ def machine() -> MachineConfig:
     return MachineConfig(
         name="ipad-tcg",
         accel="tcg",
-        cpu_model="cortex-a57",
-        cores=4,
-        memory_mb=3072,
-        machine_type="virt",
+        cpu_model=BOARD["cpu_model"],
+        cores=BOARD["cores"],
+        memory_mb=BOARD["memory_mb"],
+        machine_type=BOARD["machine_type"],
         clock={"rtc": "utc"},
-        display={"width": 1112, "height": 834, "format": "ramfb"},
+        display={
+            "width": BOARD["width"],
+            "height": BOARD["height"],
+            "format": "ramfb",
+        },
+        devices={"firmware": {"attach": "pflash"}},
     )
 
 
@@ -141,7 +146,10 @@ def test_build_args_always_emits_explicit_tcg(launcher, images, tmp_path):
     """PRD 2.2-1: the accelerator is explicit in the argv, never inferred."""
     args = _args(launcher, images, tmp_path, fq.free_tcp_port())
 
-    assert args[0:2] == ["-accel", "tcg"]
+    # Not a positional assertion: the firmware spelling now leads, so where
+    # ``-accel`` sits is an implementation detail.  What matters is that it is
+    # present, paired with ``tcg``, and that ``tcg`` is never spelled twice.
+    assert _option_value(args, "-accel") == "tcg"
     assert args.count("tcg") == 1
 
 
@@ -162,12 +170,20 @@ def test_build_args_contains_the_machine_definition(launcher, images, tmp_path):
     """PRD 4.2: CPU model, machine type, cores and memory are all explicit."""
     args = _args(launcher, images, tmp_path, fq.free_tcp_port())
 
-    assert _option_value(args, "-cpu") == "cortex-a57"
-    assert _option_value(args, "-machine") == "virt"
-    assert _option_value(args, "-smp") == "4"
-    assert _option_value(args, "-m") == "3072"
-    assert _option_value(args, "-bios") == Path(images["firmware"]).as_posix()
+    # Asserted against the fixture's own values, not literals: the point is that
+    # whatever the machine says reaches the argv verbatim, so re-stating the
+    # numbers here would only test that this file agrees with itself.
+    machine = launcher.machine
+    assert _option_value(args, "-cpu") == machine.cpu_model
+    assert _option_value(args, "-machine") == machine.machine_type
+    assert _option_value(args, "-smp") == str(machine.cores)
+    assert _option_value(args, "-m") == str(machine.memory_mb)
     assert _option_value(args, "-rtc") == "base=utc"
+    # ... and the firmware reaches QEMU in exactly one of the two exclusive
+    # forms, never neither (see the pflash section below).
+    assert (_option_value(args, "-bios") is not None) ^ (
+        any("if=pflash" in value for value in args)
+    )
 
 
 def test_build_args_uses_a_loopback_tcp_qmp_socket(launcher, images, tmp_path):
@@ -244,8 +260,13 @@ def test_build_args_omits_the_data_volume_when_none_is_given(launcher, images, t
     )
     drives = [value for flag, value in zip(args, args[1:]) if flag == "-drive"]
 
-    assert len(drives) == 1
-    assert "readonly=on" in drives[0]
+    # Count the *disk* drives, not every -drive: the pflash pair is firmware,
+    # not a volume, so a plain len() would count the firmware and report a
+    # missing Data volume that is correctly absent.
+    disk_drives = [d for d in drives if "if=virtio" in d]
+    assert len(disk_drives) == 1
+    assert "readonly=on" in disk_drives[0]
+    assert Path(images["data"]).as_posix() not in " ".join(drives)
 
 
 def test_build_args_uses_the_ramfb_display_path_by_default(launcher, images, tmp_path):
@@ -938,3 +959,236 @@ def test_full_lifecycle_through_a_command_list_ends_in_a_graceful_shutdown(
     assert exit_code == 0
     assert "SHUTDOWN" in events
     assert launcher.is_running() is False
+
+
+# ---------------------------------------------------------------------------
+# the board we intend to boot (PRD 6 WP02/WP04)
+#
+# These numbers come from the pinned device repository
+# (local-private/upstream/UniXNU-qemu), which is NOT part of this repository,
+# so they are recorded here rather than read.  A drift between what
+# config/machine.json declares and what that board actually needs is caught
+# here instead of in the field, where it would surface as a guest that
+# describes memory or CPUs that do not exist.
+# ---------------------------------------------------------------------------
+
+#: What the pinned board demands, with the citation for each value.
+#: ``board.toml`` lives under local-private/ and is deliberately not committed.
+BOARD = {
+    "cpu_model": "cortex-a710",  # run-qemu.py:155
+    "machine_type": "virt,virtualization=off,secure=off,gic-version=3",  # run-qemu.py:154
+    "cores": 1,  # board.toml:143 cpu_regs="0" -> make-qemu-adt.py:78 cpus=1
+    "memory_mb": 6144,  # board.toml:92 dram_size="0x180000000"
+    "width": 1376,  # run-qemu.py:39-43
+    "height": 1024,
+}
+
+
+def test_the_shipped_machine_config_agrees_with_the_pinned_board():
+    """The repository config must describe the board we mean to boot."""
+    machine = read_json(MACHINE_CONFIG_PATH)
+
+    assert machine["cpu_model"] == BOARD["cpu_model"]
+    assert machine["machine_type"] == BOARD["machine_type"]
+    assert machine["cores"] == BOARD["cores"]
+    assert machine["memory_mb"] == BOARD["memory_mb"]
+    assert machine["display"]["width"] == BOARD["width"]
+    assert machine["display"]["height"] == BOARD["height"]
+
+
+def test_build_args_describes_the_machine_the_board_expects(tmp_path):
+    """cpu / machine / smp / -m all come from the config, unmodified."""
+    machine = MachineConfig(
+        name="ipad-tcg",
+        accel="tcg",
+        cpu_model=BOARD["cpu_model"],
+        cores=BOARD["cores"],
+        memory_mb=BOARD["memory_mb"],
+        machine_type=BOARD["machine_type"],
+        display={"width": BOARD["width"], "height": BOARD["height"], "format": "ramfb"},
+    )
+    launcher = QemuLauncher(machine)
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"fw")
+    system = tmp_path / "system.img"
+    system.write_bytes(b"sys")
+
+    args = launcher.build_args(firmware, system, None, tmp_path, 4444)
+
+    assert _option_value(args, "-cpu") == BOARD["cpu_model"]
+    assert _option_value(args, "-machine") == BOARD["machine_type"]
+    assert _option_value(args, "-smp") == str(BOARD["cores"])
+    assert _option_value(args, "-m") == str(BOARD["memory_mb"])
+
+
+def test_build_args_stops_a_triple_fault_loop_rather_than_spinning_forever():
+    """PRD 4.2: without -no-reboot a faulting guest never terminates the run."""
+    machine = MachineConfig(accel="tcg")
+    launcher = QemuLauncher(machine)
+    args = launcher.build_args(
+        Path("fw.bin"), Path("sys.img"), None, Path("."), 4444
+    )
+    assert "-no-reboot" in args
+
+
+def test_build_args_tells_the_guest_driver_the_screen_geometry():
+    """PRD 4.2: QemuRamfb reads its geometry from fw_cfg, not from a guess."""
+    machine = MachineConfig(
+        accel="tcg", display={"width": 1376, "height": 1024, "format": "ramfb"}
+    )
+    launcher = QemuLauncher(machine)
+    args = launcher.build_args(
+        Path("fw.bin"), Path("sys.img"), None, Path("."), 4444
+    )
+    assert (
+        "-fw_cfg",
+        "name=opt/org.unixnu/ramfb-size,string=1376x1024",
+    ) in [(args[i], args[i + 1]) for i in range(len(args) - 1)]
+
+
+# ---------------------------------------------------------------------------
+# firmware attachment: -bios and -drive if=pflash are mutually exclusive
+#
+# qemu-virt.c:1907-1916 exits(1) when both are present, so a launcher that
+# emits -bios for a board whose firmware is a pflash pair starts QEMU only
+# to have it die immediately with a message that names neither.
+# ---------------------------------------------------------------------------
+
+
+def _pflash_config(**overrides) -> MachineConfig:
+    devices = {"firmware": {"attach": "pflash"}}
+    devices.update(overrides)
+    return MachineConfig(accel="tcg", devices=devices)
+
+
+def test_pflash_attachment_never_emits_bios(tmp_path):
+    """The two spellings cannot coexist; pflash must displace -bios entirely."""
+    firmware = tmp_path / "code.fd"
+    firmware.write_bytes(b"x" * 64)
+    launcher = QemuLauncher(_pflash_config())
+
+    args = launcher.build_args(firmware, tmp_path / "sys.img", None, tmp_path, 4444)
+
+    assert "-bios" not in args
+    drives = [args[i + 1] for i, v in enumerate(args) if v == "-drive"]
+    code = [d for d in drives if "if=pflash" in d and "readonly=on" in d]
+    vars_ = [d for d in drives if "if=pflash" in d and "readonly=off" in d]
+    assert len(code) == 1 and firmware.as_posix() in code[0]
+    assert len(vars_) == 1
+
+
+def test_pflash_vars_file_is_created_at_the_code_size_before_the_existence_check(tmp_path):
+    """run-qemu.py:151-152 truncates vars.fd to the code firmware's size.
+
+    Nothing creates it today, so a launcher that emits the drive but not the
+    file hands QEMU a path that does not exist -- and its own pre-flight check
+    would refuse to start first.
+    """
+    code = tmp_path / "code.fd"
+    code.write_bytes(b"c" * 4096)
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"s")
+    launcher = QemuLauncher(_pflash_config())
+    args = launcher.build_args(code, system, None, tmp_path, 4444)
+
+    vars_spec = next(
+        args[i + 1]
+        for i, v in enumerate(args)
+        if v == "-drive" and "if=pflash" in args[i + 1] and "readonly=off" in args[i + 1]
+    )
+    vars_path = _parse_drive_file(vars_spec)
+    assert vars_path is not None
+    # launch() materialises it; the size comes from the code drive.
+    launcher.launch([sys.executable, "-c", "pass"], args=args, workdir=tmp_path)
+    try:
+        assert Path(vars_path).stat().st_size == 4096
+    finally:
+        launcher.close()
+
+
+def test_bios_attachment_is_still_available_when_asked_for(tmp_path):
+    """The single-blob spelling still works for a machine that wants it.
+
+    ``pflash`` is the default because that is what the booted board needs, but
+    a firmware with no persistent variables is legitimately a ``-bios`` blob, so
+    the spelling must remain reachable rather than being removed with the
+    default.
+    """
+    firmware = tmp_path / "fw.bin"
+    firmware.write_bytes(b"fw")
+    launcher = QemuLauncher(
+        MachineConfig(accel="tcg", devices={"firmware": {"attach": "bios"}})
+    )
+    args = launcher.build_args(firmware, tmp_path / "sys.img", None, tmp_path, 4444)
+    assert _option_value(args, "-bios") == firmware.as_posix()
+    assert not [a for a in args if "if=pflash" in a]
+
+
+def test_an_unknown_firmware_attachment_is_refused():
+    """A spelling that would silently pick one of two exclusive forms is a
+    usage error, not a default."""
+    with pytest.raises(UniPadError) as excinfo:
+        QemuLauncher(MachineConfig(accel="tcg", devices={"firmware": {"attach": "nvram"}}))
+    assert excinfo.value.code == ErrorCode.CONFIG_INVALID
+
+
+# ---------------------------------------------------------------------------
+# the ESP is a directory, and QEMU's fat: driver says so
+#
+# The only ESP form that boots UniXNU is file=fat:<dir>.  _parse_drive_file
+# used to return the whole "fat:F:/..." string, which Path(...).exists() then
+# reported as missing -- so launch() aborted with image_not_found on the one
+# disk layout the boot path actually needs.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fat_esp_directory_is_not_reported_as_a_missing_image(tmp_path):
+    esp = tmp_path / "esp"
+    esp.mkdir()
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    args = [
+        "-drive",
+        f"if=none,id=esp,format=raw,readonly=on,file=fat:{esp.as_posix()}",
+    ]
+    assert launcher._missing_paths(args) == []
+
+
+def test_a_fat_esp_that_does_not_exist_is_still_reported_missing(tmp_path):
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    args = ["-drive", f"if=none,id=esp,format=raw,file=fat:{tmp_path / 'nope'}"]
+    missing = launcher._missing_paths(args)
+    assert len(missing) == 1 and "fat:" in missing[0]
+
+
+def test_a_host_device_node_is_left_for_qemu_to_judge():
+    """/dev/rdiskN exists on macOS and never on Windows; the launcher cannot
+    judge it, so it must not claim it is missing."""
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    args = ["-drive", "if=none,id=os,format=raw,file=host_device:/dev/rdisk2"]
+    assert launcher._missing_paths(args) == []
+
+
+def test_the_machine_config_defaults_are_the_shipped_config():
+    """``MachineConfig()`` and ``config/machine.json`` must be one machine.
+
+    Two definitions of "the machine" drift silently: a caller that builds a
+    config in code gets a different guest from one that reads the file, and
+    nothing in either place notices.  The shipped file is the authority, so the
+    defaults are asserted against it rather than restated.
+    """
+    defaults = MachineConfig()
+    shipped = read_json(MACHINE_CONFIG_PATH)
+
+    assert defaults.name == shipped["name"]
+    assert defaults.accel == shipped["accel"]
+    assert defaults.cpu_model == shipped["cpu_model"]
+    assert defaults.cores == shipped["cores"]
+    assert defaults.memory_mb == shipped["memory_mb"]
+    assert defaults.machine_type == shipped["machine_type"]
+    assert defaults.clock.get("rtc") == shipped["clock"]["rtc"]
+    assert defaults.display["width"] == shipped["display"]["width"]
+    assert defaults.display["height"] == shipped["display"]["height"]
+    assert defaults.display["format"] == shipped["display"]["format"]
+    # ... and the firmware decision too, or a default-built launcher attaches
+    # the firmware in the form the board cannot use.
+    assert defaults.devices.get("firmware", {}).get("attach", "bios") == shipped["devices"]["firmware"]["attach"]

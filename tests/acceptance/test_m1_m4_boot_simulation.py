@@ -63,6 +63,18 @@ pytestmark = pytest.mark.acceptance
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MACHINE_CONFIG_PATH = REPO_ROOT / "config" / "machine.json"
 
+#: What the pinned UniXNU-qemu board demands.  board.toml lives under
+#: local-private/ and is not committed, so the values are recorded here with
+#: their citations rather than read (see tests/unit/test_host_qemu.py:BOARD).
+BOARD = {
+    "cpu_model": "cortex-a710",  # run-qemu.py:155
+    "machine_type": "virt,virtualization=off,secure=off,gic-version=3",  # run-qemu.py:154
+    "cores": 1,  # board.toml:143 cpu_regs="0" -> make-qemu-adt.py:78 cpus=1
+    "memory_mb": 6144,  # board.toml:92 dram_size="0x180000000"
+    "width": 1376,  # run-qemu.py:39-43
+    "height": 1024,
+}
+
 #: The M1..M4 markers the staged boot log must emit, in order (PRD 6).
 #: Derived from the fake's own contract rather than re-typed here, so a change
 #: to the boot stages cannot silently invalidate this assertion.
@@ -227,7 +239,13 @@ def _cli_paths(tmp_path: Path) -> list[str]:
 def test_launch_with_machine_config_reaches_qmp_ready_running(machine, images, tmp_path, port):
     """PRD 6 M1 / FR02: the machine config launches and QMP proves readiness."""
     assert machine.accel == "tcg"
-    assert (machine.display["width"], machine.display["height"]) == (1112, 834)
+    # The shipped config is the authority, so this reads it rather than
+    # re-stating the numbers: a config that drifts from the board we boot must
+    # fail here, not in the field.
+    assert (machine.display["width"], machine.display["height"]) == (
+        BOARD["width"],
+        BOARD["height"],
+    )
 
     with running_guest(tmp_path, machine, images, port, name="m1") as guest:
         launched, readiness = guest.launched, guest.readiness
@@ -348,7 +366,13 @@ def test_recorded_qemu_args_show_tcg_and_loopback_qmp(machine, images, tmp_path,
         assert _option_value(args, "-machine") == machine.machine_type
         assert _option_value(args, "-smp") == str(machine.cores)
         assert _option_value(args, "-m") == str(machine.memory_mb)
-        assert _option_value(args, "-bios") == images["firmware"].as_posix()
+        # Exactly one firmware attachment, and the pflash pair the board needs:
+        # -bios and -drive if=pflash are mutually exclusive in QEMU, so asserting
+        # one spelling would pass while the other silently replaced it.
+        assert _option_value(args, "-bios") is None
+        pflash = [v for v in args if "if=pflash" in v]
+        assert len(pflash) == 2, pflash
+        assert f"file={images['firmware'].as_posix()}" in pflash[0]
         assert _option_value(args, "-qmp") == f"tcp:127.0.0.1:{port},server=on,wait=off"
         assert _option_value(args, "-monitor") == "none"      # control != serial
         assert _option_value(args, "-serial") == f"file:{guest.serial_path.as_posix()}"
