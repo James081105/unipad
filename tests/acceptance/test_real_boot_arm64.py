@@ -114,6 +114,101 @@ def _ascii_workdir(tmp_path: Path) -> Path:
     return workdir
 
 
+#: How long a lock may be held before it is assumed abandoned.  A real boot
+#: takes a few seconds end to end; a holder that exceeds this by an order of
+#: magnitude has died without cleaning up, and waiting for it forever would
+#: turn a crashed run into a hung one.
+_LOCK_STALE_SECONDS = 120.0
+
+
+class _RealQemuLock:
+    """A cross-process lock around the one test that launches a real QEMU.
+
+    This is the only test in the repository that starts a real QEMU process.
+    When two pytest runs overlap -- an agent verifying while another agent
+    verifies, which is normal here -- both reach for the real binary, both pick
+    a port the same way, and one of them gets a QEMU that exits with code 1.
+    That failure looks exactly like a broken launcher and is not one, so it has
+    to be prevented rather than retried: a flaky test that "proves a real boot"
+    is how a real regression gets dismissed as noise.
+
+    Implemented as a lock *directory* because it needs no dependency, survives
+    a process that is killed outright, and is visible in the filesystem when
+    something goes wrong.
+    """
+
+    def __init__(self, path: Path, stale_after: float = _LOCK_STALE_SECONDS) -> None:
+        self.path = path
+        self.stale_after = stale_after
+        self.acquired = False
+
+    def acquire(self, timeout: float = 600.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.path.mkdir(parents=True)
+                self.acquired = True
+                return True
+            except FileExistsError:
+                if self._break_if_stale():
+                    continue
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.25)
+
+    def _break_if_stale(self) -> bool:
+        """Remove a lock whose holder has been gone too long.  ``True`` = retry."""
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return True
+        if age <= self.stale_after:
+            return False
+        # Another process may have broken it between the stat and the rmtree.
+        try:
+            for item in self.path.iterdir():
+                item.unlink()
+            self.path.rmdir()
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            return False
+        return True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            for item in self.path.iterdir():
+                item.unlink()
+            self.path.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        finally:
+            self.acquired = False
+
+    def __enter__(self) -> "_RealQemuLock":
+        if not self.acquire():
+            raise RuntimeError(
+                f"could not acquire the real-QEMU lock at {self.path}; another "
+                "run is holding it"
+            )
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
+def _real_qemu_lock() -> _RealQemuLock:
+    """The lock guarding the single real-QEMU test in the repository."""
+    root = Path("F:/iosvirtual/local-private/tmp/real-boot")
+    if not root.parent.is_dir():
+        root = Path(tempfile.gettempdir()) / "unipad-real-qemu"
+    return _RealQemuLock(root / "real-qemu.lock")
+
+
 @pytest.fixture
 def machine() -> MachineConfig:
     """A small machine for the stub: it needs no more than this to run."""
@@ -184,35 +279,39 @@ def test_a_real_guest_boots_and_is_controlled_over_qmp(tmp_path, machine):
 
     binary = _qemu_binary()
     assert binary is not None  # guarded by requires_qemu
-    launched = launcher.launch(binary, args, workdir=workdir)
-    try:
-        # --- readiness is proved, never assumed (PRD 7.4 / FR08) ----------
-        readiness = launcher.wait_for_qmp(timeout=30.0)
-        assert readiness.ready is True, readiness.evidence
-        assert readiness.evidence["status"]["status"] == "running"
-        assert launcher.is_running() is True
+    # One real QEMU at a time: two overlapping pytest runs would otherwise race
+    # for a port and one would fail for a reason that has nothing to do with the
+    # launcher.  See _RealQemuLock.
+    with _real_qemu_lock():
+        launched = launcher.launch(binary, args, workdir=workdir)
+        try:
+            # --- readiness is proved, never assumed (PRD 7.4 / FR08) ----------
+            readiness = launcher.wait_for_qmp(timeout=30.0)
+            assert readiness.ready is True, readiness.evidence
+            assert readiness.evidence["status"]["status"] == "running"
+            assert launcher.is_running() is True
 
-        # --- real ARM64 code ran, and its output reached our serial log ----
-        seen = _wait_for_markers(serial_path, BOOT_MARKERS, SERIAL_TIMEOUT)
-        for marker in BOOT_MARKERS:
-            assert marker in seen, f"serial log never carried {marker!r}: {seen!r}"
+            # --- real ARM64 code ran, and its output reached our serial log ----
+            seen = _wait_for_markers(serial_path, BOOT_MARKERS, SERIAL_TIMEOUT)
+            for marker in BOOT_MARKERS:
+                assert marker in seen, f"serial log never carried {marker!r}: {seen!r}"
 
-        # --- the guest is controllable over QMP, not just observable ------
-        client = launcher.qmp_client()
-        assert client is not None
-        # The dump path must be ASCII too: QEMU writes the file itself, so
-        # the same code-page limit applies and the launcher's own check
-        # cannot see this one.
-        shot = Screenshotter(client, workdir / "shots").capture("stub")
-        assert shot["ok"] is True, shot
-        assert Path(shot["path"]).is_file()
+            # --- the guest is controllable over QMP, not just observable ------
+            client = launcher.qmp_client()
+            assert client is not None
+            # The dump path must be ASCII too: QEMU writes the file itself, so
+            # the same code-page limit applies and the launcher's own check
+            # cannot see this one.
+            shot = Screenshotter(client, workdir / "shots").capture("stub")
+            assert shot["ok"] is True, shot
+            assert Path(shot["path"]).is_file()
 
-        stop = launcher.stop(graceful=True, timeout=30.0)
-        assert stop.ok is True
-        exit_code = launcher.wait_for_exit(timeout=30.0)
-        assert exit_code == 0
-    finally:
-        launcher.close()
+            stop = launcher.stop(graceful=True, timeout=30.0)
+            assert stop.ok is True
+            exit_code = launcher.wait_for_exit(timeout=30.0)
+            assert exit_code == 0
+        finally:
+            launcher.close()
 
     # The argv that did this is the evidence PRD 9.2 asks for; it must survive
     # the run so a later reader can see exactly what was started.
@@ -226,3 +325,63 @@ def _kernel_arg(launcher: QemuLauncher) -> str | None:
         if value == "-kernel" and index + 1 < len(argv):
             return argv[index + 1]
     return None
+
+
+# ---------------------------------------------------------------------------
+# the real-QEMU lock
+#
+# The lock exists because of one specific failure: two overlapping pytest runs
+# both launching the real QEMU, both picking a port the same way, and one of
+# them getting an exit code 1 that reads exactly like a broken launcher.  These
+# tests pin the behaviour that prevents it, so a future edit cannot quietly turn
+# the guard into a no-op.
+# ---------------------------------------------------------------------------
+
+
+def test_the_lock_excludes_a_second_holder(tmp_path: Path) -> None:
+    """A second process must wait, not proceed."""
+    lock = _RealQemuLock(tmp_path / "lock")
+    with lock:
+        second = _RealQemuLock(tmp_path / "lock", stale_after=10_000.0)
+        assert second.acquire(timeout=0.5) is False
+    # And once the first is gone the second gets it.
+    assert second.acquire(timeout=0.5) is True
+    second.release()
+    assert not (tmp_path / "lock").exists()
+
+
+def test_a_stale_lock_is_broken_rather_than_waited_on_forever(tmp_path: Path) -> None:
+    """A holder that died without cleaning up must not wedge every later run."""
+    path = tmp_path / "lock"
+    path.mkdir()
+    (path / "held-by").write_text("a process that is gone", encoding="utf-8")
+    # Backdate it beyond the staleness window.
+    old = time.time() - 3600.0
+    os.utime(path, (old, old))
+
+    stale = _RealQemuLock(path, stale_after=60.0)
+    assert stale.acquire(timeout=0.5) is True
+    stale.release()
+    assert not path.exists()
+
+
+def test_a_fresh_lock_is_respected_not_broken(tmp_path: Path) -> None:
+    """The staleness rule must not fire on a lock that is merely young."""
+    path = tmp_path / "lock"
+    path.mkdir()
+    (path / "held-by").write_text("a live process", encoding="utf-8")
+
+    fresh = _RealQemuLock(path, stale_after=3600.0)
+    assert fresh.acquire(timeout=0.5) is False
+
+
+def test_releasing_an_unacquired_lock_is_a_noop(tmp_path: Path) -> None:
+    """Release on a lock this process never took must not delete someone else's."""
+    path = tmp_path / "lock"
+    path.mkdir()
+    (path / "held-by").write_text("someone else", encoding="utf-8")
+
+    bystander = _RealQemuLock(path)
+    assert bystander.acquired is False
+    bystander.release()
+    assert (path / "held-by").is_file(), "release removed a lock it did not hold"
