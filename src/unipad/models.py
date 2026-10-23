@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 # --- Milestones (PRD section 6).  Strings, not an enum: new sub-gates appear upstream. ---
 M0 = "M0"
@@ -173,6 +173,16 @@ class MachineConfig:
     rejected at launch (accelerator_not_tcg).
     """
 
+    #: Real top-level sections of ``config/machine.json`` that this dataclass
+    #: deliberately does not carry: ``schema_version`` is the file's own version
+    #: stamp and ``disks`` is read by the controller, which owns paths.  They are
+    #: named so :meth:`unknown_keys` can tell a known-unmodelled section from a
+    #: typo -- tolerating everything would make the check useless, and tolerating
+    #: nothing would reject the shipped file.
+    NON_MODELLED_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"schema_version", "disks"}
+    )
+
     name: str = "ipad-tcg"
     accel: str = "tcg"
     # The defaults describe the board UniPad actually boots (the pinned
@@ -197,6 +207,30 @@ class MachineConfig:
     def from_dict(cls, d: dict[str, Any]) -> "MachineConfig":
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+    @classmethod
+    def unknown_keys(cls, d: Mapping[str, Any]) -> tuple[str, ...]:
+        """Top-level keys in ``d`` that are neither modelled nor tolerated.
+
+        :meth:`from_dict` drops unknown keys silently, which is correct for a
+        caller holding a superset dict and wrong for a caller reading
+        ``config/machine.json``.  There, a dropped key is a typo, or a key from a
+        newer schema, or a feature the operator believes is configured and is
+        not -- and in each case the file describes one machine while the launch
+        builds another.  This is the question that caller must ask.
+
+        Two kinds of unmodelled key are deliberately tolerated, and they are
+        named here so that the tolerance is a decision rather than an accident:
+        keys ending in ``_note``, which are prose explaining a modelled field,
+        and :data:`NON_MODELLED_KEYS`, which are real sections the controller
+        reads directly.  Without the distinction every note would have to be
+        tolerated or none could be, and ``cpu_modle`` would be indistinguishable
+        from ``cpu_model_note``.
+        """
+        tolerated = set(cls.__dataclass_fields__) | set(cls.NON_MODELLED_KEYS)
+        return tuple(
+            sorted(k for k in d if k not in tolerated and not k.endswith("_note"))
+        )
 
 
 @dataclass

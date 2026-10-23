@@ -23,6 +23,11 @@ from pathlib import Path
 
 import pytest
 
+#: The shipped machine definition, read from disk rather than hand-written, so
+#: a key added to the file without being added to the model fails a test here
+#: instead of silently changing the machine an operator thinks they configured.
+MACHINE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "machine.json"
+
 from unipad.models import (
     IPA_MVP_GATES,
     M13,
@@ -366,6 +371,65 @@ def test_machine_config_from_dict_ignores_unknown_keys() -> None:
     # Assert.
     assert config.accel == "tcg"
     assert not hasattr(config, "accel_note")
+
+
+def test_machine_config_unknown_keys_reports_exactly_what_it_dropped() -> None:
+    """``from_dict`` dropping a key silently is only safe if someone can ask.
+
+    The lenient behaviour is right for a caller holding a superset dict.  It is
+    wrong for the caller reading ``config/machine.json``: there, a dropped key is
+    a typo or a feature the operator believes is configured and is not, and the
+    file would then disagree with the machine it describes.  ``unknown_keys`` is
+    the question that caller must ask before trusting the file.
+    """
+    # Arrange: a misspelling of a real key and an invented one, deliberately out
+    # of alphabetical order so the sort is observable rather than incidental.
+    raw = {"zeta_typo": 1, "name": "ipad-tcg", "cpu_modle": "cortex-a710"}
+
+    # Act.
+    dropped = MachineConfig.unknown_keys(raw)
+
+    # Assert: sorted, complete, and nothing else.
+    assert dropped == ("cpu_modle", "zeta_typo")
+
+
+def test_machine_config_unknown_keys_tolerates_documentation_and_declared_sections() -> None:
+    """The tolerance is a decision, not an accident.
+
+    ``*_note`` keys are prose explaining a modelled field and ``NON_MODELLED_KEYS``
+    are real sections the controller reads directly.  Both must pass, because
+    otherwise the shipped ``config/machine.json`` could never be validated and
+    ``cpu_modle`` would be indistinguishable from ``cpu_model_note``.
+    """
+    # Arrange: every tolerated form, plus one modelled key.
+    raw = {
+        "name": "ipad-tcg",
+        "cpu_model_note": "prose",
+        "memory_note": "prose",
+        "schema_version": 1,
+        "disks": {"artifact_root": "F:/iosvirtual/artifacts"},
+    }
+
+    # Act / Assert.
+    assert MachineConfig.unknown_keys(raw) == ()
+
+
+def test_machine_config_unknown_keys_is_empty_for_the_shipped_config() -> None:
+    """The shipped file must pass its own validation.
+
+    Read from disk rather than hand-written, so a key added to the file without
+    being added to the model -- or added to the model without being declared in
+    ``NON_MODELLED_KEYS`` -- fails here instead of silently changing the machine
+    an operator believes they configured.
+    """
+    # Arrange.
+    raw = json.loads(MACHINE_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    # Act / Assert.
+    assert MachineConfig.unknown_keys(raw) == (), (
+        "config/machine.json has keys MachineConfig does not model and does not "
+        "declare; either the model, NON_MODELLED_KEYS, or the file is wrong"
+    )
 
 
 # ---------------------------------------------------------------------------
