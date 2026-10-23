@@ -67,6 +67,14 @@ NETWORK_MODES: tuple[str, ...] = ("none", "user")
 #: that persists settings across boots cannot be expressed with ``-bios`` alone.
 #: qemu-virt.c:1907-1916 exits(1) when both forms appear, so the choice is
 #: exclusive by construction -- never both, never neither.
+#: Why a non-ASCII path cannot be used, and what to do about it.  A named
+#: constant so the message is testable rather than paraphrased.
+NON_ASCII_PATH_REASON = (
+    "The Windows QEMU build resolves file paths with the ANSI code page. "
+    "Put the run directory on an ASCII-only path; on this host %TEMP% is "
+    "under a non-ASCII user directory."
+)
+
 FIRMWARE_ATTACHMENTS: tuple[str, ...] = ("bios", "pflash")
 
 
@@ -418,6 +426,7 @@ class QemuLauncher:
         *,
         headless: bool = False,
         serial_log: Optional[Path] = None,
+        kernel: Optional[Path] = None,
         extra_args: Sequence[str] = (),
     ) -> list[str]:
         """Build the full QEMU argv (without the executable).
@@ -431,6 +440,12 @@ class QemuLauncher:
             qmp_port: TCP port for the QMP control channel.
             headless: When ``True`` add ``-display none`` (no guest window).
             serial_log: Override for ``-serial file:<path>``.
+            kernel: An AArch64 image loaded directly at the CPU's reset vector.
+                When given, QEMU starts the guest *instead of* any firmware, so
+                neither ``-bios`` nor the pflash pair is emitted -- the two are
+                not additive, and a run that carried both would be ambiguous
+                about which one starts the machine.  ``None`` keeps the
+                firmware path.
             extra_args: Caller-supplied extra arguments, appended verbatim.
 
         Returns:
@@ -456,8 +471,12 @@ class QemuLauncher:
         args: list[str] = []
 
         # Firmware first: the two spellings are mutually exclusive, so the whole
-        # decision is made before anything else references the firmware.
-        if self.firmware_attachment == "pflash":
+        # decision is made before anything else references the firmware.  A
+        # kernel image displaces both -- QEMU starts the guest at the reset
+        # vector rather than running a bootloader first.
+        if kernel is not None:
+            args.extend(["-kernel", _qemu_path(Path(kernel))])
+        elif self.firmware_attachment == "pflash":
             firmware_path = Path(firmware)
             args.extend(
                 [
@@ -500,21 +519,27 @@ class QemuLauncher:
         if rtc:
             args.extend(["-rtc", f"base={rtc}"])
 
-        # System volume: read-only (PRD 4.2 "read-only property correct").
-        args.extend(
-            [
-                "-drive",
-                f"if=virtio,format=raw,file={_qemu_path(system_image)},readonly=on,media=disk",
-            ]
-        )
-        if data_image is not None:
-            # Data volume: writable, separate from the system volume.
+        # A -kernel boot has no disks: the image is loaded at the reset vector
+        # and there is nothing for a block device to back.  Attaching the same
+        # file as a virtio disk as well makes QEMU reject the whole argv
+        # (exit 1, "could not open ... Invalid argument"), so the drives are
+        # suppressed rather than emitted alongside.
+        if kernel is None:
+            # System volume: read-only (PRD 4.2 "read-only property correct").
             args.extend(
                 [
                     "-drive",
-                    f"if=virtio,format=raw,file={_qemu_path(data_image)},readonly=off,media=disk",
+                    f"if=virtio,format=raw,file={_qemu_path(system_image)},readonly=on,media=disk",
                 ]
             )
+            if data_image is not None:
+                # Data volume: writable, separate from the system volume.
+                args.extend(
+                    [
+                        "-drive",
+                        f"if=virtio,format=raw,file={_qemu_path(data_image)},readonly=off,media=disk",
+                    ]
+                )
 
         display = dict(machine.display or {})
         display_format = str(display.get("format", "ramfb")).lower()
@@ -626,6 +651,13 @@ class QemuLauncher:
             )
 
         binary = self._resolve_binary(binary_name)
+        # Only the real QEMU has this limitation: the ANSI code page is how its
+        # file backends resolve paths.  A substitute binary -- the test fake is
+        # a Python script -- has no such constraint, so refusing a run on its
+        # behalf would block a path that works.  It runs after the binary is
+        # resolved so "the binary is missing" stays the more fundamental error.
+        if "qemu-system" in Path(binary).name.lower():
+            self._check_ascii_paths(resolved_args)
         self._adopt_args(resolved_args)
 
         stdout_path = work / "qemu-stdout.log"
@@ -786,6 +818,18 @@ class QemuLauncher:
         readiness.waited_seconds = round(time.monotonic() - self._wait_started, 3)
         self._readiness = readiness
         return readiness
+
+    @property
+    def last_args(self) -> list[str]:
+        """A copy of the argv the launcher actually started.
+
+        This is evidence, not bookkeeping: PRD 9.2 requires the QEMU command
+        line in the evidence set, and a run whose recorded argv could differ
+        from the one the child received would make that requirement
+        unverifiable.  A copy is returned so a caller cannot rewrite history
+        after the fact.
+        """
+        return list(self._last_args)
 
     def is_running(self) -> bool:
         """``True`` while the QEMU child process exists and has not exited."""
@@ -1018,6 +1062,49 @@ class QemuLauncher:
             return tokens[1:], tokens[0]
         return [], command
 
+    @staticmethod
+    def _check_ascii_paths(args: Sequence[str]) -> None:
+        """Refuse a run whose paths this QEMU build cannot open.
+
+        The Windows QEMU builds resolve file paths with the ANSI code page, so a
+        path containing a non-ASCII character -- a user directory such as
+        ``C:/Users/<name with CJK>/AppData/Local/Temp``, which is exactly where
+        ``tempfile`` lands on this host -- makes QEMU exit 1 with
+        ``open <path> failed``.  That message names the file but not the reason,
+        so the failure looks like a missing artifact.
+
+        Checking up front turns it into a diagnosis: the same run with an ASCII
+        work directory succeeds.  Every path-bearing value is checked, not just
+        the ones we generate, because a caller may pass its own.
+
+        Raises:
+            UniPadError: ``config_invalid`` naming the offending value.
+        """
+        #: Options whose following value is a path (or contains one).
+        PATH_FLAGS = ("-bios", "-kernel", "-serial")
+        for index, value in enumerate(args):
+            candidate = None
+            if value in PATH_FLAGS and index + 1 < len(args):
+                candidate = args[index + 1]
+            elif value == "-drive" and index + 1 < len(args):
+                target = _parse_drive_file(args[index + 1])
+                if target:
+                    candidate = target
+            elif value == "-qmp" and index + 1 < len(args):
+                candidate = args[index + 1]
+            if not candidate:
+                continue
+            try:
+                candidate.encode("ascii")
+            except UnicodeEncodeError:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "qemu cannot open a path containing non-ASCII characters",
+                    option=value,
+                    value=candidate,
+                    reason=NON_ASCII_PATH_REASON,
+                ) from None
+
     def _materialise_pflash_vars(self, args: Sequence[str], work: Path) -> None:
         """Create any writable pflash vars file the argv asks for.
 
@@ -1087,6 +1174,10 @@ class QemuLauncher:
                 target = args[index + 1]
                 if not Path(target).exists():
                     missing.append(f"-bios {target}")
+            elif value == "-kernel" and index + 1 < len(args):
+                target = args[index + 1]
+                if not Path(target).exists():
+                    missing.append(f"-kernel {target}")
             elif value == "-drive" and index + 1 < len(args):
                 spec = args[index + 1]
                 prefix, path = _strip_block_driver(_raw_drive_file(spec) or "")

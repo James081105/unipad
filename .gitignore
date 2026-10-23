@@ -42,3 +42,6 @@ desktop.ini
 # 测试运行残留物
 .pytest-refute.tmp
 fake-qemu-args.json
+
+# 编译探针残留物
+/a.out

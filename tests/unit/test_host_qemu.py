@@ -26,6 +26,7 @@ here is evidence that a guest, a display or a disk exists
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -99,6 +100,15 @@ def _args(launcher: QemuLauncher, images: dict[str, Path], tmp_path: Path, port:
     return launcher.build_args(
         images["firmware"], images["system"], images["data"], tmp_path, port
     )
+
+
+def _real_qemu_binary() -> str | None:
+    """A real ``qemu-system-aarch64`` on PATH or in this host's install dir."""
+    found = shutil.which("qemu-system-aarch64")
+    if found:
+        return found
+    candidate = MACHINE_CONFIG_PATH.parents[1] / "local-private" / "tools" / "qemu" / "qemu-system-aarch64.exe"
+    return str(candidate) if candidate.exists() else None
 
 
 def _option_value(args: list[str], flag: str) -> str | None:
@@ -877,13 +887,28 @@ def test_launch_accepts_a_spaced_command_line(launcher, images, tmp_path):
 
 def test_launch_keeps_a_real_path_with_spaces_unsplit(launcher, images, tmp_path):
     """A Windows path may contain spaces; it is never mistaken for a command line."""
-    spaced = tmp_path / "Program Files" / "qemu-system-aarch64.exe"
+    # ASCII on purpose: the non-ASCII path guard (see the ASCII section below)
+    # would otherwise fire first and this test would stop being about command
+    # splitting at all.
+    root = tmp_path if str(tmp_path).isascii() else Path("F:/iosvirtual/local-private/tmp/spaces")
+    spaced = root / "Program Files" / "qemu-system-aarch64.exe"
     spaced.parent.mkdir(parents=True, exist_ok=True)
     spaced.write_bytes(b"not a real qemu")
 
+    # The images are ASCII for the same reason: the launcher refuses a
+    # non-ASCII path outright now, and that guard is the correct behaviour --
+    # but it is not what this test is about.
+    ascii_images = tmp_path if str(tmp_path).isascii() else root
+    fw = ascii_images / "fw.bin"
+    fw.write_bytes(b"fw")
+    sys_img = ascii_images / "sys.img"
+    sys_img.write_bytes(b"sys")
+    port = fq.free_tcp_port()
+    clean_args = launcher.build_args(fw, sys_img, None, ascii_images, port)
+
     for candidate in (str(spaced), spaced):
         with pytest.raises(UniPadError) as excinfo:
-            launcher.launch(candidate, _args(launcher, images, tmp_path, fq.free_tcp_port()))
+            launcher.launch(candidate, clean_args)
 
         error = excinfo.value
         assert error.code == ErrorCode.QEMU_LAUNCH_FAILED
@@ -1192,3 +1217,157 @@ def test_the_machine_config_defaults_are_the_shipped_config():
     # ... and the firmware decision too, or a default-built launcher attaches
     # the firmware in the form the board cannot use.
     assert defaults.devices.get("firmware", {}).get("attach", "bios") == shipped["devices"]["firmware"]["attach"]
+
+
+# ---------------------------------------------------------------------------
+# a real bare-metal boot: -kernel (PRD 4.2, 6 M1/M4)
+#
+# A UEFI hand-off is not the only way a guest starts, and on this host it is
+# the one that is blocked: it needs a kernel image that cannot be produced
+# here.  ``-kernel`` loads an AArch64 image directly at the CPU's reset
+# vector, which means the whole host-side chain -- launcher, QMP readiness,
+# serial capture, screendump, stop -- can be proved against a real QEMU
+# running real ARM64 code, instead of only against a fake.
+# ---------------------------------------------------------------------------
+
+
+def test_build_args_loads_a_kernel_image_when_one_is_given(tmp_path):
+    """``-kernel`` replaces the firmware drives; the two cannot both apply."""
+    firmware = tmp_path / "fw.bin"
+    firmware.write_bytes(b"fw")
+    system = tmp_path / "sys.img"
+    system.write_bytes(b"sys")
+    kernel = tmp_path / "stub.elf"
+    kernel.write_bytes(b"kernel")
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+
+    args = launcher.build_args(
+        firmware, system, None, tmp_path, 4444, kernel=kernel
+    )
+
+    assert _option_value(args, "-kernel") == kernel.as_posix()
+    # A UEFI firmware would be started instead of the kernel, so emitting both
+    # is not "extra", it is a contradiction.
+    assert _option_value(args, "-bios") is None
+    assert not [a for a in args if "if=pflash" in a]
+
+
+def test_build_args_without_a_kernel_keeps_the_firmware_path(launcher, images, tmp_path):
+    """The default is unchanged: no kernel means the firmware is attached."""
+    args = _args(launcher, images, tmp_path, fq.free_tcp_port())
+    assert "-kernel" not in args
+    assert any("if=pflash" in value for value in args)
+
+
+def test_a_missing_kernel_image_is_reported_before_launch(tmp_path):
+    """PRD 7.4: a kernel path that does not exist stops the run, not QEMU."""
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    (tmp_path / "fw.bin").write_bytes(b"fw")
+    (tmp_path / "sys.img").write_bytes(b"sys")
+    args = launcher.build_args(
+        tmp_path / "fw.bin", tmp_path / "sys.img", None, tmp_path, 4444,
+        kernel=tmp_path / "absent.elf",
+    )
+    missing = launcher._missing_paths(args)
+    assert len(missing) == 1
+    assert "-kernel" in missing[0]
+
+
+# ---------------------------------------------------------------------------
+# the ANSI code-page limit of the Windows QEMU build
+#
+# The Windows QEMU resolves file paths with the ANSI code page, so any path
+# containing a non-ASCII character -- a user directory such as
+# ``C:/Users/<CJK name>/AppData/Local/Temp``, which is exactly where tempfile
+# lands on this host -- makes QEMU exit 1 with ``open <path> failed``.  That
+# message names the file but not the reason, so it reads as a missing artifact.
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_ascii_run_path_is_refused_before_launch(launcher, images, tmp_path):
+    """The failure is diagnosed up front, not discovered as a dead child."""
+    port = fq.free_tcp_port()
+    args = _args(launcher, images, tmp_path, port)
+    # tmp_path is non-ASCII on this host, so the args already carry one.
+    if str(tmp_path).isascii():
+        pytest.skip("this host's tmp_path is ASCII; the guard cannot be provoked here")
+
+    # The guard runs after the binary is resolved -- "the binary is missing" is
+    # the more fundamental error -- so it can only be provoked where a real
+    # QEMU is installed.
+    from unipad.host.qemu import NON_ASCII_PATH_REASON
+
+    binary = _real_qemu_binary()
+    if binary is None:
+        pytest.skip("no qemu-system-aarch64 installed; the guard cannot be provoked")
+
+    with pytest.raises(UniPadError) as excinfo:
+        launcher.launch(binary, args, workdir=tmp_path)
+
+    error = excinfo.value
+    assert error.code == ErrorCode.CONFIG_INVALID
+    assert error.details["option"] in ("-serial", "-drive", "-bios", "-kernel")
+    assert "ANSI" in error.details["reason"]
+    assert error.details["reason"] == NON_ASCII_PATH_REASON
+
+
+def test_an_ascii_run_path_is_accepted(launcher, images, tmp_path):
+    """The guard rejects the limitation, not paths in general."""
+    if not str(tmp_path).isascii():
+        pytest.skip("this host's tmp_path is not ASCII")
+    port = fq.free_tcp_port()
+    args = _args(launcher, images, tmp_path, port)
+    # No raise: the check is a no-op on a path the build can open.
+    assert launcher._check_ascii_paths(args) is None
+
+
+def test_the_guard_does_not_apply_to_a_substitute_binary(launcher, images, tmp_path):
+    """A fake QEMU is a Python script; it has no code-page limitation."""
+    if str(tmp_path).isascii():
+        pytest.skip("needs a non-ASCII path to prove the point")
+    port = fq.free_tcp_port()
+    args = _args(launcher, images, tmp_path, port)
+    binary, prefix = _fake_launcher_command()
+
+    launched = launcher.launch(
+        [binary, *prefix, *args], workdir=tmp_path, env={"UNIPAD_FAKE_BOOT_MS": "0"}
+    )
+    try:
+        assert launched.ok is True
+    finally:
+        launcher.stop(graceful=True)
+        launcher.close()
+
+
+def test_a_kernel_boot_carries_no_disk_drives(tmp_path):
+    """QEMU rejects a virtio drive backed by an ELF, so none may be emitted."""
+    kernel = tmp_path / "stub.elf"
+    kernel.write_bytes(b"kernel")
+    launcher = QemuLauncher(MachineConfig(accel="tcg"))
+    args = launcher.build_args(
+        tmp_path / "fw.bin", tmp_path / "sys.img", tmp_path / "data.img",
+        tmp_path, 4444, kernel=kernel,
+    )
+    drives = [a for a in args if a.startswith("if=virtio")]
+    assert drives == [], drives
+    assert _option_value(args, "-kernel") == kernel.as_posix()
+
+
+def test_last_args_is_a_copy_not_the_live_list(launcher, images, tmp_path):
+    """PRD 9.2: the recorded argv is evidence, so it must not be rewritable.
+
+    A caller that mutates the returned list would silently change what the run
+    claims it started.  The copy is what makes the property hold, and without a
+    test the guard is invisible -- reverting it to returning ``self._last_args``
+    directly breaks nothing observable.
+    """
+    port = fq.free_tcp_port()
+    args = _args(launcher, images, tmp_path, port)
+    launcher._last_args = list(args)
+
+    returned = launcher.last_args
+    assert returned == args
+    returned.append("-injected")
+    returned[0] = "clobbered"
+
+    assert launcher.last_args == args, "the recorded argv was mutated through the accessor"
