@@ -1157,6 +1157,12 @@ jobs:
           # "no --kernelcache", because then build-kernel records not_run with
           # its own reason rather than the script dying on a missing path.
           KERNELCACHE_PATH: ipsw-work/kernelcache.macho
+          # The boot payload (the ESP volume).  BUILD_PAYLOAD is the environment
+          # spelling of --payload; the script reads it when the flag is absent and
+          # the flag wins when both are present.  It is on here because the boot
+          # input set is the point of the run: a kernel with nothing to start it
+          # is not a deliverable (PRD 8.1).
+          BUILD_PAYLOAD: '1'
         run: |
           set -euo pipefail
           if [ ! -f scripts/macos/build-macos.sh ]; then
@@ -1185,6 +1191,20 @@ jobs:
           else
             echo "::notice::no device tree was published; build-devicetree will record not_run (see the ipsw step)"
           fi
+          # The boot payload.  It is opt-in inside build-macos.sh (--payload) and
+          # asked for here, because it is what turns "a kernel was built" into "a
+          # machine can be started": 'unixnu build payload' writes payload.img,
+          # the FAT ESP volume carrying the kernel, the Apple-format device tree
+          # this machine boots (make-qemu-adt.py dumps it by running
+          # qemu-system-aarch64, which the step installs with brew) and
+          # EFI/UniXNU/unixnu.toml naming Payloads/DarwinBoot.efi as a driver.
+          declare -a payload_args=()
+          if [ "${BUILD_PAYLOAD:-0}" = '1' ]; then
+            payload_args+=(--payload)
+            echo "build: building the boot payload (build-payload: payload.img + kernel.macho.adt + unixnu.toml)"
+          else
+            echo "::notice::BUILD_PAYLOAD is off; no payload.img will be produced and the boot input set stays incomplete"
+          fi
           bash scripts/macos/build-macos.sh \
             --experiment "$EXPERIMENT_ID" \
             --stage "$STAGE" \
@@ -1193,10 +1213,25 @@ jobs:
             --unixnu vendor/UniXNU \
             --device vendor/UniXNU-qemu \
             ${kernel_args[@]+"${kernel_args[@]}"} \
+            ${payload_args[@]+"${payload_args[@]}"} \
             2>&1 | tee "$BUILD_LOG"
           finished=$(date -u +%s)
           echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
           echo "build duration: $((finished - started))s"
+          # Whether the ESP exists, so the boot-inputs step below can say so
+          # instead of inferring it from an artifact that may not have been
+          # produced.  Globbed rather than naming the board: the board name is
+          # board.toml's ([board] name), and a workflow that knew it would be a
+          # second place that carries it.
+          payload_image="$(ls build-output/unixnu-out/*/payload/payload.img 2>/dev/null | head -n 1 || true)"
+          if [ -n "$payload_image" ]; then
+            echo "payload_present=true" >> "$GITHUB_OUTPUT"
+            echo "payload_image=$payload_image" >> "$GITHUB_OUTPUT"
+            echo "build: payload image $payload_image ($(wc -c <"$payload_image" | tr -d ' ') bytes)"
+          else
+            echo "payload_present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::no payload.img was produced; see the build-payload entry in build-report.json"
+          fi
 
       # The build log is evidence, and it is the evidence that matters most when
       # the build fails -- which is exactly when the staging step below is
@@ -1582,19 +1617,35 @@ jobs:
       # record, and the three machine-readable manifests.  Everything here is
       # named by what record_artifact() in build-macos.sh records, so the set
       # cannot drift from what the build declares.
+      #
+      # WHY THE WHOLE TREE IS NOT UPLOADED, since that has already cost us once:
+      # the earlier `unipad-build-*` upload carried the entire build tree -- about
+      # 350-370 MB of EDK II and XNU intermediates, object files and feed clones
+      # (run 40081850615 staged 37161 files, 1507736437 bytes) -- on a PUBLIC
+      # repository, and it had to be deleted afterwards.  It was also unusable: at
+      # the measured ~60 KB/s that download takes over 90 minutes.  So the set
+      # below is enumerated file by file, nothing is globbed out of the tree, and
+      # the payload's ESP image is named explicitly rather than by a directory.
+      # PRD 8.2 step 4 keeps the same line: the allowlisted artifact uploads roles,
+      # never a tree.
       - name: Collect the boot inputs into a small bundle
         env:
           STAGE_DIR: staged
           BUNDLE_DIR: boot-inputs
+          BUILD_OUTPUT_DIR: build-output
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import hashlib
+          import json
+          import os
           import shutil
           import sys
           from pathlib import Path
 
           stage = Path("staged")
           bundle = Path("boot-inputs")
+          out = Path(os.environ.get("BUILD_OUTPUT_DIR", "build-output"))
           if not stage.is_dir():
               print("::error::no staged directory; the build produced nothing")
               sys.exit(1)
@@ -1623,10 +1674,70 @@ jobs:
               shutil.copy2(source, destination)
               kept += 1
               total += source.stat().st_size
+
+          # The payload set, taken from the build tree rather than from staged/:
+          # the staging step's default deny excludes *.img (PRD 8.2 step 4: no raw
+          # disk payloads in the allowlisted artifact), so payload.img is
+          # deliberately absent from the big upload and is named here instead.
+          # The device tree and the boot config were already lifted out of the ESP
+          # and verified by build-macos.sh (mcopy, exactly how run-qemu.py:76
+          # reads the volume), so this copies files that were checked -- a FAT
+          # image is not something a downloader can open.
+          PAYLOAD_SET = (
+              # (glob under the build output, where it lands in the bundle)
+              # UniXNU.efi is first because without it there is no
+              # EFI/BOOT/BOOTAA64.EFI at all: the firmware starts a UEFI
+              # *application* (PE subsystem 10, UniXNU.inf:13) and refuses a
+              # driver (subsystem 11) with "The image is not an application.".
+              # 'unixnu build package' builds it into package/Build/Out
+              # (package.py:21-31); the payload volume deliberately does not
+              # carry it, because run-qemu.py:93-95 is what puts it there.
+              ("unixnu-out/*/package/Build/Out/AARCH64-*/UniXNU.efi", "UniXNU.efi"),
+              ("unixnu-out/*/payload/payload.img", "payload.img"),
+              ("payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt", "kernel.macho.adt"),
+              ("payload-esp/EFI/UniXNU/unixnu.toml", "unixnu.toml"),
+              ("unixnu-out/*/payload/payload.json", "payload.json"),
+              ("build-payload.driver.log", "logs/build-payload.driver.log"),
+              ("build-payload.verify.log", "logs/build-payload.verify.log"),
+              ("unixnu-out/*/logs/payload-adt.log", "logs/payload-adt.log"),
+              ("unixnu-out/*/logs/payload-patch.log", "logs/payload-patch.log"),
+              ("build-bootloader.subsystem.log", "logs/build-bootloader.subsystem.log"),
+          )
+          for pattern, name in PAYLOAD_SET:
+              matches = sorted(out.glob(pattern))
+              if not matches:
+                  print(f"::warning::no {pattern} under {out.as_posix()}; the boot input set is incomplete")
+                  continue
+              if len(matches) > 1:
+                  # Two payloads and no way to say which one booted.
+                  print(f"::error::{len(matches)} files match {pattern}: {[m.as_posix() for m in matches]}")
+                  sys.exit(1)
+              source = matches[0]
+              destination = bundle / name
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
+              kept += 1
+              total += source.stat().st_size
           if not kept:
               print("::error::no boot inputs found in staged/")
               sys.exit(1)
-          print(f"boot inputs: {kept} file(s), {total} bytes")
+          # A boot log is only evidence about the bytes that produced it, so the
+          # bundle says which bytes it is.  Measured need: the three earlier
+          # kernel.macho builds are not byte-identical (sha256 9fc119604838856d
+          # on M2 versus 1f32f09bc7668de0 on M4), and a log that does not name
+          # its kernel is a log nobody can reproduce.
+          manifest = {
+              path.relative_to(bundle).as_posix(): {
+                  "bytes": path.stat().st_size,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+              for path in sorted(bundle.rglob("*"))
+              if path.is_file() and path.name != "manifest.json"
+          }
+          (bundle / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(f"boot inputs: {kept} file(s), {total} bytes; manifest.json names {len(manifest)}")
           for path in sorted(bundle.rglob("*")):
               if path.is_file():
                   print(f"  {path.relative_to(bundle).as_posix()} {path.stat().st_size}")
