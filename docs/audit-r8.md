@@ -180,7 +180,44 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 | 16 | **六个命令**（`doctor`/`verify`/`stop`/`collect`/`restore`/`history`）把绝对路径写进 envelope，Windows 账户名直达 stdout；一个 `strict=True` 的 xfail 把它掩住，让套件看起来是绿的 | `src/unipad/controller/cli.py` | **PRD 9.2 系统性泄漏** | 在 `_emit` 这个唯一收口点统一 redact，而不是补六个调用点——第七个会照样上线。`tests/unit/test_record_redaction.py`（9 例） |
 | 17 | `record.redact` 自己的正则只匹配 `/Users/` 不匹配账户组件，所以"拒绝绝对路径"的那条消息把用户名一起打出来；而账户名在同一路径里第二次出现时（本机 pytest 夹具根目录就是）它也不管 | `src/unipad/acceptance/record.py`、`src/unipad/host/paths.py` | **脱敏器自身泄漏** | 收紧 `_USER_PATH` 使其吃掉账户组件；新增 `host/paths.scrub_account` 处理第二次及以后的出现。变异证明 3/6 杀死变异体 |
 
+### 7.1 第九轮（2026-10-24，Windows 启动链）
+
+这一轮的起点不是"写新功能"，而是"把已经绿了很久的东西真的跑一次"。它因此暴露的缺陷有一个共同形状：**代码路径存在、格式正确、测试全绿，而它从来没有被执行过**。
+
+| # | 缺陷 | 位置 | 性质 | 修复 |
+| --- | --- | --- | --- | --- |
+| 18 | `_qmp` 在请求循环里 `return`，于是它在 `qmp_capabilities` 的回复后就返回，**从来没有把调用方给它的命令发出去**。后果全部长得像一次成功的运行：`query-status` 没发（`qmp_evidence` 记的是一条没人问过的问题的回复）、`screendump` 没发（每次运行零张截图）、`quit` 没发（每次运行都落到 `process.terminate()`） | `src/unipad/host/unixnu_boot.py` | **静默失效**，且被全绿的套件掩住 | 改成 `break`，循环后返回；`_watch` 只发一次 `query-status`。承重测试 `test_the_qmp_round_trip_speaks_the_protocol` 先以 `xfail(strict=True)` 失败，修复后按约定移除 marker |
+| 19 | `docs/boot-windows.md` §1.3 写"收到 greeting 与 `query-status` 回复"。那句话是**过头了**：那是同一条 capabilities 回复记了两次 | `docs/boot-windows.md` | 文档虚假证据 | 改写为"QMP over TCP 能建连、能握手"，并把截图链路与优雅退出单列为未实测项（§4） |
+| 20 | `board.toml [payload.adt] chip_id = "207"` 被当十进制读，与 `make-qemu-adt.py:68` 的 `int(value,16)` 冲突，读回校验必然误报 | `src/unipad/host/adt.py` | 校验失效 | 按十六进制解析并注释；测试钉住 |
+| 21 | `board["payload.adt"]` 永远取不到——TOML 里它是嵌在 `[payload]` 里的表，点号名不存在 | `src/unipad/host/adt.py` | 配置读取静默失败 | `_block()` 逐段走 |
+| 22 | `subprocess.run(["python3", ...])` 在 Windows 上 `FileNotFoundError [WinError 2]`：`CreateProcess` 用**父进程**的 PATH 解析可执行文件，不看 `env` 里那个 | `src/unipad/host/adt.py` | Windows 专属失败 | `shutil.which(command[0], path=env["PATH"])` 解析成绝对路径 |
+| 23 | `scripts/qemu-entry/make-dt.py` 在设备仓库里找不到——它在 UniXNU。直接跑工具必失败 | `src/unipad/host/adt.py` | 缺输入 | `prepare_tree()` 按 `unixnu/tree.py:_copy_scripts` 的顺序合并两棵 `scripts/` |
+| 24 | `UniXNU.efi`（固件真正启动的 UEFI application）构建了但从未收集；承载它的 350 MB 整树 artifact 在公开暴露清理时被删除，**字节已不存在于任何地方**，只剩 manifest 里的一条记录 | `scripts/macos/build-macos.sh`、`.github/workflows/build-macos.yml` | **交付物缺失**，且不可恢复 | `step_build_bootloader` glob 出它（缺一个 `die`、多一个也 `die`）并读 PE subsystem 验证是 application 而非 driver；`boot-inputs` 束把它列为第一项 |
+| 25 | `EFI/BOOT/BOOTAA64.EFI` 必须是 PE subsystem 10，而手里只有 subsystem 11 的 driver。固件报"The image is not an application."，BDS 报"failed to load Boot0001 … Not Found"——**指名设备不指名原因**，读起来像文件不存在，而 `ls FS0:\EFI\BOOT` 证明它在 | `src/unipad/host/unixnu_boot.py` | 诊断信息误导 | 启动前读 PE subsystem，指名原因拒绝；runner 侧同样检查，复用同一个 `pe_subsystem`，两边不可能对"固件会怎么对待这个文件"产生分歧 |
+| 26 | `mapfile` 是 bash 4+，macOS 自带 `/bin/bash` 3.2——新加的一段在 runner 上必然失败，而本机 `bash -n` 查不出来 | `scripts/macos/build-macos.sh` | **runner 专属失败** | 改用脚本既有的 `for candidate in glob; do [[ -f ]] && arr+=(...)` 惯用法（`plan_steps` 那里有注释说明为什么） |
+| 27 | 构建失败时，staging / 大上传 / boot-inputs 三个步骤用默认 `success()` 被**跳过**，于是 `build-bootloader` 已经产出并记录的 `UniXNU.efi` 既没暂存也没上传也没收集 | `.github/workflows/build-macos.yml` | **失败即丢证据** | 三个步骤改 `if: always()`；staging 自己的默认拒绝仍然拦住"只有日志没有产物"的构建（PRD 7.4），所以always 发布的是证据不是绿灯 |
+| 28 | `board.toml [payload] panic_screen = true` 让 payload 阶段编译 `xnu-panic-screen.c`，而它 `#include "Font.h"`（`:294`）来自一个既不是 feed、也不在两个 pinned 仓库里的 Mu-Silicium 检出。实测死法是 clang 的 `fatal error: 'Font.h' file not found`——指名 include 不指名原因，和 #25 同一种形状 | `scripts/macos/build-macos.sh` | **第二个阻塞点**，且诊断不可行动 | 跑 driver 之前先查该头文件，ledger 条目写明路径、两个查找位置、以及缺失的代价（只有 panic screen；entry probe 是同一个 patch 的另一半，两种设置都要，`payload.py:128-129`） |
+| 29 | `boot-inputs` 束的 manifest 只记**存在**的文件：丢了 `payload.img` 的束，和本来就没产出 `payload.img` 的构建，单看 manifest 无法区分 | `.github/workflows/build-macos.yml` | 证据不完整 | 缺席条目记为 `{"bytes": null, "sha256": null, "absent": true}`，汇总行打印缺席数 |
+| 30 | `boot-inputs` 目录不重建，上一次运行的残留会被当成本次证据哈希进 manifest；`STAGE_DIR` / `BUNDLE_DIR` 是声明了却没人读的死配置 | `.github/workflows/build-macos.yml` | 证据污染 + 死配置 | 开头 `rmtree` 后重建；两个变量改为真正读取（与 staging 步骤同一惯用法） |
+| 31 | 工作流注释声称"整树不再上传"，而它上一步的 `path: staged/` 仍然上传 368,499,519 字节（run 40091901777 实测）。读者会把那条注释当成对整个工作流的描述 | `.github/workflows/build-macos.yml` | **注释误导** | 注释改写为明确声明 `unipad-build-*` 仍是整树、为什么还没改（`verify-artifacts.yml` 与 `publish-artifacts.yml` 都解析 `unipad-build-*` 并按 manifest 重哈希，收窄它是对那两个工作流的契约变更，不是这里的一行改动） |
+| 32 | 本机 `C:` 卷跑到 0 字节可用，pytest 的编号临时目录工厂开始报 `OSError: could not create numbered dir … after 10 tries`，套件表现为"跑 10 个测试后挂住" | 主机环境 | 环境缺陷伪装成测试挂死 | 清掉已结束测试的 `tmp*` 暂存（实测释放 5.1 GB）；套件改用 `TEMP=F:/iosvirtual/local-private/tmp` 运行 |
+
+### 7.2 这一轮最有价值的一条
+
+#18 与 #27/#28 是同一条教训的三次重复：**"构建阶段名称、Actions 绿色、二进制格式正确"都不等于"它跑过"**。#18 期间测试套件是全绿的，而一个 QMP 命令都没有发出去。#27 期间 Actions 是绿的，而唯一的交付物被跳过。#28 期间 driver 退出码非零、clang 报错清晰，却没有任何东西告诉操作员缺的是哪个文件。
+
+因此本轮的交付判断标准只有一条：**证据本身被读过**。`boot-inputs/manifest.json` 的存在是为了让一份启动日志能指名它的内核；`if: always()` 是为了让一次失败的构建仍然留下它产出的东西；`pe_subsystem` 与 font 预检是为了把"含义不明的固件/clang 错误"变成"指名原因的拒绝"。
+
 ## 8. 仓库可见性决定（记录在案，未执行）
+
+> **2026-10-24 更正：本条已被用户授权推翻，事件经过与后果见 `docs/public-exposure-audit.md`。**
+> 用户为取得免费 macOS runner 明确授权将仓库改为公开，授权同时规定任务完成后恢复私有并核查已公开产物。
+> 实测：仓库已恢复 **PRIVATE**（0 fork / 0 star / 0 watch、无 release），公开期间上传的 8 个约 350 MB 的
+> `unipad-build-*`、4 个 `boot-inputs-*` 与 7 个 `build-logs-*` artifact 已全部删除，仅剩 34 个
+> `unipad-preflight-*`（合计 125,962 字节，内容为主机清单文本）。无法撤回的部分也如实记在该文档里：
+> 公开期间被第三方克隆的历史提交不能召回，CDN 缓存不承诺清除。
+> 本条目保留原文，因为它记录的推理（PRD §12 的禁止条款）没有被授权删除，只是被用户的明确授权
+> 一次性覆盖；下次再遇到同一个选择时，要重读的是 `public-exposure-audit.md` 而不是这一条。
 
 用户提出"GitHub Actions 对公开仓库免费，把仓库改公开就能免费用 runner"。
 
