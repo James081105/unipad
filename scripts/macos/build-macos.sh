@@ -414,6 +414,10 @@ DEVICE_DIR=''
 UEFI_DIR=''
 IPSW_PATH=''
 KERNELCACHE_PATH=''
+#: Set when this script diverges from the pinned device repository to get the
+#: build past a defect in it.  Recorded in build-report.json, because a build
+#: that quietly patches its own inputs is a build nobody can reproduce.
+CONFIG_DIVERGENCE=''
 DTB_PATH=''
 FD_PATH_IN=''
 UNIQUE_CHIP_ID=''
@@ -1246,6 +1250,45 @@ step_build_kernel() {
         ledger_add "$name" 'failed' "unixnu defconfig $DEFCONFIG failed; see $OUT_DIR/${name}.driver.log"
         return 1
     fi
+
+    # (3b) supply the archive opt-in the board's defconfig omits.
+    #
+    # Measured on a real macOS runner (run 40067448940): every XNU translation
+    # unit compiles, and the link then fails on
+    #
+    #   _mockfs_mountroot / _mockfs_vfsops / _mockfs_vnodeop_opv_desc
+    #       (referenced from _vfstbllist in vfs_conf.o)
+    #   _native_legacy_display_probe / _sheng_pmgr_run
+    #       (referenced from _bsd_init in bsd_init.o)
+    #
+    # and the driver then reports `test -f "$CRYPTO_ARCHIVE" failed`.  The cause
+    # is not the link: kernel.py's build_archives() returns immediately unless
+    # the resolved config carries XNU_BUILD_ARCHIVES, and qemu_defconfig declares
+    # CONFIG_XNU_NATIVE_AES, CONFIG_XNU_SOURCE_CORECRYPTO14,
+    # CONFIG_XNU_SOURCE_MOCKFS and CONFIG_XNU_EXTRA_LD_ARCHIVES=...libLinkStubs.a
+    # without ever opting in.  It asks for archives it never builds.
+    #
+    # This is a defect in the pinned device repository, not in this project, and
+    # it is worked around here rather than by editing vendor/: the runner clones
+    # vendor/ fresh at the locked commit, so a local edit would not survive and
+    # committing one would make the pin exist twice.  The file being changed is
+    # the *generated* out/<device>/.config, which `unixnu defconfig` just copied
+    # from the board -- so this is a divergence from the pin, recorded as one.
+    local generated_config
+    generated_config="$(work_dir)/.config"
+    if [[ -f "$generated_config" ]] && ! grep -q '^CONFIG_XNU_BUILD_ARCHIVES=' \
+            "$generated_config"; then
+        {
+            printf '\n# Added by build-macos.sh: the board defconfig declares the\n'
+            printf '# archives below without opting into building them, so the kernel\n'
+            printf '# link has no mockfs, corecrypto or link-stubs input.  Divergence\n'
+            printf '# from the pinned device repository, recorded here deliberately.\n'
+            printf 'CONFIG_XNU_BUILD_ARCHIVES=y\n'
+        } >>"$generated_config"
+        log "config: added CONFIG_XNU_BUILD_ARCHIVES=y (the board defconfig omits it)"
+        CONFIG_DIVERGENCE='CONFIG_XNU_BUILD_ARCHIVES=y added to the generated .config'
+    fi
+
     if ! run_driver "$name" 'build' 'kernel' ${extra[@]+"${extra[@]}"}; then
         ledger_add "$name" 'failed' "unixnu build kernel failed; see $OUT_DIR/${name}.driver.log"
         return 1
@@ -1846,7 +1889,8 @@ write_outputs() {
         printf '  "declared_artifacts": %s,\n' "$declared_count"
         printf '  "built_artifacts": %s,\n'   "${#BUILT_RECORDS[@]}"
         printf '  "sources_present": %s,\n' "$([[ "$sources_ok" == '1' ]] && printf 'true' || printf 'false')"
-        printf '  "evidence_note": "steps with status not_run or failed produced nothing; missing evidence is unverified, not success (PRD 7.4)."\n'
+        printf '  "evidence_note": "steps with status not_run or failed produced nothing; missing evidence is unverified, not success (PRD 7.4).",\n'
+        printf '  "config_divergence": "%s"\n' "$(json_escape "$CONFIG_DIVERGENCE")"
         printf '}\n'
     } >"$REPORT_PATH"
     assert_json_file "$REPORT_PATH" "build report" 'build_report_invalid'
