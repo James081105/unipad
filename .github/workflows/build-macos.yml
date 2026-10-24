@@ -1019,6 +1019,7 @@ jobs:
             --device "$DEVICE_REPO" \
             --work "$IPSW_WORK_DIR/work" \
             --kernelcache "$KERNELCACHE_PATH" \
+            --devicetree "$DEVICETREE_PATH" \
             --summary "$SUMMARY_PATH" \
             | tee "$IPSW_WORK_DIR/ipsw.log"
           status=$?
