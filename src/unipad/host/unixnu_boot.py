@@ -29,7 +29,7 @@ What is deliberately different:
   for an automated run whose evidence is the serial log and the screendumps.
 
 Readiness is never inferred from a sleep.  :func:`boot` waits for a QMP greeting
-and a ``query-status`` reply, and records both, exactly as
+and a ``query-status`` reply, and records the reply, exactly as
 :meth:`unipad.host.qemu.QemuLauncher.wait_for_qmp` does -- a run that only shows
 "QEMU was started" has proved nothing about the guest (PRD 7.4).
 """
@@ -56,6 +56,8 @@ __all__ = [
     "BootInputs",
     "BootReport",
     "MEMORY_MIB",
+    "PE_SUBSYSTEM_APPLICATION",
+    "PE_SUBSYSTEM_NAMES",
     "SCREEN",
     "boot",
     "build_argv",
@@ -520,6 +522,9 @@ def _qmp(port: int, execute: str, **arguments: Any) -> dict[str, Any]:
     other user and a shared connection would serialise the two.  ``arguments``
     is empty for a bare command such as ``quit``.
     """
+    # ``reply`` starts as the failure record so the function always has one to
+    # return; every successful round trip overwrites it.
+    reply: dict[str, Any] = {"error": "qmp closed without a reply"}
     with socket.create_connection(("127.0.0.1", int(port)), timeout=15) as sock:
         sock.settimeout(30)
         stream = sock.makefile("rwb", buffering=0)
@@ -527,10 +532,15 @@ def _qmp(port: int, execute: str, **arguments: Any) -> dict[str, Any]:
         for request in ({"execute": "qmp_capabilities"}, {"execute": execute, "arguments": arguments}):
             stream.write((json.dumps(request) + "\n").encode())
             while True:
-                reply = json.loads(stream.readline())
-                if "return" in reply or "error" in reply:
-                    return reply
-    return {"error": "qmp closed without a reply"}  # pragma: no cover - unreachable
+                candidate = json.loads(stream.readline())
+                if "return" in candidate or "error" in candidate:
+                    # A ``break``, not a ``return``: returning here would answer
+                    # with the *capabilities* reply and never send the command
+                    # the caller asked for, which silently turns every
+                    # ``screendump`` and ``quit`` into a no-op.
+                    reply = candidate
+                    break
+    return reply
 
 
 def _write_png(ppm: Path, target: Path) -> None:
@@ -759,7 +769,6 @@ def _watch(
                                    "stderr_tail": _tail(work / "qemu-stderr.log")}
             return report
         try:
-            greeting = _qmp(qmp_port, "query-status")
             status = _qmp(qmp_port, "query-status")
         except (OSError, json.JSONDecodeError) as exc:
             last_reason = f"{type(exc).__name__}: {exc}"
@@ -776,7 +785,6 @@ def _watch(
         report.qmp_evidence = {
             "port": qmp_port,
             "attempts": attempts,
-            "greeting": greeting,
             "status": status,
             "waited_seconds": round(time.monotonic() - started, 3),
         }
