@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from unipad.errors import ErrorCode, UniPadError
+from unipad.host.paths import safe_location, scrub_account
 
 __all__ = [
     "PROBE_VERSION",
@@ -107,9 +108,18 @@ MAX_CACHED_PAGES = 4096
 #: guessed at, because a mislabelled state is worse than an unnamed one.
 PROC_STATES = {1: "idle", 2: "run", 3: "stop", 4: "zombie", 5: "reaped"}
 
-#: AArch64 stage-1 translation, 4 KiB granules, as the guest's ``TCR_EL1``
-#: selects.  Level 1 indexes with 8 bits at shift 30; levels 2 and 3 with 9 bits
-#: at shifts 21 and 12.
+#: AArch64 stage-1 translation, 4 KiB granules.  Level 1 indexes with 8 bits at
+#: shift 30; levels 2 and 3 with 9 bits at shifts 21 and 12.
+#
+#: This is UniXNU's own value (``scripts/qemu-ps.py:29``) and it is what the
+#: real guest on this host answered correctly: the walk produced ``kernel_task``
+#: and a coherent 17 KB kernel log on 2026-10-24.  It is **not** derived from the
+#: guest's ``TCR_EL1``, which this module never reads -- the serial log prints
+#: ``TCR_EL1 0x280803518``, from which T1SZ=24 implies a 40-bit VA and a 9-bit
+#: level-1 index.  Whether the 8-bit mask is right for every address, or right
+#: for the ones this probe happened to read, is an **open question**; the guest's
+#: own tables would settle it, and the honest thing is to record the gap rather
+#: than claim the constant matches the hardware.
 _TABLE_SHIFTS = ((1, 30, 0xFF), (2, 21, 0x1FF), (3, 12, 0x1FF))
 _DESCRIPTOR_OUTPUT_MASK = 0x0000_FFFF_FFFF_F000
 _DESCRIPTOR_VALID = 0x1
@@ -140,8 +150,13 @@ _N_SECT = 0x0E
 #: The kernel load line DarwinBoot prints.  Both addresses are required: the
 #: virtual one is the base the page tables are built for, the physical one is
 #: where those bytes actually are in guest RAM.
+# ``{8,}`` rather than ``+``: a truncated log line ending mid-address
+# ("...pa 0x4") used to match and produce a physical base of 4, from which
+# ``cpu_ttep`` would be read out of the first page of guest RAM.  Every real load
+# line prints a full 64-bit address, so eight digits is a floor with no false
+# positives.
 _LOAD_LINE = re.compile(
-    rb"kernel\s+va\s+0x([0-9A-Fa-f]+)\s+pa\s+0x([0-9A-Fa-f]+)"
+    rb"kernel\s+va\s+0x([0-9A-Fa-f]{8,})\s+pa\s+0x([0-9A-Fa-f]{8,})"
 )
 
 
@@ -155,13 +170,17 @@ def _refuse(code: str, message: str, **details: Any) -> UniPadError:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Segment:
-    """One ``LC_SEGMENT_64``: where it sits in memory and in the file."""
+    """One ``LC_SEGMENT_64``: where it sits in the guest's virtual memory.
+
+    The file offset and file size are deliberately absent.  Nothing in this
+    module reads image bytes off disk -- it reads guest memory through the page
+    tables -- so carrying them would be two fields a caller could mistake for a
+    supported way to get at the kernel's contents.
+    """
 
     name: str
     vmaddr: int
     vmsize: int
-    fileoff: int
-    filesize: int
 
     def contains(self, vmaddr: int) -> bool:
         return self.vmaddr <= vmaddr < self.vmaddr + self.vmsize
@@ -226,24 +245,40 @@ class KernelImage:
         expected_sha256: Optional[str] = None,
         required_symbols: Sequence[str] = REQUIRED_SYMBOLS,
     ) -> None:
+        """Open and verify a kernel image.
+
+        ``expected_sha256`` is **required**.  The symbol addresses this probe
+        walks with come out of this file, so an image that is not the one that
+        was verified makes every address derived from it wrong -- and the walk
+        would still produce PIDs and text that look like a log.  There is no
+        safe default: ``unipad.host.ipsw`` refuses to acquire without a pin for
+        the same reason, and an opt-in check is a check nobody runs.
+        """
         self.path = Path(path)
         if not self.path.is_file():
             raise _refuse(
                 ErrorCode.IMAGE_NOT_FOUND,
                 "the kernel image is not present",
-                image=self.path.name,
+                image=safe_location(self.path),
+            )
+        if not expected_sha256:
+            raise _refuse(
+                ErrorCode.CONFIG_INVALID,
+                "a kernel image is only read against a digest it was verified "
+                "against; pass expected_sha256",
+                image=safe_location(self.path),
             )
         blob = self.path.read_bytes()
         self.size = len(blob)
         self.sha256 = hashlib.sha256(blob).hexdigest()
-        if expected_sha256 and self.sha256 != expected_sha256.lower():
+        if self.sha256 != expected_sha256.lower():
             # The one comparison that must never be relaxed: an image that is
             # not the one that was verified is not the kernel we think we are
             # reading, and every address derived from it would be wrong.
             raise _refuse(
                 ErrorCode.IMAGE_HASH_MISMATCH,
                 "the kernel image does not match the digest it was verified against",
-                image=self.path.name,
+                image=safe_location(self.path),
                 expected=expected_sha256.lower(),
                 actual=self.sha256,
             )
@@ -257,7 +292,7 @@ class KernelImage:
             raise _refuse(
                 ErrorCode.CONFIG_INVALID,
                 "the kernel image is not a 64-bit Mach-O",
-                image=self.path.name,
+                image=safe_location(self.path),
                 magic=hex(magic),
             )
         self._end = end
@@ -267,22 +302,28 @@ class KernelImage:
         symtab: Optional[tuple[int, int, int, int]] = None
         at = 32
         for _ in range(ncmds):
+            if at + 8 > len(blob):
+                raise _refuse(
+                    ErrorCode.CONFIG_INVALID,
+                    "the kernel image ends inside its load-command table",
+                    image=safe_location(self.path),
+                    at=at,
+                    bytes=len(blob),
+                )
             cmd, cmdsize = struct.unpack_from(end + "II", blob, at)
             if cmdsize < 8:
                 raise _refuse(
                     ErrorCode.CONFIG_INVALID,
                     "the kernel image has a load command smaller than its header",
-                    image=self.path.name,
+                    image=safe_location(self.path),
                     command=hex(cmd),
                 )
             if cmd == _LC_SEGMENT_64 and cmdsize >= 72:
                 name = blob[at + 8:at + 24].rstrip(b"\0").decode("utf-8", "replace")
-                vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
+                vmaddr, vmsize, _fileoff, _filesize = struct.unpack_from(
                     end + "4Q", blob, at + 24
                 )
-                self.segments += (
-                    Segment(name, vmaddr, vmsize, fileoff, filesize),
-                )
+                self.segments += (Segment(name, vmaddr, vmsize),)
             elif cmd == _LC_SYMTAB and cmdsize >= 24:
                 symtab = struct.unpack_from(end + "4I", blob, at + 8)
             at += cmdsize
@@ -291,7 +332,7 @@ class KernelImage:
                 ErrorCode.CONFIG_INVALID,
                 "the kernel image carries no symbol table, so no kernel global "
                 "can be located",
-                image=self.path.name,
+                image=safe_location(self.path),
             )
 
         symoff, nsyms, stroff, strsize = symtab
@@ -326,7 +367,7 @@ class KernelImage:
                 ErrorCode.CONFIG_INVALID,
                 "the kernel image does not define the symbols this probe reads, "
                 "so it is not a kernel this probe can read",
-                image=self.path.name,
+                image=safe_location(self.path),
                 missing=missing,
             )
         self.required_symbols = tuple(required_symbols)
@@ -352,7 +393,7 @@ class KernelImage:
             raise _refuse(
                 ErrorCode.CONFIG_INVALID,
                 "the kernel image does not define a symbol this probe needs",
-                image=self.path.name,
+                image=safe_location(self.path),
                 symbol=name,
             )
         return found
@@ -366,7 +407,10 @@ class KernelImage:
     def summary(self) -> dict[str, Any]:
         """What a sample records about the image: identity, never contents."""
         return {
-            "image": self.path.name,
+            # safe_location, not .name: a file can be named after the account,
+            # and paths.py:69-89 records a missing-image refusal that printed the
+            # username while "refusing" to name the directory.
+            "image": safe_location(self.path),
             "bytes": self.size,
             "sha256": self.sha256,
             "segments": len(self.segments),
@@ -400,12 +444,27 @@ class GuestMemory:
     def read(self, physical: int, size: int) -> bytes:
         if size <= 0:
             return b""
-        self._scratch.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._scratch.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise _refuse(
+                ErrorCode.CONFIG_INVALID,
+                "the scratch file's directory cannot be created",
+                error=type(exc).__name__,
+            ) from exc
         self._client.execute(
             "pmemsave",
             {"val": int(physical), "size": int(size), "filename": str(self._scratch)},
         )
-        data = self._scratch.read_bytes()
+        try:
+            data = self._scratch.read_bytes()
+        except OSError as exc:
+            raise _refuse(
+                ErrorCode.EVIDENCE_INCOMPLETE,
+                "the guest's memory could not be read back from the scratch file",
+                physical=hex(physical),
+                error=type(exc).__name__,
+            ) from exc
         if len(data) != size:
             raise _refuse(
                 ErrorCode.EVIDENCE_INCOMPLETE,
@@ -722,6 +781,19 @@ class GuestObserver:
         data = self.read(data_pointer, size)
         return (data[write:] + data[:write]).replace(b"\0", b"")
 
+    def reset(self) -> None:
+        """Forget every translated page and the table root.
+
+        The caches are a snapshot, not a property of the observer.  A guest can
+        reload its page tables -- and a reset or a second kernel does exactly
+        that -- after which a cached page is a *mapped* page holding the wrong
+        bytes, which is the failure this module exists to refuse.  Measured
+        without this: a second ``sample()`` on one observer issued zero guest
+        reads, because everything was still cached.
+        """
+        self._tables.clear()
+        self._root = None
+
     def sample(self, *, taken_at: str = "", log_path: Optional[Path] = None) -> Sample:
         """One stamped observation, optionally writing the kernel log out.
 
@@ -732,11 +804,21 @@ class GuestObserver:
         from datetime import datetime, timezone
 
         stamp = taken_at or datetime.now(timezone.utc).isoformat()
+        # One observation, one snapshot of the guest's tables.
+        self.reset()
         rows = self.processes()
         log = self.kernel_log()
         if log_path is not None:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(log_path).write_bytes(log)
+            try:
+                destination = Path(log_path)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(log)
+            except OSError as exc:
+                raise _refuse(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "the kernel log could not be written out",
+                    error=type(exc).__name__,
+                ) from exc
         return Sample(
             probe_version=PROBE_VERSION,
             taken_at=stamp,
@@ -806,7 +888,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from unipad.host.qmp import QmpClient
 
     def emit(document: dict) -> None:
-        print(json.dumps(document, indent=1, sort_keys=True))
+        """One JSON object on stdout, redacted before it is printed.
+
+        Redaction lives here rather than at each call site because this is the
+        single choke point every document goes through -- success and refusal
+        alike.  ``src/unipad/controller/cli.py:458-483`` records what happens
+        when it does not: six commands leaked the account name, and patching the
+        six call sites would have let the seventh ship.
+
+        Measured on this host without it: a QMP ``pmemsave`` rejection carries
+        QEMU's own text in ``details.qmp_error.desc``, and QEMU names the scratch
+        file it was asked to open -- which defaults under the user profile.  So a
+        refusal for a transport error printed the account name into stdout.
+        Path details are already reduced to their final component by
+        ``safe_location``; this covers the free text that arrives from elsewhere.
+        ``ensure_ascii=False`` matches ``ipsw.py:1268``.
+        """
+        text = json.dumps(document, indent=1, sort_keys=True, ensure_ascii=False)
+        print(scrub_account(text))
 
     def _discard(directories: list[Path]) -> None:
         import shutil
@@ -825,9 +924,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ErrorCode.EVIDENCE_INCOMPLETE,
                     "the serial log is not present, so the kernel's load "
                     "addresses cannot be read from it",
-                    serial=args.serial.name,
+                    serial=safe_location(args.serial),
                 )
-            load = load_addresses_from_serial(args.serial.read_text(encoding="utf-8", errors="replace"))
+            try:
+                serial_text = args.serial.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise _refuse(
+                    ErrorCode.EVIDENCE_INCOMPLETE,
+                    "the serial log could not be read",
+                    serial=safe_location(args.serial),
+                    error=type(exc).__name__,
+                ) from exc
+            load = load_addresses_from_serial(serial_text)
         elif args.kernel_va and args.kernel_pa:
             load = LoadAddresses(
                 kernel_va=int(args.kernel_va, 0), kernel_pa=int(args.kernel_pa, 0)
@@ -863,30 +971,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         finally:
             client.close()
 
-        emit(
-            {
-                "ok": True,
-                "probe_version": sample.probe_version,
-                "run_id": sample.run_id,
-                "kernel": {
-                    **image.summary(),
-                    "va": hex(sample.kernel_va),
-                    "pa": hex(sample.kernel_pa),
-                    "entry_pa": hex(sample.entry_pa) if sample.entry_pa else None,
-                },
-                "processes": [
-                    {"pid": row.pid, "state": row.state, "name": row.name}
-                    for row in sample.processes
-                ],
-                "kernel_log": {
-                    "bytes": sample.kernel_log_bytes,
-                    "sha256": sample.kernel_log_sha256,
-                    "written_to": args.log.name if args.log else None,
-                },
-                "memory": {"reads": sample.memory_reads, "bytes": sample.memory_bytes},
-                "taken_at": sample.taken_at,
-            }
+        document = {"ok": True}
+        document.update(sample.to_dict())
+        document["kernel"].update(image.summary())
+        document["kernel_log"]["written_to"] = (
+            safe_location(args.log) if args.log else None
         )
+        emit(document)
         _discard(owned)
         return 0
     except UniPadError as exc:
@@ -900,6 +991,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         )
         return int(exc.exit_code)
+    except Exception as exc:  # noqa: BLE001 - a refusal, never a traceback
+        # The one-JSON-object contract holds on every path.  An OSError from the
+        # host, a struct.error from a malformed image, anything at all: it is
+        # reported as a classified refusal so a controller parsing stdout never
+        # meets a decode error where a document was promised.
+        _discard(owned)
+        emit(
+            {
+                "ok": False,
+                "code": ErrorCode.EVIDENCE_INCOMPLETE,
+                "reason": "the observation did not complete",
+                "details": {"error": type(exc).__name__},
+            }
+        )
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover - the entry point is exercised through main()

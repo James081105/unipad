@@ -23,6 +23,7 @@ question this whole channel exists to answer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socketserver
 import struct
@@ -287,6 +288,22 @@ def _kernel_for_cli(tmp_path: Path) -> Path:
     )
 
 
+def _cli_args(port: int, kernel: Path, *extra: str) -> list[str]:
+    """The CLI arguments every observation test needs, digest included.
+
+    ``--expected-sha256`` is required, not optional: the symbol addresses the
+    walk uses come out of that file, so an unverified image makes every address
+    derived from it wrong.  A test that is about the digest gate passes its own.
+    """
+    digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+    return [
+        "--qmp-port", str(port),
+        "--kernel", str(kernel),
+        "--expected-sha256", digest,
+        *extra,
+    ]
+
+
 def test_the_cli_prints_exactly_one_json_object(qmp_server, tmp_path: Path, capsys) -> None:
     """One object on stdout, which is the controller's CLI convention.
 
@@ -299,15 +316,14 @@ def test_the_cli_prints_exactly_one_json_object(qmp_server, tmp_path: Path, caps
     kernel = _kernel_for_cli(tmp_path)
 
     code = go.main(
-        [
-            "--qmp-port", str(port),
-            "--kernel", str(kernel),
+        _cli_args(
+            port, kernel,
             "--kernel-va", "0x0",
             "--kernel-pa", "0x30000",
             "--run-id", "run-cli-1",
             "--log", str(tmp_path / "kernel.log"),
             "--scratch", str(tmp_path / "pmem.bin"),
-        ]
+        )
     )
 
     out = capsys.readouterr().out
@@ -362,7 +378,7 @@ def test_the_cli_refuses_when_the_load_addresses_are_unknown(
     _server, _ram, port = qmp_server
     kernel = _kernel_for_cli(tmp_path)
 
-    code = go.main(["--qmp-port", str(port), "--kernel", str(kernel)])
+    code = go.main(_cli_args(port, kernel))
 
     document = json.loads(capsys.readouterr().out)
     assert code != 0
@@ -383,13 +399,12 @@ def test_the_cli_never_prints_the_kernels_path(qmp_server, tmp_path: Path, capsy
     kernel = _kernel_for_cli(tmp_path)
 
     go.main(
-        [
-            "--qmp-port", str(port),
-            "--kernel", str(kernel),
+        _cli_args(
+            port, kernel,
             "--kernel-va", "0x0",
             "--kernel-pa", "0x30000",
             "--scratch", str(tmp_path / "pmem.bin"),
-        ]
+        )
     )
 
     out = capsys.readouterr().out
@@ -406,20 +421,22 @@ def test_the_cli_reads_the_load_line_from_a_serial_log(
     _guest_ram(ram)
     kernel = _kernel_for_cli(tmp_path)
     serial = tmp_path / "serial.log"
+    # Full-width addresses, because the load-line pattern requires at least
+    # eight hex digits -- a truncated "pa 0x4" used to match and produce a
+    # physical base of 4.
     serial.write_text(
         "DARWINBOOT: hand-off to the kernel\n"
-        "kernel   va 0x0  pa 0x30000\n"
-        "entry    pa 0x1000\n",
+        "kernel   va 0x00000000  pa 0x00030000\n"
+        "entry    pa 0x00001000\n",
         encoding="utf-8",
     )
 
     code = go.main(
-        [
-            "--qmp-port", str(port),
-            "--kernel", str(kernel),
+        _cli_args(
+            port, kernel,
             "--serial", str(serial),
             "--scratch", str(tmp_path / "pmem.bin"),
-        ]
+        )
     )
 
     document = json.loads(capsys.readouterr().out)
@@ -427,3 +444,85 @@ def test_the_cli_reads_the_load_line_from_a_serial_log(
     assert document["kernel"]["va"] == "0x0"
     assert document["kernel"]["pa"] == "0x30000"
     assert document["kernel"]["entry_pa"] == "0x1000"
+
+
+def test_a_transport_error_cannot_leak_the_account_name(
+    qmp_server, tmp_path: Path, capsys
+) -> None:
+    """PRD 9.2: a QMP error that names the scratch file must not reach stdout.
+
+    Measured on this host before the fix.  QEMU's own text arrives in
+    ``details.qmp_error.desc`` when it refuses a ``pmemsave``, and it names the
+    file it was asked to open -- which defaults under the user profile.  So a
+    transport refusal printed the account name into stdout, and
+    ``tests/acceptance/test_m0_ai_interface_smoke.py``'s own assertion would
+    have failed on the output.
+
+    The guard is at the emission point, not at the call site: ``cli.py:458-483``
+    records six commands leaking the account name and why patching the six call
+    sites would have let the seventh ship.
+    """
+    from unipad.host.paths import account_name
+
+    account = account_name()
+    if not account:
+        pytest.skip("this host reports no account name, so there is nothing to leak")
+
+    server, _ram, port = qmp_server
+    kernel = _kernel_for_cli(tmp_path)
+
+    class Rejecting:
+        """A QMP endpoint that connects, then refuses pmemsave the way QEMU does.
+
+        ``connect`` and ``close`` are here because ``main()`` calls them: a stub
+        without them fails at ``connect()`` with an ``AttributeError``, which the
+        generic refusal path turns into ``{"error": "AttributeError"}`` -- and the
+        test would then pass without the leak ever happening.  The first draft of
+        this test did exactly that, and the 对质 step (removing the redaction)
+        left it green.
+        """
+
+        def connect(self):
+            return {"greeting": {}, "capabilities": {}}
+
+        def close(self):
+            return None
+
+        def execute(self, command, arguments=None, **_):
+            raise UniPadError(
+                ErrorCode.QMP_PROTOCOL_ERROR,
+                "qmp command was rejected",
+                command=command,
+                qmp_error={
+                    "class": "GenericError",
+                    "desc": "Could not open 'C:" + chr(92) + "Users" + chr(92)
+                             + account + chr(92) + "AppData" + chr(92) + "Local"
+                             + chr(92) + "Temp" + chr(92)
+                             + "unipad-observe-xyz" + chr(92) + "pmem.bin': "
+                             + "No such file or directory",
+                },
+            )
+
+    import unipad.host.guestobserve as go_module
+    import unipad.host.qmp as qmp_module
+
+    # QmpClient is imported inside main(), so patch it where main() looks it up.
+    real = qmp_module.QmpClient
+    qmp_module.QmpClient = lambda **kwargs: Rejecting()
+    try:
+        code = go_module.main(
+            _cli_args(
+                port, kernel,
+                "--kernel-va", "0x0",
+                "--kernel-pa", "0x30000",
+                "--scratch", str(tmp_path / "pmem.bin"),
+            )
+        )
+    finally:
+        qmp_module.QmpClient = real
+
+    out = capsys.readouterr().out
+    document = json.loads(out)  # still exactly one JSON object
+    assert code != 0
+    assert document["ok"] is False
+    assert account not in out, "the account name reached stdout through a QMP error"

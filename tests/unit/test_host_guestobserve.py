@@ -36,6 +36,7 @@ keeps the two apart.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -257,7 +258,7 @@ def test_the_real_kernel_resolves_the_symbols_the_probe_reads() -> None:
     channel cannot start, so this is the test that says the channel is not
     speculative.
     """
-    image = go.KernelImage(REAL_KERNEL)
+    image = go.KernelImage(REAL_KERNEL, expected_sha256=_digest(REAL_KERNEL))
     assert image.sha256 == REAL_KERNEL_SHA256, (
         "the kernel image changed; re-measure before trusting any address "
         "derived from it, and update this digest deliberately"
@@ -278,14 +279,14 @@ def test_a_symbol_that_appears_twice_resolves_to_its_definition() -> None:
     physical address 0 -- which is mapped, so nothing raises, and every address
     read afterwards is wrong.
     """
-    image = go.KernelImage(REAL_KERNEL)
+    image = go.KernelImage(REAL_KERNEL, expected_sha256=_digest(REAL_KERNEL))
     assert image.require_symbol("cpu_ttep") == 0xFFFF_FFF0_0716_6BB8
 
 
 @pytest.mark.skipif(not REAL_KERNEL.is_file(), reason="the local kernel image is absent")
 def test_symbols_are_found_with_and_without_the_underscore() -> None:
     """Mach-O's leading underscore is a spelling, not a different symbol."""
-    image = go.KernelImage(REAL_KERNEL)
+    image = go.KernelImage(REAL_KERNEL, expected_sha256=_digest(REAL_KERNEL))
     assert image.symbol("allproc") == image.symbol("_allproc")
     assert image.require_symbol("msgbufp") == image.require_symbol("_msgbufp")
 
@@ -305,11 +306,16 @@ def test_an_image_whose_digest_is_not_the_verified_one_is_refused() -> None:
     assert refused.value.details["actual"] == REAL_KERNEL_SHA256
 
 
+def _digest(path: Path) -> str:
+    """The sha256 a test must pass back, so the digest is never spelled twice."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_a_file_that_is_not_a_mach_o_is_refused(tmp_path: Path) -> None:
     bogus = tmp_path / "not-a-kernel"
     bogus.write_bytes(b"\x7fELF" + b"\0" * 60)
     with pytest.raises(UniPadError) as refused:
-        go.KernelImage(bogus)
+        go.KernelImage(bogus, expected_sha256=_digest(bogus))
     assert refused.value.code == ErrorCode.CONFIG_INVALID
     assert "Mach-O" in refused.value.message
 
@@ -325,7 +331,7 @@ def test_an_image_with_no_symbol_table_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "no-symbols.macho"
     path.write_bytes(bytes(blob))
     with pytest.raises(UniPadError) as refused:
-        go.KernelImage(path)
+        go.KernelImage(path, expected_sha256=_digest(path))
     assert refused.value.code == ErrorCode.CONFIG_INVALID
     assert "symbol" in refused.value.message
 
@@ -407,7 +413,7 @@ def test_a_definition_beats_an_earlier_undefined_reference(tmp_path: Path) -> No
             ("_msgbufp", 0x0E, 0x4000),
         ],
     )
-    image = go.KernelImage(path)
+    image = go.KernelImage(path, expected_sha256=_digest(path))
     assert image.require_symbol("dup") == 0x1000
 
 
@@ -427,7 +433,7 @@ def test_a_symbol_with_no_definition_is_not_reported_as_one(tmp_path: Path) -> N
         ],
     )
     with pytest.raises(UniPadError) as refused:
-        go.KernelImage(path)
+        go.KernelImage(path, expected_sha256=_digest(path))
     assert refused.value.code == ErrorCode.CONFIG_INVALID
     assert "cpu_ttep" in str(refused.value.details.get("missing"))
 
@@ -436,6 +442,29 @@ def test_an_absent_image_is_refused(tmp_path: Path) -> None:
     with pytest.raises(UniPadError) as refused:
         go.KernelImage(tmp_path / "nowhere.macho")
     assert refused.value.code == ErrorCode.IMAGE_NOT_FOUND
+
+
+def test_a_kernel_image_without_a_digest_is_refused(tmp_path: Path) -> None:
+    """The digest gate is not optional.
+
+    The symbol addresses this probe walks with come out of this file, so an
+    image nobody verified makes every address derived from it wrong -- and the
+    walk would still produce PIDs and text that look like a log.  ``if
+    expected_sha256 and ...`` made the gate opt-in, which is a gate nobody runs;
+    this pins that it is required.
+    """
+    path = _build_macho(
+        tmp_path,
+        [
+            ("_cpu_ttep", 0x0E, 0x2000),
+            ("_allproc", 0x0E, 0x3000),
+            ("_msgbufp", 0x0E, 0x4000),
+        ],
+    )
+    with pytest.raises(UniPadError) as refused:
+        go.KernelImage(path)
+    assert refused.value.code == ErrorCode.CONFIG_INVALID
+    assert "digest" in refused.value.message
 
 
 # ---------------------------------------------------------------------------
@@ -802,3 +831,85 @@ def test_the_observer_never_asks_the_virtual_cpu_for_anything(
     _plant_empty_kernel(guest)
     observer.kernel_log()
     assert {name for name, _ in guest.commands} == {"pmemsave"}
+
+
+def test_a_missing_scratch_file_is_a_refusal_not_a_traceback(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """QEMU answered but wrote nothing: that is a refusal, not ``FileNotFoundError``.
+
+    The length check below the read was unreachable in exactly this case --
+    ``read_bytes()`` raised first, and ``main()`` caught only ``UniPadError``, so
+    a transport that answered without writing produced a traceback on stderr and
+    *nothing* on stdout.  That breaks the one-JSON-object contract the module
+    itself cites, and it is the shape a controller parsing stdout cannot use.
+    """
+    observer = _observer(guest, tmp_path)
+
+    class Silent:
+        def execute(self, command, arguments=None, **_):
+            return {"return": {}}
+
+    memory = go.GuestMemory(Silent(), tmp_path / "never-written.bin")
+    with pytest.raises(UniPadError) as refused:
+        memory.read(0x1000, 4096)
+    assert refused.value.code == ErrorCode.EVIDENCE_INCOMPLETE
+    assert "scratch" in refused.value.message
+
+
+def test_a_second_sample_rereads_the_guests_page_tables(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """The caches are a snapshot, not a property of the observer.
+
+    Measured without this: a second ``sample()`` on one observer issued **zero**
+    guest reads, because every page was still cached.  A guest that reloads its
+    tables -- a reset, a second kernel -- would then be read through the old
+    ones, and both sets of bytes are mapped, so nothing would raise.
+    """
+    observer = _observer(guest, tmp_path)
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+
+    first = observer.sample(taken_at="2026-10-25T00:00:00+00:00")
+    assert first.memory_reads > 0
+    assert observer.memory.reads > 0
+
+    observer.sample(taken_at="2026-10-25T00:00:01+00:00")
+    assert observer.memory.reads > first.memory_reads, (
+        "the second sample read nothing new, so it was served from the first "
+        "one's page-table cache"
+    )
+
+
+def test_a_truncated_load_address_is_refused() -> None:
+    """``pa 0x4`` is not an address.
+
+    A short hex run matched the pattern and produced a physical base of 4, from
+    which ``cpu_ttep`` would be read out of the first page of guest RAM.  The
+    guard is a minimum width, because every real load line prints a full 64-bit
+    address.
+    """
+    with pytest.raises(UniPadError) as refused:
+        go.load_addresses_from_serial("kernel   va 0x4  pa 0x4\n")
+    assert refused.value.code == ErrorCode.EVIDENCE_INCOMPLETE
+
+
+def test_a_malformed_image_does_not_escape_as_a_traceback(tmp_path: Path) -> None:
+    """A truncated load-command table is a refusal with a code.
+
+    Without the bounds check the symbol loop's sibling has, a short file with a
+    large ``ncmds`` raised ``struct.error`` -- which ``main()`` did not catch, so
+    the caller got a traceback and an empty stdout.
+    """
+    # 36 bytes: the header is 32, so the first command's 8-byte header does not
+    # fit and the walk runs off the end of the file rather than reading a
+    # zero-sized command.
+    blob = bytearray(36)
+    struct.pack_into("<8I", blob, 0, go._MH_MAGIC_64, 0, 0, 0, 2, 0, 0, 0)
+    path = tmp_path / "truncated.macho"
+    path.write_bytes(bytes(blob))
+    with pytest.raises(UniPadError) as refused:
+        go.KernelImage(path, expected_sha256=_digest(path))
+    assert refused.value.code == ErrorCode.CONFIG_INVALID
+    assert "load-command" in refused.value.message
