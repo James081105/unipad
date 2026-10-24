@@ -1289,19 +1289,46 @@ class RunOutcome:
 def _run_lock(run_dir: Path) -> Iterator[None]:
     """Hold ``acceptance.lock`` for the duration of one evaluation.
 
-    A second concurrent evaluation of the same run is refused with
+    A second *concurrent* evaluation of the same run is refused with
     ``BLOCKED`` instead of interleaving two writers into one bundle.
+
+    A lock left behind by a process that no longer exists is a different
+    thing, and refusing on it would wedge the run directory forever: the
+    only recovery would be knowing to delete the file by hand, which is not
+    something an operator can be expected to guess.  Measured on this host
+    on 2026-10-24: two background runs were stopped, their lock files
+    survived, and every later evaluation of those two run ids read BLOCKED
+    with "another acceptance evaluation holds this run" -- a message that
+    names a holder that is not there.
+
+    So the recorded PID is checked before refusing, and a dead holder's lock
+    is removed and re-acquired.  The PID is reused check, not a liveness
+    proof: a recycled PID belonging to an unrelated process would let two
+    evaluations interleave.  That is accepted because the alternative is a
+    permanent wedge, and because the write itself is the last resort -- the
+    bundle is rewritten atomically by its own writer, so a collision corrupts
+    a bundle rather than the run.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     lock = run_dir / LOCK_FILENAME
-    try:
-        handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        raise blocked(
-            "another acceptance evaluation holds this run",
-            run_id=run_dir.name,
-            lock=LOCK_FILENAME,
-        ) from exc
+    while True:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError as exc:
+            if not _lock_holder_is_alive(lock):
+                # A holder that is gone.  Remove and retry once; if the removal
+                # loses a race the loop simply re-reads the new holder's PID.
+                try:
+                    lock.unlink()
+                except FileNotFoundError:  # pragma: no cover - removed underneath us
+                    pass
+                continue
+            raise blocked(
+                "another acceptance evaluation holds this run",
+                run_id=run_dir.name,
+                lock=LOCK_FILENAME,
+            ) from exc
     try:
         os.write(handle, f"{os.getpid()}\n".encode("utf-8"))
         os.close(handle)
@@ -1311,6 +1338,34 @@ def _run_lock(run_dir: Path) -> Iterator[None]:
             lock.unlink()
         except FileNotFoundError:  # pragma: no cover - removed underneath us
             pass
+
+
+def _lock_holder_is_alive(lock: Path) -> bool:
+    """Whether the process named in ``lock`` still exists.
+
+    An unreadable or PID-less lock is treated as held: refusing is the safe
+    answer when the file says something this process cannot interpret, and
+    the message still names the lock so the operator can look at it.
+    """
+    try:
+        text = lock.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return True
+    if not text.isdigit():
+        return True
+    pid = int(text)
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # It exists but belongs to someone else: a live holder, not a stale one.
+        return True
+    except OSError:  # pragma: no cover - platform without signals
+        return True
+    return True
 
 
 class AcceptanceRunner:

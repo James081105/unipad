@@ -1679,10 +1679,18 @@ step_build_bootloader() {
         [[ -f "$candidate" ]] && unixnu_efi+=("$candidate")
     done
     if (( ${#unixnu_efi[@]} == 0 )); then
-        die 'artifact_missing' \
-            "the UEFI application the firmware starts was not built: $(work_dir)/package/Build/Out/AARCH64-*/UniXNU.efi (package.py:21-31; 'unixnu build package' ran in step (3) and exited 0)" \
-            "{\"step\":\"$name\",\"glob\":\"$(json_escape "$(work_dir)/package/Build/Out/AARCH64-*/UniXNU.efi")\"}" \
-            "$EXIT_FAILURE"
+        # ledger_add, not die: by this point step (3) has run and the kernel, the
+        # DarwinBoot image and the manifest records all exist.  `die` is for a
+        # refusal *before* anything runs -- the script's own header says so -- and
+        # using it here would discard build-report.json, artifact-manifest.json
+        # and every artifact record on precisely the failure where the evidence
+        # matters most.  Every other postcondition failure in this same function
+        # (`unixnu build package failed`) records failed and returns 1, which
+        # stops the plan identically through stage_failed.
+        ledger_add "$name" 'failed' \
+            "the UEFI application the firmware starts was not built: $(work_dir)/package/Build/Out/AARCH64-*/UniXNU.efi (package.py:21-31; 'unixnu build package' ran in step (3) and exited 0)"
+        log "bootloader: FAIL no UniXNU.efi under $(work_dir)/package/Build/Out; see the ledger entry"
+        return 1
     fi
     if (( ${#unixnu_efi[@]} > 1 )); then
         die 'evidence_incomplete' \

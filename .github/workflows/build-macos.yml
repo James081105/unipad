@@ -1668,14 +1668,20 @@ jobs:
           stage = Path(os.environ.get("STAGE_DIR", "staged"))
           bundle = Path(os.environ.get("BUNDLE_DIR", "boot-inputs"))
           out = Path(os.environ.get("BUILD_OUTPUT_DIR", "build-output"))
+          # Recreated, never appended to, and removed on EVERY exit path below --
+          # including the early ones.  A leftover from an earlier run would
+          # otherwise be hashed into the manifest as if it were evidence about
+          # this build, and the manifest's whole job is to say which bytes
+          # produced a boot log.  The early refusals matter most: the upload step
+          # is `if: always()`, so a partial directory would be published, and
+          # `if-no-files-found: error` would not catch it because the directory
+          # is not empty.  Measured: with no staged/ and a pre-existing
+          # boot-inputs/leftover.efi, the refusal used to leave that file behind
+          # with no manifest to say it is not from this build.
+          shutil.rmtree(bundle, ignore_errors=True)
           if not stage.is_dir():
               print("::error::no staged directory; the build produced nothing")
               sys.exit(1)
-          # Recreated, never appended to.  A leftover from an earlier run would
-          # otherwise be hashed into the manifest below as if it were evidence
-          # about this build -- and the manifest's whole job is to say which
-          # bytes produced a boot log.
-          shutil.rmtree(bundle, ignore_errors=True)
           # What a boot needs, as path fragments.  Ordered most-specific first.
           WANTED = (
               "kernel.macho",

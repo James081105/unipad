@@ -1770,6 +1770,7 @@ _SCRATCH_DRIVER = '''\
 """A stand-in for scripts/unixnu/cli.py that records what it was asked to do."""
 import json
 import os
+import struct
 import sys
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -1800,6 +1801,29 @@ def write(rel, text="artifact" + chr(10)):
     return path
 
 
+def pe_efi_application():
+    """A minimal PE32+ AArch64 image whose subsystem is 10 (EFI application).
+
+    `unixnu build package` builds the real one into package/Build/Out
+    (cli.py:38 --target defaults to DEBUG, cli.py:134 forwards it, and
+    package/build.sh:18,88 write $BUILD_DIR/Build/Out/$ARCH-$TARGET with
+    ARCH=AARCH64), and build-bootloader refuses the whole run when it is
+    absent -- so a fixture that omits it cannot reach any stage after the
+    bootloader.  It has to be a real PE32+ header rather than text:
+    build-bootloader reads the subsystem and refuses anything that is not an
+    application, which is what the firmware answers a driver with.
+    """
+    head = bytearray(0x400)
+    head[0:2] = b"MZ"
+    offset = 0x80
+    struct.pack_into("<I", head, 0x3C, offset)
+    head[offset:offset + 4] = b"PE" + bytes(2)
+    optional = offset + 24
+    struct.pack_into("<H", head, optional, 0x20B)    # PE32+ (64-bit)
+    struct.pack_into("<H", head, optional + 68, 10)  # EFI application
+    return bytes(head)
+
+
 if sub == "defconfig":
     os.makedirs(work, exist_ok=True)
     with open(os.path.join(work, ".config"), "w", encoding="utf-8") as fh:
@@ -1822,6 +1846,16 @@ elif sub == "build":
         # assembles into the tree from the device repository's scripts/.
         with open(os.path.join(tree, "scripts", "build-darwinboot-efi.py"), "w", encoding="utf-8") as fh:
             fh.write(DARWINBOOT)
+        # The UEFI application the firmware starts at EFI/BOOT/BOOTAA64.EFI.
+        # build-bootloader refuses the run when it is absent, and reads its PE
+        # subsystem: a driver there is what the firmware answers "The image is
+        # not an application." to, which is the whole reason UniXNU.efi and not
+        # DarwinBoot.efi is the one that goes on the ESP.
+        app = os.path.join(work, "package", "Build", "Out", "AARCH64-DEBUG", "UniXNU.efi")
+        os.makedirs(os.path.dirname(app), exist_ok=True)
+        with open(app, "wb") as fh:
+            fh.write(pe_efi_application())
+        print("wrote %s" % app.replace(BS, "/"))
         print("wrote %s" % tree.replace(BS, "/"))
 elif sub == "ipsw":
     print(write("ipsw/DeviceTree.im4p", "fake device tree" + chr(10)).replace(BS, "/"))
@@ -1923,8 +1957,15 @@ class _ScratchRepo:
         assert script.is_file(), script
         payload = script.read_bytes()
 
-        (self.repo / "src" / "unipad").mkdir(parents=True)
-        (self.repo / "src" / "unipad" / "__init__.py").write_text("", encoding="utf-8")
+        # The real package, not a stub.  build-bootloader reads the PE subsystem
+        # of the image it is about to publish through
+        # ``unipad.host.unixnu_boot.pe_subsystem`` -- the same reader the Windows
+        # host refuses with -- so a scratch repository that stubbed ``unipad``
+        # out would make that check fail with a ModuleNotFoundError instead of
+        # doing its job, and the one guard that keeps a driver off the ESP would
+        # be untested here.  src/unipad is pure Python with no third-party
+        # import, so the copy is self-contained.
+        shutil.copytree(REPO_ROOT / "src" / "unipad", self.repo / "src" / "unipad")
         (self.repo / "scripts" / "macos").mkdir(parents=True)
         copied = self.repo / "scripts" / "macos" / "build-macos.sh"
         copied.write_bytes(payload)
@@ -2240,11 +2281,24 @@ def test_a_full_run_records_what_it_built_in_the_canonical_manifest(
     assert manifest["device_repo_commit"] == scratch.pins["device_repo"]
     assert manifest["toolchain"]["python3"].startswith("Python ")
 
-    # (3) the three artifacts the stages produced, each hashed from the file the
+    # (3) the artifacts the stages produced, each hashed from the file the
     #     manifest names -- so a record of a file that is not there, or of a hash
     #     that is not the file's, fails here.
+    #
+    #     UniXNU.efi is in the set because build-bootloader records it: it is the
+    #     UEFI *application* the firmware starts at EFI/BOOT/BOOTAA64.EFI, and
+    #     until it was collected the runner built it and threw it away.  The
+    #     subsystem is checked at the same time (see the same step), so this is
+    #     the one entry in the manifest whose absence means the machine cannot
+    #     start at all.
     built = {entry["name"]: entry for entry in manifest["artifacts"]}
-    assert set(built) == {"kernel.macho", "DarwinBoot.efi", "DeviceTree.im4p", "kernelcache.bin"}
+    assert set(built) == {
+        "kernel.macho",
+        "DarwinBoot.efi",
+        "UniXNU.efi",
+        "DeviceTree.im4p",
+        "kernelcache.bin",
+    }
 
     def on_disk(entry: dict) -> Path:
         recorded = Path(entry["path"])
@@ -2289,9 +2343,17 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     """PRD 7.4: missing evidence is unverified, never success.
 
     Two independent reasons a stage cannot run are in play at once -- the
-    Apple-format device tree needs a platform seed this script will not invent,
-    and this board declares no [firmware] -- and neither may be folded into
-    "ran".  The run itself succeeds (exit 0) and still reports ok=false.
+    Apple-format device tree needs qemu-system-aarch64 to dump the machine's own
+    device tree, and this board declares no [firmware] -- and neither may be
+    folded into "ran".  The run itself succeeds (exit 0) and still reports ok=false.
+
+    The seed is NOT one of the two reasons here, and that is the point of this
+    test's history: the scratch repository used to stub ``src/unipad`` out, so
+    the seed derivation failed and the sub-step stopped at the seed gate.  With
+    the real package in the fixture the derivation succeeds -- as it does on a
+    real runner, where the pin is on disk -- and the gate that actually stops
+    this run is QEMU.  The seed refusal is pinned separately in
+    ``test_the_platform_seed_is_never_invented_when_it_cannot_be_derived``.
     """
     ipsw = fresh_out.parent / "iPad.ipsw"
     ipsw.write_text("fake ipsw\n", encoding="utf-8")
@@ -2302,11 +2364,13 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert result.returncode == 0, result.stdout + result.stderr
 
     report_steps = scratch.steps()
-    # (1) the Apple-format device tree: its own ledger entry, its own reason.
+    # (1) the Apple-format device tree: its own ledger entry, its own reason.  A
+    #     real input that the sub-step installs when it can, and a runner with
+    #     neither records the tool's own refusal rather than claiming a tree.
     adt = report_steps["build-devicetree/adt"]
     assert adt["status"] == "not_run", adt
-    assert "platform seed" in adt["reason"], adt
-    assert "--unique-chip-id" in adt["reason"], adt
+    assert "qemu-system-aarch64" in adt["reason"], adt
+    assert "brew install qemu" in adt["reason"], adt
     # ...and it produced nothing, so the manifest carries no hash for it.
     assert "adt" not in {entry["name"] for entry in scratch.manifest()["artifacts"]}
 
@@ -2327,7 +2391,7 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert stage["step_summary"].startswith("ran="), stage
     assert "not_run=2" in stage["step_summary"], stage
     assert len(stage["not_run_reasons"]) == 2, stage
-    assert any("platform seed" in reason for reason in stage["not_run_reasons"])
+    assert any("qemu-system-aarch64" in reason for reason in stage["not_run_reasons"])
     assert any("no [firmware]" in reason for reason in stage["not_run_reasons"])
     # (5) and the same ledger is what build-report.json carries, so the two files
     #     cannot disagree about what ran.
@@ -2578,16 +2642,68 @@ def test_dry_run_writes_nothing(scratch: _ScratchRepo, tmp_path: Path) -> None:
     assert scratch.argv_log() == []
 
 
+# --- 6.9b the platform seed: derived, never echoed --------------------------
+
+
+def test_a_derived_platform_seed_is_kept_by_digest_and_never_echoed(
+    scratch: _ScratchRepo, tmp_path: Path
+) -> None:
+    """board.toml [payload.adt] unique_chip_id = "required" and the value is in
+    no repository by design, so a run that is not given one derives it from the
+    pinned device-repo commit.  What may be published is its digest.
+
+    Two things are asserted here, and the second is the one that matters: the
+    seed file exists in the run's own workspace (chmod 600), and NEITHER the log
+    NOR the ledger NOR build-report.json contains the value.  A seed is a device
+    identity, not a secret -- nothing derives a key from it -- but a value that
+    reached the uploaded log would give every checkout of the same pin the same
+    guest, which is the one thing the seed exists to distinguish.
+
+    The refusal path ("no flag, no environment spelling, nothing to derive
+    from") is NOT reachable from this fixture: the scratch repository carries a
+    real device-repo HEAD and the real lock, which is exactly the situation on a
+    real runner, so the derivation always succeeds here.  That refusal is pinned
+    where it lives -- ``unipad.host.adt`` refuses a seedless run itself, and
+    ``tests/unit/test_host_adt.py`` asserts it -- because the script's gate is a
+    conversion of that hard failure into an accurate not_run, not a second
+    implementation of it.
+    """
+    scratch.out = tmp_path / "seed-out"
+    ipsw = tmp_path / "iPad.ipsw"
+    ipsw.write_text("fake ipsw\n", encoding="utf-8")
+    result = scratch.run("--ipsw", ipsw.as_posix(), stage="M4")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # The value is on disk, in the run's own workspace, and nowhere else.
+    seed_file = scratch.out / "platform-seed"
+    assert seed_file.is_file(), "no seed was derived for a board that requires one"
+    seed = seed_file.read_text(encoding="utf-8").strip()
+    assert re.fullmatch(r"[0-9a-f]{16}", seed), seed
+
+    record = json.loads((scratch.out / "platform-seed.json").read_text(encoding="utf-8"))
+    assert record["seed_sha256"] == hashlib.sha256(seed.encode()).hexdigest()
+    assert seed not in json.dumps(record), record
+    # The build log is uploaded as evidence, so this is the assertion that keeps
+    # the value out of it.  The script writes build.log into its output dir.
+    log = scratch.out / "build.log"
+    if log.is_file():
+        assert seed not in log.read_text(encoding="utf-8", errors="replace")
+    report = scratch.report()
+    assert seed not in json.dumps(report), "the seed reached build-report.json"
+
+
 # --- 6.10 the Apple-format device tree refuses to depend on QEMU -------------
 
 
 def test_the_apple_device_tree_refuses_to_depend_on_qemu(
     scratch: _ScratchRepo, tmp_path: Path
 ) -> None:
-    """make-qemu-adt.py shells out to qemu-system-aarch64 (make-qemu-adt.py:96-97),
-    and QEMU is a native Windows build (config/sources.lock.json
-    tools.qemu.build).  Depending on it would make the macOS build hang off a
-    Windows artifact, so the step records not_run naming it instead.
+    """make-qemu-adt.py shells out to qemu-system-aarch64 (make-qemu-adt.py:93-101)
+    to dump the device tree of the machine it is about to describe, and refuses
+    without it (:95, "brew install qemu").  So QEMU is a *real* input of this one
+    sub-step -- a Homebrew package the step installs when it can -- and not a
+    build input the way Xcode is.  A runner with neither records not_run naming
+    the tool's own refusal rather than claiming the tree was produced.
 
     Only assertable where QEMU is genuinely absent; on a host that has it the
     step may legitimately run, and the test says so rather than pretending.
@@ -2603,6 +2719,12 @@ def test_the_apple_device_tree_refuses_to_depend_on_qemu(
     adt = scratch.steps()["build-devicetree/adt"]
     assert adt["status"] == "not_run", adt
     assert "qemu-system-aarch64" in adt["reason"], adt
-    assert "not a macOS build input" in adt["reason"], adt
+    # A real input that is installed when it can be, not a foreign artifact: the
+    # reason quotes the tool's own refusal and names the package manager.  The
+    # negative assertion is the load-bearing half -- the old reason called QEMU
+    # "not a macOS build input", which was false and is what let the sub-step
+    # stay not_run forever without anyone noticing it could simply be installed.
+    assert "brew install qemu" in adt["reason"], adt
+    assert "not a macOS build input" not in adt["reason"], adt
     assert "adt" not in {entry["name"] for entry in scratch.manifest()["artifacts"]}
 

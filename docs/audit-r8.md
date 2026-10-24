@@ -200,9 +200,47 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 | 29 | `boot-inputs` 束的 manifest 只记**存在**的文件：丢了 `payload.img` 的束，和本来就没产出 `payload.img` 的构建，单看 manifest 无法区分 | `.github/workflows/build-macos.yml` | 证据不完整 | 缺席条目记为 `{"bytes": null, "sha256": null, "absent": true}`，汇总行打印缺席数 |
 | 30 | `boot-inputs` 目录不重建，上一次运行的残留会被当成本次证据哈希进 manifest；`STAGE_DIR` / `BUNDLE_DIR` 是声明了却没人读的死配置 | `.github/workflows/build-macos.yml` | 证据污染 + 死配置 | 开头 `rmtree` 后重建；两个变量改为真正读取（与 staging 步骤同一惯用法） |
 | 31 | 工作流注释声称"整树不再上传"，而它上一步的 `path: staged/` 仍然上传 368,499,519 字节（run 40091901777 实测）。读者会把那条注释当成对整个工作流的描述 | `.github/workflows/build-macos.yml` | **注释误导** | 注释改写为明确声明 `unipad-build-*` 仍是整树、为什么还没改（`verify-artifacts.yml` 与 `publish-artifacts.yml` 都解析 `unipad-build-*` 并按 manifest 重哈希，收窄它是对那两个工作流的契约变更，不是这里的一行改动） |
-| 32 | 本机 `C:` 卷跑到 0 字节可用，pytest 的编号临时目录工厂开始报 `OSError: could not create numbered dir … after 10 tries`，套件表现为"跑 10 个测试后挂住" | 主机环境 | 环境缺陷伪装成测试挂死 | 清掉已结束测试的 `tmp*` 暂存（实测释放 5.1 GB）；套件改用 `TEMP=F:/iosvirtual/local-private/tmp` 运行 |
+| 32 | 本机 `C:` 卷跑到 0 字节可用，pytest 的编号临时目录工厂开始报 `OSError: could not create numbered dir … after 10 tries`，套件表现为"跑 10 个测试后挂住" | 主机环境 | 环境缺陷伪装成测试挂死 | 清掉已结束测试的 `tmp*` 暂存（实测释放 5.1 GB）；套件改用仓库外的 `TEMP` 运行。**注意：第一版把 `TEMP` 指到了 `local-private/` 底下，反而引出 4 个新的假失败，见 7.3** |
 
-### 7.2 这一轮最有价值的一条
+### 7.3 第九轮后半段：我自己引入的回归，与三个环境性假失败
+
+启动链跑通之后，macOS 管线验收门是**红的**。这一节记的是"绿的提交把门搞红了"这件事本身，
+以及三个差点被当成代码缺陷的环境问题。
+
+| # | 缺陷 | 位置 | 性质 | 修复 |
+| --- | --- | --- | --- | --- |
+| 33 | `step_build_bootloader` 里 `UniXNU.efi` 缺失用 `die`，而它前面一步已经跑完、内核/DarwinBoot/manifest 记录都在——`die` 会把 `build-report.json`、`artifact-manifest.json` 和全部 artifact 记录一起丢掉，偏偏是在最需要证据的那次失败上 | `scripts/macos/build-macos.sh` | **失败即丢证据**（与 #27 同一类，但发生在脚本内部） | 改为 `ledger_add 'failed'; return 1`，与同一函数里其他后置条件失败一致；计划同样通过 `stage_failed` 停止 |
+| 34 | `_SCRATCH_DRIVER` 的 `package` 分支只写 `build-darwinboot-efi.py`，不写 `UniXNU.efi`。于是 #24 的检查在这个夹具上是**无条件的 `die`**，6 个测试在 `assert result.returncode == 0` 全挂，且都到不了自己的断言 | `tests/acceptance/test_p0p1_gate_main.py` | 夹具不再忠于真实 driver（真实 driver 确实产出该文件，93,696 字节） | 夹具写一个真的 PE32+ subsystem-10 镜像（`pe_efi_application()`）；验证过正反两面：文本 → `None`，subsystem 11 → 11 |
+| 35 | 同一夹具把 `src/unipad` 桩成一个空 `__init__.py`，于是 `unipad.host` 导入失败，subsystem 检查死于 `ModuleNotFoundError`——**唯一那道把 driver 挡在 ESP 外的检查，在门里等于没测** | 同上 | 测试覆盖虚假 | 改为 `shutil.copytree` 真实 `src/unipad`（纯 Python、无第三方依赖）；这也顺带修正了另一个问题，见下 |
+| 36 | 桩掉 `src/unipad` 还让 seed 派生失败，于是 `test_a_stage_that_cannot_run_says_so…` 一直在断言 **seed** 理由——而真实 checkout 上 seed 是**派得出来**的，那个测试是为了错误的理由通过 | 同上 | 测试通过但原因错误 | 断言改为 QEMU 理由（真实 checkout 上真正拦住这一步的东西），并新增 `test_a_derived_platform_seed_is_kept_by_digest_and_never_echoed` 钉住种子只以摘要出现；seed 拒绝路径在 `tests/unit/test_host_adt.py` 已钉住，docstring 里写明为什么不在这里造一个够不着的夹具 |
+| 37 | 接受门互斥锁 `acceptance.lock` 用 `O_EXCL` 创建，被 kill 的进程会把锁**永久留下**，之后同一个 run_id 每次都是 BLOCKED，报 "another acceptance evaluation holds this run"——指名一个并不存在的持有者。本机实测：我停掉两个后台 pytest，两个锁留下，两个测试从此全红 | `src/unipad/acceptance/runner.py` | **永久楔死**，且诊断信息说谎 | 锁里记录的 PID 先做存活检查，死者之锁被移除后重取；PID 复用风险写在 docstring 里（接受理由：永久楔死更糟） |
+
+**三个环境性假失败，差点被记成代码缺陷：**
+
+1. **`TEMP` 指到 `local-private/` 底下。** 我为绕过 C: 卷满把 `TEMP` 设成 `F:/iosvirtual/local-private/tmp`，
+   于是 4 个测试的夹具根落在 `local-private/` 里，而工作流步骤按 PRD 12 **拒绝** `local-private/` 下的路径
+   ——报错是"private material is never fetched or built here"，看起来像我破坏了数据保护规则。
+   改用 `F:/unipad-tmp`（仓库外、F: 盘、不在 `local-private/` 下）后全部消失。
+   **教训：为绕过磁盘问题改环境变量，会用一类新的假失败替换掉原来那类。**
+2. **并发 pytest 互相删暂存树。** pytest 的 `tmp_path_factory` 只保留最近三个根，多个进程并发时
+   会删掉彼此的 scratch 树。本会话先后出现过 15、8、6、0 四个不同的失败数，全部来自同一份代码。
+   两个 teammate 各自纠正了自己两次，最终在**单进程**下得到 6，再修完夹具得到 0。
+   **任何失败数在并发下都不可信。**
+3. **`bash -n` 查不出 bash 3.2 不兼容。** `mapfile` 是 bash 4+，macOS 自带 `/bin/bash` 3.2，
+   而 Git Bash 5 下 `bash -n` 完全通过。同一个文件第 2484 行自己写着这条约束，
+   新加的代码却违反了它——是 teammate 抓出来的，不是任何工具。
+
+### 7.4 这一轮最有价值的一条
+
+#33 与 #27 是同一条教训的两次重复：**"写下来"和"活下来"是两件事**。#27 是工作流层面
+（失败时跳过上传步骤），#33 是脚本内部层面（失败时 `die` 掉整个输出）。两次都是"在失败路径上
+把证据扔掉"，而失败路径恰恰是唯一需要证据的地方。
+
+#35/#36 则是另一种：**测试可能因为错误的理由通过**。桩掉 `src/unipad` 让 seed 派生失败，
+于是那个测试断言 seed 理由并通过了两年都没人发现——真实 checkout 上它早就该断言 QEMU。
+夹具越忠于真实 driver，测试越可能暴露自己一直在测错东西。
+
+
 
 #18 与 #27/#28 是同一条教训的三次重复：**"构建阶段名称、Actions 绿色、二进制格式正确"都不等于"它跑过"**。#18 期间测试套件是全绿的，而一个 QMP 命令都没有发出去。#27 期间 Actions 是绿的，而唯一的交付物被跳过。#28 期间 driver 退出码非零、clang 报错清晰，却没有任何东西告诉操作员缺的是哪个文件。
 
