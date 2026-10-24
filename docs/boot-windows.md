@@ -46,9 +46,21 @@ Directory of: FS0:\EFI\BOOT\
 
 ### 1.3 QMP 与串口日志链路
 
-`unipad.host.unixnu_boot.boot()` 实测：TCP QMP（Windows 无 `AF_UNIX`）收到 greeting 与
-`query-status` 回复；`serial.log` 落盘；`screendump` 经 QMP 取回并转成 PNG
-（`_write_png` 自己写 PNG，无第三方依赖）。`boot-report.json` 记录完整 argv 与输入清单。
+`unipad.host.unixnu_boot.boot()` 实测：TCP QMP（Windows 无 `AF_UNIX`）建连成功；
+`serial.log` 落盘；`boot-report.json` 记录完整 argv 与输入清单。
+
+**更正（2026-10-24 晚）**：本节最初写的是"收到 greeting 与 `query-status` 回复"。那句话是**过头了**。
+`_qmp` 当时在请求循环里 `return`，于是它在 `qmp_capabilities` 的回复后就返回，**从来没有把调用方给的命令发出去**。
+也就是说：`query-status` 没发、`screendump` 没发、`quit` 也没发——每次运行都落到
+`process.terminate()`，而报告里记的是一条"没人问过的问题的回复"。
+
+这不是猜测，是 `tests/unit/test_host_unixnu_boot.py::test_the_qmp_round_trip_speaks_the_protocol`
+用一条严格 xfail 逼出来的：该测试断言 QMP 交换的形状（greeting → `qmp_capabilities` → 命令），
+在修复前必然失败。修复后 marker 按约定移除，测试转为承重测试。
+
+因此 §1.3 现在能证明的只有：**QMP over TCP 能建连、能握手**。截图链路与优雅退出是修复后的
+代码路径，**尚未在真实 QEMU 上跑过一次**（见 §4）。这也是"构建阶段绿色不等于启动验收"的一个具体例子：
+那段时间测试是全绿的，而 QMP 命令一个都没发出去。
 
 ---
 
@@ -89,10 +101,23 @@ BaseTools 从源码构建）与 AArch64 clang；macOS runner 的 `build-bootload
 `unixnu build package`，但产物收集只取了 `unixnu-out/qemu/kernel/kernel.macho` 与
 `darwinboot-efi/`，没有收集 `package/Build/Out/AARCH64-DEBUG/UniXNU.efi`。这是收集遗漏，不是没构建。
 
-改正：`scripts/macos/build-macos.sh` 新增 `build-payload` 步骤（`unixnu build payload`），
-产出 `payload.img` 与其中的 `kernel.macho.adt`，并把 `UniXNU.efi`、`kernel.macho`、
-`DarwinBoot.efi`、`unixnu.toml`、日志一起上传为 `boot-inputs-<run_id>`；本地由
-`python -m unipad.host.unixnu_boot` 搭 ESP 启动。
+**字节已经不存在了。** `local-private/b5/artifact-manifest.json` 里有它的记录
+（93,696 字节，sha256 `59b7aa748848328bc88d363d57180c9faba491eccfd5e7847565e033d4858016`），
+但承载它的 350 MB 整树 artifact 在公开暴露清理时被删除，本机也没有副本——`boot.zip`
+（14 MB）只是 `boot-inputs` 束，只含 kernel 与 darwinboot。所以只能重新构建，不能恢复。
+
+改正（已写入仓库，等 runner 验证）：
+
+1. `scripts/macos/build-macos.sh` 的 `step_build_bootloader` 新增两步：
+   glob 出 `AARCH64-*/UniXNU.efi`（缺一个 `die`，多一个也 `die`——"两个候选却说不出哪个会启动"
+   本身就是证据不完整），然后读 PE subsystem，**不是 10 就记 `failed`**。
+   复用 `unipad.host.unixnu_boot.pe_subsystem`，这样 runner 与 Windows 本机不可能对
+   "固件会怎么对待这个文件"产生分歧。三种结局都实测过：DarwinBoot.efi → FAIL(11)、
+   打补丁的孪生体 → PASS(10)、设备树 → FAIL(不是 PE32+)。
+2. `.github/workflows/build-macos.yml` 的 `boot-inputs` 束把 `UniXNU.efi` 列为**第一项**，
+   并新增 `manifest.json`：束内每个文件的 sha256 与字节数（`manifest.json` 不哈希自己）。
+   理由是实测出来的——三个历史 `kernel.macho` 并不逐字节相同（M2 `9fc119604838856d…`
+   vs M4 `1f32f09bc7668de0…），一份不点名自己内核的启动日志是没人能复现的日志。
 
 同时 `unipad.host.unixnu_boot._refuse_non_application()` 在启动前读 PE subsystem，
 把上面那条含义不明的固件错误变成一条指名原因的拒绝。
@@ -124,6 +149,10 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
    `os.urandom(64)` 写 `/chosen/random-seed`。相同输入两次生成的 sha256 必然不同。
    这是内核的早期熵源，理应随机；因此 ADT 的哈希只能证明"这一份"，不能证明"可复现"。
 
+   实测两次生成（同一条 pin、同一种子）：都是 17,624 字节，235 个节点+属性**结构完全相同**，
+   `unique-chip-id`、`chip-id`、`model`、`target-type`、`timebase-frequency` 全部逐字节相同，
+   唯一不同的是 64 字节 `random-seed`。也就是说：**结构确定，熵源随机**。
+
 ### 3.2 平台种子
 
 `board.toml [payload.adt] unique_chip_id = "required"`，种子按设计不入任何仓库。本机由
@@ -149,10 +178,11 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 
 | 项 | 状态 | 原因 |
 | --- | --- | --- |
-| UEFI → UniXNU 交接 | **BLOCKED** | 缺 `UniXNU.efi`（§2），需 runner 新构建 |
+| UEFI → UniXNU 交接 | **BLOCKED** | 缺 `UniXNU.efi` 字节（§2），已写好收集改正，等 runner 跑一次 |
 | UniXNU → DarwinBoot 交接 | UNVERIFIED | 上一条未过 |
 | DarwinBoot → XNU | UNVERIFIED | 上一条未过 |
 | 内核进入用户态 / SpringBoard | UNVERIFIED | 上一条未过 |
+| QMP `screendump` / `quit` 真的生效 | UNVERIFIED | 代码已修（§1.3），未在真实 QEMU 上跑过 |
 | `QemuRamfb.efi` 设置 1376x1024 | UNVERIFIED | 该驱动由 payload 构建放在 ESP 上，本机未生成 |
 | 十条端到端验收 | BLOCKED | 同上 |
 
@@ -160,9 +190,17 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 
 ## 5. 下一条实验假设
 
-把 `UniXNU.efi` 拿到手（runner `build-payload` 步骤的产物）后，按
+把 `UniXNU.efi` 拿到手（runner 新一次 `build-payload` + `build-bootloader` 的产物）后，按
 `python -m unipad.host.unixnu_boot --device vendor/UniXNU-qemu --qemu … --unixnu UniXNU.efi …`
 直接启动。
+
+同一次运行要一并验证的两件事（都是本轮新修、都没实测过的）：
+
+1. **QMP `screendump` 是否真的出图**。修复前它是个 no-op；修复后应当每个
+   `--every` 秒产出一张 PNG，`boot-report.json` 的 `screenshots` 非空。
+   如果仍然为空，`qmp_evidence.screendump_error` 会说明原因。
+2. **QMP `quit` 是否让 QEMU 自己退**。修复前每次都是 `process.terminate()`；
+   修复后 `exit_code` 应当来自 QEMU 自己的退出码。
 
 帧缓冲几何：`-fw_cfg name=opt/org.unixnu/ramfb-size,string=1376x1024` **只在 ESP 上真有
 `QemuRamfb.efi` 时才发**（`unixnu_boot.boot()` 检测后传给 `build_argv`），因为该 fw_cfg 项就是
