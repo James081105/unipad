@@ -189,7 +189,12 @@ def _one_reason(reasons: tuple[str, ...]) -> str:
 # ---------------------------------------------------------------------------
 # milestones
 # ---------------------------------------------------------------------------
-def milestone_probe(check_id: str, repo_root: Path, evidence_dir: Path) -> Probe:
+def milestone_probe(
+    check_id: str,
+    repo_root: Path,
+    evidence_dir: Path,
+    view: milestones.HostView,
+) -> Probe:
     """A zero-arg probe for one registered milestone check.
 
     ``milestones.evaluate`` already orders its branches blockers -> PRD veto ->
@@ -197,9 +202,21 @@ def milestone_probe(check_id: str, repo_root: Path, evidence_dir: Path) -> Probe
     named and never PASS.  This adapter changes nothing about that; it only
     drops the three arguments the runner cannot supply.
 
-    The snapshot is computed once and shared: ``evaluate`` re-observes the host
-    on every call when no snapshot is given, and sixteen milestones would
-    otherwise observe the same host sixteen times.
+    ``view`` is required rather than defaulted, and that is the whole point of
+    the parameter.  ``HostView`` caches its file index on the instance and
+    ``_snapshot`` caches its observations on the view, so the caches only pay
+    off if one view is shared -- and a view that is *constructed* per check
+    throws both away every time.  When this adapter called ``evaluate`` with no
+    view, ``evaluate`` built a fresh ``default_view()`` for each check, and one
+    evaluation over the real registry measured **21 snapshots, 168 walks (42 of
+    ``local-private/out/real-boot`` at 1.35 s each) and 163 s** on this host --
+    the same work, forty-two times over.  ``probes_for`` builds the view once
+    and hands the same object to every milestone probe; a caller with exactly
+    one check to run may pass ``milestones.default_view()`` itself.
+
+    The snapshot is therefore computed once and shared, which is what the
+    previous docstring already claimed -- the claim was simply not true of the
+    code, because the thing doing the caching was being rebuilt underneath it.
 
     Evidence is adopted into the run directory for the same reason p1's is: the
     runner resolves every reference against the run dir (``runner.py:1116``),
@@ -213,7 +230,7 @@ def milestone_probe(check_id: str, repo_root: Path, evidence_dir: Path) -> Probe
 
     def probe() -> Verdict:
         if "verdict" not in cache:
-            result = milestones.evaluate(check_id)
+            result = milestones.evaluate(check_id, view=view)
             verdict = result.verdict
             adopted = tuple(
                 _adopt(item.path, repo_root, evidence_dir)
@@ -434,11 +451,27 @@ def probes_for(
     synthesises ``probe_not_registered:<id>`` -> BLOCKED for an absent probe, so
     an omission is a red row and not a silent pass -- but a red row nobody
     notices is still worse than a table that is complete.
+
+    The host view is built here, once, and handed to every milestone probe.
+    ``HostView`` caches its file index on the instance and ``_snapshot`` caches
+    its observations on the view, so a view constructed per check throws both
+    caches away -- which is what this used to do, at a measured 163 s and 168
+    walks per evaluation.  Constructing the view costs nothing (it stats four
+    directories and walks nothing; the first ``find()`` is what walks), so it is
+    built unconditionally rather than guarded on ``milestone_ids``.
+
+    ``milestones.default_view()`` locates the repository itself rather than
+    taking ``repo_root``; the two agree because ``registry.build_inputs``
+    defaults its own root the same way, and no in-tree caller overrides it.  A
+    caller that passes a different ``repo_root`` should pass its own view too.
     """
+    # One view for the whole run.  This line is the fix; everything above it is
+    # the reason it has to be here rather than inside ``milestone_probe``.
+    view = milestones.default_view()
     probes: dict[str, Probe] = {}
     for check_id in milestone_ids:
         probes[check_id] = milestone_probe(
-            check_id, repo_root, run_dir / EVIDENCE_DIRNAME
+            check_id, repo_root, run_dir / EVIDENCE_DIRNAME, view
         )
     env = e2e.E2EEnvironment.create(run_dir, repo_root=repo_root)
     for case_id in case_ids:
