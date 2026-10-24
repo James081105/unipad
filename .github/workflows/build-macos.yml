@@ -1153,6 +1153,26 @@ jobs:
           echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
           echo "build duration: $((finished - started))s"
 
+      # The build log is evidence, and it is the evidence that matters most when
+      # the build fails -- which is exactly when the staging step below is
+      # skipped and nothing is uploaded.  Without this, a link failure is a
+      # one-line "linker command failed with exit code 1" in the job log and the
+      # actual linker diagnostic sits unread on a runner that is about to be
+      # destroyed.  Measured on run 40066923763: the kernel reached its link
+      # step for the first time and the reason was not recoverable.
+      - name: Upload the build logs (always, success or failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build-output/unixnu-out/*/logs/
+            build-output/build.log
+            macos-build.log
+            ipsw-work/ipsw.log
+          retention-days: 30
+          if-no-files-found: warn
+
       # PRD 12: the published kernelcache is Apple material.  It is removed
       # unconditionally -- `always()`, so a failed or cancelled build leaves
       # nothing behind either -- because "temporary" that only applies on
