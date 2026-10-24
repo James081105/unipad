@@ -158,7 +158,15 @@ def test_doctor_prints_one_json_envelope_with_inventory_and_budget(tmp_path):
 
     # --- the machine definition is reported, not assumed ---------------
     assert data["machine"]["accel"] == "tcg"
-    assert data["machine"]["config"] == MACHINE_CONFIG.as_posix()
+    # The path is redacted, and that is the point (PRD 9.2): the envelope must
+    # not carry an absolute path, because on this host one embeds the account
+    # name.  What has to survive is the part that identifies the file, or the
+    # operator cannot tell two candidate configs apart -- so this asserts the
+    # redaction kept the tail rather than asserting the raw path, which is what
+    # it used to do and which was the leak.
+    assert data["machine"]["config"].endswith("config/machine.json"), data["machine"]
+    assert "F:/" not in data["machine"]["config"], data["machine"]
+    assert MACHINE_CONFIG.name in data["machine"]["config"], data["machine"]
 
 
 def test_missing_qemu_is_a_finding_not_a_crash_and_not_success(tmp_path, monkeypatch):
@@ -227,7 +235,11 @@ def test_unfrozen_sources_lock_blocks_the_build_command(tmp_path):
     assert document["error"]["code"] == ErrorCode.BLOCKED
     details = document["error"]["details"]
     assert details["present"] is True
-    assert details["sources_lock"] == SOURCES_LOCK.as_posix()
+    # Redacted, per PRD 9.2 -- an absolute path embeds the account name on this
+    # host.  The lock is still identifiable by its final component, which is
+    # what an operator needs to act on.
+    assert details["sources_lock"].endswith("config/sources.lock.json"), details
+    assert "F:/" not in details["sources_lock"], details
     # nothing was built: the command stopped before the build capability.
     assert not (tmp_path / "runs").exists() or not any((tmp_path / "runs").iterdir())
 

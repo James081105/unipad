@@ -965,6 +965,63 @@ jobs:
               sys.exit(main())
           PY
 
+      # PRD 8.1 / 8.3: the original kernelcache.  kernel.prelink() takes it from
+      # --kernelcache, from board.toml [kernel.prelink] kernelcache, or out of
+      # the IPSW (kernel.py:111-114); this board names no local file and its
+      # [ipsw] url is https, so without this step build-kernel has no input and
+      # records not_run -- which is why no macOS runner has ever produced a
+      # kernel.macho.
+      #
+      # Two properties this step must have, and why:
+      #
+      # * It runs OUTSIDE build-output/ and staged/.  The kernelcache is Apple
+      #   material extracted from a pinned firmware image (PRD 12): it may be
+      #   used to build, but it must never be staged, hashed into
+      #   artifact-manifest.json or uploaded.  The staging step below scans
+      #   BUILD_OUTPUT_DIR only, so keeping the output elsewhere is what makes
+      #   that true by construction rather than by an ignore rule that can
+      #   drift.
+      # * It is continue-on-error.  A blocked or truncated download must not
+      #   take the whole job down: the remaining stages still have evidence to
+      #   produce, and build-kernel then records not_run with its own reason
+      #   instead of the run vanishing.  The step's own JSON records the refusal
+      #   code, so a silent failure is still visible.
+      - name: Acquire the pinned IPSW and publish the kernelcache
+        id: ipsw
+        continue-on-error: true
+        env:
+          LOCK_PATH: config/sources.lock.json
+          DEVICE_REPO: vendor/UniXNU-qemu
+          IPSW_WORK_DIR: ipsw-work
+          KERNELCACHE_PATH: ipsw-work/kernelcache.macho
+          SUMMARY_PATH: ipsw-work/ipsw-summary.json
+        run: |
+          set -uo pipefail
+          # Not `set -e`: this step is allowed to fail, and a failing command
+          # must not abort the shell before the summary is written.
+          python3 -m unipad.host.ipsw \
+            --lock "$LOCK_PATH" \
+            --device "$DEVICE_REPO" \
+            --work "$IPSW_WORK_DIR/work" \
+            --kernelcache "$KERNELCACHE_PATH" \
+            --summary "$SUMMARY_PATH" \
+            | tee "$IPSW_WORK_DIR/ipsw.log"
+          status=$?
+          echo "ipsw_status=$status" >> "$GITHUB_OUTPUT"
+          if [ -f "$KERNELCACHE_PATH" ]; then
+            echo "kernelcache_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "kernelcache_present=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The image itself is deleted by the module the moment extraction
+          # finishes; what is left here is the published Mach-O and the record.
+          if [ "$status" -eq 0 ]; then
+            echo "== ipsw: PASS (verified whole, kernelcache published)"
+          else
+            echo "::warning::the IPSW step failed (exit $status); build-kernel will record not_run. See $SUMMARY_PATH"
+          fi
+          exit 0
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:
@@ -979,6 +1036,11 @@ jobs:
           STAGE_DIR: staged
           BUILD_LOG: macos-build.log
           TOOLCHAIN_CACHE_DIR: ~/.cache/unipad-macos-build
+          # The published kernelcache, when the IPSW step produced one.  Passed
+          # only when it exists: an absent file must reach build-macos.sh as
+          # "no --kernelcache", because then build-kernel records not_run with
+          # its own reason rather than the script dying on a missing path.
+          KERNELCACHE_PATH: ipsw-work/kernelcache.macho
         run: |
           set -euo pipefail
           if [ ! -f scripts/macos/build-macos.sh ]; then
@@ -994,6 +1056,13 @@ jobs:
           # uses to prove every feed clone is already on disk -- somewhere the
           # acquisition step never wrote.  Pointing it at the same directory the
           # staging step scans keeps one out root for the whole job.
+          declare -a kernel_args=()
+          if [ -f "$KERNELCACHE_PATH" ]; then
+            kernel_args+=(--kernelcache "$KERNELCACHE_PATH")
+            echo "build: using the extracted kernelcache ($KERNELCACHE_PATH)"
+          else
+            echo "::notice::no kernelcache was published; build-kernel will record not_run (see the ipsw step)"
+          fi
           bash scripts/macos/build-macos.sh \
             --experiment "$EXPERIMENT_ID" \
             --stage "$STAGE" \
@@ -1001,10 +1070,34 @@ jobs:
             --out "$BUILD_OUTPUT_DIR" \
             --unixnu vendor/UniXNU \
             --device vendor/UniXNU-qemu \
+            ${kernel_args[@]+"${kernel_args[@]}"} \
             2>&1 | tee "$BUILD_LOG"
           finished=$(date -u +%s)
           echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
           echo "build duration: $((finished - started))s"
+
+      # PRD 12: the published kernelcache is Apple material.  It is removed
+      # unconditionally -- `always()`, so a failed or cancelled build leaves
+      # nothing behind either -- because "temporary" that only applies on
+      # success is a cache nobody audits.
+      #
+      # This step sits AFTER the build, and that ordering is the whole point:
+      # an `if: always()` step still runs at its position in the sequence, so
+      # placing it next to the acquisition would delete the kernelcache before
+      # the build that needs it.  The first draft did exactly that.
+      - name: Remove the extracted firmware material
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d ipsw-work ]; then
+            du -sh ipsw-work 2>/dev/null || true
+            rm -rf ipsw-work
+            echo "removed ipsw-work/ (Apple firmware material, PRD 12)"
+          fi
+          if [ -e ipsw-work ]; then
+            echo "::error::ipsw-work/ could not be removed; Apple firmware material would survive the job"
+            exit 1
+          fi
 
       # PRD 8.2 step 4 / 8.3: stage ONLY allowlisted roles, hash everything, and
       # build the machine-readable artifact-manifest.json (PRD 8.1).  Default

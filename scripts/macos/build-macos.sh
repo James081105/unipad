@@ -270,6 +270,44 @@ json_string_array() {
     printf ']'
 }
 
+# assert_json_file PATH LABEL CODE -- the file must parse, or the run fails.
+#
+# WHY THIS EXISTS
+#   This script writes three JSON files.  Only one of them was ever checked.
+#   ``artifact-manifest.json`` is written by Python (write_manifest), which
+#   cannot emit a malformed document, and it is checked.  ``build-report.json``
+#   and ``stage-result.json`` are hand-printed from two dozen printf lines, each
+#   emitting one fragment -- and nothing verified the result.
+#
+#   Measured: a line spelled
+#       printf '    "unfrozen_build": %s,\n' "$(( LOCK_UNFROZEN )) && printf 'true' || printf 'false'"
+#   evaluates the arithmetic expansion inside the double quotes and leaves the
+#   rest as literal text, so the file carries
+#       "unfrozen_build": 0 && printf 'true' || printf 'false',
+#   and is not JSON at all.  Nothing caught it, because the only JSON check in
+#   the script was pointed at the one file Python wrote.
+#
+#   A report that does not parse is worse than a missing one: the Windows
+#   verifier and the acceptance recorder both json.load() it, so the corruption
+#   surfaces as a parse error in a different repository, on a different host,
+#   attributed to the consumer instead of to the producer.  Fail here, where
+#   the bytes were produced and the producer is still on the stack.
+#
+# The Python guard mirrors the manifest check's: with no interpreter there is
+# nothing to parse with, and the run has already failed earlier for that reason.
+assert_json_file() {
+    local path="$1" label="$2" code="$3"
+    [[ -s "$path" ]] || return 0
+    [[ -n "$PY" ]] || return 0
+    if "$PY" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
+            "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+    die "$code" \
+        "$label is not valid JSON: $path" \
+        "{\"report\":\"$(json_escape "$path")\"}" "$EXIT_FAILURE"
+}
+
 # emit_error CODE MESSAGE [DETAIL_JSON]
 # Always a machine-readable object on stderr; never a bare string.
 emit_error() {
@@ -1811,6 +1849,7 @@ write_outputs() {
         printf '  "evidence_note": "steps with status not_run or failed produced nothing; missing evidence is unverified, not success (PRD 7.4)."\n'
         printf '}\n'
     } >"$REPORT_PATH"
+    assert_json_file "$REPORT_PATH" "build report" 'build_report_invalid'
 
     # --- stage-result.json -------------------------------------------------
     # One machine-readable stage result, as PRD 8.1 "报告" requires.  ok is
@@ -1835,6 +1874,7 @@ write_outputs() {
         printf '  "note": "A stage in which anything is not_run or failed never reports success. Real Apple-tool work is UNVERIFIED off macOS (PRD 7.4)."\n'
         printf '}\n'
     } >"$STAGE_RESULT_PATH"
+    assert_json_file "$STAGE_RESULT_PATH" "stage result" 'stage_result_invalid'
 
     # --- artifact-manifest.json -------------------------------------------
     # Written through Python so the bytes match unipad.models.write_json
@@ -1851,14 +1891,7 @@ write_outputs() {
         die 'evidence_incomplete' "artifact manifest was not written: $MANIFEST_PATH" \
             "{\"manifest\":\"$(json_escape "$MANIFEST_PATH")\"}" "$EXIT_FAILURE"
     fi
-    if [[ -n "$PY" ]]; then
-        if ! "$PY" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
-                "$MANIFEST_PATH" >/dev/null 2>&1; then
-            die 'artifact_manifest_invalid' \
-                "artifact manifest is not valid JSON: $MANIFEST_PATH" \
-                "{\"manifest\":\"$(json_escape "$MANIFEST_PATH")\"}" "$EXIT_FAILURE"
-        fi
-    fi
+    assert_json_file "$MANIFEST_PATH" "artifact manifest" 'artifact_manifest_invalid'
 }
 
 # write_manifest RECORDS_FILE -- write MANIFEST_PATH from one-record-per-line

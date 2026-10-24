@@ -73,8 +73,17 @@ def safe_location(path: Path | str) -> str:
     this is enough to tell candidates apart.  What it withholds -- the drive,
     the profile, the username -- is exactly what PRD 9.2 protects.
 
+    The final component is *also* scrubbed for the account name, because
+    withholding the directory is not the same as withholding the username: a
+    file can be named after the account, and on this host those exist (the
+    pytest fixture root is ``pytest-of-<name>``, and a download named by hand
+    can carry anything).  Measured through ``unipad.host.ipsw``: a missing-image
+    refusal for ``.../nope/<name>-missing.ipsw`` printed the username while
+    refusing to name the directory, which is the shape of a guard that reads as
+    though it ran.
+
     A path with no final component (a drive root, or ``""``) redacts to ``""``
     rather than to something that looks like a name, so an empty result is
     always "there was nothing safe to say" and never a mistaken identity.
     """
-    return Path(path).name
+    return scrub_account(Path(path).name)

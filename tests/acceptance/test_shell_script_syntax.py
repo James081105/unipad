@@ -111,9 +111,27 @@ def test_the_guard_covers_every_shell_script() -> None:
     The glob is ``scripts/**/*.sh``; this asserts the repository has not grown
     a shell script somewhere the glob cannot see, which is the only way this
     file can silently stop covering something.
+
+    ``vendor/`` is excluded, and the reason is not convenience: it holds the
+    *fetched* upstream repositories, at the commits ``config/sources.lock.json``
+    pins.  They are not this repository's scripts, their content changes
+    whenever a pin moves, and parsing them would make this guard fail for a
+    reason no change here caused -- which is exactly the "fails on files you
+    never touched" shape that trains people to ignore it.  ``local-private/``
+    is excluded for the same reason (it is gitignored host material).
+
+    What this means, stated plainly: the guard covers the scripts *we* ship.  A
+    pin bump that breaks an upstream script is the build step's problem, and it
+    reports it as a build failure with the script named, not as a coverage gap
+    here.
     """
-    on_disk = {path for path in ROOT.rglob("*.sh") if ".git" not in path.parts}
-    on_disk -= {path for path in on_disk if "local-private" in path.parts}
+    on_disk = {
+        path
+        for path in ROOT.rglob("*.sh")
+        if ".git" not in path.parts
+        and "local-private" not in path.parts
+        and "vendor" not in path.parts
+    }
     named = set(SHELL_SCRIPTS)
     assert on_disk == named, (
         "shell scripts exist that this module does not check: "
