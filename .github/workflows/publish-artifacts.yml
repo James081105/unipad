@@ -76,7 +76,16 @@ jobs:
   # re-implementing it (DRY), so the publish gate and the CI gate are identical.
   verify:
     name: verify (reusable verify-artifacts)
-    timeout-minutes: 20
+    # NOTE: no ``timeout-minutes`` here.  A job whose ``uses:`` points at a
+    # reusable workflow may only carry name/uses/with/secrets/needs/if/
+    # permissions/strategy/concurrency; ``timeout-minutes`` is rejected, and
+    # because the rejection happens while building the job graph the run
+    # completes in zero seconds with ``jobs: []`` and no log at all -- which
+    # reads as "nothing ran" rather than as a validation error.  Measured on
+    # 2026-10-24: run 40107079873 (and every publish run since the reusable
+    # call was introduced) failed exactly that way.  The deadline lives in
+    # verify-artifacts.yml's own ``verify`` job, where it is allowed and where
+    # it already is.
     permissions:
       actions: read
       contents: read

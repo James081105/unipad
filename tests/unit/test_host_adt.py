@@ -848,33 +848,20 @@ def test_prepare_tree_copies_nothing_when_neither_repository_has_scripts(
 # ---------------------------------------------------------------------------
 # the board.toml-to-flag mapping is one mapping
 # ---------------------------------------------------------------------------
-def test_the_flag_table_matches_the_tools_own_argument_names() -> None:
-    """A flag the tool does not spell is a flag it will refuse.
+def test_the_ramdisk_and_trust_cache_switches_reach_the_command(tmp_path: Path) -> None:
+    """Asking for the ramdisk and the trust cache puts them on the command line.
 
-    The table is the one place the mapping lives, and the tool's parser is the
-    authority on what each key becomes -- so the two are compared here rather
-    than trusted.
+    The other half of this check -- that the tool's own parser spells
+    ``--packed-data-ramdisk`` and ``--trust-cache`` -- needs the device
+    repository's source and lives in ``tests/integration/``, which runs where
+    the pinned vendor checkout has been prepared.  Both halves used to be one
+    test here, and the vendor half read ``vendor/UniXNU-qemu/scripts/
+    make-qemu-adt.py`` unguarded, so ``preflight`` went red on a clean checkout
+    (run 40107080802, 2026-10-24) with a ``FileNotFoundError`` raised before a
+    single assertion of its own ran.
+
+    This half is pure: a synthetic board is all it needs.
     """
-    source = (REAL_DEVICE / ADT_TOOL).read_text(encoding="utf-8")
-    if not source:
-        pytest.skip("the ADT tool is not present in this checkout")
-    for key, flag in adt.ADT_FLAGS:
-        assert flag in source, (key, flag)
-    for switch in adt.ADT_SWITCHES:
-        assert f"--{switch.replace('_', '-')}" in source, switch
-    # ``--dram-size`` and ``--output`` are emitted unconditionally and are not in
-    # the table, so they are checked here rather than by the loop above.
-    for unconditional in ("--dram-size", "--output", "--unique-chip-id", "--chip-id"):
-        assert unconditional in source, unconditional
-
-
-def test_the_switches_and_the_ramdisk_flags_are_the_tools_own(tmp_path: Path) -> None:
-    """``--packed-data-ramdisk`` and ``--trust-cache`` exist in the tool's parser."""
-    source = (REAL_DEVICE / ADT_TOOL).read_text(encoding="utf-8")
-    if not source:
-        pytest.skip("the ADT tool is not present in this checkout")
-    for flag in ("--packed-data-ramdisk", "--data-ramdisk", "--trust-cache", "--ipad-identity"):
-        assert flag in source, flag
     board = _synthetic_board(tmp_path)
     command = adt.adt_command(
         board, tmp_path / "kernel.macho.adt", seed=SEED_HEX, data_ramdisk=True, trust_cache=True

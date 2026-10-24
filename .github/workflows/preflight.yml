@@ -418,3 +418,170 @@ jobs:
                   handle.write(text)
           print(text)
           PY
+
+  # PRD 16 four-layer test discipline, layer 2: "dependency integration".  The
+  # unit stage above runs in a clean checkout -- vendor/ is git-excluded and
+  # empty there -- so a unit test that needs the real pinned upstream tool
+  # cannot live in it.  It lives in tests/integration and runs here, where the
+  # pin has actually been cloned.
+  #
+  # This job is what makes that split safe rather than a way to quietly stop
+  # checking something: pytest exits 5 ("collected no tests") when every check
+  # skips, and this job treats 5 as a FAILURE.  A stage where everything skips
+  # is a stage that proved nothing, and it must not read green.
+  #
+  # It runs on ubuntu-latest because the checks are pure byte/text inspection of
+  # two public GitHub repositories, so it spends no Windows runner minutes and
+  # certainly no macOS minutes (PRD 8.4).
+  integration:
+    name: integration (pinned upstream)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Clone the pinned upstream repositories
+        env:
+          LOCK_PATH: config/sources.lock.json
+          VENDOR_DIR: vendor
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          """Clone exactly the two repositories config/sources.lock.json pins.
+
+          Both commits are read from the lock and from nowhere else: a second
+          place that knows a sha is how a pin silently drifts (CLAUDE.md #15).
+          The repositories are public, so no credentials are used and none are
+          echoed (PRD 9.2).
+          """
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          lock = json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8"))
+          vendor = Path(os.environ["VENDOR_DIR"])
+          sources = {
+              "UniXNU": lock["unixnu"],
+              "UniXNU-qemu": lock["device_repo"],
+          }
+          failures = []
+          for name, entry in sources.items():
+              repo = str(entry.get("repo") or "")
+              commit = str(entry.get("commit") or "")
+              if not repo or not commit:
+                  failures.append(f"{name}: sources.lock.json has no repo/commit pin")
+                  continue
+              target = vendor / name
+              if target.is_dir():
+                  print(f"{name}: already present, skipping clone")
+                  continue
+              target.parent.mkdir(parents=True, exist_ok=True)
+              for command in (
+                  ["git", "init", "-q", str(target)],
+                  ["git", "-C", str(target), "remote", "add", "origin", repo],
+                  ["git", "-C", str(target), "fetch", "-q", "--depth", "1", "origin", commit],
+                  ["git", "-C", str(target), "checkout", "-q", commit],
+              ):
+                  result = subprocess.run(command, capture_output=True, text=True)
+                  if result.returncode != 0:
+                      failures.append(f"{name}: {' '.join(command[:3])} failed: {result.stderr.strip()[:200]}")
+                      break
+              else:
+                  print(f"{name}: {commit} checked out")
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(1)
+          PY
+
+      - name: Prove the pinned checkout is the one the lock names
+        env:
+          LOCK_PATH: config/sources.lock.json
+          VENDOR_DIR: vendor
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          """The cloned HEADs must equal the lock's commits.
+
+          A stage that silently tests a branch instead of a pin passes today
+          and means nothing tomorrow, so the identity is proved here rather
+          than assumed from the clone command.
+          """
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          lock = json.loads(Path(os.environ["LOCK_PATH"]).read_text(encoding="utf-8"))
+          vendor = Path(os.environ["VENDOR_DIR"])
+          failures = []
+          for name, entry in (("UniXNU", lock["unixnu"]), ("UniXNU-qemu", lock["device_repo"])):
+              repo_dir = vendor / name
+              if not repo_dir.is_dir():
+                  failures.append(f"{name}: {repo_dir} was not cloned")
+                  continue
+              pinned = str(entry.get("commit") or "")
+              result = subprocess.run(
+                  ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                  capture_output=True, text=True,
+              )
+              if result.returncode != 0:
+                  failures.append(f"{name}: cannot read HEAD ({result.stderr.strip()[:160]})")
+                  continue
+              head = result.stdout.strip()
+              if head != pinned:
+                  failures.append(f"{name}: HEAD {head} != pin {pinned}")
+              else:
+                  # Deliberately no sha truncation: the full commit is the identity.
+                  print(f"{name}: HEAD matches the pin")
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(1)
+          PY
+
+      - name: Run integration checks (tests/integration)
+        run: |
+          set +e
+          mkdir -p preflight
+          python -m pytest tests/integration -q -rs 2>&1 | tee preflight/pytest-integration.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "pytest_exit_code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0)
+              echo "integration checks passed"
+              ;;
+            5)
+              # pytest exit 5 is "collected no tests", which is what a stage
+              # where every check skipped looks like.  Treating that as a pass
+              # is how a real check quietly stops happening.
+              echo "::error::tests/integration collected no tests (exit 5): every check skipped, so the pinned-upstream contract is UNVERIFIED"
+              exit 5
+              ;;
+            *)
+              echo "::error::pytest failed with exit code $code"
+              exit "$code"
+              ;;
+          esac
+
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unipad-preflight-integration-${{ github.run_id }}
+          path: preflight/pytest-integration.log
+          if-no-files-found: warn
+          retention-days: 30
