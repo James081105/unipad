@@ -1021,3 +1021,57 @@ def test_discard_root_removes_only_an_empty_root(tmp_path: Path, pair, stub_deco
         ipsw.acquire(lock, device, workspace, image_override=image)
     assert workspace.discard_root() is True, "an empty root was left behind"
     assert not throwaway.exists(), throwaway
+
+
+def test_a_chip_id_divergence_is_reported_not_refused(tmp_path: Path, stub_decode) -> None:
+    """A cross-check the operator cannot see must not stop the build.
+
+    The first real macOS run refused the genuine pinned image with "no erase
+    build identity for this board's device class", because at least one of the
+    four fields does not read the way board.toml spells it.  Device class plus
+    restore behaviour identify the board unambiguously, so the module proceeds on
+    those and *records* the chip/board divergence instead of swallowing it.
+    """
+    image = _build_image(
+        tmp_path,
+        manifest=_manifest(chip_id="0x8012", board_id="0x0d"),
+    )
+    lock, device = _write_declarations(tmp_path, image=image)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with workspace:
+        result = ipsw.acquire(lock, device, workspace, image_override=image)
+    assert result.kernelcache_sha256 == _sha(MACHO), result
+    divergence = ipsw.DIVERGENT_IDENTITY[0]
+    assert divergence, "a chip/board divergence was swallowed rather than recorded"
+    assert divergence["image_chip_id"] == 0x8012, divergence
+    assert divergence["board_chip_id"] == 0x8011, divergence
+
+
+def test_two_matching_identities_are_a_refusal_not_a_guess(tmp_path: Path, stub_decode) -> None:
+    """Ambiguity is refused, with the candidates listed.
+
+    Two erase identities for the same device class means the Manifest -- and
+    therefore every component path -- could come from either.  That is a guess,
+    and the refusal has to say what it saw so the next attempt can act on it.
+    """
+    manifest = plistlib.loads(_manifest())
+    identity = manifest["BuildIdentities"][0]
+    # Two identities for the same device class and restore behaviour, neither
+    # matching the board's chip id -- so the strict four-field rule finds
+    # nothing and the device-class rule finds two.  That is the shape the
+    # ambiguity branch exists for.
+    twin = json.loads(json.dumps(identity))
+    twin["Info"]["ApChipID"] = "0x9999"
+    manifest["BuildIdentities"].append(twin)
+    identity["Info"]["ApChipID"] = "0x8888"
+    image = _build_image(tmp_path, manifest=plistlib.dumps(manifest))
+    lock, device = _write_declarations(tmp_path, image=image)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(lock, device, workspace, image_override=image)
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.VERIFICATION_FAILED, error
+    assert error.details.get("matching_identities") == 2, error.details
+    # The refusal lists what the image actually carried.
+    assert len(error.details.get("image_identities", ())) == 2, error.details

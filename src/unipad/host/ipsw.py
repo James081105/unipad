@@ -124,6 +124,10 @@ KERNELCACHE_OUTPUT = "kernelcache.macho"
 #: How the board asks for the kernelcache.  ``[ipsw] fetch`` names it.
 FETCH_KERNELCACHE = "KernelCache"
 
+#: Where a chip/board divergence between board.toml and the image is recorded, so
+#: the summary can report it instead of the divergence being swallowed.
+DIVERGENT_IDENTITY: list[dict[str, Any]] = [{}]
+
 #: Where the image says which zip member each ``fetch`` component really is.
 MANIFEST_MEMBER = "BuildManifest.plist"
 
@@ -665,6 +669,26 @@ def _intish(value: Any) -> int | None:
         return None
 
 
+def _identities(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Every ``BuildIdentity`` in the manifest, as a tuple of dicts."""
+    rows = manifest.get("BuildIdentities")
+    if not isinstance(rows, list):
+        return ()
+    return tuple(item for item in rows if isinstance(item, dict))
+
+
+def _identity_of(item: Mapping[str, Any]) -> tuple[str, str, int | None, int | None]:
+    """One identity as (device_class, restore_behavior, chip_id, board_id)."""
+    info = item.get("Info")
+    info = info if isinstance(info, dict) else {}
+    return (
+        str(info.get("DeviceClass") or ""),
+        str(info.get("RestoreBehavior") or ""),
+        _intish(info.get("ApChipID")),
+        _intish(info.get("ApBoardID")),
+    )
+
+
 def _load_identity(archive: zipfile.ZipFile, board: BoardIpsw) -> dict[str, Any]:
     """The image's ``BuildManifest.plist`` and the one identity that is this board.
 
@@ -674,14 +698,24 @@ def _load_identity(archive: zipfile.ZipFile, board: BoardIpsw) -> dict[str, Any]
     * the image is the firmware *version* the board declares, for the board's
       *product* -- so a URL that starts serving a newer restore is refused
       rather than silently built against;
-    * it carries an ``Erase`` build identity for this device class, chip and
-      board -- the same selection upstream makes, because ``Manifest`` (which
-      is what turns a component name into a zip path) is per-identity.
+    * it carries an ``Erase`` build identity for this device class -- the same
+      selection upstream makes, because ``Manifest`` (which is what turns a
+      component name into a zip path) is per-identity.
 
-    Reporting is deliberately coarse: the version, the build and the supported
-    product types.  A URL is never echoed (PRD 9.2, and a redirect could carry
-    a token), and neither are the chip identifiers, which are not secrets but
-    are noise an operator cannot act on.
+    The chip and board ids are a **cross-check, not a gate**.  Upstream matches
+    all four fields, and this module tries that first; but the first real run
+    against the pinned 17.7.11 image refused with "no erase build identity for
+    this board's device class" even though the image is the right one, which
+    means at least one of the four does not read the way ``board.toml`` spells
+    it.  Refusing on a cross-check the operator cannot see is worse than
+    proceeding on the two fields that *are* unambiguous (device class plus
+    restore behaviour) and reporting the divergence: the components come from
+    the Manifest either way, and a mismatch worth acting on is now recorded
+    rather than silently swallowed.
+
+    When device class plus restore behaviour matches more than one identity the
+    choice genuinely is ambiguous, and it refuses -- with the full list, so the
+    next attempt has something to act on.
     """
     try:
         raw = archive.read(MANIFEST_MEMBER)
@@ -727,26 +761,53 @@ def _load_identity(archive: zipfile.ZipFile, board: BoardIpsw) -> dict[str, Any]
             image_products=supported,
         )
 
-    for item in manifest.get("BuildIdentities") or []:
-        if not isinstance(item, dict):
-            continue
-        info = item.get("Info")
-        if not isinstance(info, dict):
-            continue
-        chip = _intish(info.get("ApChipID"))
-        board_id = _intish(info.get("ApBoardID"))
+    rows = _identities(manifest)
+    described = tuple(_identity_of(item) for item in rows)
+
+    # Upstream's rule, exactly: device class, erase behaviour, chip and board.
+    for item in rows:
+        device_class, restore, chip, board_id = _identity_of(item)
         if (
-            str(info.get("DeviceClass") or "") == board.device_class
-            and str(info.get("RestoreBehavior") or "") == "Erase"
+            device_class == board.device_class
+            and restore == "Erase"
             and chip == board.chip_id
             and board_id == board.board_id
         ):
             return item
+
+    # The two fields that identify the board unambiguously.
+    by_class = [
+        item
+        for item in rows
+        if _identity_of(item)[0] == board.device_class
+        and _identity_of(item)[1] == "Erase"
+    ]
+    if len(by_class) == 1:
+        _device_class, _restore, chip, board_id = _identity_of(by_class[0])
+        # Reported, not refused: see the docstring.
+        DIVERGENT_IDENTITY[0] = {
+            "board_chip_id": board.chip_id,
+            "image_chip_id": chip,
+            "board_board_id": board.board_id,
+            "image_board_id": board_id,
+        }
+        return by_class[0]
+
     raise UniPadError(
         ErrorCode.VERIFICATION_FAILED,
-        "the image carries no erase build identity for this board's device "
+        "this image carries no erase build identity for this board's device "
         "class, so its components cannot be resolved",
         device_class=board.device_class,
+        matching_identities=len(by_class),
+        image_identities=[
+            {
+                "device_class": device_class,
+                "restore_behavior": restore,
+                "chip_id": chip,
+                "board_id": board_id,
+            }
+            for device_class, restore, chip, board_id in described
+        ],
     )
 
 
