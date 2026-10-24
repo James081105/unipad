@@ -995,7 +995,19 @@ jobs:
           IPSW_WORK_DIR: ipsw-work
           KERNELCACHE_PATH: ipsw-work/kernelcache.macho
           SUMMARY_PATH: ipsw-work/ipsw-summary.json
+          # The package lives in src/ and is installed as an editable shim on
+          # the development host only -- a GitHub runner has no such shim, so
+          # without this the step dies with
+          # ModuleNotFoundError: No module named 'unipad'.  Measured on run
+          # 40065266844.
+          PYTHONPATH: src
         run: |
+          # pipefail is load-bearing, not decoration.  Without it, `status=$?`
+          # after `... | tee log` is tee's exit code, and a failing python
+          # reads as a passing step -- which is exactly what happened on the
+          # first real run: the module could not be imported, the step printed
+          # "== ipsw: PASS", and the build then recorded not_run for a reason
+          # that looked like a policy choice rather than an import error.
           set -uo pipefail
           # Not `set -e`: this step is allowed to fail, and a failing command
           # must not abort the shell before the summary is written.
