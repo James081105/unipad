@@ -1077,11 +1077,11 @@ PAYLOAD_DRAM_SIZE=''
 PAYLOAD_PANIC_SCREEN='no'
 PAYLOAD_SKIP_SETUP_TOOL=''
 PAYLOAD_TRUST_CACHE_SHA256=''
-#: Where build-payload left the ESP it extracted for verification, and the
-#: verified device tree inside it.  The latter is what tells
-#: build-devicetree/adt not to spend another QEMU dump on a tree that already
-#: exists.
-PAYLOAD_ESP_DIR=''
+#: Where build-payload leaves the verified device tree it lifted out of the ESP.
+#: The latter is what tells build-devicetree/adt not to spend another QEMU dump on
+#: a tree that already exists.  (The directory itself is not carried in a
+#: variable: the runner names it in its boot-inputs globs, and a third place that
+#: looked authoritative without being read is a knob nobody can turn.)
 PAYLOAD_ADT_PATH=''
 
 # read_board_fields -- NAME<TAB>VALUE per line, read from board.toml of the
@@ -1782,6 +1782,18 @@ step_build_payload() {
             "{\"driver\":\"$(json_escape "$DRIVER")\"}" "$EXIT_FAILURE"
     fi
 
+    # (0) the board's own [payload] block, in the log.  read_board_fields read it
+    #     and the verifier below reads it again, so this is where the two halves
+    #     are named together: a reader of the log sees what this run's board
+    #     asked for without opening board.toml, and a board that changes shows up
+    #     here rather than only inside the verifier's output.
+    local trust_caches=0
+    if [[ -n "$PAYLOAD_TRUST_CACHE_SHA256" ]]; then
+        trust_caches="$(printf '%s' "$PAYLOAD_TRUST_CACHE_SHA256" \
+            | tr ',' '\n' | grep -c '[^[:space:]]')"
+    fi
+    log "payload: board [payload] volume=$PAYLOAD_VOLUME size=${PAYLOAD_SIZE_MIB}MiB dram_size=$PAYLOAD_DRAM_SIZE loader=$PAYLOAD_LOADER panic_screen=$PAYLOAD_PANIC_SCREEN trust_cache_pins=$trust_caches skip_setup_tool=${PAYLOAD_SKIP_SETUP_TOOL:-<none>}"
+
     # (1) inputs.  The volume is a copy of the prelinked kernel plus a device
     #     tree, so build-kernel and build-bootloader must have produced theirs
     #     first; the driver refuses a missing one with a message about its own
@@ -1887,7 +1899,6 @@ step_build_payload() {
     image="$(work_dir)/payload/payload.img"
     report="$(work_dir)/payload/payload.json"
     esp="$OUT_DIR/payload-esp"
-    PAYLOAD_ESP_DIR="$esp"
     if ! verify_payload_image "$image" "$report" "$esp" "$seed" "$TARGET"; then
         ledger_add "$name" 'failed' \
             "the payload volume did not verify; see $(shown_path "$OUT_DIR/${name}.verify.log")"
