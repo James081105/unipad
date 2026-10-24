@@ -1279,7 +1279,15 @@ jobs:
       # PRD 8.2 step 4 / 8.3: stage ONLY allowlisted roles, hash everything, and
       # build the machine-readable artifact-manifest.json (PRD 8.1).  Default
       # deny: an unrecognised file is excluded and recorded, never uploaded.
+      # `if: always()` because a FAILED build is when its evidence matters most,
+      # and the default `success()` threw all of it away: run 40094234507 failed
+      # in build-payload, and because this step was skipped the UniXNU.efi that
+      # build-bootloader had already produced and recorded was never staged,
+      # never uploaded, and never collected.  The stage's own default deny still
+      # refuses a build that produced nothing but logs (PRD 7.4), so "always"
+      # publishes evidence, not a green light.
       - name: Stage allowlisted artifacts and build artifact-manifest.json
+        if: always()
         id: stage
         env:
           BUILD_OUTPUT_DIR: build-output
@@ -1599,6 +1607,7 @@ jobs:
           PY
 
       - name: Upload build artifact (allowlisted roles only, 30-day retention)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.naming.outputs.artifact_name }}
@@ -1618,7 +1627,7 @@ jobs:
       # named by what record_artifact() in build-macos.sh records, so the set
       # cannot drift from what the build declares.
       #
-      # WHY THE WHOLE TREE IS NOT UPLOADED, since that has already cost us once:
+      # WHY THIS BUNDLE IS NOT A TREE GLOB, since that has already cost us once:
       # the earlier `unipad-build-*` upload carried the entire build tree -- about
       # 350-370 MB of EDK II and XNU intermediates, object files and feed clones
       # (run 40081850615 staged 37161 files, 1507736437 bytes) -- on a PUBLIC
@@ -1628,7 +1637,20 @@ jobs:
       # the payload's ESP image is named explicitly rather than by a directory.
       # PRD 8.2 step 4 keeps the same line: the allowlisted artifact uploads roles,
       # never a tree.
+      #
+      # READ THIS BEFORE TRUSTING THE PARAGRAPH ABOVE AS A DESCRIPTION OF THE
+      # WORKFLOW.  It describes this step only.  The `Upload build artifact` step
+      # directly above still does `path: staged/`, so `unipad-build-*` is still
+      # ~370 MB of the same tree, on every run.  That is a known, unfixed defect,
+      # measured again on run 40091901777 (368,499,519 bytes) after this bundle
+      # existed.  It has not been changed because verify-artifacts.yml and
+      # publish-artifacts.yml both resolve `unipad-build-*` and re-hash its
+      # contents against artifact-manifest.json; narrowing the upload is a
+      # contract change to those two workflows, not a one-line edit here.  Until
+      # it is made, treat every `unipad-build-*` artifact as a tree, and use
+      # `boot-inputs-*` for anything a human is expected to act on.
       - name: Collect the boot inputs into a small bundle
+        if: always()
         env:
           STAGE_DIR: staged
           BUNDLE_DIR: boot-inputs
@@ -1643,12 +1665,17 @@ jobs:
           import sys
           from pathlib import Path
 
-          stage = Path("staged")
-          bundle = Path("boot-inputs")
+          stage = Path(os.environ.get("STAGE_DIR", "staged"))
+          bundle = Path(os.environ.get("BUNDLE_DIR", "boot-inputs"))
           out = Path(os.environ.get("BUILD_OUTPUT_DIR", "build-output"))
           if not stage.is_dir():
               print("::error::no staged directory; the build produced nothing")
               sys.exit(1)
+          # Recreated, never appended to.  A leftover from an earlier run would
+          # otherwise be hashed into the manifest below as if it were evidence
+          # about this build -- and the manifest's whole job is to say which
+          # bytes produced a boot log.
+          shutil.rmtree(bundle, ignore_errors=True)
           # What a boot needs, as path fragments.  Ordered most-specific first.
           WANTED = (
               "kernel.macho",
@@ -1709,8 +1736,17 @@ jobs:
                   print(f"::warning::no {pattern} under {out.as_posix()}; the boot input set is incomplete")
                   continue
               if len(matches) > 1:
-                  # Two payloads and no way to say which one booted.
+                  # Two payloads and no way to say which one booted.  The
+                  # bundle is removed rather than left half-written: the upload
+                  # step below is `if: always()`, so a partial directory would
+                  # be published as a boot-inputs set, and
+                  # `if-no-files-found: error` would not catch it because the
+                  # directory is not empty.  Removing it makes the upload's own
+                  # guard the thing that fires, one step later, with a message
+                  # about the upload -- which is worse than this one but is at
+                  # least not a silently incomplete bundle.
                   print(f"::error::{len(matches)} files match {pattern}: {[m.as_posix() for m in matches]}")
+                  shutil.rmtree(bundle, ignore_errors=True)
                   sys.exit(1)
               source = matches[0]
               destination = bundle / name
@@ -1720,12 +1756,20 @@ jobs:
               total += source.stat().st_size
           if not kept:
               print("::error::no boot inputs found in staged/")
+              shutil.rmtree(bundle, ignore_errors=True)
               sys.exit(1)
           # A boot log is only evidence about the bytes that produced it, so the
           # bundle says which bytes it is.  Measured need: the three earlier
           # kernel.macho builds are not byte-identical (sha256 9fc119604838856d
           # on M2 versus 1f32f09bc7668de0 on M4), and a log that does not name
           # its kernel is a log nobody can reproduce.
+          #
+          # Absent entries are recorded as absent.  A missing payload file is a
+          # warning and the step still exits 0 -- the build may legitimately not
+          # have produced one -- so without this a bundle that LOST payload.img
+          # would be indistinguishable, from the manifest alone, from a build
+          # that never made it.  The manifest is the only thing a downloader
+          # reads before booting, so it has to be able to say "not here".
           manifest = {
               path.relative_to(bundle).as_posix(): {
                   "bytes": path.stat().st_size,
@@ -1734,10 +1778,15 @@ jobs:
               for path in sorted(bundle.rglob("*"))
               if path.is_file() and path.name != "manifest.json"
           }
+          for pattern, name in PAYLOAD_SET:
+              if name not in manifest:
+                  manifest[name] = {"bytes": None, "sha256": None, "absent": True}
           (bundle / "manifest.json").write_text(
               json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
-          print(f"boot inputs: {kept} file(s), {total} bytes; manifest.json names {len(manifest)}")
+          missing = sorted(name for name, entry in manifest.items() if entry.get("absent"))
+          print(f"boot inputs: {kept} file(s), {total} bytes; manifest.json names {len(manifest)}"
+                + (f" ({len(missing)} absent: {missing})" if missing else ""))
           for path in sorted(bundle.rglob("*")):
               if path.is_file():
                   print(f"  {path.relative_to(bundle).as_posix()} {path.stat().st_size}")

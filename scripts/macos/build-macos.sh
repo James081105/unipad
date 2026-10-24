@@ -1822,6 +1822,40 @@ step_build_payload() {
     local -a need=('git' 'make' 'python3')
     apple_step_gate "$name" "${need[@]}" || return 0
 
+    # (2b) the panic screen's font header, BEFORE the driver is allowed to die on
+    #     it.  board.toml [payload] panic_screen = true, so payload.py:130-136
+    #     runs the device repo's patch-xnu-entry-probe.py, which compiles
+    #     scripts/xnu-panic-screen.c -- and that file includes "Font.h"
+    #     (xnu-panic-screen.c:294) from a Mu-Silicium checkout that is NOT a feed
+    #     and NOT in either pinned repository.  patch-xnu-entry-probe.py:183
+    #     reads UNIXNU_UEFI (which payload.py:139 sets from ctx.uefi, and ctx.uefi
+    #     is None for the payload step) and otherwise falls back to
+    #     <tree>/uefi-sheng, which the assembled tree never contains.
+    #
+    #     Measured on run 40094234507: the step reached the driver and died in
+    #     clang with "fatal error: 'Font.h' file not found", which names the
+    #     include and not the reason -- the same shape as the firmware's "The
+    #     image is not an application."  So it is checked here, where the ledger
+    #     can say what is missing and what it costs.
+    #
+    #     What it costs: the panic screen only.  The entry probe (stage bars,
+    #     --no-reset) is the other half of the same patch and is wanted with
+    #     either setting (payload.py:128-129), so a kernel patched without the
+    #     font still boots; it just cannot draw a panic message.  This stage is
+    #     recorded failed rather than worked around, because the board asked for
+    #     the screen and the file it needs is not on this host.
+    if [[ "$PAYLOAD_PANIC_SCREEN" == 'yes' ]]; then
+        local uefi_root="${UNIXNU_UEFI:-$(tree_dir)/uefi-sheng}"
+        local font="$uefi_root/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
+        if [[ ! -f "$font" ]]; then
+            ledger_add "$name" 'failed' \
+                "the panic screen's font header is not on this host: $font (xnu-panic-screen.c:294 includes \"Font.h\"; patch-xnu-entry-probe.py:183 reads UNIXNU_UEFI and otherwise <tree>/uefi-sheng, and Mu-Silicium is neither a feed nor part of either pinned repository). Point UNIXNU_UEFI at a Mu-Silicium checkout to build the payload with board.toml [payload] panic_screen"
+            log "payload: FAIL $font is missing; see the ledger entry"
+            return 1
+        fi
+        log "payload: panic-screen font $font"
+    fi
+
     # (3) the two Homebrew packages the step cannot run without.  Neither is a
     #     preflight requirement (see the header), so they are satisfied here.
     #     The status is captured rather than read from $? inside the branch:
