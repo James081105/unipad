@@ -1099,6 +1099,35 @@ jobs:
               print(f"seeded {name}: {len(entries)} entries into {len(trees)} tree(s)")
           PY
 
+      # The DarwinBoot EFI build links with lld-link, LLVM's MSVC-compatible
+      # linker.  A GitHub macOS runner ships Xcode's ld and has no Homebrew LLVM,
+      # so build-bootloader stops at "unixnu: lld-link not found on PATH (brew
+      # install llvm lld)".  Measured on run 40076039682, where the kernel and all
+      # ten archive builders had already succeeded.
+      #
+      # $GITHUB_PATH is used rather than an exported PATH so the keg is visible to
+      # every later step, not just this one.
+      - name: Install LLVM (lld-link for the bootloader link)
+        run: |
+          set -euo pipefail
+          if ! command -v lld-link >/dev/null 2>&1; then
+            echo "lld-link absent; installing llvm and lld"
+            brew install llvm lld
+          fi
+          found=0
+          for keg in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            if [ -d "$keg" ]; then
+              echo "$keg" >> "$GITHUB_PATH"
+              echo "$keg added to PATH"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no llvm keg on disk after brew install llvm lld"
+            exit 1
+          fi
+          lld-link --version
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:
