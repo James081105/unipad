@@ -1034,6 +1034,71 @@ jobs:
           fi
           exit 0
 
+      # The XNU build's own prepare-xnu-source.py fetches three directory
+      # listings from api.github.com with a bare urlopen -- unauthenticated, so
+      # it shares GitHub's 60-requests-per-hour per-IP limit with every other
+      # Actions runner on that address.  Measured on run 40066399042:
+      # "HTTP Error 403: rate limit exceeded", which failed build-kernel before
+      # a single translation unit was compiled.
+      #
+      # The script caches those listings by path and verifies every blob by its
+      # git SHA-1, so seeding them with an authenticated request (5000/hour)
+      # removes all three API calls without changing any content: the blobs are
+      # still downloaded and still hash-checked by the upstream script.
+      #
+      # The tags are read from vendor/UniXNU/feeds.toml rather than written
+      # here, so there is no second place that knows them.
+      - name: Pre-seed the XNU header listings with an authenticated request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_ROOT: build-output/unixnu-out
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ.get("GITHUB_TOKEN", "")
+          feeds = tomllib.loads(
+              Path("vendor/UniXNU/feeds.toml").read_text(encoding="utf-8")
+          )
+          xnu = feeds.get("xnu", {})
+          driverkit = xnu.get("driverkit_tag", "xnu-10063.121.3")
+          trustcache = xnu.get("trustcache_tag", "xnu-8796.101.5")
+          repo = "https://api.github.com/repos/apple-oss-distributions/xnu/contents"
+          wanted = [
+              (f"{repo}/iokit/DriverKit?ref={driverkit}",
+               f"xnu-driverkit-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/iokit/DriverKit/crypto?ref={driverkit}",
+               f"xnu-driverkit-crypto-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/EXTERNAL_HEADERS/TrustCache?ref={trustcache}",
+               f"xnu-trustcache-{trustcache.removeprefix('xnu-')}.json"),
+          ]
+          headers = {"Accept": "application/vnd.github+json"}
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+          root = Path(os.environ.get("OUT_ROOT", "build-output/unixnu-out"))
+          trees = sorted(root.glob("*/tree"))
+          if not trees:
+              raise SystemExit(f"no assembled build tree under {root}")
+          for url, name in wanted:
+              request = urllib.request.Request(url, headers=headers)
+              body = urllib.request.urlopen(request, timeout=60).read()
+              # Refuse to seed a listing that is not the directory listing the
+              # script expects: an error page would be cached as if it were data.
+              entries = json.loads(body)
+              if not isinstance(entries, list):
+                  raise SystemExit(f"{url} did not return a directory listing")
+              for tree in trees:
+                  target = tree / ".cache" / "sources" / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(body)
+              print(f"seeded {name}: {len(entries)} entries into {len(trees)} tree(s)")
+          PY
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:
