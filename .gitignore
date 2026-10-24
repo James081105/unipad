@@ -58,3 +58,12 @@ fake-qemu-args.json
 /a.out
 /a.o
 .suite-run.txt
+
+# macOS 构建入口的默认输出目录（--out 未给出时落在仓库内）
+scripts/macos/build-out/
+
+# 平台种子：按设计不入任何仓库（unipad.host.adt.SEED_LABEL 的域分隔即为此设）。
+# build-macos.sh 把它写在运行自己的 workspace 下，从不写进 checkout；这两行是
+# 防止有人用默认 --out 在仓库里跑一次之后顺手 git add -A 的兜底。
+platform-seed
+platform-seed.json
