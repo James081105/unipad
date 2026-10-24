@@ -1526,6 +1526,75 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # The full staged artifact is ~356 MB, most of it EDK2 and XNU build
+      # intermediates (the bootloader role alone is 32713 files).  Downloading it
+      # from Azure measured at ~60 KB/s, which is over 90 minutes -- so the one
+      # run that produced a real kernel was also the one whose output was
+      # impractical to act on.
+      #
+      # This collects just the boot inputs: the linked kernel, the DarwinBoot
+      # driver image, the device trees, the firmware volume, the per-part hash
+      # record, and the three machine-readable manifests.  Everything here is
+      # named by what record_artifact() in build-macos.sh records, so the set
+      # cannot drift from what the build declares.
+      - name: Collect the boot inputs into a small bundle
+        env:
+          STAGE_DIR: staged
+          BUNDLE_DIR: boot-inputs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import shutil
+          import sys
+          from pathlib import Path
+
+          stage = Path("staged")
+          bundle = Path("boot-inputs")
+          if not stage.is_dir():
+              print("::error::no staged directory; the build produced nothing")
+              sys.exit(1)
+          # What a boot needs, as path fragments.  Ordered most-specific first.
+          WANTED = (
+              "kernel.macho",
+              "darwinboot-efi/",
+              "boot.json",
+              ".dtb",
+              ".fd",
+              "artifact-manifest.json",
+              "build-report.json",
+              "stage-result.json",
+              "ipsw-summary.json",
+          )
+          kept, total = 0, 0
+          for source in sorted(stage.rglob("*")):
+              if not source.is_file():
+                  continue
+              relative = source.relative_to(stage).as_posix()
+              if not any(fragment in relative for fragment in WANTED):
+                  continue
+              destination = bundle / relative
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
+              kept += 1
+              total += source.stat().st_size
+          if not kept:
+              print("::error::no boot inputs found in staged/")
+              sys.exit(1)
+          print(f"boot inputs: {kept} file(s), {total} bytes")
+          for path in sorted(bundle.rglob("*")):
+              if path.is_file():
+                  print(f"  {path.relative_to(bundle).as_posix()} {path.stat().st_size}")
+          PY
+
+      - name: Upload the boot inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-inputs-${{ github.run_id }}
+          path: boot-inputs/
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Step summary
         if: always()
         env:
