@@ -179,31 +179,75 @@ def test_main_accepts_an_explicit_argv() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. --run refuses rather than fabricating a verdict
+# 2. --run evaluates the registered universe and never fabricates a verdict
 # ---------------------------------------------------------------------------
 
 
-def test_run_refuses_until_the_check_universe_exists(capsys) -> None:
-    """An empty bundle must never be able to read as a pass.
+def test_run_evaluates_the_registered_universe(capsys) -> None:
+    """``--run`` produces a real verdict now that the registry exists.
 
-    There is no registered ``CHECKS`` table yet.  Writing a bundle anyway would
-    produce a run with zero checks, which still rolls up to a verdict -- and
-    "nothing ran" must not be able to read as "it passed".  The refusal has to
-    name the reason and exit nonzero.
+    This test used to pin the opposite: ``--run`` refused with "no registered
+    check universe exists yet", which was correct when no ``CHECKS`` table had
+    been built and was also the whole problem -- a gate that cannot run cannot
+    report anything.  ``registry.py`` now registers 40 checks, so the
+    refusal's precondition is gone.
+
+    What is pinned instead is the property that mattered underneath the
+    refusal: a run must produce a *verdict*, and that verdict must never be PASS
+    on a host with no guest.  The assertion is on the verdict and the exit code,
+    not on a message string, because the message is free to change and the
+    verdict is not.
     """
-    code = gate_main.main(["--run", "demo"])
+    code = gate_main.main(["--run", "demo-universe"])
     assert code == int(ExitCode.BLOCKED), code
     captured = capsys.readouterr()
-    assert "refusing" in (captured.err + captured.out).lower()
-    assert "no registered check universe" in captured.err
+    combined = captured.err + captured.out
+    assert "refusing" not in combined.lower(), combined
+    assert "no registered check universe" not in combined, combined
+    # A verdict was reached and printed, rather than a refusal.
+    assert "demo-universe" in combined, combined
+    assert "BLOCKED" in combined, combined
 
 
-def test_the_run_refusal_is_machine_readable_with_json(capsys) -> None:
-    code = gate_main.main(["--run", "demo", "--json"])
-    assert code == int(ExitCode.BLOCKED)
+def test_the_run_verdict_is_machine_readable_with_json(capsys) -> None:
+    """The JSON form carries the verdict, the exit code and the reasons.
+
+    Every reason names a specific blocking check and its blocker, because
+    ``blocking_by:<id>:<blocker>`` is the only form an operator can act on.  A
+    verdict with no reasons would be indistinguishable from a bare refusal.
+    """
+    code = gate_main.main(["--run", "demo-json", "--json"])
+    assert code == int(ExitCode.BLOCKED), code
     payload = json.loads(capsys.readouterr().out)
-    assert payload["refused"] is True
-    assert "no registered check universe" in payload["reason"]
+    # A successful run has no "refused" key at all; asserting on the
+    # key's presence is what distinguishes a verdict from a refusal.
+    assert payload.get("refused") is not True, payload
+    assert payload["run_id"] == "demo-json", payload
+    assert payload["verdict"] == "BLOCKED", payload
+    assert payload["exit_code"] == int(ExitCode.BLOCKED), payload
+    assert payload["reasons"], "a BLOCKED verdict with no reasons says nothing"
+    assert all(reason.startswith("blocking_by:") for reason in payload["reasons"]), (
+        payload["reasons"]
+    )
+    # The four-field record is carried, not dropped on the floor.
+    assert isinstance(payload["field_unverified"], list), payload
+
+
+def test_the_run_never_reports_pass_without_a_guest(capsys) -> None:
+    """The load-bearing one: a green suite must not substitute for a guest.
+
+    ``release_verdict`` requires at least one ONSITE evidence reference in the
+    blocking tier before it will say PASS (``record.py`` §5.5, line 6).  On this
+    host there is no iPadOS guest, so even a run in which every blocking probe
+    returned PASS would still be BLOCKED.  This test asserts the gate *reaches*
+    that rule rather than bypassing it -- the reasons must not be empty, and the
+    verdict must not be PASS.
+    """
+    code = gate_main.main(["--run", "demo-noguest", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code != int(ExitCode.OK), (code, payload)
+    assert payload["verdict"] != "PASS", payload
+    assert payload["reasons"], payload
 
 
 # ---------------------------------------------------------------------------

@@ -62,6 +62,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..errors import ErrorCode, UniPadError, ExitCode
 from . import record
 from .record import EvidenceRef, FourFields, Verdict, VerdictKind
+from .runner import BUNDLE_FILENAME
 
 __all__ = [
     "VerdictFields",
@@ -423,6 +424,134 @@ def _refuse_run(run_id: str) -> int:
 _ARGS: argparse.Namespace = argparse.Namespace(json=False)
 
 
+def _run(run_id: str) -> int:
+    """Evaluate the registered check universe for ``run_id`` and write its bundle.
+
+    This is the path that used to refuse.  It refused for a good reason -- with
+    no registered ``CHECKS`` table, a run would write a bundle with zero checks,
+    which still rolls up to a verdict, and "nothing ran" must never be able to
+    read as "it passed".  The registry now exists (``registry.py``, 40 checks),
+    so the refusal's precondition is gone and the honest thing is to run.
+
+    What it does **not** do is soften the outcome.  The verdict comes from
+    ``release_verdict`` and the exit code from ``exit_code_for``; nothing here
+    interprets, rounds, or second-guesses either.  On a host with no iPadOS
+    guest the verdict is BLOCKED with ``no_onsite_evidence`` and the exit code
+    is 3, and that is the correct answer rather than a defect to be worked
+    around.
+
+    The run directory is ``runs/<run_id>`` under the repository, which is what
+    ``runner`` documents and what ``--verify`` expects to be handed back.
+    """
+    from pathlib import Path
+
+    from . import registry
+    from .runner import AcceptanceRunner
+
+    run_dir = _run_root() / run_id
+    inputs = registry.build_inputs(run_dir)
+    runner = AcceptanceRunner(
+        run_dir=run_dir,
+        checks=inputs.checks,
+        probes=inputs.probes,
+        environment=inputs.environment,
+        cases=inputs.cases,
+        milestones=inputs.milestones,
+        measurements=inputs.measurements,
+        coverage_gaps=inputs.coverage_gaps,
+        suite=_suite_summary(),
+    )
+    try:
+        outcome = runner.run()
+    except Exception as exc:  # noqa: BLE001 - a refusal must never be a traceback
+        return _report_refusal(run_id, exc)
+
+    if _ARGS.json:
+        print(json.dumps(outcome.to_dict(), indent=2, sort_keys=True))
+    else:
+        print("run %s: %s" % (run_id, outcome.verdict))
+        for reason in outcome.reasons:
+            print("  reason: %s" % reason)
+        print(render_rows([as_verdict("runner", check) for check in outcome.bundle.checks]))
+        if not outcome.field_unverified:
+            print("  no field left unverified")
+        else:
+            print("  fields left unverified on site:")
+            for item in outcome.field_unverified:
+                print("    %s" % item)
+        print("  bundle: %s" % (run_dir / BUNDLE_FILENAME).name)
+    return int(outcome.exit_code)
+
+
+def _run_root() -> Path:
+    """Where run directories live, and why not ``runs/``.
+
+    ``runs/`` is the convention ``runner`` documents, and it is also a
+    ``HostView`` search root (``milestones.default_view``).  That combination is
+    the problem: the run's own adopted evidence lands at
+    ``runs/<id>/acceptance/artifacts/m0/ai-smoke.json``, and the *next* run's
+    milestone probes find that copy by basename and cite it as the real
+    artifact.  A run vouching for itself -- measured as
+    ``test_m0_reports_the_gap_that_is_really_open`` failing with
+    ``runs/demo-json/evidence/artifacts/m0/ai-smoke.json`` where it expected
+    ``artifacts/m0/ai-smoke.json``.
+
+    ``local-private/`` is pruned from the ``HostView`` walk (``_PRUNE``) and only
+    ``local-private/out/real-boot`` is an explicit root, so a run under
+    ``local-private/acceptance-runs/`` is invisible to every probe while
+    remaining fully resolvable by the runner, which does a plain
+    ``run_dir / ref.path`` and never consults the host view.  It is gitignored,
+    exactly as ``runs/`` was.
+
+    Pruning by directory name instead was considered and rejected: the runner's
+    own ``EVIDENCE_DIRNAME`` is ``"acceptance"``, which is also this package's
+    directory, so pruning it would exclude ``src/unipad/acceptance/`` from every
+    host view.
+
+    ``parents[3]``, not ``parents[2]``: ``__file__`` is
+    ``src/unipad/acceptance/__main__.py``, so ``parents[2]`` is ``src/``.
+    """
+    return Path(__file__).resolve().parents[3] / "local-private" / "acceptance-runs"
+
+
+def _report_refusal(run_id: str, exc: BaseException) -> int:
+    """Report a run that could not be evaluated, without a traceback.
+
+    ``AcceptanceRunner.run()`` raises for the things that are not verdicts --
+    a held lock, a bundle that cannot be written.  Those are refusals to have a
+    verdict, and printing them as one would be the failure mode this whole gate
+    exists to prevent.
+    """
+    from ..errors import UniPadError
+
+    if isinstance(exc, UniPadError):
+        message = "cannot run the gate for %r: %s" % (run_id, exc.message)
+        code = int(exc.exit_code)
+    else:  # a genuine bug: say so, and do not dress it up as a verdict
+        message = "the gate failed while evaluating %r: %s: %s" % (
+            run_id,
+            type(exc).__name__,
+            exc,
+        )
+        code = int(ExitCode.FAILURE)
+    if _ARGS.json:
+        print(json.dumps({"refused": True, "reason": message}, indent=2, sort_keys=True))
+    else:
+        print(message, file=sys.stderr)
+    return code
+
+
+def _suite_summary() -> dict[str, Any] | None:
+    """The pytest summary, when this gate was invoked from a suite run.
+
+    Recorded as simulation-scoped evidence: it says what the *unit* suite did,
+    never what the product did.  ``None`` when there is no summary to record,
+    rather than an empty dict that would read as "a suite ran and found
+    nothing".
+    """
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point.  Returns the process exit code; never raises for a refusal."""
     global _ARGS
@@ -441,7 +570,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(ExitCode.OK)
 
     if args.run:
-        return _refuse_run(args.run)
+        return _run(args.run)
     if args.verify:
         return _verify(args.verify)
 
