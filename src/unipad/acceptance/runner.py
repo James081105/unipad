@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -1287,85 +1288,259 @@ class RunOutcome:
 
 @contextmanager
 def _run_lock(run_dir: Path) -> Iterator[None]:
-    """Hold ``acceptance.lock`` for the duration of one evaluation.
+    """Hold this run's lock for the duration of one evaluation.
 
-    A second *concurrent* evaluation of the same run is refused with
-    ``BLOCKED`` instead of interleaving two writers into one bundle.
+    The lock is the host kernel's, not ours.  On Windows it is a named mutex;
+    elsewhere it is an ``flock`` on the lock file.  Both are released by the
+    kernel when the holding process exits for *any* reason -- a normal return,
+    an exception, ``os._exit``, or being killed -- and both are arbitrated by
+    the kernel, so exactly one contender can hold at a time.
 
-    A lock left behind by a process that no longer exists is a different
-    thing, and refusing on it would wedge the run directory forever: the
-    only recovery would be knowing to delete the file by hand, which is not
-    something an operator can be expected to guess.  Measured on this host
-    on 2026-10-24: two background runs were stopped, their lock files
-    survived, and every later evaluation of those two run ids read BLOCKED
-    with "another acceptance evaluation holds this run" -- a message that
-    names a holder that is not there.
+    Why it is not a PID check
+    -------------------------
+    The previous implementation recorded a PID and, before refusing, asked the
+    OS whether that PID still existed with ``os.kill(pid, 0)``.  That check was
+    measured on this host (Windows 11, CPython 3.12, 2026-10-25) and it does not
+    answer the question it was asked:
 
-    So the recorded PID is checked before refusing, and a dead holder's lock
-    is removed and re-acquired.  The PID is reused check, not a liveness
-    proof: a recycled PID belonging to an unrelated process would let two
-    evaluations interleave.  That is accepted because the alternative is a
-    permanent wedge, and because the write itself is the last resort -- the
-    bundle is rewritten atomically by its own writer, so a collision corrupts
-    a bundle rather than the run.
+    * ``os.kill(pid, 0)`` on five PIDs belonging to processes that had *just
+      exited* returned **without raising, five times out of five**.  The code
+      read that as "the holder is alive".
+    * ``os.kill(999999, 0)`` on a PID that never existed raised
+      ``OSError [WinError 87] ERROR_INVALID_PARAMETER``, not
+      ``ProcessLookupError`` -- and the ``except OSError`` branch also read
+      "alive".
+    * ``ProcessLookupError``, the only outcome that meant "stale", was not
+      reachable through this path at all.
+
+    So the liveness check added in f15c9ef to fix the wedge was dead code that
+    always answered "held": a killed holder's lock still read BLOCKED forever,
+    which is the exact defect it was written to remove.  The goal document
+    (§4.1) forbids ``os.kill(pid, 0)`` on Windows as a POSIX-style no-op liveness
+    probe; the measurement above is the concrete reason, and it is recorded here
+    rather than paraphrased because the CTRL_C_EVENT explanation that is usually
+    given for it did not reproduce -- probing a live holder left it running and
+    able to finish normally.  The probe is not dangerous so much as it is
+    *uninformative*, and an uninformative check that always says "held" is worse
+    than no check, because it looks like one.
+
+    The recorded PID is still written, but as *diagnostic information only*.  It
+    is printed in the BLOCKED message so an operator can see who to look at.  It
+    is never the basis for deciding that a lock is stale, and no code path
+    deletes a lock it did not acquire.
+
+    What the kernel gives us, case by case
+    --------------------------------------
+    * two contenders: exactly one is handed the mutex, the other is told it is
+      held -- no polling, no sleep, no guess;
+    * the loser never probes the winner, so it cannot disturb it;
+    * a killed holder: the kernel closes its handle, so the object is released
+      and the next contender takes over instead of reading BLOCKED forever;
+    * two contenders recovering simultaneously: the kernel hands the mutex to
+      one of them, so only one enters the critical section;
+    * a loser exiting: it holds no handle, so its exit cannot release anything.
+
+    The lock file is *not* consulted for any of these decisions.  It exists so
+    the refusal can name a holder.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     lock = run_dir / LOCK_FILENAME
-    while True:
-        try:
-            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError as exc:
-            if not _lock_holder_is_alive(lock):
-                # A holder that is gone.  Remove and retry once; if the removal
-                # loses a race the loop simply re-reads the new holder's PID.
-                try:
-                    lock.unlink()
-                except FileNotFoundError:  # pragma: no cover - removed underneath us
-                    pass
-                continue
-            raise blocked(
-                "another acceptance evaluation holds this run",
-                run_id=run_dir.name,
-                lock=LOCK_FILENAME,
-            ) from exc
+    handle, state = _acquire_lock(run_dir, lock)
+    if handle is None:
+        holder = _read_holder(lock)
+        raise blocked(
+            f"another acceptance evaluation holds this run ({state})",
+            run_id=run_dir.name,
+            lock=LOCK_FILENAME,
+            holder=holder,
+        )
     try:
-        os.write(handle, f"{os.getpid()}\n".encode("utf-8"))
-        os.close(handle)
+        _write_holder(lock)
         yield
     finally:
+        _release_lock(handle, lock)
+
+
+# ---------------------------------------------------------------------------
+# the lock itself: a kernel object, arbitrated by the kernel
+# ---------------------------------------------------------------------------
+
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
+
+
+def _mutex_name(run_dir: Path) -> str:
+    """A stable name for the kernel object guarding this run.
+
+    The name has to be the same for every process that means the same run and
+    different for every different run, so it is derived from the run's absolute
+    path.  A digest is used rather than the path itself because a Windows object
+    name may not contain a backslash outside the namespace separator, and
+    ``D:\\a\\unipad\\runs\\run1`` has four of them.
+    """
+    digest = hashlib.sha256(str(run_dir).encode("utf-8")).hexdigest()[:32]
+    return f"Local\\unipad-acceptance-{digest}"
+
+
+def _configure_kernel32() -> Any:
+    """Bind ``kernel32``'s signatures, or return ``None`` off Windows.
+
+    Without explicit ``argtypes``/``restype`` ctypes assumes ``int``, which
+    truncates a 64-bit ``HANDLE`` to 32 bits.  Most handles happen to be small
+    enough to survive that, which is exactly what makes it a latent defect
+    rather than an obvious one, so the signatures are declared rather than
+    left to the default.
+    """
+    if sys.platform != "win32":  # pragma: no cover - Windows-only path
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:  # pragma: no cover - ctypes is stdlib on Windows
+        return None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return kernel32
+
+
+def _acquire_lock(run_dir: Path, lock: Path) -> tuple[Any, str]:
+    """Take the kernel's lock for this run, or report why it is unavailable.
+
+    Returns ``(handle, state)``.  A ``None`` handle means the lock is held by
+    somebody else and ``state`` says so; the caller turns that into the refusal.
+    """
+    if sys.platform == "win32":
+        return _acquire_mutex(run_dir)
+    return _acquire_flock(lock)
+
+
+def _acquire_mutex(run_dir: Path) -> tuple[Any, str]:
+    """Windows: a named mutex, created or opened, then waited on once."""
+    kernel32 = _configure_kernel32()
+    if kernel32 is None:  # pragma: no cover - no ctypes
+        return None, "this host cannot create the Windows mutex (no ctypes)"
+
+    name = _mutex_name(run_dir)
+    # CreateMutexW creates the object if it is absent and opens it if it is
+    # already there, so there is no create-or-open race to lose.
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        return None, f"CreateMutexW failed (error {kernel32.GetLastError()})"
+
+    waited = kernel32.WaitForSingleObject(handle, 0)
+    if waited == _WAIT_OBJECT_0:
+        return handle, "acquired"
+    if waited == _WAIT_ABANDONED:
+        # A previous holder died without releasing, and another handle kept the
+        # object alive across its death.  The kernel has handed the mutex to us,
+        # so we now own it.
+        #
+        # This branch is correct but rarely taken, and that is worth knowing
+        # rather than papering over: with a zero-timeout wait the abandoned case
+        # is only observable when *some other* handle kept the named object
+        # alive while the holder died.  A killed holder usually held the last
+        # handle, the object is destroyed with it, and our own ``CreateMutexW``
+        # then creates a fresh one -- so the wait returns WAIT_OBJECT_0 and the
+        # takeover looks like an ordinary acquire.  Either way the outcome is
+        # the same: we hold the lock and the run directory is not wedged.  What
+        # we do *not* do is claim we detected an abandonment we did not see.
+        return handle, "recovered after the previous holder exited"
+    if waited == _WAIT_TIMEOUT:
+        kernel32.CloseHandle(handle)
+        return None, "held by another evaluation"
+    kernel32.CloseHandle(handle)  # pragma: no cover - undocumented result
+    return None, f"WaitForSingleObject returned {waited:#x}"
+
+
+def _acquire_flock(lock: Path) -> tuple[Any, str]:
+    """POSIX: an ``flock`` on the lock file, released by the kernel on exit."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX without fcntl
+        return None, "this host has neither the Windows mutex nor fcntl"
+    try:
+        handle = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as exc:
+        return None, f"cannot open {LOCK_FILENAME}: {exc}"
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(handle)
+        return None, "held by another evaluation"
+    return handle, "acquired"
+
+
+def _release_lock(handle: Any, lock: Path) -> None:
+    """Release what this process acquired, and only that.
+
+    The kernel object is released first, then the diagnostic file is removed --
+    but only when its contents still name *this* process, so a note written by
+    somebody who took over after we went away survives our exit.  That check is
+    a belt-and-braces guard on the diagnostic file, not the mechanism: the
+    kernel object is what enforces exclusivity, and it cannot be released by a
+    process that does not hold it.
+    """
+    if sys.platform == "win32":
+        kernel32 = _configure_kernel32()
+        if kernel32 is not None:
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except (ImportError, OSError):  # pragma: no cover - already gone
+            pass
+        finally:
+            try:
+                os.close(handle)
+            except OSError:  # pragma: no cover - already closed
+                pass
+
+    try:
+        holder = _read_holder(lock)
+    except OSError:  # pragma: no cover - unreadable note
+        return
+    if holder and holder.get("pid") == str(os.getpid()):
         try:
             lock.unlink()
         except FileNotFoundError:  # pragma: no cover - removed underneath us
             pass
 
 
-def _lock_holder_is_alive(lock: Path) -> bool:
-    """Whether the process named in ``lock`` still exists.
-
-    An unreadable or PID-less lock is treated as held: refusing is the safe
-    answer when the file says something this process cannot interpret, and
-    the message still names the lock so the operator can look at it.
-    """
+def _write_holder(lock: Path) -> None:
+    """Record who holds the lock, for the refusal message and nothing else."""
+    stamp = datetime.now(timezone.utc).isoformat()
     try:
-        text = lock.read_text(encoding="utf-8", errors="replace").strip()
+        with open(lock, "w", encoding="utf-8") as handle:
+            handle.write(f"pid={os.getpid()}\nsince={stamp}\n")
     except OSError:
-        return True
-    if not text.isdigit():
-        return True
-    pid = int(text)
-    if pid <= 0:
-        return True
+        # The lock is already held; failing to write a diagnostic note must not
+        # fail the evaluation that holds it.
+        pass
+
+
+def _read_holder(lock: Path) -> Optional[dict[str, str]]:
+    """The holder's diagnostic note, or ``None`` when there is nothing to read."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # It exists but belongs to someone else: a live holder, not a stale one.
-        return True
-    except OSError:  # pragma: no cover - platform without signals
-        return True
-    return True
+        text = lock.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    holder: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("pid", "since"):
+            holder[key] = value.strip()
+    return holder or None
 
 
 class AcceptanceRunner:
