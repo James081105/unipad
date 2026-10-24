@@ -124,6 +124,9 @@ KERNELCACHE_OUTPUT = "kernelcache.macho"
 #: How the board asks for the kernelcache.  ``[ipsw] fetch`` names it.
 FETCH_KERNELCACHE = "KernelCache"
 
+#: How the board asks for the device tree.  Also in ``[ipsw] fetch``.
+FETCH_DEVICETREE = "DeviceTree"
+
 #: Where a chip/board divergence between board.toml and the image is recorded, so
 #: the summary can report it instead of the divergence being swallowed.
 DIVERGENT_IDENTITY: list[dict[str, Any]] = [{}]
@@ -560,6 +563,11 @@ class Acquisition:
     kernelcache_member: str
     components: dict[str, Path]
     verified_components: dict[str, str]
+    #: Keyed by the *component* the board named in [ipsw] fetch ("DeviceTree"),
+    #: not by the member's leaf name ("DeviceTree.j120ap.im4p").  ``components``
+    #: is keyed by leaf because that is how the pins are spelled, and a caller
+    #: asking for the device tree asks for it by component.
+    by_component: dict[str, Path] = field(default_factory=dict)
 
 
 def sha256_file(path: Path) -> str:
@@ -1167,6 +1175,7 @@ def acquire(
         kernelcache_member=member,
         components={Path(entry).name: path for _, (entry, path) in found.items()},
         verified_components=verified,
+        by_component={component: path for component, (_, path) in found.items()},
     )
 
 
@@ -1208,7 +1217,13 @@ def _publish(cache: Path, destination: Path, expected_sha256: str) -> int:
     return destination.stat().st_size
 
 
-def _summary(result: Acquisition, published: Path, published_bytes: int) -> dict[str, Any]:
+def _summary(
+    result: Acquisition,
+    published: Path,
+    published_bytes: int,
+    devicetree: Path | None = None,
+    devicetree_bytes: int = 0,
+) -> dict[str, Any]:
     """The machine-readable record of one acquisition.
 
     Every field is a digest, a size, or a final component -- never a path.  A
@@ -1224,6 +1239,8 @@ def _summary(result: Acquisition, published: Path, published_bytes: int) -> dict
         "kernelcache_bytes": published_bytes,
         "kernelcache_sha256": result.kernelcache_sha256,
         "kernelcache_member": result.kernelcache_member,
+        "devicetree_name": devicetree.name if devicetree else "",
+        "devicetree_bytes": devicetree_bytes,
         "components": sorted(result.components),
         "verified_components": dict(result.verified_components),
     }
@@ -1309,6 +1326,12 @@ def main(argv: list[str] | None = None) -> int:
         help="where to publish the decoded kernelcache Mach-O",
     )
     parser.add_argument(
+        "--devicetree",
+        default=None,
+        help="also publish the board's device tree, so build-devicetree does "
+        "not need the whole 6.8 GB image on disk (build-macos.sh --devicetree)",
+    )
+    parser.add_argument(
         "--image",
         default=None,
         help="an already-downloaded image to verify and unpack instead of "
@@ -1322,6 +1345,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = IpswWorkspace(Path(args.work))
+    devicetree: Path | None = None
+    devicetree_bytes = 0
     try:
         result = acquire(
             Path(args.lock),
@@ -1332,6 +1357,23 @@ def main(argv: list[str] | None = None) -> int:
         published_bytes = _publish(
             result.kernelcache, Path(args.kernelcache), result.kernelcache_sha256
         )
+        # The device tree is published only when asked for, because
+        # build-devicetree is a later milestone's step and a caller that does not
+        # need it should not be handed a file it did not ask for.
+        if args.devicetree:
+            tree = result.by_component.get(FETCH_DEVICETREE)
+            if tree is None:
+                raise UniPadError(
+                    ErrorCode.ARTIFACT_MISSING,
+                    "the board declares no DeviceTree component to publish; "
+                    "board.toml [ipsw] fetch must name %r"
+                    % FETCH_DEVICETREE,
+                    fetch=list(result.components),
+                )
+            devicetree_bytes = _publish(
+                tree, Path(args.devicetree), sha256_file(tree)
+            )
+            devicetree = Path(args.devicetree)
     except UniPadError as exc:
         _print(
             {
@@ -1355,7 +1397,17 @@ def main(argv: list[str] | None = None) -> int:
         workspace.discard_root()
 
     _print(
-        {"ok": True, "error": None, **_summary(result, Path(args.kernelcache), published_bytes)},
+        {
+            "ok": True,
+            "error": None,
+            **_summary(
+                result,
+                Path(args.kernelcache),
+                published_bytes,
+                devicetree,
+                devicetree_bytes,
+            ),
+        },
         args.summary,
     )
     return int(ExitCode.OK)

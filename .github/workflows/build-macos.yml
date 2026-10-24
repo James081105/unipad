@@ -994,6 +994,9 @@ jobs:
           DEVICE_REPO: vendor/UniXNU-qemu
           IPSW_WORK_DIR: ipsw-work
           KERNELCACHE_PATH: ipsw-work/kernelcache.macho
+          # The device tree is extracted in the same pass, so build-devicetree
+          # does not need the whole 6.8 GB image kept alive across the build.
+          DEVICETREE_PATH: ipsw-work/devicetree
           SUMMARY_PATH: ipsw-work/ipsw-summary.json
           # The package lives in src/ and is installed as an editable shim on
           # the development host only -- a GitHub runner has no such shim, so
@@ -1024,6 +1027,11 @@ jobs:
             echo "kernelcache_present=true" >> "$GITHUB_OUTPUT"
           else
             echo "kernelcache_present=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f "$DEVICETREE_PATH" ]; then
+            echo "devicetree_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "devicetree_present=false" >> "$GITHUB_OUTPUT"
           fi
           # The image itself is deleted by the module the moment extraction
           # finishes; what is left here is the published Mach-O and the record.
@@ -1142,6 +1150,7 @@ jobs:
           STAGE_DIR: staged
           BUILD_LOG: macos-build.log
           TOOLCHAIN_CACHE_DIR: ~/.cache/unipad-macos-build
+          DEVICETREE_PATH: ipsw-work/devicetree
           # The published kernelcache, when the IPSW step produced one.  Passed
           # only when it exists: an absent file must reach build-macos.sh as
           # "no --kernelcache", because then build-kernel records not_run with
@@ -1168,6 +1177,12 @@ jobs:
             echo "build: using the extracted kernelcache ($KERNELCACHE_PATH)"
           else
             echo "::notice::no kernelcache was published; build-kernel will record not_run (see the ipsw step)"
+          fi
+          if [ -f "$DEVICETREE_PATH" ]; then
+            kernel_args+=(--devicetree "$DEVICETREE_PATH")
+            echo "build: using the extracted device tree ($DEVICETREE_PATH)"
+          else
+            echo "::notice::no device tree was published; build-devicetree will record not_run (see the ipsw step)"
           fi
           bash scripts/macos/build-macos.sh \
             --experiment "$EXPERIMENT_ID" \
@@ -1588,6 +1603,7 @@ jobs:
               "darwinboot-efi/",
               "boot.json",
               ".dtb",
+              "ipsw-work/devicetree",
               ".fd",
               "artifact-manifest.json",
               "build-report.json",

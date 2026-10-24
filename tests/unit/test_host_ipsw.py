@@ -1075,3 +1075,79 @@ def test_two_matching_identities_are_a_refusal_not_a_guess(tmp_path: Path, stub_
     assert error.details.get("matching_identities") == 2, error.details
     # The refusal lists what the image actually carried.
     assert len(error.details.get("image_identities", ())) == 2, error.details
+
+
+def test_the_cli_publishes_the_device_tree_too(tmp_path: Path, pair, stub_decode) -> None:
+    """The device tree is published only when asked for, and it is real.
+
+    ``--devicetree`` is what lets build-devicetree run without the whole 6.8 GB
+    image being kept alive across the build -- the extraction is the same work
+    either way, since board.toml [ipsw] fetch names "DeviceTree" and
+    BuildManifest.plist resolves it to a member.
+    """
+    image, lock, device = pair
+    cache = tmp_path / "out" / "kernelcache.macho"
+    tree = tmp_path / "out" / "devicetree"
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(cache),
+        "--devicetree", str(tree),
+        "--image", str(image),
+    )
+    assert code == 0, payload
+    assert payload["ok"] is True, payload
+    assert payload["devicetree_name"] == "devicetree", payload
+    assert payload["devicetree_bytes"] == len(b"synthetic devicetree"), payload
+    assert tree.is_file(), payload
+    assert tree.read_bytes() == b"synthetic devicetree", tree
+
+
+def test_the_device_tree_is_not_published_when_not_asked_for(
+    tmp_path: Path, pair, stub_decode
+) -> None:
+    """A caller that does not ask for it is not handed a file it did not request."""
+    image, lock, device = pair
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--image", str(image),
+    )
+    assert code == 0, payload
+    assert payload["devicetree_name"] == "", payload
+    assert payload["devicetree_bytes"] == 0, payload
+
+
+def test_a_board_with_no_devicetree_component_refuses_rather_than_writing_nothing(
+    tmp_path: Path, stub_decode
+) -> None:
+    """A requested publish that cannot be satisfied is a refusal, not a no-op.
+
+    The alternative is a build step handed a path that does not exist, which
+    build-macos.sh would refuse one step later with a message about a missing
+    file rather than about the board's own configuration.
+    """
+    image = _build_image(
+        tmp_path,
+        manifest=_manifest(members={"KernelCache": KERNELCACHE_MEMBER}),
+    )
+    lock, device = _write_declarations(
+        tmp_path, image=image, fetch=("KernelCache",)
+    )
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--devicetree", str(tmp_path / "out" / "devicetree"),
+        "--image", str(image),
+    )
+    assert code != 0, payload
+    assert payload["error"]["code"] == "artifact_missing", payload
+    assert "DeviceTree" in payload["error"]["message"], payload

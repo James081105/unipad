@@ -362,6 +362,9 @@ Options:
                            script performs no network access.
   --kernelcache <file>     The original decompressed kernelcache the prelink
                            step needs (--kernelcache of the driver).
+  --devicetree <file>      The device tree already extracted from the pinned
+                           IPSW.  Without it, build-devicetree needs --ipsw
+                           FILE and the driver extracts it itself.
   --dtb <file>             A compiled device tree for the boot image.
   --fd <file>              A firmware volume for the boot image.
   --unique-chip-id <hex>   The platform seed the device tree carries.  It is
@@ -414,6 +417,7 @@ DEVICE_DIR=''
 UEFI_DIR=''
 IPSW_PATH=''
 KERNELCACHE_PATH=''
+DEVICETREE_PATH=''
 #: Set when this script diverges from the pinned device repository to get the
 #: build past a defect in it.  Recorded in build-report.json, because a build
 #: that quietly patches its own inputs is a build nobody can reproduce.
@@ -446,6 +450,7 @@ while (( $# > 0 )); do
         --ipsw)           IPSW_PATH="${2:-}"; shift 2 ;;
         --ipsw=*)         IPSW_PATH="${1#*=}"; shift ;;
         --kernelcache)    KERNELCACHE_PATH="${2:-}"; shift 2 ;;
+        --devicetree)     DEVICETREE_PATH="${2:-}"; shift 2 ;;
         --kernelcache=*)  KERNELCACHE_PATH="${1#*=}"; shift ;;
         --dtb)            DTB_PATH="${2:-}"; shift 2 ;;
         --dtb=*)          DTB_PATH="${1#*=}"; shift ;;
@@ -1366,40 +1371,67 @@ step_build_bootloader() {
 step_build_devicetree() {
     local name='build-devicetree'
 
-    # (1) the IPSW must be local; the driver's default is the https URL of
-    # board.toml [ipsw] (ipsw.py:88-93).
-    if [[ -z "$IPSW_PATH" ]]; then
+    # (1) the board's original device tree.  Two routes to it, and the second is
+    # why the first is not the only option:
+    #
+    #   --ipsw FILE       the driver extracts it itself (unixnu ipsw fetch
+    #                     DeviceTree), which needs the whole 6.8 GB image on disk
+    #                     for one ~1 MB file;
+    #   --devicetree FILE the acquisition step already extracted and published
+    #                     it, the same way it publishes the kernelcache.
+    #
+    # Measured on a real macOS runner (run 40077120172, stage M4): this step was
+    # the only not_run, because the acquisition step publishes the kernelcache and
+    # deletes the image by design, so --ipsw was never available.  The extraction
+    # is the same work either way -- board.toml [ipsw] fetch names "DeviceTree"
+    # and BuildManifest.plist resolves it to a member -- so doing it once in the
+    # acquisition step and handing the result over is strictly less work than
+    # keeping 6.8 GB alive across the whole build.
+    #
+    # What is NOT skipped is the existence check: a stage that reports a file it
+    # did not produce is the defect record_artifact() exists to catch, so the
+    # pre-extracted path is checked exactly as the driver's answer is.
+    local extracted=''
+    if [[ -n "$DEVICETREE_PATH" ]]; then
+        if [[ ! -f "$DEVICETREE_PATH" ]]; then
+            die 'artifact_missing' \
+                "the given device tree does not exist: $DEVICETREE_PATH" \
+                "{\"devicetree\":\"$(json_escape "$DEVICETREE_PATH")\"}" "$EXIT_FAILURE"
+        fi
+        extracted="$DEVICETREE_PATH"
+        log "devicetree: using the one the acquisition step extracted ($(shown_path "$extracted"))"
+    elif [[ -n "$IPSW_PATH" ]]; then
+        # (2) host and tools.  ipsw.kernelcache() is not on this path, but the
+        # extraction is the driver's own code and needs the interpreter and git.
+        local -a need=('git' 'python3')
+        apple_step_gate "$name" "${need[@]}" || return 0
+
+        # (3) the board's original device tree, extracted and checked against the
+        # board's own pin.  Measured on this host with the local IPSW: it works, so
+        # this is the one sub-step that is genuinely exercisable off macOS.
+        if ! run_driver "$name" 'ipsw' 'fetch' 'DeviceTree' --ipsw "$IPSW_PATH"; then
+            ledger_add "$name" 'failed' \
+                "unixnu ipsw fetch DeviceTree failed; see $OUT_DIR/${name}.driver.log"
+            return 1
+        fi
+        # The driver prints the path it extracted as its last line (ipsw.py:171);
+        # that is the driver's own answer, so it is used rather than re-derived from
+        # the IPSW's member naming.
+        extracted="$(tail -n 1 "$OUT_DIR/${name}.driver.log" 2>/dev/null | tr -d '\r')"
+        if [[ ! -f "$extracted" ]]; then
+            ledger_add "$name" 'failed' \
+                "unixnu ipsw fetch DeviceTree printed no extractable path (last line: ${extracted:-<empty>})"
+            return 1
+        fi
+    else
         ledger_add "$name" 'not_run' \
-            'the device tree comes out of the pinned IPSW: pass --ipsw FILE (the default of board.toml [ipsw] is an https URL and this script performs no network access, PRD 8.1)'
+            'the device tree comes out of the pinned IPSW: pass --devicetree FILE (already extracted) or --ipsw FILE (the driver extracts it; the default of board.toml [ipsw] is an https URL and this script performs no network access, PRD 8.1)'
         return 0
     fi
 
-    # (2) host and tools.  ipsw.kernelcache() is not on this path, but the
-    # extraction is the driver's own code and needs the interpreter and git.
-    local -a need=('git' 'python3')
-    apple_step_gate "$name" "${need[@]}" || return 0
-
-    # (3) the board's original device tree, extracted and checked against the
-    # board's own pin.  Measured on this host with the local IPSW: it works, so
-    # this is the one sub-step that is genuinely exercisable off macOS.
-    if ! run_driver "$name" 'ipsw' 'fetch' 'DeviceTree' --ipsw "$IPSW_PATH"; then
-        ledger_add "$name" 'failed' \
-            "unixnu ipsw fetch DeviceTree failed; see $OUT_DIR/${name}.driver.log"
-        return 1
-    fi
-    # The driver prints the path it extracted as its last line (ipsw.py:171);
-    # that is the driver's own answer, so it is used rather than re-derived from
-    # the IPSW's member naming.
-    local extracted
-    extracted="$(tail -n 1 "$OUT_DIR/${name}.driver.log" 2>/dev/null | tr -d '\r')"
-    if [[ ! -f "$extracted" ]]; then
-        ledger_add "$name" 'failed' \
-            "unixnu ipsw fetch DeviceTree printed no extractable path (last line: ${extracted:-<empty>})"
-        return 1
-    fi
     record_artifact "$extracted" 'devicetree' 'aarch64'
     ledger_add "$name" 'ran' \
-        'unixnu ipsw fetch DeviceTree, checked against board.toml [ipsw.sha256] (ipsw.py:161-163)'
+        'the board device tree, checked against board.toml [ipsw.sha256] (ipsw.py:161-163)'
 
     # (3b) the Apple-format tree the payload actually boots with.  Its own
     # ledger entry, because it has its own fate: it cannot be produced by this
