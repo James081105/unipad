@@ -677,7 +677,14 @@ def boot(
             machine_mib=MEMORY_MIB,
         )
 
-    work = Path(workdir)
+    # Absolute, because QEMU runs with this directory as its cwd and every path
+    # the child is handed has to survive that.  Measured on run 1: a relative
+    # workdir made `screendump` fail with "Could not create
+    # 'local-private\\boot7\\run1\\screen.ppm': No such file or directory" --
+    # QEMU resolved the *relative* filename against the run directory, so it
+    # looked for run1/run1/screen.ppm.  The same class of bug as the relative
+    # firmware path in the argv.
+    work = Path(workdir).resolve()
     work.mkdir(parents=True, exist_ok=True)
     esp = work / "esp"
     staged = stage_esp(inputs, esp, spec)
@@ -797,7 +804,10 @@ def _watch(
             break
         ppm = work / "screen.ppm"
         try:
-            reply = _qmp(qmp_port, "screendump", filename=str(ppm))
+            # The same spelling the argv uses: absolute and forward-slashed.  A
+            # backslash is an escape in a QEMU value and a relative path resolves
+            # against the run directory (see :func:`build_argv`'s ``qpath``).
+            reply = _qmp(qmp_port, "screendump", filename=ppm.resolve().as_posix())
         except (OSError, json.JSONDecodeError) as exc:
             report.qmp_evidence["screendump_error"] = f"{type(exc).__name__}: {exc}"
             continue
