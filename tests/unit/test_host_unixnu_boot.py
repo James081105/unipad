@@ -1207,6 +1207,41 @@ def _already_exited(launched: list[list[str]]):
     return start
 
 
+def _synthetic_device(tmp_path: Path) -> Path:
+    """A ``device_dir`` whose board.toml is present, valid and self-consistent.
+
+    These tests exist to cover the *report* path, which is reached only after
+    ``read_board_payload`` has accepted a board -- so they need a board, and
+    ``REAL_DEVICE`` is not one they can have: ``vendor/`` is git-excluded, so the
+    unit stage runs in a checkout where it does not exist.  Measured on CI
+    2026-10-25 (run 40169385708): three tests died with
+    ``board.toml not found in UniXNU-qemu`` -- they were the only tests in this
+    module that pass a *real* qemu and therefore the only ones that get far
+    enough to need the board, which is why the module's ``real_spec`` fixture
+    and its ``pytest.skip`` never covered them.
+
+    A synthetic board is the right answer rather than depending on ``real_spec``
+    and skipping, because skipping would mean the report path has no coverage
+    anywhere a clean checkout runs -- which is every CI run.  ``dram_size`` is
+    spelled to agree with ``MEMORY_MIB`` because ``boot`` refuses a board that
+    disagrees with the machine, and a test that failed for that reason would
+    prove nothing about the report.
+    """
+    device = tmp_path / "device"
+    device.mkdir(exist_ok=True)
+    (device / "board.toml").write_text(
+        '[payload]\nloader = "driver"\n'
+        f'dram_size = "{ub.MEMORY_MIB * 1024 * 1024:#x}"\n'
+        # ``read_board_adt`` refuses a board with no [payload.adt] table at all,
+        # and a ``chip_id`` is the one key it will not default -- so the minimal
+        # self-consistent board is these three lines.  The hex string carries no
+        # 0x prefix because make-qemu-adt.py reads it with ``int(value, 16)``.
+        '[payload.adt]\nchip_id = "207"\n',
+        encoding="utf-8",
+    )
+    return device
+
+
 def test_boot_builds_a_report_that_says_a_root_volume_was_attached(
     inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1228,7 +1263,9 @@ def test_boot_builds_a_report_that_says_a_root_volume_was_attached(
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"raw os volume, not a UDIF container")
 
-    report = ub.boot(inputs, work, qemu=qemu, device_dir=REAL_DEVICE, root_image=root)
+    report = ub.boot(
+        inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path), root_image=root
+    )
 
     # The failure is the fake's, not the attachment's: QEMU "exited" before QMP
     # answered, which is exactly what this stand-in is for.
@@ -1281,7 +1318,9 @@ def test_boot_without_a_root_volume_says_so_in_the_report(
     monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
     work = tmp_path / "run"
 
-    report = ub.boot(inputs, work, qemu=qemu, device_dir=REAL_DEVICE)
+    report = ub.boot(
+        inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path)
+    )
 
     assert report.root_image is None, report.root_image
     written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
@@ -1305,7 +1344,7 @@ def test_the_cli_prints_which_kind_of_run_it_was(
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"raw os volume")
     base = [
-        "--device", str(REAL_DEVICE),
+        "--device", str(_synthetic_device(tmp_path)),
         "--qemu", str(qemu),
         "--firmware", str(inputs.firmware),
         "--kernel", str(inputs.kernel),
