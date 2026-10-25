@@ -76,6 +76,26 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def is_udif(path: Path) -> bool:
+    """Whether the file ends in a UDIF ``koly`` trailer.
+
+    Sniffed, not inferred from the suffix.  ``.dmg`` does not mean UDIF in an
+    IPSW: ``044-76034-038.dmg`` is 3,303,014,400 bytes of *raw* APFS and carries
+    no trailer at all, while ``044-76040-038.dmg`` is a UDIF container.  A
+    suffix-based heuristic refused the one image that needed no decoding -- which
+    is how the first version of this function behaved, and why it sniffs.
+    """
+    try:
+        size = path.stat().st_size
+        if size <= 512:
+            return False
+        with path.open("rb") as handle:
+            handle.seek(size - 512)
+            return handle.read(4) == b"koly"
+    except OSError:
+        return False
+
+
 def go_decode(source: Path, destination: Path) -> dict:
     """Decode a UDIF container to raw bytes, or raise naming what is missing.
 
@@ -102,9 +122,10 @@ def main() -> int:
                         help="seconds to let the kernel run before the first observation")
     parser.add_argument("--run", type=Path, default=REPO / "local-private/boot9")
     parser.add_argument("--decode-udif", action="store_true",
-                        help="treat --root-image as a UDIF container and decode it first "
-                             "(implied by a .dmg suffix); needs an LZFSE decoder for the "
-                             "OS member, which this host does not have")
+                        help="force UDIF decoding even when the trailer is absent; "
+                             "decoding is otherwise detected by sniffing the koly "
+                             "trailer, and needs an LZFSE decoder for the OS member, "
+                             "which this host does not have")
     args = parser.parse_args()
 
     root = args.root_image.resolve()
@@ -116,7 +137,7 @@ def main() -> int:
     # can be handed the image the IPSW actually ships.  QEMU's format=raw cannot
     # read one, and without this the pinned OS member is unusable even though the
     # volume it contains is exactly the one the kernel waits for.
-    if args.decode_udif or root.suffix.lower() == ".dmg":
+    if args.decode_udif or is_udif(root):
         decoded = args.run / "os-root.raw"
         print(f"{root.name} is a UDIF container; decoding to {decoded.name} ...", flush=True)
         try:
