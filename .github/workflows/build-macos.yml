@@ -1860,6 +1860,46 @@ jobs:
           if [ "${BUILD_PAYLOAD:-0}" = '1' ]; then payload_args+=(--payload); fi
           declare -a uefi_args=()
           if [ -d vendor/uefi-sheng ]; then uefi_args+=(--uefi vendor/uefi-sheng); fi
+          # The owner root chain's two outputs, which only THIS pass can have.
+          #
+          # build-os-root.py:174 is the chain's own last line, and it is the
+          # command it says to run next:
+          #
+          #   unixnu build payload ... --trust-cache {trust} --data-ramdisk {seed}
+          #
+          # where trust is <tree>/build/original-static-system-trust/
+          # original-static-system.bundle (build-os-root.py:139) and seed is
+          # <tree>/.cache/firmware/owner-data/owner-data-1g.dbr
+          # (build-os-root.py:48,96).  The chain's own header says what the
+          # trust cache is for, in the device repository's words
+          # (build-os-root.py:26-27): "Without it AMFI refuses to run launchd
+          # (exit reason namespace 9, EXEC, code 8, SECURITY_POLICY)."
+          #
+          # Neither was passed anywhere, so this pass rebuilt the ESP around a
+          # kernel that can finally mount a root volume and still could not
+          # start a userland.  That is the worst shape this bug could take: it
+          # looks like progress.
+          #
+          # Only when the chain actually produced them.  This step is gated on
+          # os_root_status == 'pass', so they should be there -- but a glob that
+          # silently expands to nothing and a flag that is silently omitted are
+          # the same failure, so the absence is said out loud.
+          declare -a root_args=()
+          root_tree="$(ls -d build-output/unixnu-out/*/tree 2>/dev/null | head -n 1 || true)"
+          trust_cache="$root_tree/build/original-static-system-trust/original-static-system.bundle"
+          data_ramdisk="vendor/UniXNU-qemu/.cache/firmware/owner-data/owner-data-1g.dbr"
+          if [ -f "$trust_cache" ]; then
+            root_args+=(--trust-cache "$trust_cache")
+            echo "build: the owner root chain's trust cache is at $trust_cache ($(wc -c <"$trust_cache" | tr -d ' ') bytes)"
+          else
+            echo "::warning::the owner root chain produced no trust cache at $trust_cache; this payload's kernel cannot exec launchd (build-os-root.py:26-27)"
+          fi
+          if [ -f "$data_ramdisk" ]; then
+            root_args+=(--data-ramdisk "$data_ramdisk")
+            echo "build: the owner root chain's Data ramdisk is at $data_ramdisk ($(wc -c <"$data_ramdisk" | tr -d ' ') bytes)"
+          else
+            echo "::warning::the owner root chain produced no Data ramdisk at $data_ramdisk"
+          fi
           bash scripts/macos/build-macos.sh \
             --experiment "$EXPERIMENT_ID" \
             --stage "$STAGE" \
@@ -1870,6 +1910,7 @@ jobs:
             ${uefi_args[@]+"${uefi_args[@]}"} \
             ${kernel_args[@]+"${kernel_args[@]}"} \
             ${payload_args[@]+"${payload_args[@]}"} \
+            ${root_args[@]+"${root_args[@]}"} \
             2>&1 | tee "$BUILD_LOG"
           finished=$(date -u +%s)
           echo "finished_at=$finished" >> "$GITHUB_OUTPUT"

@@ -228,6 +228,15 @@ class BootInputs:
     #: runner's payload build writes one with the board's exact arguments; a
     #: locally generated one is the fallback when only the pieces are at hand.
     payload_toml: Optional[Path] = None
+    #: The trust cache, staged as ``kernel.macho.trustcache`` beside the kernel.
+    #: Optional because a boot can be run without one -- but not because it is
+    #: unimportant: ``vendor/UniXNU-qemu/scripts/build-os-root.py:26-27`` records
+    #: that without it AMFI refuses to run launchd (namespace 9, EXEC, code 8,
+    #: SECURITY_POLICY), and ``unixnu/payload.py:101`` guards the whole trust
+    #: cache block behind ``if trust:`` with no else, so a payload built without
+    #: one succeeds and produces a guest that cannot start a userland.  A boot
+    #: input set that carries it can say so; one that does not must say that too.
+    trust_cache: Optional[Path] = None
 
     def missing(self) -> list[str]:
         """The paths that do not exist, named by role."""
@@ -238,6 +247,8 @@ class BootInputs:
                 absent.append(f"{role}={safe_location(Path(path))}")
         if self.payload_toml is not None and not Path(self.payload_toml).is_file():
             absent.append(f"payload_toml={safe_location(Path(self.payload_toml))}")
+        if self.trust_cache is not None and not Path(self.trust_cache).is_file():
+            absent.append(f"trust_cache={safe_location(Path(self.trust_cache))}")
         return absent
 
     def to_dict(self) -> dict[str, str]:
@@ -245,6 +256,8 @@ class BootInputs:
                   ("firmware", "kernel", "devicetree", "darwinboot", "unixnu")}
         if self.payload_toml is not None:
             record["payload_toml"] = safe_location(Path(self.payload_toml))
+        if self.trust_cache is not None:
+            record["trust_cache"] = safe_location(Path(self.trust_cache))
         return record
 
 
@@ -410,6 +423,7 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         EFI/UniXNU/Payloads/kernel.macho
         EFI/UniXNU/Payloads/kernel.macho.adt      the QEMU device tree
         EFI/UniXNU/Payloads/DarwinBoot.efi
+        EFI/UniXNU/Payloads/kernel.macho.trustcache      when the run has one
 
     ``QemuRamfb.efi`` is *not* staged: it is a driver the payload build puts on
     the ESP ahead of DarwinBoot to set the frame-buffer geometry
@@ -437,6 +451,18 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         target = esp / relative
         shutil.copyfile(source, target)
         written[relative] = target.stat().st_size
+
+    # The trust cache, at the name the payload step uses
+    # (``unixnu/payload.py:143-144``).  Recorded only when there is one, so a
+    # caller that does not use a trust cache sees exactly the record it saw
+    # before this field existed -- and so the record itself says which kind of
+    # run it was: the key's presence is the answer to "did this boot carry a
+    # trust cache", which is the question that decides whether AMFI will let the
+    # kernel exec launchd (``build-os-root.py:26-27``).
+    if inputs.trust_cache is not None:
+        target = esp / "EFI/UniXNU/Payloads/kernel.macho.trustcache"
+        shutil.copyfile(inputs.trust_cache, target)
+        written["EFI/UniXNU/Payloads/kernel.macho.trustcache"] = target.stat().st_size
 
     if inputs.payload_toml is not None:
         config = Path(inputs.payload_toml).read_text(encoding="utf-8")

@@ -46,6 +46,7 @@ import dataclasses
 import socket
 import struct
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,7 @@ import pytest
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host import unixnu_boot as ub
-from unipad.host.unixnu_boot import BootInputs
+from unipad.host.unixnu_boot import BootInputs, stage_esp
 
 ROOT = Path(__file__).resolve().parents[2]
 REAL_DEVICE = ROOT / "vendor" / "UniXNU-qemu"
@@ -1481,3 +1482,65 @@ def test_the_cli_requires_every_path() -> None:
     with _pytest.raises(SystemExit) as caught:
         ub.main(["--device", "x", "--qemu", "y"])
     assert caught.value.code == 2, caught.value
+
+
+# ---------------------------------------------------------------------------
+# the trust cache
+# ---------------------------------------------------------------------------
+#: The name the payload step gives it, and the only place it is spelled.
+TRUSTCACHE_NAME = "EFI/UniXNU/Payloads/kernel.macho.trustcache"
+
+
+def test_a_trust_cache_is_staged_at_the_name_the_payload_uses(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """The sixth file, and why it is not always there.
+
+    ``unixnu/payload.py:143-144`` copies the trust cache to
+    ``kernel.macho.trustcache`` beside the kernel, and ``build-os-root.py:26-27``
+    records what its absence costs: AMFI refuses to run launchd (namespace 9,
+    EXEC, code 8, SECURITY_POLICY).  A boot input set that has one must stage it
+    under that exact name, because that is the name the loader looks for.
+    """
+    bundle = tmp_path / "original-static-system.bundle"
+    bundle.write_bytes(b"synthetic trust bundle")
+    staged = stage_esp(
+        replace(inputs, trust_cache=bundle), tmp_path / "esp", real_spec
+    )
+    assert staged[TRUSTCACHE_NAME] == bundle.stat().st_size, staged
+    assert (tmp_path / "esp" / TRUSTCACHE_NAME).read_bytes() == b"synthetic trust bundle"
+
+
+def test_a_boot_without_a_trust_cache_stages_the_same_five_files(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """The default is unchanged, and the record says which kind of run it was.
+
+    The key is absent rather than present-with-zero, so a caller that does not
+    use a trust cache sees exactly the record it saw before the field existed --
+    and so the record itself answers "did this boot carry one", which is the
+    question that decides whether the guest can exec launchd at all.
+    """
+    staged = stage_esp(inputs, tmp_path / "esp", real_spec)
+    assert TRUSTCACHE_NAME not in staged, staged
+    assert not (tmp_path / "esp" / TRUSTCACHE_NAME).exists()
+    assert sorted(key for key in staged if key.startswith("EFI/")) == sorted(ESP_FILES), staged
+
+
+def test_a_trust_cache_that_does_not_exist_is_named_by_missing(
+    tmp_path: Path, inputs: BootInputs
+) -> None:
+    """A declared input that is absent is a refusal, not an empty staging.
+
+    ``missing()`` is what ``boot`` checks before it starts QEMU.  A trust cache
+    that was asked for and is not on disk has to land there: silently staging
+    five files would produce a boot that looks complete and cannot start a
+    userland, which is the exact shape of the defect this field exists to close.
+    """
+    absent = tmp_path / "not-there.bundle"
+    # ``safe_location`` names only the final component, by design (PRD 9.2: an
+    # error detail must not carry the drive, the profile or the username), so the
+    # assertion is on the name and not on the whole path.
+    assert replace(inputs, trust_cache=absent).missing() == [
+        "trust_cache=not-there.bundle"
+    ], replace(inputs, trust_cache=absent).missing()

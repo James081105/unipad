@@ -438,11 +438,22 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 
 ### 11.18 本轮新增的未验证项（不得冒充的部分）
 
-- **`qemu_root_defconfig` 内核：仍未构建出来，连续第五轮。** 这一次连链接都没过，所以「空实现之后链接能过」是推断。验证它的 run 尚未触发。
-- **`llvm-objcopy` 丢掉 Mach-O 弱标记：未证实。** 有三组对照证据（同文件另一个可选符号有定义所以不报、五个 `native_ufs_store_*` 在普通 `.o` 里不报、`LegacyDisplayProbe.o` 未 objcopy 所以不报），但没有一次是直接测量 objcopy 前后符号表的弱位。如实记为「当时证据最强的解释」。
+- ~~**`qemu_root_defconfig` 内核：仍未构建出来，连续第五轮。**~~ **〔2026-10-26 已闭合：run 40241617618 报 `stages: ran=7 not_run=0 failed=0 skipped=1`，workflow 自己的回读确认 `the kernel was built from qemu_root_defconfig`。这是本项目第一次构建出带 owner root chain 的内核。最后一轮的修法与内核无关——是一个 heredoc 里的 `
+`（见 11.19）。〕**
+- **`llvm-objcopy` 丢掉 Mach-O 弱标记：未证实。** 有三组对照证据（同文件另一个可选符号有定义所以不报、五个 `native_ufs_store_*` 在普通 `.o` 里不报、`LegacyDisplayProbe.o` 未 objcopy 所以不报），但没有一次是直接测量 objcopy 前后符号表的弱位。如实记为「当时证据最强的解释」。**〔2026-10-26 补：run 40241617618 链接已过，所以这条机制即使为真也不再承重；它仍然是未测量的。〕**
 - **空实现是否会被 `NativeHidInput` 真正调用：未测量。** 设计上会（`&symbol` 现在非空），而空体意味着什么都不发生。要等内核跑起来才能量。
-- **run 40238050858 暴露的 heredoc 缺陷：已修并已有编译门禁，但未在 runner 上复验。** `build-macos.sh` 里喂给解释器的每个 heredoc 现在都会被真编译（`test_build_macos_python_syntax.py`），而该门禁本身只在本机量过。
+- **run 40238050858 暴露的 heredoc 缺陷：已修并已有编译门禁，但未在 runner 上复验。** `build-macos.sh` 里喂给解释器的每个 heredoc 现在都会被真编译（`test_build_macos_python_syntax.py`），而该门禁本身只在本机量过。**〔2026-10-26 已由 run 40241617618 复验：该 run 的第二遍构建没有再现 SyntaxError，且走完了 7 个 stage。〕**
 - **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12 / 11.14 / 11.16。
+
+### 11.19 run 40241617618：内核第一次构建出来，同时暴露出下一层缺口
+
+这一轮的两个事实必须分开记，因为它们一个已证实、一个没有。
+
+**(1) 已证实。** `qemu_root_defconfig` 的内核构建出来了。第二遍构建 `stages: ran=7 not_run=0 failed=0 skipped=1`，`failed=0`；workflow 的回读（`grep -q 'building qemu_root_defconfig'`）确认内核来自 root config。artifact `boot-inputs-40241617618`（260,410,178 字节）已下载到本机。
+
+**(2) 未证实，且是下一层的缺口。** 同一个 run 的日志写着 `payload: no trust cache in the volume (board.toml allows 2)`——而这个 stage 是**成功**的。原因是 `payload.py:99-101`：`trust` 在两个 flag 都缺席时是 `None`，随后 `if trust:` 包住整个校验块且**没有 else**，于是拷贝跳过、`make-qemu-adt.py` 不被告知、payload.json 记 null，卷照写、退出码 0。`build-os-root.py:26-27` 写着代价（AMFI 拒绝 launchd，namespace 9 / EXEC / code 8 / SECURITY_POLICY），同一个脚本的最后一行就是该跑的命令。**所以「payload 阶段从未传过 `--trust-cache` / `--data-ramdisk`」这个缺口此前被构建成功完全掩盖**，而它的形状让它看起来像进展：第二遍围着「终于能挂根卷的内核」重建 ESP，缺这两个 flag 让构建更接近完成、让访客更不可能起来。
+
+**(3) 已做但未在 runner 复验。** `build-macos.sh` 新增两个 flag 并由 `step_build_payload` 转发，workflow 第二遍从 chain 的产出路径取文件传入。测试 `tests/acceptance/test_payload_trust_cache.py` **执行** payload 阶段的 argv 构造区段（stub 掉 `run_driver` 后断言它收到的参数），并执行 workflow 第二遍的 shell（stub 掉 `build-macos.sh` 后断言它收到的参数）。八项反向删除全部验证为红，其中一项的边界如实记录在该测试自己的 docstring 里。**「传进去之后 AMFI 放行 launchd」是设计意图，不是实测。**
 
 ## 11. 结论与下一步
 

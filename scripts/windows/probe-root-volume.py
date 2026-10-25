@@ -2,12 +2,16 @@
 
 What this measures
 ------------------
-Whether a ``qemu_defconfig`` UniXNU kernel enumerates a *second* virtio-blk
-device at all.  That is the question the root-volume blocker reduces to:
-``qemu_root_defconfig`` is ``qemu_defconfig`` plus ``CONFIG_XNU_NATIVE_VIRTIO_BLOCK``
-and the owner root chain, so if this kernel has no block driver then attaching
-the OS volume is not sufficient and the verified-root chain is required, not
-merely sufficient.
+Whether a UniXNU kernel enumerates a *second* virtio-blk device at all.  That is
+the question the root-volume blocker reduces to: ``qemu_root_defconfig`` is
+``qemu_defconfig`` plus ``CONFIG_XNU_NATIVE_VIRTIO_BLOCK`` and the owner root
+chain, so if this kernel has no block driver then attaching the OS volume is not
+sufficient and the verified-root chain is required, not merely sufficient.
+
+Which kernel is measured is ``--inputs``.  The default bundle carries a
+``qemu_defconfig`` kernel; run 40241617618's bundle carries the first kernel ever
+built from ``qemu_root_defconfig``, and that is the one this probe exists to
+measure now that it exists.
 
 The kernel is observed through :mod:`unipad.host.guestobserve` while QEMU is
 still running, which is the only way to read its process list: ``allproc`` is a
@@ -37,6 +41,7 @@ hang, or a hang as a long run.
 Usage
 -----
     python scripts/windows/probe-root-volume.py --root-image PATH [--seconds N]
+        [--inputs BUNDLE] [--devicetree PATH] [--trust-cache PATH] [--run DIR]
 """
 from __future__ import annotations
 
@@ -70,11 +75,33 @@ FIRMWARE = REPO / "local-private/tools/qemu/share/edk2-aarch64-code.fd"
 DEVICE_DIR = REPO / "vendor/UniXNU-qemu"
 #: The boot inputs, from the macOS runner's payload build.  The device tree is
 #: the one exception and is explained at its use site.
+#:
+#: It is an ARGUMENT (``--inputs``) with this as the default, because the bundle
+#: is a per-run artifact: run 40241617618 produced the first kernel built from
+#: ``qemu_root_defconfig``, and a probe whose bundle is a constant cannot measure
+#: that kernel without an edit to this file -- and an edit to a path constant is
+#: exactly the change that gets made without noticing what else in the file
+#: assumes the old bundle.  Which is what happened to KERNEL_SHA below.
 INPUTS = REPO / "local-private/boot7/boot-inputs"
-UNIXNU_EFI = INPUTS / "UniXNU.efi"
-KERNEL = INPUTS / "unixnu-out/qemu/kernel/kernel.macho"
-DARWINBOOT_EFI = (INPUTS / "unixnu-out/qemu/tree/build/darwinboot-efi/build"
-                  / "DarwinBoot/DEBUG_CLANGPDB/AARCH64/DarwinBoot.efi")
+#: The three files this probe needs out of the bundle, as bundle-relative paths.
+#: Kept as data rather than as three module constants so ``--inputs`` can point at
+#: any bundle: a constant computed from INPUTS at import time is a constant, and
+#: a second bundle would need the import re-run.
+UNIXNU_EFI_NAME = "UniXNU.efi"
+KERNEL_NAME = "unixnu-out/qemu/kernel/kernel.macho"
+DARWINBOOT_EFI_NAME = ("unixnu-out/qemu/tree/build/darwinboot-efi/build"
+                       "/DarwinBoot/DEBUG_CLANGPDB/AARCH64/DarwinBoot.efi")
+#: The kernel the observer is told to expect, by digest -- and where that digest
+#: comes from.  It used to be a constant in this file (pinned to boot7's kernel),
+#: which meant every new bundle needed the constant updated by hand, and a stale
+#: constant refuses a legitimate kernel for a reason that reads like corruption.
+#: The bundle's own manifest.json already records the digest of every file it
+#: carries, so the check reads the digest the bundle claims for its own kernel.
+#: That is a stronger check rather than a weaker one: it refuses a kernel that
+#: does not match the bundle it came out of, which is the actual failure mode (a
+#: swapped or truncated kernel), and it cannot go stale.
+MANIFEST_NAME = "manifest.json"
+KERNEL_KEY = "unixnu-out/qemu/kernel/kernel.macho"
 #: Where a generated device tree can be found.  The payload build that would
 #: have written one into the bundle failed on a missing font header, so the
 #: bundle carries none -- its own manifest records the role as ``absent`` --
@@ -83,7 +110,6 @@ DARWINBOOT_EFI = (INPUTS / "unixnu-out/qemu/tree/build/darwinboot-efi/build"
 #: trusted; see verify_adt_matches_board.
 STAGED_ADT = (REPO / "local-private/boot7/run2/esp/EFI/UniXNU/Payloads"
               / "kernel.macho.adt")
-KERNEL_SHA = "9d4b1ab14d74fdfa6afeac12871427e26441cab9f3e2efc97e42b103275643e0"
 
 #: Which board member a given image is, by the digest board.toml [ipsw.sha256]
 #: pins, and what role that member plays.  The digests are read out of the board
@@ -96,6 +122,42 @@ KERNEL_SHA = "9d4b1ab14d74fdfa6afeac12871427e26441cab9f3e2efc97e42b103275643e0"
 #: ``044-76040-038.dmg``.  That is a second, independent defect from the missing
 #: driver, and it was invisible because nothing said which image it was.
 ROLES = {"044-76040-038.dmg": "os", "044-76034-038.dmg": "systemos"}
+
+
+def bundle_kernel_sha(inputs: Path) -> str:
+    """The digest the bundle's own manifest claims for its kernel.
+
+    Read, not hard-coded.  A constant in this file is a constant that knows one
+    bundle: run 40241617618 shipped a different kernel, and the constant would
+    have refused it with a message about a mismatch -- which reads as corruption
+    and is actually a stale expectation.  The manifest is written by the same
+    step that wrote the files, so it is the authority for what this bundle
+    contains, and a kernel that disagrees with it is genuinely suspect.
+
+    A bundle whose manifest is missing, unreadable, or silent about the kernel is
+    a refusal rather than a fallback to "no check": the observer's
+    ``--expected-sha256`` is what makes its symbol resolution mean anything, and
+    running without it would produce a report nobody can trust.
+    """
+    import json
+
+    manifest = inputs / MANIFEST_NAME
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except FileNotFoundError as failure:
+        raise SystemExit(
+            f"{manifest} is absent, so this probe cannot know which kernel this "
+            "bundle carries; refusing rather than observing an unidentified kernel"
+        ) from failure
+    except (OSError, json.JSONDecodeError) as failure:
+        raise SystemExit(f"{manifest} could not be read: {failure}") from failure
+    entry = payload.get(KERNEL_KEY)
+    if not isinstance(entry, dict) or not str(entry.get("sha256", "")).strip():
+        raise SystemExit(
+            f"{manifest} carries no sha256 for {KERNEL_KEY}; refusing rather "
+            "than observing an unidentified kernel"
+        )
+    return str(entry["sha256"]).strip().lower()
 
 
 def board_members() -> dict[str, str]:
@@ -214,12 +276,45 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=8.0,
                         help="seconds to let the kernel run before the first observation")
     parser.add_argument("--run", type=Path, default=REPO / "local-private/boot9")
+    parser.add_argument("--inputs", type=Path, default=INPUTS,
+                        help="the boot-inputs bundle to boot (default: %(default)s)")
+    parser.add_argument("--trust-cache", type=Path, default=None,
+                        help="the owner root chain's trust bundle, staged as "
+                             "kernel.macho.trustcache; without it AMFI refuses "
+                             "launchd (build-os-root.py:26-27)")
+    parser.add_argument("--devicetree", type=Path, default=STAGED_ADT,
+                        help="the Apple-format device tree to boot (default: "
+                             "%(default)s).  It MUST carry the board's "
+                             "root_match_volume_uuid, and it must carry the "
+                             "TrustCache memory-map binding when --trust-cache "
+                             "is given: make-dt.py:162 emits that binding only "
+                             "under its own --trust-cache, so a tree built "
+                             "without one leaves the trust cache file on the "
+                             "ESP unbound and the guest no better off.")
     parser.add_argument("--decode-udif", action="store_true",
                         help="force UDIF decoding even when the trailer is absent; "
                              "decoding is otherwise detected by sniffing the koly "
                              "trailer, and needs an LZFSE decoder for the OS member, "
                              "which this host does not have")
     args = parser.parse_args()
+
+    # The bundle is resolved before anything is read out of it, so a caller that
+    # passes --inputs gets a probe that reads THAT bundle everywhere rather than
+    # in three of the four places.  The device tree is the exception and stays an
+    # argument of its own: it is not in the bundle (see
+    # verify_adt_matches_board), and a probe that took it from --inputs would have
+    # nothing to take.
+    inputs = args.inputs.resolve()
+    for name in (UNIXNU_EFI_NAME, KERNEL_NAME, DARWINBOOT_EFI_NAME):
+        wanted = inputs / name
+        if not wanted.is_file():
+            print(f"boot inputs are incomplete: {wanted} is absent")
+            return 2
+    kernel = inputs / KERNEL_NAME
+    unixnu = inputs / UNIXNU_EFI_NAME
+    darwinboot = inputs / DARWINBOOT_EFI_NAME
+    kernel_sha = bundle_kernel_sha(inputs)
+    print(f"bundle {inputs}; kernel sha256 {kernel_sha[:16]}", flush=True)
 
     root = args.root_image.resolve()
     if not root.is_file() or root.stat().st_size <= 0:
@@ -304,17 +399,32 @@ def main() -> int:
     # boot() takes" was false in exactly the way that matters.  The device tree
     # is the one input whose fresh source is absent, so it is verified against
     # the board rather than trusted.
-    verify_adt_matches_board(STAGED_ADT, board_root_uuid())
+    verify_adt_matches_board(args.devicetree, board_root_uuid())
     inputs = BootInputs(
         firmware=FIRMWARE,
-        kernel=KERNEL,
-        devicetree=STAGED_ADT,
-        darwinboot=DARWINBOOT_EFI,
-        unixnu=UNIXNU_EFI,
+        kernel=kernel,
+        devicetree=args.devicetree,
+        darwinboot=darwinboot,
+        unixnu=unixnu,
         # Deliberately None: stage_esp *generates* unixnu.toml from the board's
         # own spec, which is what makes the board's kernel_args reach the guest.
         payload_toml=None,
+        trust_cache=args.trust_cache,
     )
+    if args.trust_cache is None:
+        print("NOTE: no --trust-cache; this guest's kernel cannot exec launchd "
+              "(AMFI, build-os-root.py:26-27), so a userland marker will not "
+              "appear however far the boot gets")
+    elif b"TrustCache" not in args.devicetree.read_bytes():
+        # The binding is 16 zero bytes under the name TrustCache in the ADT's
+        # memory-map node (make-dt.py:162, emitted only under make-dt.py's own
+        # --trust-cache).  A tree without it is a boot where the trust cache file
+        # is staged and never bound, which is the most misleading shape this
+        # measurement could take: everything looks supplied and nothing is.
+        print("REFUSING: --trust-cache was given but this device tree carries no "
+              "TrustCache binding (make-dt.py:162), so the file would be staged "
+              "and never bound.  Build the tree with --trust-cache.")
+        return 2
     esp = run / "esp"
     print(f"staging the ESP into {esp} ...", flush=True)
     staged = stage_esp(inputs, esp, spec)
@@ -324,7 +434,9 @@ def main() -> int:
     # The sizes come from the copy that just happened rather than from a second
     # stat of a path a later edit could move, and a missing file here is a boot
     # that never reaches the kernel.
-    expected = 5
+    # Five without a trust cache, six with one.  A constant that says five is a
+    # probe that refuses the run it was given.
+    expected = 6 if args.trust_cache is not None else 5
     files = {k: v for k, v in staged.items() if k.startswith("EFI/")}
     if len(files) != expected:
         print(f"stage_esp wrote {len(files)} payload files, expected {expected}: "
@@ -395,8 +507,8 @@ def main() -> int:
             attempts += 1
             code = go.main([
                 "--qmp-port", str(port),
-                "--kernel", str(KERNEL),
-                "--expected-sha256", KERNEL_SHA,
+                "--kernel", str(kernel),
+                "--expected-sha256", kernel_sha,
                 "--serial", str(serial),
                 "--run-id", run.name,
                 "--log", str(kernel_log),

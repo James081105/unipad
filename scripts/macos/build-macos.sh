@@ -452,6 +452,21 @@ Options:
                            FILE and the driver extracts it itself.
   --dtb <file>             A compiled device tree for the boot image.
   --fd <file>              A firmware volume for the boot image.
+  --trust-cache <file>     The owner root chain's trust bundle
+                           (original-static-system.bundle: the static and
+                           System trust caches as one file), forwarded to
+                           'unixnu build payload' as --trust-cache.  Without
+                           it AMFI refuses to run launchd (build-os-root.py:26
+                           records exit reason namespace 9, EXEC, code 8,
+                           SECURITY_POLICY), so a payload built without one
+                           boots a kernel that cannot start a userland.  The
+                           first build pass runs before the chain exists and
+                           so has none; see the note above step_build_payload.
+  --data-ramdisk <file>    The owner root chain's packed Data seed
+                           (owner-data-1g.dbr), forwarded to 'unixnu build
+                           payload' as --data-ramdisk.  Same ordering as
+                           --trust-cache: the chain makes it, so only a pass
+                           that ran after the chain can have one.
   --unique-chip-id <hex>   The platform seed the device tree carries.  It is
                            not stored in any repository (board.toml
                            [payload.adt] unique_chip_id = "required").  Without
@@ -523,6 +538,13 @@ UEFI_DIR=''
 IPSW_PATH=''
 KERNELCACHE_PATH=''
 DEVICETREE_PATH=''
+#: The owner root chain's two outputs the payload stage needs, which nothing
+#: else in this script consumes.  Both are optional here on purpose: the FIRST
+#: build pass runs before the chain exists, so it has neither, and a stage that
+#: was refused for a missing input must record that rather than die.  What they
+#: are for is not optional at all -- see the note above step_build_payload.
+TRUST_CACHE_PATH=''
+DATA_RAMDISK_PATH=''
 #: Set when this script diverges from the pinned device repository to get the
 #: build past a defect in it.  Recorded in build-report.json, because a build
 #: that quietly patches its own inputs is a build nobody can reproduce.
@@ -567,6 +589,10 @@ while (( $# > 0 )); do
         --ipsw=*)         IPSW_PATH="${1#*=}"; shift ;;
         --kernelcache)    KERNELCACHE_PATH="${2:-}"; shift 2 ;;
         --devicetree)     DEVICETREE_PATH="${2:-}"; shift 2 ;;
+        --trust-cache)    TRUST_CACHE_PATH="${2:-}"; shift 2 ;;
+        --trust-cache=*)  TRUST_CACHE_PATH="${1#*=}"; shift ;;
+        --data-ramdisk)   DATA_RAMDISK_PATH="${2:-}"; shift 2 ;;
+        --data-ramdisk=*) DATA_RAMDISK_PATH="${1#*=}"; shift ;;
         --kernelcache=*)  KERNELCACHE_PATH="${1#*=}"; shift ;;
         --dtb)            DTB_PATH="${2:-}"; shift 2 ;;
         --dtb=*)          DTB_PATH="${1#*=}"; shift ;;
@@ -646,7 +672,8 @@ if [[ "$IPSW_PATH" =~ ^https?:// ]]; then
 fi
 # A declared file input that is not a file is a usage error, refused here rather
 # than discovered by the driver halfway through a build.
-for pair in 'kernelcache:'"$KERNELCACHE_PATH" 'ipsw:'"$IPSW_PATH" 'dtb:'"$DTB_PATH" 'fd:'"$FD_PATH_IN"; do
+for pair in 'kernelcache:'"$KERNELCACHE_PATH" 'ipsw:'"$IPSW_PATH" 'dtb:'"$DTB_PATH" 'fd:'"$FD_PATH_IN" \
+            'trust-cache:'"$TRUST_CACHE_PATH" 'data-ramdisk:'"$DATA_RAMDISK_PATH"; do
     label="${pair%%:*}"
     value="${pair#*:}"
     if [[ -n "$value" && ! -f "$value" ]]; then
@@ -2424,6 +2451,42 @@ PY
 # write the volume.  Both are installed here when they are absent, because a
 # macOS runner with Apple's toolchain has neither by default and the step would
 # otherwise fail for a reason that has nothing to do with the build.
+#
+# ---------------------------------------------------------------------------
+# THE TWO FILES THIS STAGE CANNOT DO WITHOUT, AND WHY THEY ARE OPTIONAL HERE
+# ---------------------------------------------------------------------------
+# 'unixnu build payload' takes --trust-cache and --data-ramdisk, and this script
+# did not pass either.  That is not a small omission: build-os-root.py:26-27
+# records what the missing trust cache costs, in the device repository's own
+# words --
+#
+#     build-original-system-trust.py: the original static and System trust caches
+#     as one bundle, the payload's --trust-cache. Without it AMFI refuses to run
+#     launchd (exit reason namespace 9, EXEC, code 8, SECURITY_POLICY).
+#
+# -- and the same script's LAST line (build-os-root.py:174) is the command the
+# chain says to run next:
+#
+#     unixnu build payload ... --trust-cache {trust} --data-ramdisk {seed}
+#
+# So a payload built without them is a volume that boots a kernel which cannot
+# start a userland.  Every acceptance criterion downstream of "launchd is PID 1"
+# sits behind it.
+#
+# They are OPTIONAL ARGUMENTS to this script for one reason only, and it is an
+# ordering reason rather than a judgement about whether they matter: the owner
+# root chain is what PRODUCES them, and it runs BETWEEN the workflow's two build
+# passes.  The first pass therefore has neither and must not be refused for
+# that.  The second pass has both, and a second pass that does not forward them
+# rebuilds the same dead ESP with a kernel that can finally mount a root volume
+# -- which is the worst possible outcome, because it looks like progress.
+#
+# So the shape is: accept the paths, forward them when they are given, and say
+# in the log which of the two the run has.  What the stage must NOT do is
+# invent a trust cache of its own: the chain's static module is pinned by
+# sha256 (build-os-root.py:159-162, da88460e...) and board.toml [payload]
+# trust_cache_sha256 lists the two the board accepts, so a substitute would be
+# refused by payload.py:106 anyway.
 step_build_payload() {
     local name='build-payload'
 
@@ -2640,10 +2703,45 @@ step_build_payload() {
     if [[ -n "$UEFI_DIR" ]]; then
         uefi_args+=(--uefi "$UEFI_DIR")
     fi
-    log "+ unixnu build payload -D $DEVICE_DIR --out $UNIXNU_OUT --kernel $kernel --unique-chip-id <seed sha256 $PLATFORM_SEED_SHA256>${uefi_args:+ ${uefi_args[*]}}"
+    # (4b) the owner root chain's two outputs.  Same shape as --uefi and for the
+    #      same reason: omitted rather than passed empty, so the driver's argv.log
+    #      carries what this run actually had.  The difference from --uefi is
+    #      what their absence MEANS, which is why they get a log line of their
+    #      own -- an ESP built without the trust cache is a volume that boots a
+    #      kernel AMFI will not let exec launchd (build-os-root.py:26-27), and
+    #      that has to be visible in the log rather than inferable from the
+    #      absence of a flag.
+    local -a root_args=()
+    # A counter, not ${#root_args[@]}: macOS ships /bin/bash 3.2 (see the plan
+    # note below), where ${#arr[@]} on an empty array under `set -u` is an
+    # unbound-variable error.  The script's other empty-array expansions use the
+    # ${arr+"${arr[@]}"} form for the same reason; this one needs a COUNT, and a
+    # counter is the version that works everywhere.
+    local root_count=0
+    if [[ -n "$TRUST_CACHE_PATH" ]]; then
+        root_args+=(--trust-cache "$TRUST_CACHE_PATH")
+        root_count=$((root_count + 1))
+    fi
+    if [[ -n "$DATA_RAMDISK_PATH" ]]; then
+        root_args+=(--data-ramdisk "$DATA_RAMDISK_PATH")
+        root_count=$((root_count + 1))
+    fi
+    if (( root_count == 2 )); then
+        log "payload: the owner root chain's trust cache and Data ramdisk are both supplied; this ESP can start a userland"
+    elif (( root_count == 0 )); then
+        # The first pass's normal state.  Recorded rather than silent, because
+        # the same silence on the SECOND pass is the defect this branch exists
+        # to make visible -- and a reader cannot tell the two apart from the
+        # build report alone.
+        log "payload: no trust cache and no Data ramdisk (the owner root chain has not run in this pass); AMFI will refuse launchd from this volume"
+    else
+        log "payload: only one of the trust cache and the Data ramdisk was supplied; see --trust-cache/--data-ramdisk"
+    fi
+    log "+ unixnu build payload -D $DEVICE_DIR --out $UNIXNU_OUT --kernel $kernel --unique-chip-id <seed sha256 $PLATFORM_SEED_SHA256>${uefi_args:+ ${uefi_args[*]}}${root_args:+ ${root_args[*]}}"
     if ! ( export UNIXNU_QEMU_ACCEL="$TARGET"
            run_driver "$name" 'build' 'payload' --kernel "$kernel" --unique-chip-id "$seed" \
-               ${uefi_args+"${uefi_args[@]}"} ); then
+               ${uefi_args+"${uefi_args[@]}"} \
+               ${root_args+"${root_args[@]}"} ); then
         ledger_add "$name" 'failed' "unixnu build payload failed; see $OUT_DIR/${name}.driver.log"
         return 1
     fi
