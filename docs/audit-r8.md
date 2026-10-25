@@ -327,6 +327,27 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **全量套件在 `tests/acceptance` + `tests/unit` 同进程下有一个跨套件污染失败**：`test_doctor_is_structurally_stable_across_invocations` 在全量下红、在 `tests/unit` 单独跑时全绿（2206 tests / 0 failures / 6 skipped）。`run_cli` 是进程内调用 `cli.main`，pytest 按字母序先跑 acceptance 后跑 unit，所以污染来自 acceptance。**哪个键在动尚未查明**（junit 的失败文本在关键处被截断），已派 teammate 定位；在查明之前不得通过「多 pop 一个键」让它变绿——那个测试的契约就是「doctor 里不是测量的部分不得移动」。
 - **`.tmp-bt/`：38 MB teammate 暂存工作区曾让 `test_the_guard_covers_every_shell_script` 在一次内容完全正常的树上变红**（八份 `build-macos.sh` 副本）。已修：该守卫现在把「本仓库」定义成 git 跟踪的内容，暂存目录叫什么都不会再触发；并实测它仍然能在真正新增一个未被点名的脚本时失败并点名。暂存目录本身仍在本仓库内，已要求移出。
 
+### 11.7 第三轮：根链在 runner 上第一次跑到 step 9，阻断是两个固定仓库之间的版本错位（事实 48–49，2026-10-25）
+
+这一轮没有换架构，是把上一轮定位到的 runner 洞（11.5(2)：只跑一遍、不传 `--ipsw`）补上之后，看链到底能跑多远。
+
+**(1) 链第一次真正跑起来，而且跑得很远。** 补了两遍构建 + 第三个 pin（`uefi_sheng` 的 `Font.h`）+ stage 提到 M4 之后，run 40187668943 里 `build-os-root.py` 第一次越过它此前每次死掉的第一个子步。通过的有：`build-storage-abi.py`（真 QEMU 观测一次）、`build-owner-systemos-policy.py`（日志原文 `PASS: original SystemOS signature and every 806400 block verified by real C/RSA`）、`build-verified-root-probe.py`、`NativeVirtioBlock` 与 `NativeRamBlock` 的 verified-root 绑定（各 190 个槽位）、APFS 容器从 32 MiB 长到 1 GiB 并 `fsck_apfs -n -x` 通过（卷 `OwnerData`，UUID `675761EF-5622-4F5B-89DF-4CAD5BA456F6`）、`packed_ramdisk.py`（1,073,741,824 字节 seed → 1,245,328 字节 packed）。第一遍的 `build-kernel` 也真的产出了 `qemu_defconfig` 内核：`kernel.macho` sha256 `412e38386dfb0ef22b22d1436084f001bb627af0e55c39d14beb348cf951d037`、51,859,456 字节；`DarwinBoot.efi` sha256 `f78ad56a6635a71026fee36dc40c0cd74ca60044012438d33ded65eb992055a0`、27,136 字节；`UniXNU.efi` sha256 `59b7aa748848328bc88d363d57180c9faba491eccfd5e7847565e033d4858016`、93,696 字节；`payload.img` sha256 `415594fb5b8393a70fb8ed193e5274ca4efc57c4060062b5fcc229596c5f689e`、201,326,592 字节。第一遍 `stages: ran=8 not_run=1 failed=0`。
+
+**(2) 它死在链的 step 9，而根因不是代码缺陷也不是环境，改代码修不好。** 报错是 `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp:206:59: error: only virtual member functions can be marked 'override'` 与 `:207:13: error: no member named 'getRefreshAttributes' in 'IOMobileFramebufferLegacy'`。逐层查下去：被钉死的设备仓库 `xVanTuring/UniXNU-qemu`（唯一分支、已在尖端 `97b75b1f`）的 `build-native-legacy-display.py` 从一张**固定 slot 表**生成 `OriginalLegacyFramebufferABI.h`，表里没有 slot 301；而 UniXNU 的 gitlink 把 `drivers/NativeMobileDisplay` 钉在 `c031d882`（`feat(display): report the panel refresh rate`），该提交恰好加了 slot 301 的 override。**「把 slot 301 补进生成器」不是可行修法**：同一个脚本的 owned-set 不变量会再拒绝一次（`require(i in (0,1,7,14,84,86,87,141,155,184,188,288,290,296) or i in pure, 'Only qualified own methods and guarded leaves override')`），而设备仓库没有更新的提交可换（`git ls-remote` 只有 `main` 一个分支）。所以子模块回退一个提交到 `eb9c949`，其 override 集合正是生成器声明的那一个。代价只是 `sheng-vsync` 的刷新率上报，由一个本板不传的 boot arg 把守，不在任何 root mount / launchd 路径上。
+
+**(3) 第一次修法放错了位置，是 runner 自己告诉我的。** 只在锁文件里改 sha、并只在链步骤之前强制树里的检出，run 40199915736 于是在 `prepare-sources` 就退出 1：`pinned sources are missing and this script performs no network access, so the upstream driver cannot be allowed to fetch them: submodule:drivers/NativeMobileDisplay`，后面每一步全 skip，构建一次都没被 exercise。原因是 `unixnu fetch` 用**驱动仓库自己的 gitlink 表**初始化模块子模块（`feeds.py:159-165`），而 `offline_missing()` 拿磁盘上的 HEAD 与**锁**比——锁才是权威（PRD 8.1）。所以分歧必须发生在** sources 落地的位置**，即 acquisition 步骤，在 `unixnu fetch` / `unixnu tree` 之后、cross-check 之前；链步骤那份强制保留为第二道幂等保障（它保证的是链真正编译的那份副本，即树里的检出）。
+
+**(4) 两个测试的红色是宿主环境，而分辨它花了一次测量而不是一次猜测。** 全量套件 **3114 tests / 0 failures / 5 skipped**（在没有其他 pytest 进程、树静止的条件下取得；此前每一次全量数字都被并发争用或移动的树污染过）。此前那两个失败与我的改动无关（`_lock_payload()` 把 `submodules` 置空，锁里那一项到不了这两个测试），真实原因有两层且都量过：**WSL 的 Ubuntu 没有 `ext4.vhdx`**（`wsl -l -v` 两个发行版 Stopped，全盘找不到该文件），于是 PATH 上每个 `bash` 都是启动器，`C:\Windows\System32ash.exe` 以 `Bash/Service/CreateInstance/MountDisk/HCS/ERROR_FILE_NOT_FOUND` 退出，脚本一行都没读到，表现出来却是 `build-report.json` 的 `FileNotFoundError`——读起来像「构建脚本坏了」；退到能跑的 Cygwin bash 后撞第二层：pytest 的 `tmp_path` 在 `C:`（5.1 GiB 空闲）而 `DEFAULT_MIN_FREE_GB=8`，脚本以 exit 3 与「5 GiB free, 8 GiB required」拒绝。修法是量出来的：`_bash()` 现在**运行**每个候选而非只解析名字；`_out_dir()` 在默认卷放不下时把输出搬到有空间的卷且**不传 `--min-free-gb`**（8 GiB 门禁仍真实生效）；`_report()` 只在脚本自己报「not enough free space」时具名 skip，其余任何缺报告的情况升级成断言失败。**同一个红色，如果直接放宽门禁或删掉断言，两次都会变绿，而每一次都等于埋掉一条真实契约。**
+
+**(5) 我自己写的第一版测试没有牙齿，已抓出。** 新增的排序断言用 `text.index("apply_submodule_divergences()")` 找调用点，而 `def apply_submodule_divergences():` 里就含这个子串，且定义位于 `run_driver("fetch")` 之上——断言在证明不了任何事的情况下通过。改成匹配调用形式；把调用移到 fetch 之前，它立刻失败（实测）。同轮还有一次：`text.index("cross_check(")` 找到的是定义，改成 `= cross_check(feeds`。
+
+### 11.8 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核与 `os_root_status=pass`：仍未取得。** 显示驱动的 sha 分歧已按上述理由处置并推送（`cbdce24` / `f96e70d`），但验证它的 run（40200941051）在本节撰写时仍在跑，其 `os_root_status` 与第二遍是否构建 `qemu_root_defconfig` **未读**。链在显示之后还有 `build-original-system-trust.py` 一个从未跑过的步骤（它产出 payload 的 `--trust-cache`，缺它 AMFI 会以 `SECURITY_POLICY` 拒绝 launchd）。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 需要的三样东西（能读根的 `qemu_root_defconfig` 内核、OS 根卷镜像、SystemOS 与 trust cache）本机都不全；本机已有的内核全部零命中块存储驱动（事实 40）。
+- **WSL 破损未修，也不该由我修。** `ext4.vhdx` 缺失意味着 PATH 上的 `bash` 全部不可用；两个 `build-macos.sh` 测试靠搬到有空间的卷跑起来了，但这是在 Cygwin bash 下成立的，WSL 恢复后需要复跑一次确认没有分叉。
+- **`drivers/NativeMobileDisplay` 回退一个提交的代价未经实测。** 「只影响 `sheng-vsync` 刷新率上报」是从源码与调用点推出的，不是在访客里量到的；它不影响 root mount / launchd 路径这一结论同样只有静态证据。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
