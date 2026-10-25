@@ -314,6 +314,22 @@ def test_doctor_is_structurally_stable_across_invocations(
         document["data"]["host_inventory"].pop("collected_at_epoch")
         document["data"]["host_inventory"].pop("memory")
         document["data"]["disks"] = [disk["drive"] for disk in document["data"]["disks"]]
+        # ``host_inventory`` carries a second, differently shaped copy of the
+        # same disk measurement -- ``inventory._disk_block`` calls
+        # ``shutil.disk_usage`` per drive letter and rounds free space to 0.1
+        # GiB, a few milliseconds after ``data["disks"]`` measured it.  That is
+        # the same non-determinism ``collected_at_epoch`` and ``memory`` already
+        # are, arriving through the inventory's copy of the list: any other
+        # test writing ~100 MiB between these two invocations moves ``free_gb``
+        # (measured 2026-10-25, ``D:`` 12.5 -> 12.3 on a 200 MiB allocation),
+        # and a drive crossing 10 GiB free adds a ``warning`` key to the record
+        # outright -- 9.5 GiB free produced one.  Reduce it to drive identity,
+        # exactly as ``data["disks"]`` is reduced above.  The record's values
+        # are not being surrendered: ``test_m0_baseline.py`` asserts
+        # ``device``/``size_gb``/``free_gb`` and their types directly.
+        document["data"]["host_inventory"]["disks"] = [
+            disk["device"] for disk in document["data"]["host_inventory"]["disks"]
+        ]
     assert first.document == second.document
 
 
