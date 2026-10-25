@@ -1481,12 +1481,41 @@ jobs:
             echo "::error::no reconstructed refer image under $REFER_DIR; the System trust cache cannot be bundled"
             exit 1
           fi
-          # (3) the tree, and the QEMU the storage-ABI observation boots once.
+          # (3) the tree, the QEMU the storage-ABI observation boots once, and the
+          #     two files that observation needs.  Measured on run 40186682998: the
+          #     chain reached build-storage-abi.py and died with
+          #     "build-output/unixnu-out/qemu/payload/payload.img missing (unixnu
+          #     build payload)" -- a message that names the file and not the cause,
+          #     which is that the job was triggered on the workflow's default
+          #     stage=M2 and plan_steps gates build-bootloader at n>=3, so
+          #     build-payload had nothing to load and recorded not_run.  Checking
+          #     here costs one stat and names the cause before the volumes have
+          #     been moved and the chain has been started.
           tree="$(ls -d "$OUT_ROOT"/*/tree 2>/dev/null | head -n 1 || true)"
           if [ -z "$tree" ]; then
             echo "::error::no assembled build tree under $OUT_ROOT; build-kernel must have run first"
             exit 1
           fi
+          work="$(dirname "$tree")"
+          for wanted in "$work/kernel/kernel.macho" "$work/payload/payload.img"; do
+            if [ ! -f "$wanted" ]; then
+              # not_run and exit 0, not exit 1: the chain did not break, it was
+              #  refused for a missing input, and a failed step would read as the
+              #  former.  The step is continue-on-error either way and the second
+              #  pass keys on os_root_status, so nothing downstream is misled.
+              echo "os_root_status=not_run" >> "$GITHUB_OUTPUT"
+              echo "::error::the chain's first sub-step needs $wanted, which the first build pass did not produce."
+              echo "::error::build-storage-abi.py:18,31 boots that kernel from the payload volume, so the chain cannot start without it."
+              case "$(basename "$wanted")" in
+                kernel.macho)
+                  echo "::error::build-kernel recorded not_run -- see the build-kernel entry in first-pass-build-report.json for its reason." ;;
+                payload.img)
+                  echo "::error::build-payload loads DarwinBoot.efi as a driver, and plan_steps gates build-bootloader at n>=3: a stage below M3 plans a payload stage with no bootloader to load. Trigger this workflow with stage=M3 or later." ;;
+              esac
+              exit 0
+            fi
+            echo "chain: $(basename "$wanted") present ($(wc -c <"$wanted" | tr -d ' ') bytes)"
+          done
           if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
             echo "qemu-system-aarch64 absent; installing it (build-storage-abi.py:18 boots the candidate once)"
             brew install qemu
