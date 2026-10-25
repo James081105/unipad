@@ -441,14 +441,25 @@ UDIF 与否靠**嗅探 `koly` 尾部**判断，不看 `.dmg` 后缀：`044-76034
 - **内核仍然挂不上。** 整个内核日志里检索 `virtio` / `block storage` / `IOMedia` /
   `AppleDiskImage` / `disk0` / `apfs`（`install_apfs_vfs_fs` 之外）/ `GPT` / `partition`，
   **除 `Waiting on` 那一行本身外零命中**——第二个盘从未被枚举成任何 IOMedia。
-  原因是配置而不是运气：`vendor/UniXNU-qemu/configs/qemu_defconfig`（本机四个内核构建全部用它）
+  原因是配置而不是运气：`vendor/UniXNU-qemu/configs/qemu_defconfig`（本机**全部五个**内核构建都用它）
   **没有** `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`；`qemu_root_defconfig` 才加它，并且同时要
   `CONFIG_XNU_VERIFIED_ROOT_PROBE`、`CONFIG_XNU_OWNER_ROOT_AUDIT/TRUST/CACHE_MOUNT/CACHE_STARTUP/
   BOOT_MANIFEST/UNION_SYSTEMOS`、`CONFIG_XNU_NATIVE_RAM_BLOCK`、`CONFIG_XNU_OWNER_DATA_MOUNT`、
   `CONFIG_XNU_NATIVE_LEGACY_DISPLAY`，以及两个在内核步骤之外产出的归档。
-  全盘四个 `kernel.macho` 逐个检索 `NativeVirtioBlock` 等五个串，**全部为 0**（`Libkern` 为 5，
-  证明检索方式有效），所以"换一个已经构建好的内核试试"这条路在本机不存在。
+  全盘 `local-private/**/kernel.macho` 共 24 个文件、按 sha256 去重后 **5 个真构建**（四个 51,859,456
+  字节、一个 46,415,872 字节；其余 13–73 KB 的是占位桩不是内核），逐个检索
+  `NativeVirtioBlock`/`virtio,mmio`/`CONFIG_XNU_NATIVE_VIRTIO_BLOCK`/`VirtioBlock` 四个串，
+  **全部为 0**（对照：`Libkern`=5、`IOMedia`=28、`apfs_module_start`=1，证明检索方式有效），
+  所以"换一个已经构建好的内核试试"这条路在本机不存在。**此处 2026-10-25 更正过一次**：早先写的是
+  "四个"，实际去重是五个——少数一个不会改变结论，但一个数错的计数会让人以为清点做过了。
 - **launchd PID 1 因此从未被观测到。** §1.4 证明的是交接与空闲线程，不是用户态。
 
 **结论：根卷阻断是「需要一个本机不存在的内核配置及其整条 owner 签名链」，
 不是「需要一个本机不存在的镜像」。** 早先"缺的不是镜像而是挂上去"的说法是错的，已在此更正。
+
+**而这个内核配置为什么拿不到，位置在 runner 而不在本机**：runner 的 M2 计划里
+`build-os-root` 就排在 `build-kernel` 前面，而 `build-kernel` 只在 `root_chain_present`
+为真时才换成 `qemu_root_defconfig`；可是 `build-os-root` 要一个**本地** IPSW，workflow
+只调用一次 `build-macos.sh`、从不传 `--ipsw`，它自己的 IPSW 步骤取完 kernelcache 就把
+6.8 GB 镜像删掉了。所以 runner 上 `build-os-root` 恒 `not_run`、无链、内核恒
+`qemu_defconfig`。详见 `docs/implementation-plan.md` 事实 45。
