@@ -442,3 +442,66 @@ def _stub_source() -> str:
 
 
 VENDOR_DRIVER = ROOT / "vendor" / "UniXNU"
+
+def test_the_sink_is_named_in_the_generated_config_not_only_in_the_environment() -> None:
+    """The interface is the generated .config, and that was measured.
+
+    The first attempt exported XNU_EXTRA_LD_ARCHIVES, which
+    build-xnu-4k-baseline.sh:732 does append to the kernel's archives -- and run
+    40229046208 built the archive, logged "buttons sink: libButtonsSink.a
+    built", and still failed the link on the same symbol.  The config's own
+    CONFIG_XNU_EXTRA_LD_ARCHIVES (qemu_defconfig:29 names libLinkStubs.a)
+    becomes that environment variable, so the export was overwritten.
+
+    Two things this pins: the archive is APPENDED to the value the board already
+    carries -- replacing it would drop libLinkStubs.a and trade one
+    undefined-symbol failure for three (_mockfs_mountroot, _mockfs_vfsops,
+    _mockfs_vnodeop_opv_desc, measured on run 40067448940) -- and the naming
+    happens after `unixnu defconfig` has written the file, because the file
+    being edited is the generated one.
+    """
+    helper = _function("name_buttons_sink_in_config")
+    assert "CONFIG_XNU_EXTRA_LD_ARCHIVES=" in helper, (
+        "the helper does not name the config variable the board already uses"
+    )
+    assert "work_dir)/.config" in helper, (
+        "the helper edits something other than the generated out/<device>/.config"
+    )
+    # ...and it appends rather than replaces, which is the whole difference
+    # between adding an archive and dropping one.
+    appended = 'lines[index] = f'
+    assert "line[len(key):]" in helper and appended in helper, (
+        "the helper does not append to the value the board already carries, so "
+        "it would replace libLinkStubs.a"
+    )
+    assert "{value} {relative}" in helper, (
+        "the appended value does not keep the board's own token, so "
+        "libLinkStubs.a would be dropped"
+    )
+    assert "CONFIG_DIVERGENCE" in helper, (
+        "the divergence from the pin is not recorded, so the manifest cannot "
+        "say the generated .config was changed"
+    )
+
+    step = _function("step_build_kernel")
+    defconfig = step.index("run_driver \"$name\" 'defconfig'")
+    sink = step.index("name_buttons_sink_in_config")
+    assert defconfig < sink, (
+        "the button sink is named in the config before `unixnu defconfig` has "
+        "written it, so there is no file to edit"
+    )
+    assert sink < step.index("run_driver \"$name\" 'build' 'kernel'"), (
+        "the button sink is named after the kernel build, which is too late"
+    )
+    # ...and the stub itself is built under the tree, so the config can name it
+    # with the board's own {tree} placeholder rather than a second spelling.
+    stub = _function("build_buttons_sink_stub")
+    assert "tree_dir)/build/buttons-sink" in stub, (
+        "the stub is not built under the tree, so the config cannot name it "
+        "with the {tree} placeholder qemu_defconfig:29 uses"
+    )
+    assert "{tree}/build/buttons-sink/libButtonsSink.a" in helper, (
+        "the config value does not use the board's {tree} placeholder, so it "
+        "is a second spelling of a directory the board already names"
+    )
+

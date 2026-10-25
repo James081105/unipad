@@ -1959,7 +1959,10 @@ step_build_os_root() {
 # an interface the vendor script already exposes for exactly this shape.
 build_buttons_sink_stub() {
     local step="$1"
-    local out="$OUT_DIR/buttons-sink"
+    # Under the tree, not under OUT_DIR, because the config names the archive
+    # with the board's own {tree} placeholder (qemu_defconfig:29) and a second
+    # spelling of the same directory is how the two drift apart.
+    local out="$(tree_dir)/build/buttons-sink"
     local archive="$out/libButtonsSink.a"
     if [[ -f "$archive" ]]; then
         return 0
@@ -2004,6 +2007,71 @@ STUB
         return 1
     fi
     log "buttons sink: $(basename "$archive") built (the optional sink NativeHidInput imports)"
+    return 0
+}
+
+# name_buttons_sink_in_config STEP -- put the stub on the kernel link's archives.
+#
+# THE ENVIRONMENT IS NOT THE INTERFACE, and that was measured rather than
+# assumed.  The first attempt exported XNU_EXTRA_LD_ARCHIVES, which
+# build-xnu-4k-baseline.sh:732 does append to the kernel's archives -- and run
+# 40229046208 built the archive and still failed the link on the same symbol,
+# because the config's own CONFIG_XNU_EXTRA_LD_ARCHIVES (qemu_defconfig:29 names
+# libLinkStubs.a) becomes that environment variable, overwriting the export.
+# The generated out/<device>/.config is therefore where the archive is named.
+#
+# It is APPENDED to the value the board already carries rather than replacing
+# it: replacing it would drop libLinkStubs.a and trade one undefined-symbol
+# failure for three (_mockfs_mountroot, _mockfs_vfsops,
+# _mockfs_vnodeop_opv_desc -- measured on run 40067448940).
+#
+# The file being changed is the generated one `unixnu defconfig` just copied
+# from the board, so this is a divergence from the pin, recorded as one -- the
+# same shape, and the same reasoning, as CONFIG_XNU_BUILD_ARCHIVES=y below: the
+# runner clones vendor/ fresh at the locked commit every run, so a local edit
+# would not survive and committing one would make the pin exist twice.
+name_buttons_sink_in_config() {
+    local step="$1"
+    local config generated archive relative
+    config="$(work_dir)/.config"
+    archive="$(tree_dir)/build/buttons-sink/libButtonsSink.a"
+    if [[ ! -f "$config" ]]; then
+        die 'artifact_missing'             "the generated kernel config $config is absent, so the button sink cannot be named on the link."             "{"config":\"$(json_escape "$config")\"}" "$EXIT_FAILURE"
+    fi
+    if [[ ! -f "$archive" ]]; then
+        die 'artifact_missing'             "the button sink archive $archive is absent; build_buttons_sink_stub did not run."             "{"archive":\"$(json_escape "$archive")\"}" "$EXIT_FAILURE"
+    fi
+    relative="{tree}/build/buttons-sink/libButtonsSink.a"
+    if grep -qF "$relative" "$config"; then
+        return 0
+    fi
+    generated="$("$PY" - "$config" "$relative" <<'PYEDITOR'
+import sys
+from pathlib import Path
+
+config, relative = Path(sys.argv[1]), sys.argv[2]
+key = "CONFIG_XNU_EXTRA_LD_ARCHIVES="
+lines = config.read_text(encoding="utf-8").splitlines()
+for index, line in enumerate(lines):
+    if line.startswith(key):
+        value = line[len(key):].strip().strip('"')
+        if relative in value.split():
+            sys.exit(0)
+        lines[index] = f'{key}"{value} {relative}"'
+        config.write_text("
+".join(lines) + "
+", encoding="utf-8")
+        print(f"config: {key} now also names {relative}")
+        sys.exit(0)
+print(f"config: {key} is not in the generated config, so nothing was appended", file=sys.stderr)
+sys.exit(1)
+PYEDITOR
+)" || {
+        log "buttons sink: $generated"
+        return 1
+    }
+    log "buttons sink: $generated"
+    CONFIG_DIVERGENCE="${CONFIG_DIVERGENCE:+$CONFIG_DIVERGENCE; }$relative appended to CONFIG_XNU_EXTRA_LD_ARCHIVES in the generated .config"
     return 0
 }
 
@@ -2087,11 +2155,6 @@ step_build_kernel() {
     #      to absent, and it is the only lever this repository holds: the
     #      staging that loses the flag and the declaration itself both live in
     #      pinned public repositories.
-    if [[ "$defconfig" == 'qemu_root_defconfig' ]]; then
-        if build_buttons_sink_stub "$name"; then
-            export XNU_EXTRA_LD_ARCHIVES="${XNU_EXTRA_LD_ARCHIVES:+$XNU_EXTRA_LD_ARCHIVES }$OUT_DIR/buttons-sink/libButtonsSink.a"
-        fi
-    fi
     # (3) run.  The defconfig first, because build kernel refuses without it.
     local -a extra=()
     if [[ -n "$KERNELCACHE_PATH" ]]; then extra+=(--kernelcache "$KERNELCACHE_PATH"); fi
@@ -2118,6 +2181,17 @@ step_build_kernel() {
     if ! run_driver "$name" 'defconfig' "$defconfig" ${extra[@]+"${extra[@]}"}; then
         ledger_add "$name" 'failed' "unixnu defconfig $defconfig failed; see $OUT_DIR/${name}.driver.log"
         return 1
+    fi
+
+    # (3b) the optional button sink, AFTER the defconfig and not before it: the
+    #      thing being edited is the generated .config that `unixnu defconfig`
+    #      has just written, so naming the archive earlier would find no file to
+    #      edit.  (The first draft put it here-and-before, and would have died on
+    #      its own artifact_missing.)
+    if [[ "$defconfig" == 'qemu_root_defconfig' ]]; then
+        if build_buttons_sink_stub "$name"; then
+            name_buttons_sink_in_config "$name" || return 1
+        fi
     fi
 
     # (3b) supply the archive opt-in the board's defconfig omits.
@@ -2155,7 +2229,9 @@ step_build_kernel() {
             printf 'CONFIG_XNU_BUILD_ARCHIVES=y\n'
         } >>"$generated_config"
         log "config: added CONFIG_XNU_BUILD_ARCHIVES=y (the board defconfig omits it)"
-        CONFIG_DIVERGENCE='CONFIG_XNU_BUILD_ARCHIVES=y added to the generated .config'
+        # Appended, not assigned: the button sink records its own divergence
+        # above, and an assignment here would erase it from the manifest.
+        CONFIG_DIVERGENCE="${CONFIG_DIVERGENCE:+$CONFIG_DIVERGENCE; }CONFIG_XNU_BUILD_ARCHIVES=y added to the generated .config"
     fi
 
     if ! run_driver "$name" 'build' 'kernel' ${extra[@]+"${extra[@]}"}; then
