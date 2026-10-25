@@ -36,6 +36,8 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
 from unipad.host import guestobserve as go  # noqa: E402
+from unipad.errors import UniPadError  # noqa: E402
+from unipad.host.udif import LzfseDecoder, UdifImage  # noqa: E402
 from unipad.host.unixnu_boot import BootInputs, build_argv, read_board_payload  # noqa: E402
 
 QEMU = REPO / "local-private/tools/qemu/qemu-system-aarch64.exe"
@@ -74,6 +76,17 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def go_decode(source: Path, destination: Path) -> dict:
+    """Decode a UDIF container to raw bytes, or raise naming what is missing.
+
+    No LZFSE decoder is supplied, which is the honest default on this host:
+    Python's standard library has none, and 3415 of the OS member's 3814 chunks
+    are LZFSE.  The refusal says so rather than producing a partial image.
+    """
+    image = UdifImage(source)
+    return image.write_raw(destination, LzfseDecoder())
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -88,12 +101,36 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=8.0,
                         help="seconds to let the kernel run before the first observation")
     parser.add_argument("--run", type=Path, default=REPO / "local-private/boot9")
+    parser.add_argument("--decode-udif", action="store_true",
+                        help="treat --root-image as a UDIF container and decode it first "
+                             "(implied by a .dmg suffix); needs an LZFSE decoder for the "
+                             "OS member, which this host does not have")
     args = parser.parse_args()
 
     root = args.root_image.resolve()
     if not root.is_file() or root.stat().st_size <= 0:
         print(f"root image unusable: {root}")
         return 2
+
+    # A UDIF container is decoded here rather than by the operator, so the probe
+    # can be handed the image the IPSW actually ships.  QEMU's format=raw cannot
+    # read one, and without this the pinned OS member is unusable even though the
+    # volume it contains is exactly the one the kernel waits for.
+    if args.decode_udif or root.suffix.lower() == ".dmg":
+        decoded = args.run / "os-root.raw"
+        print(f"{root.name} is a UDIF container; decoding to {decoded.name} ...", flush=True)
+        try:
+            record = go_decode(root, decoded)
+        except UniPadError as exc:
+            print(f"decode refused ({exc.code}): {exc.message}")
+            print("The OS member's 3415 of 3814 chunks are LZFSE, and Python's "
+                  "standard library has no LZFSE decoder, so a raw image has to be "
+                  "supplied or a decoder written. The raw SystemOS member "
+                  "(044-76034-038.dmg) needs no decoding.")
+            return 3
+        print(f"decoded: {record['size_bytes']} bytes, "
+              f"gpt={record['gpt']}", flush=True)
+        root = decoded
 
     # Name the image against the board's own pins.  A run that attached the wrong
     # member is a run whose negative result means nothing, so the probe says which
