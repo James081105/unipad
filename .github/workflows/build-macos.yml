@@ -1516,6 +1516,82 @@ jobs:
             fi
             echo "chain: $(basename "$wanted") present ($(wc -c <"$wanted" | tr -d ' ') bytes)"
           done
+          # (3b) the display driver's checkout, forced to the commit the lock pins.
+          #
+          #      MEASURED, on run 40187668943 (stage M4), which is the run that got
+          #      further into the owner root chain than any before it: storage-abi,
+          #      both signed policies (806400 SystemOS blocks verified by real
+          #      C/RSA), the verified-root probe, NativeVirtioBlock and NativeRamBlock
+          #      in verified mode, the 1 GiB OwnerData container
+          #      (675761EF-5622-4F5B-89DF-4CAD5BA456F6) and the packed ramdisk all
+          #      passed -- and then the chain died at its step 9 with
+          #
+          #        NativeLegacyDisplay.cpp:206:59: error: only virtual member
+          #          functions can be marked 'override'
+          #        NativeLegacyDisplay.cpp:207:13: error: no member named
+          #          'getRefreshAttributes' in 'IOMobileFramebufferLegacy'
+          #
+          #      `unixnu fetch` initialises drivers/NativeMobileDisplay at the commit
+          #      UniXNU's own gitlink names (c031d882, "feat(display): report the
+          #      panel refresh rate"), but the pinned device repository's
+          #      build-native-legacy-display.py generates
+          #      OriginalLegacyFramebufferABI.h from a fixed slot table with no
+          #      entry for slot 301 -- and then refuses the override anyway:
+          #      "Only qualified own methods and guarded leaves override".  The
+          #      device repository is at its only branch's tip (97b75b1), so there
+          #      is no newer commit to move to; the display submodule has to move
+          #      back.  The lock's `commit` is that commit and `gitlink_commit`
+          #      records what UniXNU actually pins, so the divergence is in one
+          #      auditable place instead of being a silent local edit.
+          #
+          #      Forcing it HERE rather than editing vendor/ is the same reasoning
+          #      as step_build_kernel's CONFIG_XNU_BUILD_ARCHIVES divergence: the
+          #      runner clones vendor/ fresh at the locked commit every run, so a
+          #      local edit would not survive and committing one would make the pin
+          #      exist twice.
+          display_commit="$(python3 -c '
+          import json, sys
+          lock = json.load(open(sys.argv[1], encoding="utf-8"))
+          entry = next((e for e in lock.get("submodules") or []
+                        if e.get("path") == "drivers/NativeMobileDisplay"), None)
+          print((entry or {}).get("commit") or "")
+          ' "$LOCK_PATH")"
+          display_gitlink="$(python3 -c '
+          import json, sys
+          lock = json.load(open(sys.argv[1], encoding="utf-8"))
+          entry = next((e for e in lock.get("submodules") or []
+                        if e.get("path") == "drivers/NativeMobileDisplay"), None)
+          print((entry or {}).get("gitlink_commit") or "")
+          ' "$LOCK_PATH")"
+          if [ -z "$display_commit" ]; then
+            echo "::error::$LOCK_PATH pins no commit for drivers/NativeMobileDisplay, so the display driver the chain compiles is not reproducible."
+            exit 1
+          fi
+          display="$tree/drivers/NativeMobileDisplay"
+          display_head="$(git -C "$display" rev-parse HEAD 2>/dev/null || true)"
+          if [ "$display_head" != "$display_commit" ]; then
+            echo "chain: moving drivers/NativeMobileDisplay from ${display_head:-<absent>} to $display_commit"
+            if [ -n "$display_gitlink" ]; then
+              echo "chain:   $LOCK_PATH records UniXNU's gitlink as $display_gitlink; this is the recorded divergence, not an accident"
+            fi
+            if ! git -C "$display" fetch --depth=1 origin "$display_commit"; then
+              echo "::error::could not fetch drivers/NativeMobileDisplay at $display_commit"
+              exit 1
+            fi
+            git -C "$display" checkout --detach FETCH_HEAD
+          else
+            echo "chain: drivers/NativeMobileDisplay already at $display_commit"
+          fi
+          display_head="$(git -C "$display" rev-parse HEAD)"
+          if [ "$display_head" != "$display_commit" ]; then
+            echo "::error::drivers/NativeMobileDisplay is at $display_head, not the locked $display_commit"
+            exit 1
+          fi
+          if [ ! -f "$display/NativeLegacyDisplay.cpp" ]; then
+            echo "::error::$display_commit carries no NativeLegacyDisplay.cpp"
+            exit 1
+          fi
+          echo "chain: drivers/NativeMobileDisplay $display_commit ($(git -C "$display" log -1 --format=%s))"
           if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
             echo "qemu-system-aarch64 absent; installing it (build-storage-abi.py:18 boots the candidate once)"
             brew install qemu

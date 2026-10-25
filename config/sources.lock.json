@@ -71,7 +71,9 @@
     },
     {
       "path": "drivers/NativeMobileDisplay",
-      "commit": "c031d882b9721d943383d11f66dc4748252ce929"
+      "commit": "eb9c949164826c2e52f2771eac19e4b8bd8a3dae",
+      "gitlink_commit": "c031d882b9721d943383d11f66dc4748252ce929",
+      "commit_note": "MOVED BACK one commit from UniXNU's own gitlink, deliberately and on evidence. Measured on run 40187668943 (stage M4): build-os-root.py reached step 9 for the first time -- storage-abi, both signed policies, the verified-root probe, NativeVirtioBlock/NativeRamBlock verified bindings, the grown 1 GiB OwnerData volume (675761EF-5622-4F5B-89DF-4CAD5BA456F6) and the packed ramdisk all passed -- and then died in build-native-legacy-display.py -> build-arm-driver.py NativeLegacyDisplay with `NativeLegacyDisplay.cpp:206:59: error: only virtual member functions can be marked 'override'` and `:207:13: error: no member named 'getRefreshAttributes' in 'IOMobileFramebufferLegacy'`. The pinned device repository (xVanTuring/UniXNU-qemu 97b75b1f, its only branch, at its tip) generates OriginalLegacyFramebufferABI.h from a fixed slot table that has no entry for slot 301, and its own invariant then refuses the override: `require(i in (0,1,7,14,84,86,87,141,155,184,188,288,290,296) or i in pure, 'Only qualified own methods and guarded leaves override')`. So the device repository is incompatible with c031d882 and with everything after it, and there is no newer device commit to move to. c031d882 is `feat(display): report the panel refresh rate`; eb9c949 is its parent `fix(gop): re-kick the swap queue after each retirement`, whose override set is exactly the one the device repository's generator declares. What is given up is the sheng-vsync refresh-rate report, which is gated on a boot argument this board does not pass and affects no root-mount or launchd path (PRD/Goal 6: the display is not a gate for them). gitlink_commit records what UniXNU b881ac7d actually pins so the divergence is auditable rather than silent; build-macos.yml forces the assembled tree's checkout to `commit` before it runs the chain."
     },
     {
       "path": "drivers/NativeRamBlock",
