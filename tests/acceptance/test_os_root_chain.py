@@ -637,3 +637,136 @@ def test_the_locked_display_driver_overrides_only_declared_slots() -> None:
             "NativeLegacyDisplay.cpp does not override it, so the class cannot "
             "be instantiated"
         )
+
+# ---------------------------------------------------------------------------
+# the refer image the chain's tenth step reads
+# ---------------------------------------------------------------------------
+def _closing_fi(lines: list[str], opening: int) -> int:
+    """The ``fi`` that closes the ``if`` starting at or after ``opening``."""
+    return next(i for i in range(opening, len(lines)) if lines[i].strip() == "fi")
+
+
+def _refer_block() -> str:
+    """The chain step's refer-path resolution, exactly as the shell reads it.
+
+    Extracted from the workflow rather than retyped, so the assertion below is
+    about the code the runner executes.  A retyped copy would keep passing
+    after the runner's version drifted, which is the failure mode this whole
+    file exists to prevent.
+
+    Both shapes are extracted -- with and without the absolute-isation -- so the
+    test is about the PATH the step computes and not about whether a particular
+    guard happens to be present.  The first draft demanded the guard's exact
+    spelling and therefore failed with ``StopIteration`` on the unfixed
+    workflow, which proves the extractor is brittle and nothing about the
+    defect.
+    """
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if 'refer="$(ls "$REFER_DIR"/*.ipsw' in line
+    )
+    empty = next(i for i in range(start, len(lines)) if '[ -z "$refer" ]' in lines[i])
+    ranges = [(start, _closing_fi(lines, empty))]
+    # Whatever follows the empty-check: the absolute-isation and its own guard,
+    # when the workflow has them.  Comments are skipped so the reason they give
+    # is not read as code; the first line that is neither a comment nor about
+    # ``refer`` ends the block.
+    cursor = ranges[0][1] + 1
+    while cursor < len(lines):
+        line = lines[cursor]
+        if line.strip() == "" or line.lstrip().startswith("#"):
+            cursor += 1
+            continue
+        if "refer=" not in line and '[ ! -f "$refer" ]' not in line:
+            break
+        ranges.append((cursor, _closing_fi(lines, cursor)))
+        cursor = ranges[-1][1] + 1
+    return "\n".join("\n".join(lines[begin : end + 1]) for begin, end in ranges)
+
+
+def test_the_chain_hands_build_os_root_an_absolute_refer_path(tmp_path: Path) -> None:
+    """The refer path must be absolute, because the module resolves it from the tree.
+
+    Measured on run 40203832707 -- the run that took nine of the chain's ten
+    steps to PASS for the first time (storage-abi, both policies, 1483785 OS
+    blocks and 806400 SystemOS blocks verified by real C/RSA, the verified-root
+    probe, both block drivers in verified mode, the 1 GiB owner data, and the
+    whole display/GOP/HID audit) and then died on the tenth with::
+
+        FileNotFoundError: [Errno 2] No such file or directory:
+          '.../build-output/unixnu-out/qemu/tree/refer/iPad_Pro_HFR_...ipsw'
+
+    ``build-os-root.py`` runs ``cd "$tree"`` first and then does
+    ``ipsw.symlink_to(Path(args.ipsw).resolve())``, so a workspace-relative
+    ``--ipsw`` becomes a symlink pointing at ``<tree>/ipsw-work/refer/...`` --
+    a path that does not exist.  The traceback names the *symlink*, so it reads
+    as a missing refer image when the image was there the whole time.
+
+    The same relative path is handed to ``extract-target-volume.py``, so this
+    also covers the two volumes' extraction on a run that starts with an empty
+    ``.cache`` -- which this run skipped only because the volumes were already
+    on disk.
+    """
+    block = _refer_block()
+
+    workspace = tmp_path / "work"
+    refer_dir = workspace / "ipsw-work" / "refer"
+    refer_dir.mkdir(parents=True)
+    image = refer_dir / "iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+    image.write_bytes(b"not an IPSW; the path is what is under test\n")
+    # The build tree, which is the cwd build-os-root.py runs from and therefore
+    # the base its Path(args.ipsw).resolve() is relative to.
+    tree = workspace / "build-output" / "unixnu-out" / "qemu" / "tree"
+    tree.mkdir(parents=True)
+
+    script = tmp_path / "refer.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        'REFER_DIR="ipsw-work/refer"\n'
+        + block
+        + "\nprintf '%s\\n' \"$refer\"\n",
+        encoding="utf-8",
+    )
+    # The step's own cwd is the workspace: that is where REFER_DIR resolves.
+    # The TREE is where the module runs, and the two are not the same place --
+    # which is the entire defect.
+    result = subprocess.run(
+        [_bash(), str(script)], cwd=workspace, capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        "the step's own refer block did not run:\n"
+        + (result.stdout + result.stderr)[-2000:]
+    )
+    printed = result.stdout.strip().splitlines()[-1]
+
+    assert os.path.isabs(printed), (
+        f"the refer path is workspace-relative ({printed!r}).  build-os-root.py "
+        "does `Path(args.ipsw).resolve()` from inside the build tree, so a "
+        "relative --ipsw becomes a symlink pointing at "
+        "<tree>/ipsw-work/refer/... -- a path that does not exist -- and "
+        "build-original-system-trust.py then fails with FileNotFoundError "
+        "naming the symlink rather than its target.  Measured on run "
+        "40203832707."
+    )
+    assert Path(printed).name == image.name, (
+        f"the refer path names {Path(printed).name!r}, not the lock's "
+        f"{image.name!r}; build-original-system-trust.py hard-codes that name"
+    )
+    # The invariant the traceback was actually reporting, and the reason the
+    # absolute form matters: the path has to name a real file *from the tree*,
+    # because that is the cwd the module resolves it against.  Bash does the
+    # stat, so this holds on every host the workflow can run on -- a Python
+    # comparison of two absolute spellings does not, because a Cygwin `pwd` and
+    # a Windows `Path` describe the same file differently.
+    stat = subprocess.run(
+        [_bash(), "-c", 'test -f "$1"', "_", printed],
+        cwd=tree,
+        capture_output=True,
+        text=True,
+    )
+    assert stat.returncode == 0, (
+        f"{printed!r} is not a file when stat'ed from the build tree, which is "
+        "where build-os-root.py runs and resolves --ipsw.  Its refer symlink "
+        "would dangle and its tenth step would fail naming the symlink, not "
+        "the target (measured on run 40203832707)."
+    )

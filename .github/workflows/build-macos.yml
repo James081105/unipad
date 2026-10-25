@@ -1571,6 +1571,35 @@ jobs:
             echo "::error::no reconstructed refer image under $REFER_DIR; the System trust cache cannot be bundled"
             exit 1
           fi
+          # Absolute, because build-os-root.py resolves --ipsw against its OWN
+          # cwd -- and it runs from the build tree, not from the workspace.
+          #
+          # MEASURED on run 40203832707, which is the run that got nine of the
+          # chain's ten steps to pass for the first time (storage-abi, both
+          # policies -- 1483785 OS blocks and 806400 SystemOS blocks verified by
+          # real C/RSA -- the verified-root probe, both block drivers in verified
+          # mode, the 1 GiB owner data, and the whole display/GOP/HID audit) and
+          # then died on the tenth with
+          #
+          #   FileNotFoundError: [Errno 2] No such file or directory:
+          #     '.../build-output/unixnu-out/qemu/tree/refer/iPad_Pro_HFR_...ipsw'
+          #
+          # The step passed `--ipsw ipsw-work/refer/...` -- workspace-relative --
+          # and the module did `ipsw.symlink_to(Path(args.ipsw).resolve())` from
+          # inside the tree, so the symlink it created pointed at
+          # `<tree>/ipsw-work/refer/...`, a path that does not exist.  The
+          # message names the symlink, not the target, so it reads as a missing
+          # refer image when the image was there the whole time.
+          #
+          # The same relative path is handed to extract-target-volume.py, so
+          # this also fixes the two volumes' extraction on a run that starts
+          # with an empty .cache.  `cd ... && pwd` rather than realpath, which
+          # is not in every macOS image the runner may use.
+          refer="$(cd "$(dirname "$refer")" && pwd)/$(basename "$refer")"
+          if [ ! -f "$refer" ]; then
+            echo "::error::$refer is not a file; the System trust cache cannot be bundled"
+            exit 1
+          fi
           # (3) the tree, the QEMU the storage-ABI observation boots once, and the
           #     two files that observation needs.  Measured on run 40186682998: the
           #     chain reached build-storage-abi.py and died with

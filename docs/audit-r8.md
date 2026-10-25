@@ -348,6 +348,26 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **WSL 破损未修，也不该由我修。** `ext4.vhdx` 缺失意味着 PATH 上的 `bash` 全部不可用；两个 `build-macos.sh` 测试靠搬到有空间的卷跑起来了，但这是在 Cygwin bash 下成立的，WSL 恢复后需要复跑一次确认没有分叉。
 - **`drivers/NativeMobileDisplay` 回退一个提交的代价未经实测。** 「只影响 `sheng-vsync` 刷新率上报」是从源码与调用点推出的，不是在访客里量到的；它不影响 root mount / launchd 路径这一结论同样只有静态证据。
 
+### 11.9 第四轮：根链十步里九步第一次全过，第十步死于一个工作区相对路径（事实 50，2026-10-25）
+
+这一轮只改了一处，而它是上一轮那个版本错位修好之后**露出来的下一个洞**。`build-os-root.py` 的十个子步里，此前每次都在 step 9 死；step 9 通过之后，第一次看见了 step 10。
+
+**(1) step 9 真的过了，而且连带整条显示链都过了。** run 40203832707：`NativeLegacyDisplay: -Werror build and actual ARM64/iOS 17 object audit passed`，`NativeHidInput` / `NativeKeyStoreEvents` / `NativeGOPPresenter` 同样通过，`PASS: original Legacy has 358 slots with nine abstract leaves`，`Built genuine original Legacy inheritance/dispatch; seven backend leaves still guarded, runtime lifecycle unqualified`。连同此前已过的步骤，十步里九步成立：storage-abi（190 槽 / 176 绑定）、VerifiedRoot 主机校验（7 组真实 RSA）、OS 策略（**1,483,785 块**）、SystemOS 策略（**806,400 块**）、verified-root probe、两个 verified 块驱动、1 GiB OwnerData 与 packed ramdisk。
+
+**(2) step 10 报的是 `FileNotFoundError`，而它指认的对象不是原因。** 报错指着 `<tree>/refer/iPad_Pro_HFR_...ipsw`，读起来是「refer 镜像不见了」。真相是：workflow 的 (2) 段用 `ls "$REFER_DIR"/*.ipsw` 取路径，`$REFER_DIR` 是工作区相对的；`build-os-root.py:166` 做 `ipsw.symlink_to(Path(args.ipsw).resolve())`，而这一步的 cwd 是**树**（`cd "$tree" && python3 scripts/build-os-root.py`），于是相对路径被解析到 `<tree>/ipsw-work/refer/...`。镜像一直在 `ipsw-work/refer/`，只是**两个目录不是同一个地方**。
+
+**(3) 这个缺陷还盖住了另一件事。** 同一个相对路径也喂给 `extract-target-volume.py`。这一遍没在抽取两个卷时失败，只是因为卷已经在 `.cache` 里（上一遍留下的）；一个从空 `.cache` 开始的 run 会在更早的地方以同一个根因死。修成绝对路径同时盖住两者。
+
+**(4) 修法与它的测试。** workflow 在把 `refer` 交给模块之前把它变成绝对路径（`cd "$(dirname ...)" && pwd`，不用 `realpath`——不是每个 runner 镜像都有），并加一条「不是文件就拒绝」的守卫。测试 `test_the_chain_hands_build_os_root_an_absolute_refer_path` 从 workflow 里**抽出那段 shell 本身**而不是重打一份，在临时工作区里跑它，再按模块的做法从树里 `stat` 结果。两个方向都量过：修好后 passed；退回 HEAD 后 `AssertionError: the refer path is workspace-relative ('ipsw-work/refer/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw')`。
+
+**(5) 这个测试的第一版没有牙齿，而坏法值得记。** 它要求 `[ ! -f "$refer" ]` 那行守卫的确切拼写，于是未修复的 workflow 上以 `StopIteration` 失败——证明的是抽取器很脆，与缺陷无关。改成两种形状都抽（有或没有绝对化）之后，失败才落在缺陷本身。这与 11.7(5) 是同一类错误：**一个测试因为自己的前提不满足而红，和因为它守的契约被破坏而红，是两回事**，而前者比没有测试更危险，因为它看起来在工作。
+
+### 11.10 本轮新增的未验证项（不得冒充的部分）
+
+- **`os_root_status=pass` 与 `qemu_root_defconfig` 内核：仍未取得。** run 40203832707 的 step 14 成功但未发出 `pass`，step 15/16 因此被跳过。链的十个子步里没有更多未跑过的步骤（step 10 是最后一步），所以路径修好之后这一遍应当直接给出 `pass`——**但这是推断，不是测量**，验证它的 run 尚未触发。
+- **`XNU_OWNER_DATA_VOLUME_UUID` 在容器从 32 MiB 长到 1 GiB 之后是否仍然有效：未经核对。** `prepare-owner-data-fixture.py` 写下的 `seed.json` 记的是 32 MiB 容器的 UUID（本轮实测 `18AF0FFB-77A7-4878-B999-70DD8B4076DC`），而 1 GiB 容器是之后由 `packed_ramdisk.py` 产出的；`build-macos.sh:1959` 从 `seed.json` 读 UUID 并导出。若增长过程换了 UUID，内核会嵌入一个过时的值——下一遍的日志（`build-macos.sh:1873`）会把它打出来，届时核对，现在不下结论。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8，这一轮没有推进它，因为前置物（能读根的 `qemu_root_defconfig` 内核）还没有造出来。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
