@@ -141,24 +141,47 @@ def _with_trailer(path: Path, **fields: int) -> Path:
     blob = bytearray(path.read_bytes())
     base = len(blob) - TRAILER_SIZE
     for name, value in fields.items():
-        offset = {"xml_offset": 216, "xml_length": 224}[name]
+        offset = {"xml_offset": 216, "xml_length": 224, "data_fork_length": 32}[name]
         struct.pack_into(">Q", blob, base + offset, value)
     path.write_bytes(bytes(blob))
     return path
 
 
-def _simple(path: Path) -> Path:
-    """A two-entry image whose second entry starts at sector 8.
+def _declare(path: Path, entry_index: int, sectors: int) -> Path:
+    """Overwrite one blkx entry's declared ``SectorCount`` (header offset 16).
 
-    Sector 8 is the whole point: a parser that reads a chunk's relative sector
-    as absolute writes the second entry's payload at the wrong offset, and the
-    resulting image is the right size with the wrong bytes.
+    Used to build images whose chunk table does *not* tile what the header
+    claims, which is the case :meth:`UdifImage._verify_coverage` exists for.
+    """
+    def mutate(plist) -> None:
+        blob = bytearray(plist["resource-fork"]["blkx"][entry_index]["Data"])
+        struct.pack_into(">Q", blob, 16, sectors)
+        plist["resource-fork"]["blkx"][entry_index]["Data"] = bytes(blob)
+
+    return _build(path, [(0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)])], mutate=mutate)
+
+
+def _simple(path: Path) -> Path:
+    """A two-entry image: one sector, then an entry at sector 1 with three chunks.
+
+    Two properties, each load-bearing.
+
+    * The second entry starts at **sector 1**, not 0, and its chunks carry
+      relative sectors 0, 1 and 2.  A parser that uses the relative number
+      writes payload ``B`` at sector 0 -- on top of ``A`` -- and ``C`` at sector
+      2, inside the first entry's range.  The image is then the right size with
+      the wrong bytes.
+    * The four sectors **tile exactly**: 0, then 1, 2, 3.  An earlier version of
+      this fixture started the second entry at sector 8, leaving sectors 1-7
+      uncovered, and the coverage check added alongside it refused the fixture
+      -- correctly.  A fixture that does not tile cannot exercise a writer whose
+      whole job is to place bytes by offset.
     """
     return _build(
         path,
         [
             (0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)]),
-            (8, [(CHUNK_RAW, 0, 1, 0, b"B" * SECTOR),
+            (1, [(CHUNK_RAW, 0, 1, 0, b"B" * SECTOR),
                  (CHUNK_ZERO_FILL, 1, 1, 0, b""),
                  (CHUNK_RAW, 2, 1, 0, b"C" * SECTOR)]),
         ],
@@ -170,12 +193,12 @@ def _simple(path: Path) -> Path:
 # ---------------------------------------------------------------------------
 def test_the_trailer_and_the_chunk_tables_are_read(tmp_path: Path) -> None:
     image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
-    assert image.raw_size == 11 * SECTOR, image.raw_size
-    assert image.sector_count == 11, image.sector_count
+    assert image.raw_size == 4 * SECTOR, image.raw_size
+    assert image.sector_count == 4, image.sector_count
     assert len(image.entries) == 2, image.entries
     first, second = image.entries
     assert (first.sector, first.sector_count) == (0, 1), first
-    assert (second.sector, second.sector_count) == (8, 3), second
+    assert (second.sector, second.sector_count) == (1, 3), second
     assert len(second.chunks) == 3, second.chunks
 
 
@@ -190,9 +213,9 @@ def test_a_chunks_sector_is_absolute_not_relative(tmp_path: Path) -> None:
     """
     image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
     sectors = [chunk.sector for chunk in image.entries[1].chunks]
-    assert sectors == [8, 9, 10], sectors
+    assert sectors == [1, 2, 3], sectors
     offsets = [chunk.byte_offset for chunk in image.entries[1].chunks]
-    assert offsets == [8 * SECTOR, 9 * SECTOR, 10 * SECTOR], offsets
+    assert offsets == [1 * SECTOR, 2 * SECTOR, 3 * SECTOR], offsets
 
 
 def test_the_terminator_is_not_a_chunk(tmp_path: Path) -> None:
@@ -225,13 +248,13 @@ def test_raw_and_zero_fill_decode_without_a_decoder(tmp_path: Path) -> None:
     image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
     destination = tmp_path / "out.raw"
     record = image.write_raw(destination, LzfseDecoder())
-    assert record["size_bytes"] == 11 * SECTOR, record
+    assert record["size_bytes"] == 4 * SECTOR, record
     data = destination.read_bytes()
-    assert len(data) == 11 * SECTOR, len(data)
+    assert len(data) == 4 * SECTOR, len(data)
     assert data[0:SECTOR] == b"A" * SECTOR, data[:16]
-    assert data[8 * SECTOR : 9 * SECTOR] == b"B" * SECTOR, data[8 * SECTOR : 24]
-    assert data[9 * SECTOR : 10 * SECTOR] == b"\0" * SECTOR, "zero-fill"
-    assert data[10 * SECTOR : 11 * SECTOR] == b"C" * SECTOR, data[10 * SECTOR : 26]
+    assert data[1 * SECTOR : 2 * SECTOR] == b"B" * SECTOR, data[SECTOR : SECTOR + 24]
+    assert data[2 * SECTOR : 3 * SECTOR] == b"\0" * SECTOR, "zero-fill"
+    assert data[3 * SECTOR : 4 * SECTOR] == b"C" * SECTOR, data[3 * SECTOR : 26]
 
 
 def test_a_supplied_lzfse_decoder_is_used_and_checked(tmp_path: Path) -> None:
@@ -525,9 +548,18 @@ def test_every_chunk_that_needs_no_library_matches_the_independent_decode() -> N
             if chunk.type not in (CHUNK_RAW, CHUNK_ZERO_FILL):
                 continue
             produced = image.chunk_bytes(chunk, decoder)
+            # Read a *fixed* number of bytes, not len(produced).  An earlier
+            # version read len(produced), which for a zero-fill chunk that
+            # returned b"" read zero bytes and compared b"" == b"" -- a pass.
+            # Mutating the zero-fill codec to return b"" kept all 25 tests
+            # green, so the codec was entirely unverified while the docstring
+            # claimed the opposite.
             ground.seek(chunk.byte_offset)
-            expected = ground.read(len(produced))
+            expected = ground.read(chunk.byte_length)
             checked += 1
+            if len(produced) != chunk.byte_length:
+                mismatched += 1
+                continue
             if produced != expected:
                 mismatched += 1
     assert checked == 399, checked
@@ -559,3 +591,219 @@ def test_the_real_os_image_parses_the_same_way() -> None:
     assert INDEPENDENT_DECODE.stat().st_size == image.raw_size, (
         INDEPENDENT_DECODE.stat().st_size, image.raw_size
     )
+
+# ---------------------------------------------------------------------------
+# what the writer refuses to produce
+# ---------------------------------------------------------------------------
+def test_a_gap_in_the_chunk_table_is_refused(tmp_path: Path) -> None:
+    """Sectors no chunk declares stay zero, and nothing would say so.
+
+    Chunks are written by offset, so a gap is invisible in the output: the file
+    is exactly the right size, the bytes that *are* written are right, and the
+    undeclared sectors read as zeros.  ``check_gpt`` cannot help -- it returns
+    ``None`` for an image with no GPT, which is this case.
+    """
+    path = _declare(tmp_path / "gap.dmg", 0, 5)
+    image = UdifImage(path)
+    assert image.raw_size == 5 * SECTOR, image.raw_size
+    with pytest.raises(UniPadError) as caught:
+        image.write_raw(tmp_path / "out.raw", LzfseDecoder())
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "stops short" in caught.value.message, caught.value
+    assert not (tmp_path / "out.raw").exists(), "a refused write must leave nothing"
+
+
+def test_two_chunks_claiming_one_sector_is_refused(tmp_path: Path) -> None:
+    """The later chunk would silently overwrite the earlier."""
+    path = _build(
+        tmp_path / "overlap.dmg",
+        [
+            (0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)]),
+            (0, [(CHUNK_RAW, 0, 1, 0, b"B" * SECTOR)]),
+        ],
+    )
+    with pytest.raises(UniPadError) as caught:
+        UdifImage(path).write_raw(tmp_path / "out.raw", LzfseDecoder())
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "same sector" in caught.value.message, caught.value
+
+
+def test_an_empty_chunk_table_is_refused(tmp_path: Path) -> None:
+    """``max()`` over no entries is a bare ValueError; a refusal names the cause."""
+    path = _build(tmp_path / "empty.dmg", [], mutate=lambda plist: None)
+    with pytest.raises(UniPadError) as caught:
+        UdifImage(path)
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "empty" in caught.value.message, caught.value
+
+
+def test_a_short_data_fork_is_refused_on_the_lzfse_path(tmp_path: Path) -> None:
+    """The RAW path catches its own short read; LZFSE would hand it to the decoder.
+
+    A chunk whose compressed range runs past the end of the *file* -- as opposed
+    to past the declared data fork -- used to be read as ``b""`` and passed
+    straight to the caller's decoder, which decodes whatever it is given and
+    produces a plausible-looking wrong image.
+    """
+    def mutate(plist) -> None:
+        blob = bytearray(plist["resource-fork"]["blkx"][0]["Data"])
+        # A compressed offset past the end of the *file* but inside the declared
+        # fork: the fork check passes, the read comes back short.
+        struct.pack_into(">Q", blob, ENTRY_HEADER_SIZE + 24, 1 << 30)
+        plist["resource-fork"]["blkx"][0]["Data"] = bytes(blob)
+
+    path = _build(
+        tmp_path / "lzfse.dmg",
+        [(0, [(CHUNK_LZFSE, 0, 1, 0, b"\x01\x02\x03\x04")])],
+        mutate=mutate,
+    )
+    _with_trailer(path, data_fork_length=1 << 40)
+    image = UdifImage(path)
+    seen: list[tuple[bytes, int]] = []
+
+    def decode(compressed: bytes, expected: int) -> bytes:
+        seen.append((compressed, expected))
+        return b"Z" * expected
+
+    with pytest.raises(UniPadError) as caught:
+        image.write_raw(tmp_path / "out.raw", LzfseDecoder(decode))
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "shorter than a chunk's compressed range" in caught.value.message, caught.value
+    assert not seen, "the decoder must not be handed a short read"
+    assert not (tmp_path / "out.raw").exists()
+
+
+def test_a_recoverable_failure_leaves_nothing_to_retry_past(tmp_path: Path) -> None:
+    """The overwrite guard protects user data, not the module's own leftovers.
+
+    Without the cleanup, an LZFSE chunk with no decoder supplied -- the module's
+    own documented refusal -- would leave a full-size partial image behind, and
+    supplying the decoder and retrying would then be refused with "delete it
+    first".  A one-line config fix would become a delete-6-GB wall.
+    """
+    path = _build(
+        tmp_path / "mixed.dmg",
+        [
+            (0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)]),
+            (1, [(CHUNK_LZFSE, 0, 1, 0, b"\x01\x02\x03\x04")]),
+        ],
+    )
+    destination = tmp_path / "out.raw"
+    with pytest.raises(UniPadError):
+        UdifImage(path).write_raw(destination, LzfseDecoder())
+    assert not destination.exists(), "a refused write must leave nothing behind"
+
+    # ...and the retry with a decoder now succeeds, rather than being refused.
+    record = UdifImage(path).write_raw(destination, LzfseDecoder(lambda _c, n: b"Z" * n))
+    assert record["size_bytes"] == 2 * SECTOR, record
+    assert destination.read_bytes() == b"A" * SECTOR + b"Z" * SECTOR
+
+
+def test_a_gpt_header_naming_an_implausible_table_is_reported_not_allocated(
+    tmp_path: Path,
+) -> None:
+    """``entry_count`` and ``entry_size`` are u32s in a header we are checking.
+
+    ``check_gpt`` exists to run on images that may be corrupt, so it must report
+    corruption rather than raise a bare :class:`MemoryError` trying to read the
+    ~2 TiB a crafted header can name.
+    """
+    image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
+    decoded = tmp_path / "out.raw"
+    image.write_raw(decoded, LzfseDecoder())
+    with decoded.open("r+b") as handle:
+        handle.seek(SECTOR)
+        handle.write(_gpt([b"\x00" * 128, b"\x00" * 128]))
+        handle.seek(SECTOR)
+        header = bytearray(handle.read(92))
+        struct.pack_into("<I", header, 80, 0x7FFFFFFF)      # entry count
+        struct.pack_into("<I", header, 84, 0x1000)         # entry size
+        struct.pack_into("<I", header, 16, zlib.crc32(bytes(header)) & 0xFFFFFFFF)
+        handle.seek(SECTOR)
+        handle.write(bytes(header))
+    result = image.check_gpt(decoded)
+    assert result is not None
+    assert result["entries_crc_ok"] is False, result
+    assert "implausible" in result["reason"], result
+
+
+def test_a_zero_fill_chunk_returns_the_bytes_it_claims(tmp_path: Path) -> None:
+    """The codec is verified by its length, not only by what it leaves behind.
+
+    An earlier version of the cross-check test read ``len(produced)`` bytes from
+    the ground-truth image, so a zero-fill codec returning ``b""`` read zero
+    bytes and passed.  This pins the length directly.
+    """
+    image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
+    zero = [c for c in image.chunks() if c.type == CHUNK_ZERO_FILL]
+    assert len(zero) == 1, zero
+    assert image.chunk_bytes(zero[0], LzfseDecoder()) == b"\0" * SECTOR
+
+def test_a_raw_chunk_shorter_than_its_sectors_is_refused(tmp_path: Path) -> None:
+    """A raw chunk whose sectors outrun its payload.
+
+    The RAW path is the one codec that can check itself, and the check compares
+    the bytes read against ``sector_count * 512`` -- so a chunk that declares two
+    sectors and carries one is a refusal rather than a short image.  Mutating the
+    check away left the suite green, which is why this exists.
+    """
+    def mutate(plist) -> None:
+        blob = bytearray(plist["resource-fork"]["blkx"][0]["Data"])
+        # Two sectors claimed by the entry *and* by its chunk, so the coverage
+        # check passes and the raw chunk's own length check is what fires --
+        # otherwise the coverage refusal masks the one under test.
+        struct.pack_into(">Q", blob, 16, 2)                       # entry SectorCount
+        struct.pack_into(">Q", blob, ENTRY_HEADER_SIZE + 16, 2)   # chunk sectorCount
+        plist["resource-fork"]["blkx"][0]["Data"] = bytes(blob)
+
+    path = _build(
+        tmp_path / "shortraw.dmg",
+        [(0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)])],
+        mutate=mutate,
+    )
+    with pytest.raises(UniPadError) as caught:
+        UdifImage(path).write_raw(tmp_path / "out.raw", LzfseDecoder())
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "not as long as the sectors it claims" in caught.value.message, caught.value
+
+
+def test_an_empty_destination_file_is_not_user_data(tmp_path: Path) -> None:
+    """The overwrite guard protects data, and an empty file is none.
+
+    ``st_size > 0`` rather than ``>= 0``: a zero-length destination is what a
+    previous *refused* run would have left if the cleanup were absent, and
+    refusing it would turn a recoverable failure into a permanent one.  Mutating
+    the comparison to ``>= 0`` left the suite green until this was added.
+    """
+    image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
+    destination = tmp_path / "out.raw"
+    destination.write_bytes(b"")
+    record = image.write_raw(destination, LzfseDecoder())
+    assert record["size_bytes"] == 4 * SECTOR, record
+    assert destination.read_bytes()[0:SECTOR] == b"A" * SECTOR
+
+
+def test_a_chunk_range_running_past_the_fork_is_refused(tmp_path: Path) -> None:
+    """The bound is on ``offset + length``, not on ``offset``.
+
+    A chunk that starts inside the data fork and runs past its end reads bytes
+    that belong to the plist and the trailer.  Mutating the check to compare only
+    the offset left the suite green, which is why this exists.
+    """
+    def mutate(plist) -> None:
+        blob = bytearray(plist["resource-fork"]["blkx"][0]["Data"])
+        # Start two bytes before the end of the fork, claim four bytes.
+        struct.pack_into(">Q", blob, ENTRY_HEADER_SIZE + 24, 2)
+        struct.pack_into(">Q", blob, ENTRY_HEADER_SIZE + 32, 4)
+        plist["resource-fork"]["blkx"][0]["Data"] = bytes(blob)
+
+    path = _build(
+        tmp_path / "overrun.dmg",
+        [(0, [(CHUNK_RAW, 0, 1, 0, b"A" * SECTOR)])],
+        mutate=mutate,
+    )
+    _with_trailer(path, data_fork_length=4)
+    with pytest.raises(UniPadError) as caught:
+        UdifImage(path).write_raw(tmp_path / "out.raw", LzfseDecoder())
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "past the end of the data fork" in caught.value.message, caught.value

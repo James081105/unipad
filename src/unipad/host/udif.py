@@ -40,14 +40,12 @@ reads it that way and so does this module.
 
 from __future__ import annotations
 
-import base64
 import binascii
 import plistlib
 import struct
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host.paths import safe_location
@@ -79,6 +77,18 @@ GPT_SIGNATURE = b"EFI PART"
 GPT_HEADER_CRC_OFFSET = 0x10
 GPT_ENTRIES_CRC_OFFSET = 0x58
 
+#: Zero bytes written per call when filling a zero-fill chunk.  One MiB is
+#: large enough that the loop is not the bottleneck and small enough that the
+#: block stays in cache whatever the chunk's size.
+_ZERO_BLOCK = 1 << 20
+
+#: Bounds on a GPT entry table, applied before it is read.  A real GPT has at
+#: most a few hundred entries of 128 bytes; anything wildly beyond that is a
+#: corrupt header, and reading what it names is a multi-gigabyte allocation
+#: inside the one function whose job is to report corruption.
+_MAX_GPT_ENTRIES = 1 << 16
+_MAX_GPT_ENTRY_SIZE = 1 << 16
+
 
 class LzfseDecoder:
     """A caller-supplied LZFSE decoder, or the refusal that stands in for one.
@@ -92,10 +102,6 @@ class LzfseDecoder:
 
     def __init__(self, decode: Optional[Callable[[bytes, int], bytes]] = None) -> None:
         self._decode = decode
-
-    @property
-    def available(self) -> bool:
-        return self._decode is not None
 
     def decode(self, compressed: bytes, expected: int) -> bytes:
         if self._decode is None:
@@ -160,8 +166,11 @@ class Entry:
 class UdifImage:
     """A parsed UDIF image: the trailer, the chunk tables, and nothing else.
 
-    The file is *not* held open and no bytes are read until :meth:`write_raw` is
-    called, so constructing one of these is cheap even for a 5 GB image.
+    The file is not held open -- it is opened per read and closed again -- so a
+    long-lived instance costs no descriptor.  It does read 512 bytes of trailer
+    and the XML plist (234,240 bytes for the pinned image) at construction,
+    which is what makes the constructor cheap even for a 5 GB file: no chunk
+    payload is touched until :meth:`write_raw` asks for it.
     """
 
     def __init__(self, path: Path) -> None:
@@ -180,10 +189,8 @@ class UdifImage:
                 path=safe_location(self.path),
                 size_bytes=self.size,
             )
-        with self.path.open("rb") as handle:
-            handle.seek(self.size - TRAILER_SIZE)
-            trailer = handle.read(TRAILER_SIZE)
-        if trailer[0:4] != TRAILER_SIGNATURE:
+        trailer = self._read_at(self.size - TRAILER_SIZE, TRAILER_SIZE)
+        if len(trailer) != TRAILER_SIZE or trailer[0:4] != TRAILER_SIGNATURE:
             raise UniPadError(
                 ErrorCode.CONFIG_INVALID,
                 "the file does not end in a UDIF 'koly' trailer, so it is not a "
@@ -193,7 +200,7 @@ class UdifImage:
             )
         self.data_fork_offset, self.data_fork_length = struct.unpack_from(">QQ", trailer, 24)
         xml_offset, xml_length = struct.unpack_from(">QQ", trailer, 216)
-        if xml_length <= 0 or xml_offset < 0 or xml_offset + xml_length > self.size:
+        if xml_length <= 0 or xml_offset + xml_length > self.size:
             raise UniPadError(
                 ErrorCode.CONFIG_INVALID,
                 "the UDIF trailer names an XML plist outside the file",
@@ -201,9 +208,7 @@ class UdifImage:
                 xml_offset=xml_offset,
                 xml_length=xml_length,
             )
-        with self.path.open("rb") as handle:
-            handle.seek(xml_offset)
-            xml = handle.read(xml_length)
+        xml = self._read_at(xml_offset, xml_length)
         try:
             plist = plistlib.loads(xml)
         except Exception as exc:  # plistlib raises several unrelated types
@@ -324,14 +329,31 @@ class UdifImage:
 
     # -- decoding --------------------------------------------------------
 
-    def _read_compressed(self, chunk: Chunk) -> bytes:
-        if chunk.compressed_offset < 0 or chunk.compressed_length < 0:
+    def _read_at(self, offset: int, length: int) -> bytes:
+        """``length`` bytes at ``offset``, or a refusal naming what went wrong.
+
+        Every read in this module goes through here, and the wrapping is not
+        decoration: a bare :class:`OSError` carries the path it was given, which
+        on this host means the account name ends up in an error message -- the
+        exact leak PRD 9.2 forbids.  ``safe_location`` is what redacts it, and it
+        is only reached if the exception is caught and re-raised as a
+        :class:`UniPadError`.
+        """
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(offset)
+                return handle.read(length)
+        except OSError as exc:
             raise UniPadError(
                 ErrorCode.CONFIG_INVALID,
-                    "a chunk names a compressed range outside the data fork",
-                    compressed_offset=chunk.compressed_offset,
-                    compressed_length=chunk.compressed_length,
-            )
+                "the UDIF image could not be read",
+                path=safe_location(self.path),
+                offset=offset,
+                length=length,
+                error="%s: %s" % (type(exc).__name__, exc.strerror or exc),
+            ) from exc
+
+    def _read_compressed(self, chunk: Chunk) -> bytes:
         if chunk.compressed_offset + chunk.compressed_length > self.data_fork_length:
             raise UniPadError(
                 ErrorCode.CONFIG_INVALID,
@@ -340,13 +362,29 @@ class UdifImage:
                 compressed_length=chunk.compressed_length,
                 data_fork_length=self.data_fork_length,
             )
-        with self.path.open("rb") as handle:
-            handle.seek(self.data_fork_offset + chunk.compressed_offset)
-            return handle.read(chunk.compressed_length)
+        produced = self._read_at(
+            self.data_fork_offset + chunk.compressed_offset, chunk.compressed_length
+        )
+        # A short read is not a short chunk: it means the file ended where the
+        # trailer promised it did not.  The RAW path would be caught by its own
+        # length check below, but the LZFSE path hands the result straight to the
+        # caller's decoder, which would decode whatever it was given and produce
+        # a plausible-looking wrong image.
+        if len(produced) != chunk.compressed_length:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the data fork is shorter than a chunk's compressed range",
+                compressed_offset=chunk.compressed_offset,
+                compressed_length=chunk.compressed_length,
+                bytes_read=len(produced),
+            )
+        return produced
 
     def chunk_bytes(self, chunk: Chunk, lzfse: LzfseDecoder) -> bytes:
         """The decompressed bytes of one chunk, exactly ``byte_length`` of them."""
         if chunk.type == CHUNK_ZERO_FILL:
+            # Materialised here, and streamed in write_raw -- see _write_zero_fill
+            # for why this one is allowed to allocate.
             return b"\0" * chunk.byte_length
         if chunk.type == CHUNK_RAW:
             produced = self._read_compressed(chunk)
@@ -366,18 +404,94 @@ class UdifImage:
             chunk_type=hex(chunk.type),
         )
 
+    def _write_zero_fill(self, handle, count: int) -> None:
+        """Write ``count`` zero bytes in bounded blocks.
+
+        A zero-fill chunk is *ordinarily* the whole disk in an Apple UDIF image,
+        so ``b"\\0" * count`` is a 6 GB allocation for the common case.  The
+        pinned image's largest is 203,313,152 bytes, which is why nothing has
+        noticed yet; a whole-disk zero-fill is an ordinary image and this host
+        would swap rather than refuse.
+        """
+        block = b"\0" * min(count, _ZERO_BLOCK)
+        remaining = count
+        while remaining > 0:
+            take = min(remaining, len(block))
+            handle.write(block[:take])
+            remaining -= take
+
+    def _verify_coverage(self) -> None:
+        """Every sector in ``[0, raw_size)`` covered exactly once, or a refusal.
+
+        Chunks are written by absolute offset, so nothing else checks this.  A
+        gap leaves zeros the image never declared and an overlap silently lets
+        the later chunk win -- both produce an image of exactly the right size
+        with the wrong bytes, and ``check_gpt`` cannot help because it returns
+        ``None`` for any image without a GPT, which is the corrupt case.
+        """
+        spans = sorted(
+            (chunk.sector, chunk.sector + chunk.sector_count) for chunk in self.chunks()
+        )
+        if not spans:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the image has no chunks, so nothing can be written",
+                path=safe_location(self.path),
+            )
+        cursor = 0
+        for start, end in spans:
+            if start > cursor:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "the chunk table leaves a gap: sectors no chunk declares",
+                    first_uncovered_sector=cursor,
+                    gap_starts_at=start,
+                )
+            if end <= start:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "a chunk covers no sectors",
+                    sector=start,
+                    sector_count=end - start,
+                )
+            if start < cursor:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "two chunks claim the same sector; the later would silently "
+                    "overwrite the earlier",
+                    overlapping_sector=start,
+                    already_covered_through=cursor,
+                )
+            cursor = end
+        if cursor != self.sector_count:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the chunk table stops short of the image it declares",
+                covered_sectors=cursor,
+                declared_sectors=self.sector_count,
+            )
+
     def write_raw(self, destination: Path, lzfse: LzfseDecoder) -> dict[str, object]:
         """Write the whole image to ``destination`` and verify what was written.
 
-        The file is created with :func:`os.truncate` first, so an image that is
-        mostly zero-fill stays sparse on NTFS rather than costing its full size
-        on disk.  Chunks are written at their absolute sector offsets, so the
-        order they appear in the table does not matter.
+        The file is created at its full size first and every chunk is written at
+        its absolute sector offset, so the order the table lists them in does not
+        matter.  It is **not** sparse: NTFS only leaves the unwritten ranges
+        unallocated when the file is marked sparse with ``FSCTL_SET_SPARSE``,
+        which neither ``open("wb")`` nor ``truncate`` requests.  Measured on this
+        host: a 256 MiB all-zero-fill image costs 256 MiB of free space.  An
+        earlier version of this docstring claimed otherwise, and the claim was
+        wrong.
 
         Returns a record of what was written and whether the GPT survived.  The
         GPT check is the point: every chunk is written by offset, so a single
         wrong offset produces an image of exactly the right size with the wrong
         bytes in it, and only the CRC says so.
+
+        A failure part-way through leaves **nothing** behind.  The overwrite
+        guard runs before the file is created, so without this a recoverable
+        refusal -- an LZFSE chunk with no decoder supplied, say -- would leave a
+        full-size partial image that every retry then refuses to touch.
         """
         destination = Path(destination)
         if destination.exists() and destination.stat().st_size > 0:
@@ -386,17 +500,45 @@ class UdifImage:
                 "refusing to overwrite an existing image; delete it first",
                 path=safe_location(destination),
             )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as handle:
-            handle.truncate(self.raw_size)
-            written = 0
-            for chunk in self.chunks():
-                if chunk.is_terminator:
-                    continue
-                produced = self.chunk_bytes(chunk, lzfse)
-                handle.seek(chunk.byte_offset)
-                handle.write(produced)
-                written += len(produced)
+        self._verify_coverage()
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the destination directory could not be created",
+                path=safe_location(destination.parent),
+                error="%s: %s" % (type(exc).__name__, exc.strerror or exc),
+            ) from exc
+        try:
+            with destination.open("wb") as handle:
+                # Full size first, so a chunk that is shorter than the sectors it
+                # claims cannot leave a hole at the end of the file.  With the
+                # coverage check above guaranteeing every sector is written, this
+                # is a belt-and-braces no-op -- it is *not* what makes the image
+                # sparse on NTFS, which it does not do at all.
+                handle.truncate(self.raw_size)
+                written = 0
+                for chunk in self.chunks():
+                    if chunk.is_terminator:
+                        continue
+                    if chunk.type == CHUNK_ZERO_FILL:
+                        self._write_zero_fill(handle, chunk.byte_length)
+                        written += chunk.byte_length
+                        continue
+                    produced = self.chunk_bytes(chunk, lzfse)
+                    handle.seek(chunk.byte_offset)
+                    handle.write(produced)
+                    written += len(produced)
+        except BaseException:
+            # BaseException, not Exception: a KeyboardInterrupt half-way through
+            # a 6 GB write is exactly the case that would otherwise brick the
+            # destination.
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            raise
         return {
             "path": safe_location(destination),
             "size_bytes": self.raw_size,
@@ -412,15 +554,47 @@ class UdifImage:
         ``None`` when the image has no GPT at sector 1 -- which is a fact about
         the image, not a failure, and a caller that expected one should say so
         rather than have this module guess.
+
+        The entry table is bounded before it is read.  ``entry_count`` and
+        ``entry_size`` are attacker-controlled u32s in a header this function
+        exists to check, and ``entry_count * entry_size`` can name a ~2 TiB read
+        -- which on a corrupt image is the case, and which used to raise a bare
+        :class:`MemoryError` out of a function whose whole job is to report
+        corruption.
         """
-        with Path(image).open("rb") as handle:
-            handle.seek(SECTOR)
-            header = handle.read(92)
-            if len(header) < 92 or header[0:8] != GPT_SIGNATURE:
-                return None
-            entries_lba, entry_count, entry_size = struct.unpack_from("<QII", header, 72)
-            handle.seek(entries_lba * SECTOR)
-            entries = handle.read(entry_count * entry_size)
+        try:
+            with Path(image).open("rb") as handle:
+                handle.seek(SECTOR)
+                header = handle.read(92)
+                if len(header) < 92 or header[0:8] != GPT_SIGNATURE:
+                    return None
+                entries_lba, entry_count, entry_size = struct.unpack_from("<QII", header, 72)
+                table_bytes = entry_count * entry_size
+                if entry_count > _MAX_GPT_ENTRIES or entry_size > _MAX_GPT_ENTRY_SIZE:
+                    return {
+                        "header_crc_ok": None,
+                        "entries_crc_ok": False,
+                        "entry_count": entry_count,
+                        "entries_lba": entries_lba,
+                        "reason": "the GPT header names an implausible entry table",
+                    }
+                handle.seek(entries_lba * SECTOR)
+                entries = handle.read(table_bytes)
+        except OSError as exc:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the decoded image could not be read back",
+                path=safe_location(Path(image)),
+                error="%s: %s" % (type(exc).__name__, exc.strerror or exc),
+            ) from exc
+        if len(entries) != table_bytes:
+            return {
+                "header_crc_ok": None,
+                "entries_crc_ok": False,
+                "entry_count": entry_count,
+                "entries_lba": entries_lba,
+                "reason": "the image is shorter than its GPT entry table",
+            }
         stored_header, = struct.unpack_from("<I", header, GPT_HEADER_CRC_OFFSET)
         computed_header = binascii.crc32(header[:GPT_HEADER_CRC_OFFSET] + b"\0\0\0\0"
                                         + header[GPT_HEADER_CRC_OFFSET + 4:])
