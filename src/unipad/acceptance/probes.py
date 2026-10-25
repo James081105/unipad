@@ -47,13 +47,33 @@ It does not decide *which* checks exist, what tier they sit in, or what they
 depend on.  That is :mod:`unipad.acceptance.registry`'s job, and keeping the two
 apart is what stops the adapter from quietly dropping a check it finds
 inconvenient to call.
-"""
 
+What it adopts, and what it refuses
+-----------------------------------
+Every reference a producer names is spelled relative to the repository, and the
+runner resolves references against the run directory, so adoption copies the file
+across.  That copy is the one place this file touches the filesystem on another
+agent's behalf, and it is where the measured defect lived: a scratch directory
+inside the repository is neither tracked nor ignored, so nothing claimed it, and
+``_adopt`` copied it into the bundle anyway.  With paths deep enough the copy
+raised inside the probe, the runner caught it, and a run that should have read
+BLOCKED read FAIL -- acceptance tests that had nothing to do with the scratch
+directory went red for every agent on the host.
+
+The refusal rule and its boundary are stated where the rule lives
+(:class:`RepoContent`, :func:`_adopt`).  What belongs here is the property that
+makes it safe: a refusal is never silent.  Adoption is what makes a PASS
+constructible, so the guard cannot be "skip adoption when it looks awkward" --
+it has to be "adopt everything the repository claims, and record, by name and
+reason, everything it does not."
+"""
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
-from dataclasses import replace
+import subprocess
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -83,6 +103,128 @@ _P1_KINDS = {
     "blocked": VerdictKind.BLOCKED,
     "unverified": VerdictKind.UNVERIFIED,
 }
+
+#: The longest path the runner may create inside a run's evidence directory.
+#:
+#: This is a measured platform fact, not a preference.  On this host (Windows 11,
+#: CPython 3.12.9 built with MSC v.1942 and no long-path awareness)
+#: ``Path.mkdir`` succeeds for a 247-character path and fails at 248 with
+#: ``WinError 206``, and the file that follows the directory is one component
+#: longer still.  240 leaves a margin for the three calls that walk it
+#: (``mkdir``, ``shutil.copy2``, ``read_bytes``) and for hosts whose effective
+#: ceiling is lower.  POSIX ``PATH_MAX`` is 4096, so the guard is inert there.
+_MAX_DESTINATION = 240 if os.name == "nt" else 4000
+
+
+@dataclass(frozen=True)
+class RepoContent:
+    """Which top-level directories of a repository git accounts for.
+
+    ``tracked`` and ``ignored`` hold the first path component of every file git
+    tracks and every entry it ignores.  Together they answer one question:
+    *does the repository claim this directory, or is it somebody's scratch?*
+
+    ``known`` is False when git could not answer -- no ``.git`` at
+    ``repo_root``, or no ``git`` on PATH.  Then :meth:`owns` claims everything,
+    and that is the deliberate direction: a gate that cannot tell content from
+    scratch must not start refusing content, because the only thing a refusal
+    costs is a PASS that can no longer be constructed.  The scratch problem
+    returns on such a host; the broken-gate problem would not be recoverable.
+    """
+
+    repo_root: Path
+    tracked: frozenset[str]
+    ignored: frozenset[str]
+    known: bool
+
+    def owns(self, relative: str) -> bool:
+        """True when ``relative``'s top-level directory is claimed by the repo.
+
+        A file at the repository root has no directory to claim it and is
+        therefore owned -- ``host-inventory.json`` is written there by
+        ``unipad.host.inventory`` and cited as evidence, and a rule that
+        refused it would refuse a real observation.
+
+        The test is the *top-level* component, not every ancestor.  Walking
+        further down cannot distinguish a scratch directory from a package
+        directory nobody has committed yet -- ``.tmp-scratch/`` and
+        ``src/unipad/newpkg/`` are the same shape to git -- and refusing the
+        second would refuse the next module a check cites.  ``HostView._PRUNE``
+        has the same boundary, for the same reason.
+        """
+        if not self.known:
+            return True
+        head, separator, _ = relative.replace("\\", "/").partition("/")
+        if not separator:
+            return True
+        return head in self.tracked or head in self.ignored
+
+
+def _git(repo_root: Path, *arguments: str) -> str:
+    """Run one ``git`` command in ``repo_root`` and return its stdout.
+
+    Raises on a non-zero exit so the caller can degrade rather than read an
+    empty answer as "nothing is tracked" -- which would refuse everything.
+    """
+    finished = subprocess.run(
+        ["git", *arguments],
+        cwd=str(repo_root),
+        capture_output=True,
+        # UTF-8 explicitly, not the locale's: on a host whose preferred encoding
+        # cannot spell every byte git prints, a mis-decoded path is a path the
+        # ownership rule gets wrong.  ``-z`` already stops git quoting names.
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+    return finished.stdout
+
+
+def _heads(entries: str) -> set[str]:
+    """The first path component of every NUL-separated git listing entry."""
+    found: set[str] = set()
+    for entry in entries.split("\0"):
+        text = entry.strip().rstrip("/")
+        if text:
+            found.add(text.split("/", 1)[0])
+    return found
+
+
+def _repo_content(repo_root: Path) -> RepoContent:
+    """Ask git which top-level directories this repository accounts for.
+
+    Two subprocesses, **once per run**, not once per evidence item.  Measured on
+    this host: ``git ls-files -z`` 0.20 s / 196 entries, and
+    ``git ls-files -o -i --exclude-standard --directory -z`` 0.20 s / 25 entries.
+    The per-item form -- ``git ls-files --error-unmatch <path>`` -- measures
+    **219 ms**, because on Windows the cost is process creation rather than the
+    answer, so a gate that asked once per reference would spend longer in git
+    than walking the filesystem it is asking about.  Hoisting is what makes the
+    question affordable; asking it per item never was.
+
+    ``--exclude-standard`` is what makes this respect ``.gitignore`` *and*
+    ``.git/info/exclude`` (where ``/vendor`` lives) *and* the user's global
+    excludes, so the ignored set is git's own rather than a second parser of a
+    file git already parses.
+    """
+    root = Path(repo_root)
+    if not (root / ".git").exists():
+        # Not a repository of its own.  Answering from whatever encloses it
+        # would classify this tree by a different tree's rules.
+        return RepoContent(root, frozenset(), frozenset(), known=False)
+    try:
+        tracked = _git(root, "ls-files", "-z")
+        ignored = _git(
+            root, "ls-files", "-o", "-i", "--exclude-standard", "--directory", "-z"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return RepoContent(root, frozenset(), frozenset(), known=False)
+    return RepoContent(
+        root,
+        frozenset(_heads(tracked)),
+        frozenset(_heads(ignored)),
+        known=True,
+    )
 
 
 def _as_verdict(
@@ -194,6 +336,7 @@ def milestone_probe(
     repo_root: Path,
     evidence_dir: Path,
     view: milestones.HostView,
+    content: RepoContent,
 ) -> Probe:
     """A zero-arg probe for one registered milestone check.
 
@@ -218,6 +361,10 @@ def milestone_probe(
     previous docstring already claimed -- the claim was simply not true of the
     code, because the thing doing the caching was being rebuilt underneath it.
 
+    ``content`` is shared for the same reason and is built by the same caller:
+    :func:`_repo_content` costs two git subprocesses, and a probe that built its
+    own would pay them once per check.
+
     Evidence is adopted into the run directory for the same reason p1's is: the
     runner resolves every reference against the run dir (``runner.py:1116``),
     while a milestone spells its paths relative to the repository.  A milestone
@@ -233,7 +380,7 @@ def milestone_probe(
             result = milestones.evaluate(check_id, view=view)
             verdict = result.verdict
             adopted = tuple(
-                _adopt(item.path, repo_root, evidence_dir)
+                _adopt(item.path, repo_root, evidence_dir, content, item)
                 or _carry(item, evidence_dir=evidence_dir)
                 for item in verdict.evidence
             )
@@ -251,7 +398,13 @@ def milestone_probe(
 # ---------------------------------------------------------------------------
 # p1
 # ---------------------------------------------------------------------------
-def _adopt(path: str, repo_root: Path, evidence_dir: Path) -> EvidenceRef | None:
+def _adopt(
+    path: str,
+    repo_root: Path,
+    evidence_dir: Path,
+    content: RepoContent,
+    item: Any = None,
+) -> EvidenceRef | None:
     """Copy one repo file into the run's evidence directory and hash it.
 
     This is the piece that makes a PASS *constructible* for a p1 check.  p1's
@@ -272,12 +425,38 @@ def _adopt(path: str, repo_root: Path, evidence_dir: Path) -> EvidenceRef | None
     Returns ``None`` when there is no file to adopt, so the caller can fall back
     to a digestless reference rather than crashing on a path a check named but
     did not produce.
+
+    A file that exists but must **not** be adopted is refused *here*, and the
+    refusal is returned rather than signalled by ``None``.  ``None`` already
+    means "the check named an artifact it did not produce", which is a different
+    statement from "this artifact is not evidence this run may vouch for"; and a
+    refusal that reached the caller as a bare ``None`` would be recorded with the
+    wrong reason or not at all.  The reason is only knowable at the point of the
+    decision, which is here.
+
+    Two refusals, and neither names a directory
+    -------------------------------------------
+    1. **The repository does not claim it** (:meth:`RepoContent.owns`).  A
+       scratch directory is untracked *and* unignored, which is exactly the pair
+       of sets git can answer.  Measured on 2026-10-25: a teammate's ``.tmp-bt/``
+       grew to 1.2 GB inside this repository, two milestone probes named a
+       283-character path from it, ``destination.parent.mkdir`` raised
+       ``FileNotFoundError [WinError 3]``, and the runner turned that into
+       ``probe_error:M1`` -> ``blocking_failed:M1`` -> a run verdict of FAIL
+       where BLOCKED was correct.  The directory has since been moved out, so the
+       incident itself is not reproducible; the class is, because any untracked
+       directory with deep enough paths reproduces it.
+    2. **The destination would be past this platform's path limit**
+       (:data:`_MAX_DESTINATION`).  This is the backstop for the case rule 1
+       cannot see: a *claimed* path that is still too deep to copy.  Without it
+       the same crash returns the first time ``local-private/out/real-boot``
+       grows a directory tree deep enough, and that root is real evidence.
     """
     source = repo_root / path
     if not source.is_file():
         return None
-    # Two paths are never adopted, and both are the same rule: the bundle has to
-    # stand on what THIS run saw.
+    # Three paths are never adopted, and all three are the same rule: the bundle
+    # has to stand on what THIS run saw.
     #
     # 1. A file already in this run's evidence directory -- the destination would
     #    be inside the source, and the copy would feed itself.
@@ -294,7 +473,29 @@ def _adopt(path: str, repo_root: Path, evidence_dir: Path) -> EvidenceRef | None
     #    specific root would have missed them.
     if _inside(source, evidence_dir) or "runs" in source.parts:
         return None
+    if not content.owns(path):
+        return _carry(
+            item,
+            path=path,
+            evidence_dir=evidence_dir,
+            reason=(
+                "not adopted: %s is not repository content -- no git-tracked and "
+                "no git-ignored directory owns it, so it is scratch rather than "
+                "evidence this run may vouch for" % path
+            ),
+        )
     destination = evidence_dir / path
+    if len(str(destination)) > _MAX_DESTINATION:
+        return _carry(
+            item,
+            path=path,
+            evidence_dir=evidence_dir,
+            reason=(
+                "not adopted: the run's evidence path for %s would be %d "
+                "characters, past this platform's %d"
+                % (path, len(str(destination)), _MAX_DESTINATION)
+            ),
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
@@ -307,7 +508,10 @@ def _adopt(path: str, repo_root: Path, evidence_dir: Path) -> EvidenceRef | None
 
 
 def _p1_evidence(
-    items: Any, repo_root: Path, evidence_dir: Path
+    items: Any,
+    repo_root: Path,
+    evidence_dir: Path,
+    content: RepoContent,
 ) -> tuple[EvidenceRef, ...]:
     """``p1.Evidence`` -> ``record.EvidenceRef``, digested where it can be.
 
@@ -321,7 +525,7 @@ def _p1_evidence(
         path = getattr(item, "path", None)
         if not isinstance(path, str):
             continue
-        adopted = _adopt(path, repo_root, evidence_dir)
+        adopted = _adopt(path, repo_root, evidence_dir, content, item)
         if adopted is not None:
             refs.append(adopted)
             continue
@@ -329,12 +533,18 @@ def _p1_evidence(
     return tuple(refs)
 
 
-def _carry(item: Any, path: str | None = None, evidence_dir: Path | None = None) -> EvidenceRef:
+def _carry(
+    item: Any,
+    path: str | None = None,
+    evidence_dir: Path | None = None,
+    reason: str | None = None,
+) -> EvidenceRef:
     """Carry a producer's evidence reference, with its kind made legal.
 
-    Used when a file cannot be adopted -- normally because it does not exist.
-    The reference is still reported, because a check that named an artifact it
-    did not produce is saying something and dropping the reference would hide it.
+    Used when a file cannot be adopted -- normally because it does not exist, but
+    also when it exists and must not be adopted.  The reference is still
+    reported, because a check that named an artifact is saying something and
+    dropping the reference would hide it.
 
     But it is reported **as a file that exists**.  Citing the original path
     verbatim makes the runner resolve it against the run directory, fail to find
@@ -343,16 +553,27 @@ def _carry(item: Any, path: str | None = None, evidence_dir: Path | None = None)
     something absent.  So a stub is written recording what was named and why it
     is not here, and that stub is what gets cited.  The information survives, the
     bundle reloads, and the row still says the artifact was not produced.
+
+    ``reason`` overrides the default wording, and it also changes what the
+    reference carries.  The default says the file was not present; when
+    :func:`_adopt` refuses a file that *is* present, that default would be a false
+    statement in the bundle, and a bundle that lies about why a reference is
+    undigested is worse than one that says nothing.  A refusal therefore carries
+    **no digest**, even though the stub is on disk and could be hashed: a note
+    recording why an artefact was not adopted is not the artefact, and a PASS
+    whose only evidence is such a note would be a pass on nothing.  ``Verdict``
+    already refuses exactly that (``record.py:591-597``), which is why the
+    distinction is worth making here rather than left to a reader of the stub.
     """
     resolved = path if path is not None else str(getattr(item, "path", "") or "")
+    note = reason or (
+        "named by the check but not present to hash: %s\n"
+        "the check cited this path and the file did not exist at run time\n"
+        % resolved
+    )
     if evidence_dir is not None:
         stub = evidence_dir / "absent" / _stub_name(resolved)
         stub.parent.mkdir(parents=True, exist_ok=True)
-        note = (
-            "named by the check but not present to hash: %s\n"
-            "the check cited this path and the file did not exist at run time\n"
-            % resolved
-        )
         # write_bytes, not write_text: text mode on Windows rewrites every
         # newline as CRLF, so the file on disk would not be the bytes the
         # digest above is taken over, and the runner's reload would refuse
@@ -364,7 +585,12 @@ def _carry(item: Any, path: str | None = None, evidence_dir: Path | None = None)
                 Path(evidence_dir.name) / "absent" / _stub_name(resolved)
             ).as_posix(),
             kind=_legal_kind(getattr(item, "kind", "probe_log")),
-            sha256=hashlib.sha256(note.encode("utf-8")).hexdigest(),
+            sha256=(
+                None
+                if reason is not None
+                else hashlib.sha256(note.encode("utf-8")).hexdigest()
+            ),
+            digest_reason=reason,
             scope=record.EvidenceScope.SIMULATION,
         )
     scope = str(getattr(item, "scope", record.EvidenceScope.SIMULATION))
@@ -374,7 +600,8 @@ def _carry(item: Any, path: str | None = None, evidence_dir: Path | None = None)
         path=resolved,
         kind=_legal_kind(getattr(item, "kind", "probe_log")),
         sha256=None,
-        digest_reason=(
+        digest_reason=reason
+        or (
             "named by the check but not present to hash: %s" % Path(resolved).name
         ),
         scope=scope,
@@ -382,13 +609,18 @@ def _carry(item: Any, path: str | None = None, evidence_dir: Path | None = None)
 
 
 def p1_probe(
-    check: Callable[[Path], p1.P1Check], root: Path, evidence_dir: Path
+    check: Callable[[Path], p1.P1Check],
+    root: Path,
+    evidence_dir: Path,
+    content: RepoContent,
 ) -> Probe:
     """A zero-arg probe wrapping one ``check_p1_N_*`` function.
 
     ``root`` and ``evidence_dir`` are bound here rather than passed by the
     runner, because the runner's contract is zero-argument and both are facts
-    about where the gate was invoked, not about the check.
+    about where the gate was invoked, not about the check.  ``content`` is bound
+    for the same reason plus one more: it is two git subprocesses, and a probe
+    that built its own would run them once per bullet.
     """
 
     def probe() -> Verdict:
@@ -396,7 +628,7 @@ def p1_probe(
         return _as_verdict(
             result.verdict,
             tuple(result.verdict_reasons),
-            _p1_evidence(result.evidence, root, evidence_dir),
+            _p1_evidence(result.evidence, root, evidence_dir, content),
         )
 
     return probe
@@ -464,20 +696,32 @@ def probes_for(
     taking ``repo_root``; the two agree because ``registry.build_inputs``
     defaults its own root the same way, and no in-tree caller overrides it.  A
     caller that passes a different ``repo_root`` should pass its own view too.
+
+    The host view and the repository-content index are both built here, once,
+    and handed to every probe that needs them.  ``HostView`` caches its file
+    index on the instance and ``_snapshot`` caches its observations on the view,
+    so a view constructed per check throws both caches away -- which is what this
+    used to do, at a measured 163 s and 168 walks per evaluation.  Constructing
+    the view costs nothing (it stats four directories and walks nothing; the
+    first ``find()`` is what walks), so it is built unconditionally rather than
+    guarded on ``milestone_ids``.  The content index is the opposite: it costs
+    two git subprocesses, so it is built exactly once and shared.
     """
-    # One view for the whole run.  This line is the fix; everything above it is
-    # the reason it has to be here rather than inside ``milestone_probe``.
+    # One view and one content index for the whole run.  These two lines are the
+    # fix; everything above them is the reason they have to be here rather than
+    # inside the individual probe factories.
     view = milestones.default_view()
+    content = _repo_content(repo_root)
     probes: dict[str, Probe] = {}
     for check_id in milestone_ids:
         probes[check_id] = milestone_probe(
-            check_id, repo_root, run_dir / EVIDENCE_DIRNAME, view
+            check_id, repo_root, run_dir / EVIDENCE_DIRNAME, view, content
         )
     env = e2e.E2EEnvironment.create(run_dir, repo_root=repo_root)
     for case_id in case_ids:
         probes[case_id] = case_probe(case_id, env)
     for index, check in enumerate(p1_checks, start=1):
         probes["P1-%d" % index] = p1_probe(
-            check, repo_root, run_dir / EVIDENCE_DIRNAME
+            check, repo_root, run_dir / EVIDENCE_DIRNAME, content
         )
     return probes
