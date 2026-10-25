@@ -497,6 +497,48 @@ def test_the_real_os_image_parses(tmp_path: Path) -> None:
     not (REAL_OS_IMAGE.is_file() and INDEPENDENT_DECODE.is_file()),
     reason="needs the pinned image and an independently produced decode",
 )
+def test_every_chunk_that_needs_no_library_matches_the_independent_decode() -> None:
+    """The 399 raw and zero-fill chunks, byte for byte, against another decoder.
+
+    This is the part of the parse that can be checked without LZFSE, and it is
+    checked against an image a separate implementation produced -- so it tests
+    this module's arithmetic, not its agreement with itself.  What it pins:
+
+    * the compressed offsets, because a raw chunk reads ``compressed_length``
+      bytes from ``data_fork_offset + compressed_offset`` and a wrong offset
+      reads a plausible-looking wrong payload;
+    * the absolute sector arithmetic, because the chunk is then *written* at
+      ``sector * 512`` and a wrong sector puts the right bytes in the wrong
+      place -- the one failure mode the GPT CRC can only see after the fact;
+    * the zero-fill chunks, which have no payload at all and so can only be
+      checked by what they leave behind.
+
+    Measured 2026-10-25: 399 chunks, zero differing bytes, and the image size
+    agrees exactly.  The 3415 LZFSE chunks are *not* covered here -- that is the
+    gap the module documents rather than hides.
+    """
+    image = UdifImage(REAL_OS_IMAGE)
+    decoder = LzfseDecoder()
+    checked = mismatched = 0
+    with INDEPENDENT_DECODE.open("rb") as ground:
+        for chunk in image.chunks():
+            if chunk.type not in (CHUNK_RAW, CHUNK_ZERO_FILL):
+                continue
+            produced = image.chunk_bytes(chunk, decoder)
+            ground.seek(chunk.byte_offset)
+            expected = ground.read(len(produced))
+            checked += 1
+            if produced != expected:
+                mismatched += 1
+    assert checked == 399, checked
+    assert mismatched == 0, mismatched
+    assert image.raw_size == INDEPENDENT_DECODE.stat().st_size
+
+
+@pytest.mark.skipif(
+    not (REAL_OS_IMAGE.is_file() and INDEPENDENT_DECODE.is_file()),
+    reason="needs the pinned image and an independently produced decode",
+)
 def test_the_real_os_image_parses_the_same_way() -> None:
     """This module's CRC check agrees with an independently produced decode.
 
