@@ -1,0 +1,167 @@
+"""Boot the real guest on Windows QEMU with a second block device, and watch.
+
+What this measures
+------------------
+Whether a ``qemu_defconfig`` UniXNU kernel enumerates a *second* virtio-blk
+device at all.  That is the question the root-volume blocker reduces to:
+``qemu_root_defconfig`` is ``qemu_defconfig`` plus ``CONFIG_XNU_NATIVE_VIRTIO_BLOCK``
+and the owner root chain, so if this kernel has no block driver then attaching
+the OS volume is not sufficient and the verified-root chain is required, not
+merely sufficient.
+
+The kernel is observed through :mod:`unipad.host.guestobserve` while QEMU is
+still running, which is the only way to read its process list: ``allproc`` is a
+kernel data structure, not something the serial log reports.
+
+This script takes a ``--root-image`` and attaches it exactly as
+:func:`unipad.host.unixnu_boot.build_argv` does, so what is measured here is
+what the launcher would start -- not a hand-rolled argv that could differ.
+
+Usage
+-----
+    python scripts/windows/probe-root-volume.py --root-image PATH [--seconds N]
+"""
+from __future__ import annotations
+
+import argparse
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "src"))
+
+from unipad.host import guestobserve as go  # noqa: E402
+from unipad.host.unixnu_boot import BootInputs, build_argv, read_board_payload  # noqa: E402
+
+QEMU = REPO / "local-private/tools/qemu/qemu-system-aarch64.exe"
+FIRMWARE = REPO / "local-private/tools/qemu/share/edk2-aarch64-code.fd"
+DEVICE_DIR = REPO / "vendor/UniXNU-qemu"
+SOURCE_ESP = REPO / "local-private/boot7/run2/esp"
+KERNEL = REPO / "local-private/boot7/boot-inputs/unixnu-out/qemu/kernel/kernel.macho"
+KERNEL_SHA = "9d4b1ab14d74fdfa6afeac12871427e26441cab9f3e2efc97e42b103275643e0"
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root-image", type=Path, required=True,
+                        help="raw image to attach as a second virtio-blk disk")
+    parser.add_argument("--seconds", type=int, default=300)
+    parser.add_argument("--settle", type=float, default=8.0,
+                        help="seconds to let the kernel run before the first observation")
+    parser.add_argument("--run", type=Path, default=REPO / "local-private/boot9")
+    args = parser.parse_args()
+
+    root = args.root_image.resolve()
+    if not root.is_file() or root.stat().st_size <= 0:
+        print(f"root image unusable: {root}")
+        return 2
+
+    run = args.run
+    if run.exists():
+        shutil.rmtree(run, ignore_errors=True)
+    (run / "esp").mkdir(parents=True)
+    print(f"staging the ESP into {run / 'esp'} ...", flush=True)
+    shutil.copytree(SOURCE_ESP, run / "esp", dirs_exist_ok=True)
+    shutil.copyfile(FIRMWARE, run / "vars.fd")
+
+    # The same inputs unixnu_boot.boot() takes, so the argv it builds is the argv
+    # the launcher would build -- this probe measures the launcher, not a copy.
+    spec = read_board_payload(DEVICE_DIR)
+    inputs = BootInputs(
+        firmware=FIRMWARE,
+        kernel=KERNEL,
+        devicetree=run / "esp" / "EFI/UniXNU/Payloads/kernel.macho.adt",
+        darwinboot=run / "esp" / "EFI/UniXNU/Payloads/DarwinBoot.efi",
+        unixnu=run / "esp" / "EFI/BOOT/BOOTAA64.EFI",
+        payload_toml=run / "esp" / "EFI/UniXNU/unixnu.toml",
+    )
+    port = free_port()
+    argv = [str(QEMU)] + build_argv(
+        QEMU, inputs, run / "esp", run, qmp_port=port, root_image=root
+    )
+    (run / "command.txt").write_text(" ".join(argv), encoding="utf-8")
+    print(f"root image {root} ({root.stat().st_size} bytes); qmp port {port}", flush=True)
+
+    #: Kernel-log lines that mean "the boot has reached the point that answers the
+    #: question".  The kernel's own log goes to the msgbuf, not to the serial
+    #: (measured: the serial stops at DarwinBoot's ``hand-off to the kernel``),
+    #: so the marker is read out of the msgbuf the observer already fetches.
+    MARKERS = ("Waiting on", "bsd_autoconf", "mountroot", "IOMedia")
+
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    serial = run / "serial.log"
+    kernel_log = run / "kernel.log"
+    deadline = time.monotonic() + args.seconds
+    load_seen = False
+    try:
+        # Before the kernel load line there is no verified mapping between the
+        # kernel's virtual and physical bases, so nothing can be read.
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                print(f"qemu exited early with {process.returncode}", flush=True)
+                break
+            if serial.is_file():
+                text = serial.read_text(encoding="utf-8", errors="replace")
+                if "kernel   va 0x" in text or "kernel va 0x" in text:
+                    load_seen = True
+                    print("kernel load line seen; observing the live guest", flush=True)
+                    # Give the kernel a moment to install its own tables before
+                    # asking for them.
+                    time.sleep(args.settle)
+                    break
+            time.sleep(0.5)
+
+        if not load_seen:
+            print("NO LOAD LINE: the guest never reached the kernel hand-off")
+            return 4
+
+        # Repeated observations, because one sample is one instant: the first
+        # read lands wherever the kernel happened to be, and a boot that had not
+        # reached mountroot yet is indistinguishable from one that will never
+        # get there.  The loop stops as soon as a marker appears, and records how
+        # many attempts it took so the report can say when it gave up.
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            code = go.main([
+                "--qmp-port", str(port),
+                "--kernel", str(KERNEL),
+                "--expected-sha256", KERNEL_SHA,
+                "--serial", str(serial),
+                "--run-id", "boot9",
+                "--log", str(kernel_log),
+                "--scratch", str(run / "pmem.bin"),
+            ])
+            text = kernel_log.read_text(encoding="utf-8", errors="replace") if kernel_log.is_file() else ""
+            reached = [m for m in MARKERS if m in text]
+            print(f"observation {attempts}: exit {code}, {len(text)} bytes of kernel log, "
+                  f"markers {reached}", flush=True)
+            if code == 0 and reached:
+                print("reached a mountpoint marker", flush=True)
+                return 0
+            if process.poll() is not None:
+                print(f"qemu exited with {process.returncode}", flush=True)
+                return 0
+            time.sleep(6.0)
+        print(f"gave up after {attempts} observations", flush=True)
+        return 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        (run / "qemu-stdout.log").write_bytes(process.stdout.read() if process.stdout else b"")
+        (run / "qemu-stderr.log").write_bytes(process.stderr.read() if process.stderr else b"")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
