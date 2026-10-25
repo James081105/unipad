@@ -1,13 +1,19 @@
 # Windows-side boot probes
 
-Four read-only tools that answer questions the serial log cannot.  They were
+Five tools that answer questions the serial log cannot.  They were
 written during the 2026-10-24 boot of the runner's kernel on this Windows host,
 and each one exists because a specific question came up and nothing else could
 answer it.
 
 None of them modifies the guest, the kernel, or the device tree.
 `probe-adt-uart.py` writes a *variant* device tree beside the original and boots
-that; the original is never touched.
+that; the original is never touched.  `probe-root-volume.py` is the one that
+attaches a *second* block device to the machine -- the OS root volume, read-only
+-- and reads the kernel's log out of guest memory while QEMU is still running;
+it too modifies neither the guest, the kernel, nor the device tree, but unlike
+`symbolize-kernel.py` it starts QEMU and writes a run directory under
+`local-private/`, as `probe-guest-cpu.py`, `probe-guest-stack.py` and
+`probe-adt-uart.py` already do.
 
 | script | answers |
 | --- | --- |
@@ -15,6 +21,7 @@ that; the original is never touched.
 | `probe-guest-cpu.py` | "is the guest running or wedged?"  Boots the same machine `unipad.host.unixnu_boot.boot()` builds (it calls `build_argv`, so the argv is not re-implemented) and samples `info registers` over QMP. |
 | `probe-guest-stack.py` | "why is it there?"  Walks the frame-pointer chain (`X29` -> `[X29]` -> `[X29+8]`) and symbolizes every return address.  This is what proved the guest is in XNU's idle thread. |
 | `probe-adt-uart.py` | "is the missing UART node why the serial is quiet?"  Adds one `arm,pl011` node to a copy of the tree and boots it.  Answer was no. |
+| `probe-root-volume.py` | "does a `qemu_defconfig` kernel enumerate a second virtio-blk device at all, and does the root volume mount?"  Boots the same machine `unipad.host.unixnu_boot.boot()` builds -- it stages the ESP with `stage_esp` and calls `build_argv(..., root_image=root)`, so the argv is not re-implemented -- with the OS root volume attached as a second, read-only block device, and watches the live guest's kernel log over QMP.  Answer was no: `device=osroot inserted=True`, and the UUID the kernel waits for is in the image, but `CONFIG_XNU_NATIVE_VIRTIO_BLOCK` is absent from the `qemu_defconfig` kernel, so nothing ever enumerated it. |
 
 ## Usage
 
@@ -23,6 +30,7 @@ python scripts/windows/symbolize-kernel.py <kernel.macho> <va> [<va> ...]
 python scripts/windows/probe-guest-cpu.py   [SECONDS] [BUNDLE] [ADT] [WORKDIR]
 python scripts/windows/probe-guest-stack.py [SECONDS] [BUNDLE] [ADT] [WORKDIR]
 python scripts/windows/probe-adt-uart.py    [SECONDS] [BUNDLE] [ADT] [WORKDIR]
+python scripts/windows/probe-root-volume.py --root-image PATH [--seconds N] [--settle S] [--run DIR] [--decode-udif]
 ```
 
 `BUNDLE` is the runner's `boot-inputs` directory (it carries `UniXNU.efi`,
@@ -30,6 +38,16 @@ python scripts/windows/probe-adt-uart.py    [SECONDS] [BUNDLE] [ADT] [WORKDIR]
 The defaults name the paths this machine used, so a fresh checkout has to pass
 them explicitly.  `UNIPAD_QEMU` and `UNIPAD_FIRMWARE` override the QEMU binary
 and the EDK II code volume.
+
+`probe-root-volume.py`'s `--root-image` is the OS root volume as a raw disk.  A
+UDIF container is decoded first, and that is detected by sniffing the `koly`
+trailer rather than by the `.dmg` suffix -- `044-76034-038.dmg` is raw APFS with
+no trailer at all, while `044-76040-038.dmg` is a UDIF container -- so
+`--decode-udif` only forces what the sniff already found.  Its exit codes are
+load-bearing: 0 = a mountpoint marker appeared, 2 = a refusal before QEMU
+starts, 3 = the UDIF decode was refused, 4 = the guest never reached the kernel
+hand-off, 5 = the deadline expired with no marker.  An earlier version returned
+0 when it gave up, which made a failure indistinguishable from a success.
 
 ## What they established
 
@@ -40,8 +58,16 @@ and the EDK II code volume.
 * `probe-adt-uart.py`: adding a PL011 node changed nothing on serial, so the
   device tree's lack of a UART node is **not** the reason the log goes quiet, and
   upstream's tree must not be "fixed" for it.
+* `probe-root-volume.py`: the OS root volume's UUID is the one the kernel blocks
+  on, and the attachment side is code-complete and verified -- QMP `query-block`
+  reports `device=osroot inserted=True` while `esp` stays a separate device.  The
+  kernel still could not mount it: `vendor/UniXNU-qemu/configs/qemu_defconfig`
+  has no `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`, so the second disk was never
+  enumerated as an `IOMedia` at all.  That is a missing kernel **configuration**,
+  not a missing image, and launchd as PID 1 was therefore never observed.
 
-Both are recorded in `docs/boot-windows.md` §1.4 and §3.4.
+The first two are recorded in `docs/boot-windows.md` §1.4 and §3.4; the
+root-volume measurement is in §6.
 
 ## Why they are committed
 

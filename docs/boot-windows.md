@@ -9,7 +9,9 @@
   只能由束里的 `manifest.json` 说，见 §1.4）
 - 设备树：`local-private/boot6/kernel.macho.adt`，17,624 字节，**本机生成**（见 §3），
   `unique-chip-id` `02723f6de1295be8`
-- 代码：`src/unipad/host/adt.py`（生成 ADT）、`src/unipad/host/unixnu_boot.py`（搭 ESP 并启动）
+- 代码：`src/unipad/host/adt.py`（生成 ADT）、`src/unipad/host/unixnu_boot.py`（搭 ESP 并启动）、
+  `src/unipad/host/guestobserve.py`（读活访客的内核日志与进程表）、
+  `src/unipad/host/udif.py`（把 UDIF 容器解成裸镜像）
 
 本文件的职责是把**已证明的**与**未证明的**分开写。构建阶段名称、Actions 绿色、二进制格式正确，
 都不等于启动验收通过；反过来说，启动验收通过也不等于用户态跑起来。
@@ -277,7 +279,8 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 | UEFI → UniXNU 交接 | **已证明** | §1.4 串口 + PE subsystem 10 |
 | UniXNU → DarwinBoot 交接 | **已证明** | §1.4 `DARWINBOOT: loader v2 installed EL1` |
 | DarwinBoot → XNU | **已证明** | §1.4 `hand-off to the kernel` + 寄存器转储 |
-| 内核进入用户态 / SpringBoard | **BLOCKED** | 见 §5：需要 OS root 磁盘镜像、shared window 与 QemuMetal |
+| 内核进入用户态 / SpringBoard | **BLOCKED** | 见 §5 与 §6：OS root 卷已解出且 UUID 匹配，但本机内核无 `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`，第二个盘从未被枚举 |
+| 根卷挂载（第二个 virtio-blk） | **BLOCKED** | §6：缺的是内核配置，不缺镜像；挂载侧已完整验证 |
 | 内核串口输出 | 未观察到 | §3.4：**不是缺陷**，与上游一致；加 UART 节点的实验无效 |
 | `QemuRamfb.efi` 设置 1376x1024 | UNVERIFIED | 该驱动由 payload 构建放在 ESP 上，本机未生成 |
 | 十条端到端验收 | BLOCKED | 同上 |
@@ -291,8 +294,14 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 
 内核已进空闲线程，但没有任何用户态。上游 `run-qemu.py` 给出的路径是三个东西一起上：
 
-- `--os-root`：`scripts/build-os-root.py` 从**已在本机的** `local-private/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw`
-  （6,835,124,840 字节）提取 OS 磁盘镜像与 SystemOS 镜像；
+- `--os-root`：**上游自己的开关**（`vendor/UniXNU-qemu/scripts/run-qemu.py:36`，`action='store_true'`，
+  **不带路径**）。它让 `run-qemu.py:199-208` 先设 `-global virtio-mmio.force-legacy=false`，再把 IPSW 里的
+  OS 镜像与 SystemOS 镜像各挂成一个只读 `virtio-blk-device`（`drive=os` / `drive=systemos`）。
+  镜像本身由 `scripts/build-os-root.py` 从**已在本机的**
+  `local-private/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw`
+  （6,835,124,840 字节）提取。**本仓库没有 `--os-root` 这个选项**，别在 `unipad` 或探针上找它：
+  对等的写法是 `unipad.host.unixnu_boot.build_argv(..., root_image=...)`，以及
+  `scripts/windows/probe-root-volume.py --root-image PATH`（§6）；
 - `--shared-window`：`memory-backend-file` 的共享内存窗（上游注释记录：**共享全部客体内存会让用户态
   停在 launchd 上空转**，所以只共享这一个窗）；
 - `--metal`：每个 slot 一个 `metal-host` 进程，`package/QemuMetal/QemuMetalPublish.cpp` 发布授权。
@@ -302,6 +311,11 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 它同时是 PRD §12 的敏感路径：提取出来的是 Apple 的 OS 内容，只能留在 `local-private/`，
 上传只允许本项目自己生成的产物。
 
+本机已经能做的那一半：UDIF 容器可以用 `src/unipad/host/udif.py` 解成裸镜像——解开 `044-76040-038.dmg`
+这步不需要 `hdiutil`（上游是 `build-os-root.py` 自己调 `hdiutil` 挂载目标卷）。**但解出镜像并不等于
+能挂上**——§6 实测，本机内核枚举不了第二个块设备，所以 `--os-root`/`root_image=` 这一条现在卡在
+内核配置上，不在镜像上。
+
 ### 5.2 观察手段：先解决"看不见"
 
 串口在交接后安静、帧缓冲不变，所以目前**没有任何东西能告诉我们用户态发生了什么**。
@@ -310,6 +324,8 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 - 已排除：ADT 缺 UART 节点。实测给 `arm-io` 加一个 `arm,pl011`（0x09000000、SPI 1）后串口
   输出**完全没有变化**（`local-private/boot7/uart_experiment.py`），所以那不是原因，
   也不该为此改动上游生成的树。
+- **内核层已经看得见了**：`unipad.host.guestobserve` 从 `msgbufp` 环形缓冲反卷出内核日志
+  （§6 用的就是它），所以"内核到没到挂载点"不再依赖串口。剩下的盲区只剩**用户态**。
 - 待查：帧缓冲。内核拿到的是 `0x1BC7A0000`/800x600/32bpp（ramfb），但 XNU 的 console 可能画在
   另一个 surface 上，或者 `debug=0x14e` 位没有打开串口输出。
 - 待查：`run-qemu.py` 自己只打印 `UNIXNU:`/`DARWINBOOT:` 前缀的行——上游**本来就不期待**内核串口
@@ -322,3 +338,117 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 （`unixnu_boot.boot()` 检测后传给 `build_argv`），因为该 fw_cfg 项就是由那个驱动读的
 （`run-qemu.py:105-116`）。本机现搭的 ESP 不带该驱动，所以帧缓冲是固件默认的 800x600，
 §1.4 的截图比例与 iPad 不符。**不能据此判断渲染是否正常。**
+
+---
+
+## 6. 根卷挂载实测：缺的是内核配置，不是镜像（2026-10-25）
+
+`scripts/windows/probe-root-volume.py` 把 OS root 卷作为**第二个**块设备挂上、启动真客体，
+并在 QEMU 运行期间通过 `unipad.host.guestobserve` 读活访客。它回答的只有一个问题：
+一个 `qemu_defconfig` 的 UniXNU 内核，到底能不能枚举第二个 virtio-blk 设备、能不能挂上根卷。
+
+```
+python scripts/windows/probe-root-volume.py --root-image PATH [--seconds N] [--settle S] [--run DIR] [--decode-udif]
+```
+
+### 6.1 它测的就是 launcher 会启动的那台机器
+
+ESP 由 `unipad.host.unixnu_boot.stage_esp` 现搭，`vars.fd` 截断成**全零**（不是固件的字节拷贝）——
+与 `boot()` 完全一致。早先一版是 `copytree` 上一次运行的 ESP、再把固件字节写进 `vars.fd`，
+那是另一个 EDK II 变量存储、因此是另一台机器，而在本探针读的串口日志里看不出区别。
+argv 由 `build_argv(..., root_image=root)` 生成，不重新实现。
+
+拒绝都发生在 QEMU 启动之前：镜像不可用（2）、板级内存与本模块给的机器不一致（2）、
+`stage_esp` 写出的 payload 文件数不是 5（2）、UDIF 解码被拒（3）。
+客体会话本身：没到内核交接返回 4，截止时间到了仍无标记返回 5——**早先一版放弃时返回 0**，
+于是"失败"与"成功"在进程层面无法区分，实测 306 秒、44 次观测、exit 0，而客体从没到过挂载点。
+
+设备树取自己搭过的 ESP（`build-payload` 因缺字体头失败，束里没有新的树），所以每次运行都
+**按 `board.toml [payload.adt] root_match_volume_uuid` 校验这棵树**，对不上就退出：
+一份过期树会让探针去测一个错的 UUID。
+
+镜像按 `board.toml [ipsw.sha256]` 的摘要点名，并按 `run-qemu.py:186`/`:196` 的角色标注；
+挂成 SystemOS cryptex 时告警——根匹配 UUID 属于 `os` 成员，挂它**无论内核怎样都不可能成功**。
+
+### 6.2 两个盘必须在不同传输层
+
+ESP 留在 **PCI**（`virtio-blk-pci`）：EDK II 要枚举虚拟 PCI 总线才能找到并挂载它
+（`BdsDxe: loading Boot0001 ... from PciRoot(0x0)/Pci(0x1,0x0)`）。
+
+根卷必须是 **MMIO**（`virtio-blk-device`），这不是偏好：会读它的驱动按传输层匹配。
+`vendor/UniXNU/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp:148-154` 的 `probe()` 在 provider 的
+`compatible` 不是恰好 12 字节 `"virtio,mmio"` 时直接 `return nullptr`，所以 `virtio-blk-pci` 设备
+**无论内核怎么配都不可能被它绑定**。第一版 `build_argv` 的 `root_image` 把根卷也写成了
+`virtio-blk-pci`，而 QEMU 毫不抱怨地接受了这条 argv——跑得起来、日志正常，只有去读那个永远不会
+绑定它的驱动的 `probe()` 才发现错。
+
+还必须带 `-global virtio-mmio.force-legacy=false`（上游 `run-qemu.py:199` 同样如此）：不带这个 global，
+MMIO 传输留在 legacy 模式，寄存器偏移与驱动期待的不一致——`start()`
+（`NativeVirtioBlock.cpp:499-506`）要求 provider 带 `dma-coherent`、
+`mapDeviceMemoryWithIndex(0)` 长度 ≥ `0x108`，并读 `read32(0x00)==0x74726976`（"virt"）、
+`read32(0x04)==2`、`read32(0x08)==2`。
+
+### 6.3 内核日志不在串口上
+
+串口在 DarwinBoot 的 `hand-off to the kernel` 之后就不再增长（§1.4），所以标记只能从 msgbuf 里读：
+`unipad.host.guestobserve` 反卷 `msgbufp` 环形缓冲。轮询的标记是 `Waiting on` / `bsd_autoconf` /
+`mountroot` / `IOMedia`，并记录用了几次观测才到。
+
+这同时是一条方法学教训：第一次运行只在内核加载行后等 3 秒，日志只有 10,985 字节、`allproc` 还空着，
+看起来像「挂了盘反而更早失败」，其实是采样太早。**这条测量必须等内核走到挂载点才有意义。**
+
+### 6.4 UDIF 容器先解码：`src/unipad/host/udif.py`
+
+`044-76040-038.dmg`（5,157,406,069 字节）是 **UDIF 容器**，不是裸 APFS。QEMU 的 `format=raw`
+打不开它，而且**不会抱怨**——它会把这个压缩容器当裸盘交给客体，于是没有 GPT、没有 APFS、
+没有卷 UUID，启动停在和不挂盘时一模一样的 `Waiting on IOMedia` 上，而调用方看着
+`report.root_image` 已设、`main()` 打印 "root volume attached"。所以 `build_argv` 直接拒绝带
+`koly` 尾部的镜像，并指名去解码；探针则自己解。
+
+`udif.py` 读容器、写裸字节：`koly` 尾部在 `filesize-512`（全大端），XML plist 的
+`resource-fork/blkx` 每项 `Data` 是 204 字节 `mish` 头加 `NumberOfBlocks` 个 40 字节块记录
+（`type`@0、**相对扇区**@8、扇区数@16、**压缩偏移**@24、压缩长@32）。`sectorNumber` 是
+**相对本 entry** 的——这是这个格式里唯一容易搞错的一处偏移，上游自己的
+`extract-target-volume.py` 也这么读。块类型：`0x80000007` LZFSE 3415 个、`0x00000001` raw 396 个、
+`0x00000002` 零填充 3 个、`0xFFFFFFFF` 终止符。
+
+它**不解 LZFSE**：Python 标准库没有 LZFSE 解码器，而 OS 成员 3814 块里 3415 块是 LZFSE。
+解析是完整的、无需库的两种编解码（raw 与零填充）在本模块内，所以调用方给解码器
+（`LzfseDecoder(decode)`）就拿全镜像，不给就拿一条说清缺什么的拒绝。半解码静默产出一份错镜像更糟：
+GPT CRC 虽然能抓到，但那是 6 GB 写完之后的事。API：`UdifImage(path)`、`needs_lzfse()`、
+`chunk_types()`、`chunks()`、`chunk_bytes(chunk, lzfse)`、`write_raw(destination, lzfse, progress=None)`、
+`check_gpt(image)`。
+
+`write_raw` **失败不留任何东西**：可恢复的失败曾把目的地变成一整个全尺寸半成品，之后每次重试都被
+"先删掉它"挡住。它有 `progress` 回调，因为 LZFSE 路径是瓶颈且差两个数量级——本机实测约 **2 MB/s
+输出**，6 GB 约一小时，而 I/O 一侧约 31 秒；静默的一小时与卡死无法区分。
+
+UDIF 与否靠**嗅探 `koly` 尾部**判断，不看 `.dmg` 后缀：`044-76034-038.dmg` 是 3,303,014,400 字节
+裸 APFS、根本没有尾部，`044-76040-038.dmg` 才是 UDIF 容器。按后缀猜的第一版恰好拒绝了那个
+唯一不需要解码的镜像。
+
+### 6.5 结果
+
+- **镜像就是客体等的那一个。** `044-76040-038.dmg` 解出 **6,077,580,800 字节**（11,870,275 扇区，
+  6 个 entry，entry 3 从扇区 34 起、11,870,208 扇区、3809 块），GPT 头 CRC32 `0xd9e4279c` 与
+  分区项 CRC32 `0xfa7a560c` 双双匹配——这是解码字节精确的证明。分区只有一个 APFS
+  （卷名 `DawnUpdate21H461.J120J121J207J208OS`），其卷超级块在 +0xf0 处正是
+  `04769d262ca04825b443e2e5f88300f2`，与内核 `Waiting on ... IOMedia ... UUID 04769D26-...`
+  完全一致。
+- **挂载侧代码完整且已验证。** QMP `query-block` 报 `device=osroot inserted=True`（只读，
+  backed by 该镜像），`esp` 仍是独立设备。修正传输层后复测：QEMU 接受 argv（stderr 空），
+  访客走到同一点（17,113 字节内核日志、`bsd_autoconf` 在、仍在等同一个 UUID）。
+- **内核仍然挂不上。** 整个内核日志里检索 `virtio` / `block storage` / `IOMedia` /
+  `AppleDiskImage` / `disk0` / `apfs`（`install_apfs_vfs_fs` 之外）/ `GPT` / `partition`，
+  **除 `Waiting on` 那一行本身外零命中**——第二个盘从未被枚举成任何 IOMedia。
+  原因是配置而不是运气：`vendor/UniXNU-qemu/configs/qemu_defconfig`（本机四个内核构建全部用它）
+  **没有** `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`；`qemu_root_defconfig` 才加它，并且同时要
+  `CONFIG_XNU_VERIFIED_ROOT_PROBE`、`CONFIG_XNU_OWNER_ROOT_AUDIT/TRUST/CACHE_MOUNT/CACHE_STARTUP/
+  BOOT_MANIFEST/UNION_SYSTEMOS`、`CONFIG_XNU_NATIVE_RAM_BLOCK`、`CONFIG_XNU_OWNER_DATA_MOUNT`、
+  `CONFIG_XNU_NATIVE_LEGACY_DISPLAY`，以及两个在内核步骤之外产出的归档。
+  全盘四个 `kernel.macho` 逐个检索 `NativeVirtioBlock` 等五个串，**全部为 0**（`Libkern` 为 5，
+  证明检索方式有效），所以"换一个已经构建好的内核试试"这条路在本机不存在。
+- **launchd PID 1 因此从未被观测到。** §1.4 证明的是交接与空闲线程，不是用户态。
+
+**结论：根卷阻断是「需要一个本机不存在的内核配置及其整条 owner 签名链」，
+不是「需要一个本机不存在的镜像」。** 早先"缺的不是镜像而是挂上去"的说法是错的，已在此更正。
