@@ -885,7 +885,7 @@ jobs:
                   if head == commit:
                       continue
                   gitlink = entry.get("gitlink_commit") or "the gitlink"
-                  print(f"== {path}: {gitlink} -> {commit} (the lock's recorded divergence)")
+                  print(f"== {path}: {gitlink} -> {commit} (the divergence the lock records)")
                   _run_git(
                       ["-C", str(directory), "fetch", "-q", "--depth", "1", "origin", commit]
                   )
@@ -1530,6 +1530,14 @@ jobs:
           REFER_DIR: ipsw-work/refer
           OPENSSL_PREFIX: ${{ env.OPENSSL_PREFIX }}
           OUT_ROOT: build-output/unixnu-out
+          # This workflow declares NO workflow-level and NO job-level `env:`
+          # block -- LOCK_PATH is set per step, by the steps that need it.  It
+          # was missing here and `set -euo pipefail` turned that into
+          # "LOCK_PATH: unbound variable" at the display-driver divergence, on
+          # run 40201825941, after the volumes had been moved and the kernel and
+          # payload had been proved present.  Same spelling as the two
+          # build-macos.sh invocations above.
+          LOCK_PATH: config/sources.lock.json
         run: |
           set -euo pipefail
           # And again before the chain signs them, because this is the step that
