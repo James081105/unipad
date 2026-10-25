@@ -739,6 +739,133 @@ def test_an_empty_firmware_is_refused_the_same_way(
 
 
 # ---------------------------------------------------------------------------
+# the root volume
+# ---------------------------------------------------------------------------
+def test_the_root_volume_is_a_second_read_only_virtio_disk(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The OS volume is attached read-only, on its own drive id, after the ESP.
+
+    Two properties, each with the reason it is asserted rather than assumed:
+
+    * ``readonly=on``.  This is the shipped system volume; a boot that writes to
+      it is a different experiment with different consequences (PRD 4.2's
+      "read-only property correct" row).
+    * Its own ``id``.  Two virtio-blk devices sharing one drive id is one device,
+      and the ESP would stop being the disk the firmware booted from.
+    """
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root,
+    )
+
+    assert _values(argv, "-drive")[-1] == (
+        f"if=none,id=osroot,format=raw,readonly=on,file={root.resolve().as_posix()}"
+    ), argv
+    assert _values(argv, "-device") == [
+        "virtio-blk-pci,drive=esp",
+        "virtio-blk-pci,drive=osroot",
+        "ramfb",
+        "qemu-xhci",
+        "usb-kbd",
+    ], argv
+    # After the ESP, so the ESP keeps the device number every earlier run recorded.
+    assert argv.index("virtio-blk-pci,drive=esp") < argv.index("virtio-blk-pci,drive=osroot"), argv
+
+
+def test_without_a_root_image_the_argv_is_exactly_what_it_was(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The parameter is additive, not a rewrite of the device list.
+
+    The guard this pins: a change that *reordered* the ESP drive, or emitted the
+    root drive with a different spelling, would still satisfy every assertion
+    about the root drive itself while silently changing the machine every
+    earlier run described.  So the no-root argv is asserted to be the root argv
+    with exactly four tokens removed.
+    """
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    with_root = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root,
+    )
+    without = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run"
+    )
+    assert len(with_root) - len(without) == 4, (len(with_root), len(without))
+    # The four added tokens, removed, leave the argv exactly as it was: the flag
+    # before the drive spec, the drive spec, the flag before the device spec and
+    # the device spec.  A change that reordered anything would still pass every
+    # assertion above while changing the machine every earlier run described.
+    added_at = next(i for i, token in enumerate(with_root) if "id=osroot" in token)
+    assert with_root[added_at - 1 : added_at + 3] == [
+        "-drive",
+        with_root[added_at],
+        "-device",
+        "virtio-blk-pci,drive=osroot",
+    ], with_root[added_at - 1 : added_at + 3]
+    assert with_root[: added_at - 1] + with_root[added_at + 3 :] == without, without
+
+
+def test_a_missing_root_image_is_refused_before_qemu_starts(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """Refused here, not by QEMU's exit 1.
+
+    QEMU would refuse the path too, but *after* it started -- and a run that
+    started is a run that produced a serial log to read, one that stops at
+    ``Waiting on IOMedia`` and looks exactly like a run that had no root volume
+    at all.  The message says so, because that is the failure an operator hits.
+    """
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        root_image=tmp_path / "not-there.raw",
+    )
+    assert error.code is ErrorCode.IMAGE_NOT_FOUND, error
+    assert "vfs_mountroot" in error.message, error
+
+
+def test_an_empty_root_image_is_refused(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """A zero-length file is a valid raw disk to QEMU and a useless root volume."""
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"")
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        root_image=root,
+    )
+    assert error.code is ErrorCode.IMAGE_NOT_FOUND, error
+    assert "empty" in error.message, error
+
+
+def test_the_report_says_which_kind_of_run_it_was() -> None:
+    """``root_image`` is recorded, and is ``None`` when none was attached.
+
+    A run with a root volume and a run without one are indistinguishable in the
+    serial log until the kernel blocks; the report has to state which it was,
+    and ``None`` has to mean "no root volume" rather than "not recorded" -- so
+    the default survives a round trip through :meth:`BootReport.to_dict`.
+    """
+    default = ub.BootReport(ok=True)
+    assert default.root_image is None, default
+    assert default.to_dict()["root_image"] is None, default.to_dict()
+    attached = ub.BootReport(ok=True, root_image="F:/somewhere/os-root.raw")
+    assert attached.to_dict()["root_image"] == "F:/somewhere/os-root.raw", attached.to_dict()
+
+
+# ---------------------------------------------------------------------------
 # the PE subsystem
 # ---------------------------------------------------------------------------
 def test_a_non_pe_file_has_no_subsystem(tmp_path: Path) -> None:

@@ -246,6 +246,10 @@ class BootReport:
     serial_markers: list[str] = field(default_factory=list)
     screenshots: list[str] = field(default_factory=list)
     inputs: dict[str, str] = field(default_factory=dict)
+    #: The root volume this run attached, or ``None``.  Recorded because a run
+    #: without one *looks* identical in the serial log until the kernel blocks
+    #: in ``vfs_mountroot``; the report has to say which kind of run it was.
+    root_image: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -261,6 +265,7 @@ class BootReport:
             "serial_markers": list(self.serial_markers),
             "screenshots": list(self.screenshots),
             "inputs": dict(self.inputs),
+            "root_image": self.root_image,
             "error_code": self.error_code,
             "error_message": self.error_message,
         }
@@ -439,6 +444,7 @@ def build_argv(
     memory_mib: int = MEMORY_MIB,
     display: str = "none",
     ramfb_size: Optional[str] = None,
+    root_image: Optional[Path] = None,
 ) -> list[str]:
     """The QEMU argv (without the executable).
 
@@ -459,6 +465,17 @@ def build_argv(
     and switches ramfb to it before DarwinBoot starts (``run-qemu.py:105-116``).
     :func:`boot` passes it only when the ESP actually carries the driver, so a
     locally staged ESP without one does not silently claim a geometry nothing set.
+
+    ``root_image`` is the OS volume as a *second*, read-only virtio-blk disk.
+    Upstream's ``qemu_root_defconfig`` run attaches the OS image and the
+    SystemOS image exactly this way (``run-qemu.py --os-root``), and the kernel
+    finds the root by the volume UUID the board's ``[payload.adt]`` publishes.
+    Without it the guest has the ESP and nothing else, so ``vfs_mountroot``
+    blocks forever on ``Waiting on IOMedia with UUID ...`` -- measured on this
+    host on 2026-10-24, which is why the parameter exists rather than the
+    operator adding a ``-drive`` by hand.  It is read-only for the same reason
+    upstream's is: this is the shipped system volume, and a boot that writes to
+    it is a different experiment with different consequences (PRD 4.2).
     """
     if not 1 <= int(qmp_port) <= 65535:
         raise UniPadError(
@@ -475,6 +492,29 @@ def build_argv(
             "from it and the machine cannot start without both",
             path=safe_location(firmware),
         )
+    # The root image is checked here, before the argv exists, for the same
+    # reason the firmware is: QEMU would reject the whole command line at exit 1
+    # with a path that looks right, and the failure would be indistinguishable
+    # from a boot that never started.  A zero-length image is refused too -- an
+    # empty file is a valid raw disk to QEMU but a useless root volume, and the
+    # run would spend its whole window waiting for a UUID nothing can publish.
+    root: Optional[Path] = None
+    if root_image is not None:
+        root = Path(root_image).resolve()
+        if not root.is_file():
+            raise UniPadError(
+                ErrorCode.IMAGE_NOT_FOUND,
+                "the root volume image does not exist; the guest would boot "
+                "with the ESP alone and block in vfs_mountroot",
+                path=safe_location(root),
+            )
+        if root.stat().st_size <= 0:
+            raise UniPadError(
+                ErrorCode.IMAGE_NOT_FOUND,
+                "the root volume image is empty; no IOMedia can be published "
+                "from it, so the kernel's root match cannot be satisfied",
+                path=safe_location(root),
+            )
 
     def qpath(path: Path | str) -> str:
         # Absolute, and forward slashes.  QEMU is started with this run directory
@@ -498,6 +538,14 @@ def build_argv(
         # form UniXNU boots.
         "-drive", f"if=none,id=esp,format=raw,readonly=on,file=fat:{qpath(Path(esp))}",
         "-device", "virtio-blk-pci,drive=esp",
+        # The OS root volume, when one is supplied.  Its own drive id, because
+        # two virtio-blk devices sharing one would be one device; and it is
+        # emitted *after* the ESP so the ESP keeps the device number the boot
+        # log and every earlier run already recorded.
+    ] + ([
+        "-drive", f"if=none,id=osroot,format=raw,readonly=on,file={qpath(root)}",
+        "-device", "virtio-blk-pci,drive=osroot",
+    ] if root is not None else []) + [
         "-device", "ramfb",
         "-device", "qemu-xhci",
         "-device", "usb-kbd",
@@ -619,6 +667,7 @@ def boot(
     every: int = DEFAULT_EVERY,
     qmp_port: int = DEFAULT_QMP_PORT,
     display: str = "none",
+    root_image: Optional[Path] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
 
@@ -703,10 +752,17 @@ def boot(
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
         ramfb_size=SCREEN if (esp / "EFI/UniXNU/Payloads/QemuRamfb.efi").is_file() else None,
+        root_image=root_image,
     )
     (work / "command.txt").write_text(" ".join([str(qemu), *command]) + "\n", encoding="utf-8")
 
-    report = BootReport(ok=False, workdir=str(safe_location(work)), command=[str(qemu), *command], inputs=inputs.to_dict())
+    report = BootReport(
+        ok=False, workdir=str(safe_location(work)), command=[str(qemu), *command],
+        inputs=inputs.to_dict(),
+        # Named here rather than in every later assignment, so a run that fails
+        # before the report is built still says whether it had a root volume.
+        root_image=safe_location(root_image.resolve()) if root_image is not None else None,
+    )
 
     stdout_path = work / "qemu-stdout.log"
     stderr_path = work / "qemu-stderr.log"
@@ -871,6 +927,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--every", type=int, default=DEFAULT_EVERY)
     parser.add_argument("--qmp-port", type=int, default=DEFAULT_QMP_PORT)
     parser.add_argument("--display", default="none")
+    parser.add_argument("--root-image", type=Path, default=None,
+                        help="raw OS volume to attach as a second, read-only virtio-blk disk; "
+                             "without it the guest has the ESP alone and blocks in vfs_mountroot")
     parser.add_argument("--kernel-arg", action="append", default=[], metavar="NAME=VALUE",
                         help="replace the board's argument of the same name; repeatable")
     args = parser.parse_args(argv)
@@ -897,8 +956,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         every=args.every,
         qmp_port=args.qmp_port,
         display=args.display,
+        root_image=args.root_image,
     )
     print(f"qemu exit {report.exit_code}; qmp ready: {report.reached_qmp}; serial {report.serial_bytes} bytes")
+    if report.root_image:
+        print(f"root volume attached: {report.root_image}")
+    else:
+        print("no root volume attached: the guest has the ESP alone")
     for line in report.serial_markers[-8:]:
         print(f"  {line}")
     if report.screenshots:
