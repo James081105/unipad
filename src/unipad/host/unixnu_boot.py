@@ -126,6 +126,29 @@ APPLICATION_SUBSYSTEM_REASON = (
 )
 
 
+def _ends_in_udif_trailer(path: Path) -> bool:
+    """Whether a file ends in a UDIF ``koly`` trailer.
+
+    Sniffed rather than inferred from the suffix, because ``.dmg`` does not mean
+    UDIF in an IPSW: ``044-76034-038.dmg`` is 3,303,014,400 bytes of raw APFS
+    with no trailer at all, while ``044-76040-038.dmg`` is a container.  Reading
+    the last 512 bytes is one small read and it is the only thing that separates
+    them -- a suffix heuristic would refuse the image that needs no decoding.
+    """
+    try:
+        size = path.stat().st_size
+        if size <= 512:
+            return False
+        with path.open("rb") as handle:
+            handle.seek(size - 512)
+            return handle.read(4) == b"koly"
+    except OSError:
+        # An unreadable file is not a UDIF container, and saying so would be a
+        # lie: QEMU will refuse it with its own error, which is more informative
+        # than a guess made here.
+        return False
+
+
 def pe_subsystem(path: Path) -> Optional[int]:
     """The EFI subsystem of a PE32+ image, or ``None`` when it is not one.
 
@@ -470,6 +493,20 @@ def build_argv(
     Upstream's ``qemu_root_defconfig`` run attaches the OS image and the
     SystemOS image exactly this way (``run-qemu.py --os-root``), and the kernel
     finds the root by the volume UUID the board's ``[payload.adt]`` publishes.
+    **That is the mechanism, not a promise this function can keep.**  It needs
+    a kernel carrying ``CONFIG_XNU_NATIVE_VIRTIO_BLOCK``; without one the
+    device is attached and never enumerated at all, which is the state of
+    every kernel on this host (measured 2026-10-25: attaching a 3.3 GB raw
+    APFS image produced zero block-device enumeration in the kernel log,
+    and none of the four ``kernel.macho`` files here carries
+    ``NativeVirtioBlock``).  So a successful :func:`build_argv` means the
+    argv was built and the device was created -- nothing about whether the
+    guest can read it.  ``scripts/windows/probe-root-volume.py`` is what
+    answers that, and the report cannot: ``SERIAL_MARKERS`` carries no
+    ``Waiting on``/``IOMedia``/``mountroot``/``bsd_autoconf``, so the
+    ``vfs_mountroot`` block line is filtered out of ``serial_markers``
+    entirely and a run that blocked is indistinguishable from one that did
+    not except through ``root_image``.
     Without it the guest has the ESP and nothing else, so ``vfs_mountroot``
     blocks forever on ``Waiting on IOMedia with UUID ...`` -- measured on this
     host on 2026-10-24, which is why the parameter exists rather than the
@@ -516,6 +553,15 @@ def build_argv(
     # from a boot that never started.  A zero-length image is refused too -- an
     # empty file is a valid raw disk to QEMU but a useless root volume, and the
     # run would spend its whole window waiting for a UUID nothing can publish.
+    #
+    # A UDIF *container* is refused as well, and that is not a theoretical case:
+    # ``044-76040-038.dmg`` is 5,157,406,069 bytes, so it passes both checks above
+    # and QEMU opens it happily -- ``format=raw`` accepts any bytes -- and hands
+    # the guest a compressed container as a raw disk.  There is then no GPT, no
+    # APFS and no volume UUID, so the boot blocks on the same ``Waiting on
+    # IOMedia`` line as a run with no root volume at all, while the caller reads
+    # ``report.root_image`` set and ``main()`` prints "root volume attached".
+    # ``unipad.host.udif`` is what turns one of these into a raw image.
     root: Optional[Path] = None
     if root_image is not None:
         root = Path(root_image).resolve()
@@ -528,9 +574,22 @@ def build_argv(
             )
         if root.stat().st_size <= 0:
             raise UniPadError(
-                ErrorCode.IMAGE_NOT_FOUND,
+                ErrorCode.CONFIG_INVALID,
                 "the root volume image is empty; no IOMedia can be published "
-                "from it, so the kernel's root match cannot be satisfied",
+                "from it, so the kernel's root match cannot be satisfied.  This "
+                "is CONFIG_INVALID rather than IMAGE_NOT_FOUND because retrying "
+                "can never change a file's length from zero, and a caller that "
+                "branches on the code and retries would retry forever",
+                path=safe_location(root),
+            )
+        if _ends_in_udif_trailer(root):
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the root volume image is a UDIF container, not a raw disk; "
+                "QEMU's format=raw would hand the guest the compressed "
+                "container, which publishes no IOMedia. Decode it first with "
+                "unipad.host.udif (which needs an LZFSE decoder for the OS "
+                "member, 3415 of its 3814 chunks)",
                 path=safe_location(root),
             )
 
@@ -702,10 +761,19 @@ def boot(
     ``serial.log`` and the screendumps, summarised but not judged.
 
     Raises:
-        UniPadError: ``image_not_found`` for a missing input (before anything is
-            written), ``config_invalid`` for an unusable port or a machine the
-            board does not declare, ``qemu_launch_failed`` when QEMU exits
-            before QMP answers.
+        UniPadError: ``image_not_found`` for a missing *boot input* -- the five
+            :class:`BootInputs` paths and the QEMU binary, all checked before
+            anything is written.  The root volume is **not** in that set: it is
+            checked inside :func:`build_argv`, which runs after the work
+            directory, the ESP and ``vars.fd`` have been written, so a bad
+            ``root_image`` leaves a staged ESP behind.  The asymmetry is
+            deliberate -- the root volume is an attachment, not an input the
+            boot cannot proceed without -- and it is stated here because the
+            earlier wording claimed both happened "before anything is written",
+            which was not true of the root image and was not tested for it.
+            ``config_invalid`` for an unusable port, a machine the board does
+            not declare, or a root volume that is empty or a UDIF container;
+            ``qemu_launch_failed`` when QEMU exits before QMP answers.
     """
     qemu = Path(qemu)
     if not qemu.is_file():
@@ -766,6 +834,14 @@ def boot(
     # The writable vars flash, sized to the code flash exactly.  A file that is
     # already the right size is left alone: it holds the variables from a
     # previous boot, which is the point of having one.
+    #
+    # **Two boots into the same workdir are therefore not the same machine**:
+    # the second carries UEFI NVRAM the first wrote, and nothing in
+    # boot-report.json says so, so two reports from one workdir look
+    # comparable when they are not.  Recorded rather than changed --
+    # preserving the variables is the documented intent -- and a caller that
+    # wants a reproducible machine uses a fresh workdir, which is what
+    # scripts/windows/probe-root-volume.py does.
     vars_path = work / "vars.fd"
     code_size = Path(inputs.firmware).stat().st_size
     if not vars_path.is_file() or vars_path.stat().st_size < code_size:

@@ -851,7 +851,16 @@ def test_a_missing_root_image_is_refused_before_qemu_starts(
 def test_an_empty_root_image_is_refused(
     inputs: BootInputs, tmp_path: Path
 ) -> None:
-    """A zero-length file is a valid raw disk to QEMU and a useless root volume."""
+    """A zero-length file is a valid raw disk to QEMU and a useless root volume.
+
+    The code is CONFIG_INVALID, not IMAGE_NOT_FOUND.  ``IMAGE_NOT_FOUND`` is
+    absent from ``errors._CODE_TO_EXIT`` so it maps to exit 1 -- indistinguishable
+    from every other unmapped code -- and a caller that branches on it and retries
+    retries forever, because retrying can never change a file's length from zero.
+    The message used to be the only discriminator, which defeats the point of the
+    taxonomy.  The pre-existing firmware check makes the same merge; this one was
+    fixed rather than copying it.
+    """
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"")
     error = _refused(
@@ -862,8 +871,49 @@ def test_an_empty_root_image_is_refused(
         tmp_path / "run",
         root_image=root,
     )
-    assert error.code is ErrorCode.IMAGE_NOT_FOUND, error
+    assert error.code is ErrorCode.CONFIG_INVALID, error
     assert "empty" in error.message, error
+
+
+def test_a_udif_container_is_refused_as_a_root_volume(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """A UDIF container passes every size check and is still not a raw disk.
+
+    ``044-76040-038.dmg`` is 5,157,406,069 bytes, so it passes ``is_file()`` and
+    ``st_size > 0`` and QEMU opens it happily -- ``format=raw`` accepts any bytes.
+    The guest is then handed a compressed container: no GPT, no APFS, no volume
+    UUID, and the boot blocks on the same ``Waiting on IOMedia`` line as a run
+    with no root volume at all, while the caller reads ``report.root_image`` set
+    and ``main()`` prints "root volume attached".  The argv's success was the lie.
+
+    The suffix is *not* used to decide.  ``044-76034-038.dmg`` is 3,303,014,400
+    bytes of raw APFS with no trailer, and a suffix heuristic would refuse the one
+    image that needs no decoding -- which is exactly what an earlier version of
+    the probe did.  Both halves are asserted here.
+    """
+    container = tmp_path / "os-root.dmg"
+    container.write_bytes(b"\0" * 1024 + b"koly" + b"\0" * 508)
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        root_image=container,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "UDIF container" in error.message, error
+    assert "udif" in error.message, error
+
+    # ...and a raw APFS image carrying the same suffix is accepted.
+    raw = tmp_path / "systemos.dmg"
+    raw.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=raw,
+    )
+    assert any("id=osroot" in token for token in argv), argv
 
 
 def test_the_report_says_which_kind_of_run_it_was() -> None:
@@ -1115,6 +1165,169 @@ def test_the_defaults_are_the_ones_the_docstrings_claim() -> None:
     assert ub.ARGUMENT_LIMIT == 1000
     assert ub.SCREEN == "1376x1024"
     assert ub.MEMORY_MIB == 6144
+
+
+
+
+# ---------------------------------------------------------------------------
+# the report, and what it says about a root volume
+# ---------------------------------------------------------------------------
+class _ExitedQEMU:
+    """A stand-in for a QEMU that is already gone when ``_watch`` looks.
+
+    ``boot`` reaches ``_watch``, sees ``poll()`` return non-None on the first
+    iteration, and builds the rest of the report anyway -- the staged ESP, the
+    argv, ``vars.fd`` and ``boot-report.json`` all survive.  That is the one
+    path that runs ``boot`` to completion with no QEMU, no firmware and no
+    kernel on the host, which is the only way this test can exist at all.
+
+    ``stdout`` and ``stderr`` are ``None`` because ``boot`` opens its own log
+    handles and hands them to the child; a fake that claimed to own them would
+    close files ``boot`` is still inside a ``with`` block for.
+    """
+
+    returncode = 3
+    stdout = None
+    stderr = None
+
+    def poll(self) -> int:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+
+def _already_exited(launched: list[list[str]]):
+    """A ``Popen`` that records the argv and reports the process as exited."""
+
+    def start(command: list[str], **_: Any) -> _ExitedQEMU:
+        launched.append(list(command))
+        return _ExitedQEMU()
+
+    return start
+
+
+def test_boot_builds_a_report_that_says_a_root_volume_was_attached(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The report names the attachment, and the run directory proves it.
+
+    ``root_image`` is the one boot argument that is checked *after* the ESP has
+    been written (``build_argv`` runs after ``stage_esp``), so a bad root volume
+    leaves a staged run behind -- and until this test existed nothing covered
+    the assignment that puts it in the report at all.  The property that matters
+    is not that the field is set but that a reader of ``boot-report.json`` can
+    tell an attached run from an unattached one, because those two runs differ
+    in whether the guest can ever reach ``launchd``.
+    """
+    import json
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"raw os volume, not a UDIF container")
+
+    report = ub.boot(inputs, work, qemu=qemu, device_dir=REAL_DEVICE, root_image=root)
+
+    # The failure is the fake's, not the attachment's: QEMU "exited" before QMP
+    # answered, which is exactly what this stand-in is for.
+    assert report.error_code is ErrorCode.QEMU_LAUNCH_FAILED, report
+    assert report.exit_code == 3, report
+    assert report.ok is False, report
+
+    # ``safe_location`` keeps the final component only (PRD 9.2), so the report
+    # says *which* volume without carrying the drive, the profile or the
+    # username.  That is a property, not an accident, and it is pinned here.
+    assert report.root_image == "os-root.raw", report.root_image
+    assert str(tmp_path) not in report.root_image, report.root_image
+
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["root_image"] == "os-root.raw", written
+    assert written["error_code"] == "qemu_launch_failed", written
+    assert launched, "boot never reached Popen"
+
+    # The attachment is in the argv the guest was actually offered, and it is
+    # the MMIO transport the driver binds -- not the PCI one the ESP needs.
+    command = launched[0]
+    assert "virtio-blk-device,drive=osroot" in command, command
+    assert "virtio-mmio.force-legacy=false" in command, command
+    assert not any("virtio-blk-pci,drive=osroot" in item for item in command), command
+    assert f"if=none,id=osroot,format=raw,readonly=on,file={root.resolve().as_posix()}" in command, command
+
+    # And the run directory is a real one: five ESP files, a vars flash the size
+    # of the code flash, and a record of what was staged.
+    assert sorted(p.relative_to(work / "esp").as_posix() for p in (work / "esp").rglob("*")
+                  if p.is_file()) == sorted(ESP_FILES)
+    assert (work / "vars.fd").stat().st_size == inputs.firmware.stat().st_size
+    assert (work / "vars.fd").read_bytes() == b"\0" * inputs.firmware.stat().st_size
+    staged = json.loads((work / "esp-manifest.json").read_text(encoding="utf-8"))
+    assert sorted(key for key in staged if key.startswith("EFI/")) == sorted(ESP_FILES), staged
+
+
+def test_boot_without_a_root_volume_says_so_in_the_report(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unattached run is labelled too, and its argv has no second disk.
+
+    An unattended run and an attached one are different machines: the first
+    blocks in ``vfs_mountroot`` forever and the second might not.  A report that
+    left ``root_image`` null in both cases would make the two
+    indistinguishable, which is the failure this pins.
+    """
+    import json
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+
+    report = ub.boot(inputs, work, qemu=qemu, device_dir=REAL_DEVICE)
+
+    assert report.root_image is None, report.root_image
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["root_image"] is None, written
+    assert not any("osroot" in item for item in launched[0]), launched[0]
+    assert not any("virtio-mmio.force-legacy=false" in item for item in launched[0]), launched[0]
+
+
+def test_the_cli_prints_which_kind_of_run_it_was(
+    inputs: BootInputs, qemu: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """``main`` says out loud whether a root volume went with the run.
+
+    Both branches, because the line an operator reads is the one that tells
+    them which of the two machines they just booted -- and the unattached
+    branch used to be silent, so a run that could never reach ``launchd``
+    looked like any other.
+    """
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited([]))
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"raw os volume")
+    base = [
+        "--device", str(REAL_DEVICE),
+        "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware),
+        "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree),
+        "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu),
+        "--workdir", str(tmp_path / "run"),
+    ]
+
+    assert ub.main([*base, "--root-image", str(root)]) == 1
+    attached = capsys.readouterr().out
+    assert "root volume attached: os-root.raw" in attached, attached
+    assert str(tmp_path) not in attached, attached
+
+    assert ub.main(base) == 1
+    unattached = capsys.readouterr().out
+    assert "no root volume attached: the guest has the ESP alone" in unattached, unattached
+    # The exact line, not the phrase: "no root volume attached" *contains*
+    # "root volume attached", so the substring form passes on the branch it is
+    # meant to exclude.  An earlier version of this test had that bug and the
+    # suite went green anyway.
+    assert "root volume attached: os-root.raw" not in unattached, unattached
 
 
 # ---------------------------------------------------------------------------
