@@ -2943,6 +2943,19 @@ main() {
     # asked for" from "the payload step refused".
     if (( BUILD_PAYLOAD )); then
         log "payload:   requested ($PAYLOAD_REQUESTED); build-payload is planned"
+        # build-payload loads DarwinBoot.efi as a driver and refuses without it,
+        # and build-bootloader is milestone-gated at n>=3 (plan_steps).  So a
+        # stage below 3 that asks for a payload is a GUARANTEED not_run, and it is
+        # a silent one: the stage records its reason two stages later, after the
+        # kernel has been built.  Measured on run 40186682998 -- --stage M2 with
+        # BUILD_PAYLOAD=1 produced exactly that, and the owner root chain then
+        # died in build-storage-abi.py for want of the payload.img it boots.  The
+        # earlier runs that reached the driver used M4, which is where the
+        # bootloader is planned.  Named here so the reader sees it before the
+        # work is spent rather than in the ledger after.
+        if (( STAGE_NUMBER < 3 )); then
+            log "payload:   WARNING stage $STAGE does not plan build-bootloader (plan_steps gates it at n>=3), so build-payload will record not_run for a missing DarwinBoot.efi; pass a stage of 3 or more to get a payload volume"
+        fi
     else
         log 'payload:   not requested (no --payload, BUILD_PAYLOAD empty); no ESP volume will be built'
     fi
