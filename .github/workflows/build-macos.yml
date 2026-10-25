@@ -838,6 +838,73 @@ jobs:
               return problems, warnings
 
 
+          def apply_submodule_divergences():
+              """Put every module submodule at the commit the lock pins.
+
+              `unixnu fetch` initialises the module submodules from the DRIVER
+              repository's own gitlink table (feeds.py:159-165) -- a second
+              place that knows a sha.  The lock is the authority (PRD 8.1), and
+              build-macos.sh's prepare-sources proves every pinned submodule is
+              on disk at the locked commit before it runs anything
+              (offline_missing), so a lock that names a different commit than
+              the gitlink has to be applied HERE, where the sources are laid
+              down.  Applying it only before the chain is too late: the build
+              refuses before the plan runs.
+
+              MEASURED on run 40199915736.  Pinning drivers/NativeMobileDisplay
+              back one commit (see its commit_note in the lock: the pinned
+              device repository cannot compile the gitlink's version) made
+              prepare-sources exit 1 with
+
+                  pinned sources are missing and this script performs no
+                  network access ... submodule:drivers/NativeMobileDisplay
+
+              because the checkout on disk was still the gitlink's.  Nothing
+              about the build had been exercised -- the divergence has to reach
+              the place the sources are laid down, not only the place they are
+              used.
+
+              A submodule the driver never fetched is skipped: an absent
+              directory is not a divergence, and inventing a checkout here would
+              put material in vendor/ that no pin asked for.
+              """
+              moved = []
+              try:
+                  lock = json.loads(Path(LOCK_PATH).read_text(encoding="utf-8"))
+              except (OSError, ValueError) as error:
+                  raise SourcePinError(f"{LOCK_PATH}: {error.__class__.__name__}")
+              root = Path(VENDOR_DIR) / pins["unixnu"]["directory"]
+              for entry in lock.get("submodules") or []:
+                  path, commit = entry.get("path"), entry.get("commit")
+                  if not path or not commit:
+                      continue
+                  directory = root / path
+                  if not (directory / ".git").exists():
+                      continue
+                  head = _head_of(directory)
+                  if head == commit:
+                      continue
+                  gitlink = entry.get("gitlink_commit") or "the gitlink"
+                  print(f"== {path}: {gitlink} -> {commit} (the lock's recorded divergence)")
+                  _run_git(
+                      ["-C", str(directory), "fetch", "-q", "--depth", "1", "origin", commit]
+                  )
+                  _run_git(["-C", str(directory), "checkout", "-q", "--detach", "FETCH_HEAD"])
+                  head = _head_of(directory)
+                  if head != commit:
+                      raise SourcePinError(
+                          f"{path}: the checkout is at {head} but the lock pins {commit}"
+                      )
+                  moved.append(
+                      {
+                          "path": path,
+                          "gitlink_commit": entry.get("gitlink_commit"),
+                          "commit": commit,
+                      }
+                  )
+              return moved
+
+
           def main():
               problems, warnings = [], []
               try:
@@ -920,9 +987,16 @@ jobs:
 
               # ---- phase 2: assemble with the driver --------------------------
               print("== phase 2/3 assemble with the upstream driver (fetch, tree)")
+              divergences = []
               try:
                   run_driver("fetch")
                   run_driver("tree")
+                  # The driver has now initialised every module submodule from
+                  # its own gitlink table.  Anything the lock pins elsewhere is
+                  # moved here, while the sources are still being laid down --
+                  # see apply_submodule_divergences for the run that proved the
+                  # later placement is too late.
+                  divergences = apply_submodule_divergences()
               except SourcePinError as error:
                   _announce(problems, str(error))
                   _write_report(
@@ -937,6 +1011,11 @@ jobs:
                       },
                   )
                   return 1
+              if divergences:
+                  for entry in divergences:
+                      print(
+                          f"== {entry['path']} moved to the locked {entry['commit']}"
+                      )
 
               # ---- phase 3: cross-check ---------------------------------------
               print("== phase 3/3 cross-check the resolved pins against the source lock")
@@ -975,6 +1054,7 @@ jobs:
                       },
                       "status_error": status_error or None,
                       "heads": heads,
+                      "submodule_divergences": divergences,
                       "problems": check_problems,
                       "warnings": check_warnings,
                       "unverified": list(UNVERIFIED),

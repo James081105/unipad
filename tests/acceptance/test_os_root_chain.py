@@ -514,6 +514,54 @@ def test_the_workflow_forces_the_locked_display_driver_before_the_chain() -> Non
         )
 
 
+def test_the_workflow_applies_the_divergence_where_the_sources_are_laid_down() -> None:
+    """A moved submodule has to be moved in the acquisition, not only before the chain.
+
+    Measured on run 40199915736, which is the run that proved the first attempt
+    at this was in the wrong place.  Moving the lock's
+    ``drivers/NativeMobileDisplay`` commit back one commit -- without moving the
+    checkout -- made ``prepare-sources`` exit 1 with::
+
+        pinned sources are missing and this script performs no network access,
+        so the upstream driver cannot be allowed to fetch them:
+        submodule:drivers/NativeMobileDisplay
+
+    because ``unixnu fetch`` had initialised the submodule at the gitlink's
+    commit and ``offline_missing`` compares the on-disk HEAD against the LOCK.
+    The job then skipped every remaining step, so nothing about the build had
+    been exercised.  The acquisition step is where the sources are laid down, so
+    that is where the lock has to win -- and the chain step's own forcing stays
+    as the second, idempotent half.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "def apply_submodule_divergences" in text, (
+        "the acquisition step never applies the lock's submodule commits, so a "
+        "submodule the lock pins away from the driver's gitlink stays at the "
+        "gitlink and prepare-sources refuses the whole build"
+    )
+    # It has to run after the driver has initialised the submodules, or there is
+    # nothing to move -- and before the cross-check, or the report does not say
+    # what was moved.  The CALL is what carries the ordering; the definition is
+    # further up the file by construction, and matching the bare name would find
+    # the `def` and prove nothing.
+    position = text.index("divergences = apply_submodule_divergences()")
+    assert text.index('run_driver("fetch")') < position, (
+        "the divergence is applied before the driver fetches the submodules, so "
+        "there is nothing on disk to move"
+    )
+    assert text.index('run_driver("tree")') < position, (
+        "the divergence is applied before the driver assembles the tree, so the "
+        "tree may still carry the gitlink's version"
+    )
+    assert text.index("= cross_check(feeds") > position, (
+        "the divergence is applied after the cross-check, so the report never "
+        "records what was moved"
+    )
+    assert text.index('"submodule_divergences"') > position, (
+        "the acquisition report does not record the divergences it applied"
+    )
+
+
 @pytest.mark.skipif(
     not DEVICE_REPO_DIR.is_dir() or not DISPLAY_DIR.is_dir(),
     reason="vendor/UniXNU-qemu and vendor/UniXNU/drivers/NativeMobileDisplay are "
