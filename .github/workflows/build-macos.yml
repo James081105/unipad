@@ -876,9 +876,23 @@ jobs:
               drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp".  Two
               implementations of "which commit" is the
               second-place-that-knows-a-sha defect this project keeps hitting,
-              so there is one, and both callers use it.  This step's shell sets
-              PYTHONPATH=src, which is how the import resolves here.
+              so there is one, and both callers use it.
+
+              The path is put on sys.path HERE rather than inherited from
+              PYTHONPATH, because this step's env does not set it and the first
+              attempt at this delegation died with
+
+                  ModuleNotFoundError: No module named 'unipad'
+
+              (measured on run 40214067252, after `unixnu fetch` and
+              `unixnu tree` had both succeeded -- so the whole acquisition was
+              thrown away by an import).  That is the same class as run
+              40065266844, where `python3 -m unipad.host.ipsw` died the same
+              way until the workflow set PYTHONPATH=src.  A dependency that
+              only resolves because some other step set an environment variable
+              is a dependency declared in one place and broken in another.
               """
+              sys.path.insert(0, str(Path(REPO_ROOT).resolve() / "src"))
               from unipad.errors import UniPadError
               from unipad.host.source_pins import apply_divergences, read_pins
 

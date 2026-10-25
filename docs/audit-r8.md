@@ -406,6 +406,7 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **`qemu_root_defconfig` 内核：仍未构建出来，这是连续第三轮。** run 40209085545 的 step 16 以 `stage build-kernel failed` 结束。三次死因各不相同（相对 refer 路径、kernelcache 缓存缺失、子模块重置），每一次都由前一次的修法暴露出来；**「下一次能过」始终是推断**，验证它的 run 尚未触发。
 - **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12。
 - **`XNU_OWNER_DATA_VOLUME_UUID` 在 32 MiB → 1 GiB 之后是否仍然有效：仍未核对。** 见 11.10。三轮了，每次都被下一个阻断挤掉；`build-macos.sh:1873` 会把它打进日志，内核真正建出来的那一遍必须核对。
+- **run 40214067252 暴露的 import 缺陷：修法与测试都已于本轮之前补上，但尚未在 runner 上验证。** 步骤现在自己把 `src` 放进 `sys.path`，而为它写的测试用子进程 + `-S` 复现了 runner 上那条 `ModuleNotFoundError`。**仍未测量**：一次真的 acquisition。
 - **`run_driver` 里的 re-pin 在真 runner 上的开销未测量。** 每个驱动调用多 21 次 `git rev-parse`（锁里的子模块数），只有真发生分歧的才 fetch。设计上是幂等且廉价的，但没有量过。
 
 ## 11. 结论与下一步

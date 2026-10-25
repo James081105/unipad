@@ -87,23 +87,24 @@ def _step_python() -> str:
     return textwrap.dedent("\n".join(lines[start + 1 : end]))
 
 
-def _load_step(tmp_path: Path) -> Any:
+def _load_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Import the step's own Python as a module, without running ``main()``.
 
     ``__name__`` is not ``__main__``, so the ``sys.exit(main())`` at the bottom
     never fires -- which is the whole point: the module is loaded for its
     functions, not for its behaviour as a script.
 
-    ``src`` goes on ``sys.path`` because the step's
-    ``apply_submodule_divergences`` delegates to ``unipad.host.source_pins``
-    rather than carrying a second implementation: the step's own shell sets
-    ``PYTHONPATH=src``, and this import is what stands in for it.  Without it
-    the load fails with ``ModuleNotFoundError`` and every test here skips for a
-    reason that has nothing to do with what they assert.
+    ``src`` is deliberately NOT put on ``sys.path`` here.  The step puts it
+    there itself, from ``REPO_ROOT``, and a loader that did it for the step
+    would hide the defect the first delegation shipped with -- measured on run
+    40214067252, where the whole acquisition died with ``ModuleNotFoundError:
+    No module named 'unipad'`` *after* ``unixnu fetch`` and ``unixnu tree`` had
+    both succeeded, because this step's env sets no ``PYTHONPATH``.  So the
+    environment variable the step actually reads is the only thing supplied,
+    and the import has to resolve on the step's own.
     """
-    source_root = str(ROOT / "src")
-    if source_root not in sys.path:
-        sys.path.insert(0, source_root)
+    monkeypatch.setenv("REPO_ROOT", str(ROOT))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     module_path = tmp_path / "acquisition_step.py"
     module_path.write_text(_step_python(), encoding="utf-8")
     spec = importlib.util.spec_from_file_location("unipad_acquisition_step", module_path)
@@ -209,7 +210,7 @@ def _bind(
     lock.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     monkeypatch.setenv("LOCK_PATH", str(lock))
     monkeypatch.setenv("VENDOR_DIR", str(tmp_path / "vendor"))
-    return _load_step(tmp_path), driver, gitlink_commit, other
+    return _load_step(tmp_path, monkeypatch), driver, gitlink_commit, other
 
 
 def _relock(
@@ -323,3 +324,90 @@ def test_a_commit_that_cannot_be_had_is_a_refusal_not_a_silence(
     _relock(tmp_path, monkeypatch, commit="0" * 40, gitlink=gitlink)
     with pytest.raises(module.SourcePinError):
         module.apply_submodule_divergences(driver)
+
+
+
+def sys_executable() -> list[str]:
+    """A real interpreter in a state where ``unipad`` is NOT importable.
+
+    Two host facts this test has to defeat, and both were measured rather than
+    assumed:
+
+    * ``shutil.which("python3")`` is ``None`` here -- this host has ``python``
+      and not ``python3`` -- so a test that hard-codes the latter dies with
+      ``FileNotFoundError`` for a reason that has nothing to do with what it
+      asserts.  That is the fourth time this session a guard went red on its own
+      environment.
+    * ``F:\\iosvirtual\\src`` is on this host's ``sys.path`` through the user
+      site-packages, so a plain subprocess resolves ``import unipad`` *without*
+      the step doing anything.  The first draft of this test ran exactly that and
+      passed with the ``sys.path`` line deleted.  ``-S`` turns site processing
+      off, which is what a GitHub macOS runner looks like -- and it leaves the
+      step's own ``sys.path.insert`` as the only thing that can resolve the
+      import, which is the point.
+    """
+    command = shutil.which("python3") or sys.executable
+    return [command, "-S"]
+
+
+def test_the_step_resolves_its_own_import_in_a_clean_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The step must not depend on an environment variable another step sets.
+
+    Measured on run 40214067252: ``apply_submodule_divergences`` was delegated
+    to ``unipad.host.source_pins`` and the acquisition step died with::
+
+        ModuleNotFoundError: No module named 'unipad'
+
+    -- at ``apply_submodule_divergences``, which is *after* ``unixnu fetch`` and
+    ``unixnu tree`` had both succeeded, so a step that had already done its work
+    threw all of it away.  This step's ``env:`` sets no ``PYTHONPATH`` (the chain
+    step's does, which is where the assumption came from), and the same class was
+    measured before on run 40065266844 for ``python3 -m unipad.host.ipsw``.
+
+    It has to be a SUBPROCESS, and that is the whole test.  The first draft
+    imported the step into the pytest process with ``PYTHONPATH`` deleted and
+    passed with the ``sys.path`` line removed -- because some earlier test in the
+    same process had already imported ``unipad``, and ``from x import y`` is
+    answered from ``sys.modules`` without ever consulting ``sys.path``.  A guard
+    proved in a dirty interpreter proves nothing, which is the same lesson as
+    reverting a fix and not reading *why* the test went red.
+    """
+    driver, gitlink, other = _workspace(tmp_path)
+    lock = _relock(tmp_path, monkeypatch, commit=other, gitlink=gitlink)
+    monkeypatch.setenv("LOCK_PATH", str(lock))
+    monkeypatch.setenv("VENDOR_DIR", str(tmp_path / "vendor"))
+
+    harness = tmp_path / "harness.py"
+    harness.write_text(
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('step', sys.argv[1])\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "print(module.apply_submodule_divergences(sys.argv[2]))\n",
+        encoding="utf-8",
+    )
+    step = tmp_path / "acquisition_step.py"
+    step.write_text(_step_python(), encoding="utf-8")
+
+    environment = {
+        key: value for key, value in os.environ.items() if key != "PYTHONPATH"
+    }
+    environment["REPO_ROOT"] = str(ROOT)
+    result = subprocess.run(
+        [*sys_executable(), str(harness), str(step), str(driver)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=str(tmp_path),  # neutral: not the repository root, so "." is not it
+        timeout=180,
+    )
+    assert result.returncode == 0, (
+        "the step's own Python could not resolve its import with PYTHONPATH "
+        "absent, which is how run 40214067252 lost a whole acquisition:\n"
+        + (result.stdout + result.stderr)[-2000:]
+    )
+    assert _git(driver / "drivers" / "NativeMobileDisplay", "rev-parse", "HEAD") == other, (
+        "the checkout did not move, so the divergence was not applied"
+    )
