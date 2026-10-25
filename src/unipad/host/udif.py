@@ -126,6 +126,27 @@ class LzfseDecoder:
         return produced
 
 
+def default_lzfse() -> LzfseDecoder:
+    """The real decoder, so a caller does not have to hand-roll the wiring.
+
+    ``LzfseDecoder`` takes any ``(compressed, expected) -> bytes`` callable, and
+    :func:`unipad.host.lzfse.decode` is that callable -- pure stdlib, no wheel,
+    because ``pip`` is broken on this host.  A caller that wants its own can
+    still build :class:`LzfseDecoder` directly; the default exists so the
+    obvious call is the correct one.
+
+    Note what this does *not* change: :class:`LzfseDecoder` built with no
+    argument still refuses, because a half-decoder that silently produced a
+    wrong image would be worse than a refusal, and because the module must work
+    on a host where ``lzfse`` is unavailable.  The import is inside the function
+    for the same reason: nothing here makes ``udif`` depend on ``lzfse`` at
+    import time.
+    """
+    from unipad.host import lzfse
+
+    return LzfseDecoder(lzfse.decode)
+
+
 @dataclass(frozen=True)
 class Chunk:
     """One ``mish`` chunk record, with its sector range already made absolute."""
