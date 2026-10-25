@@ -466,7 +466,7 @@ def build_argv(
     :func:`boot` passes it only when the ESP actually carries the driver, so a
     locally staged ESP without one does not silently claim a geometry nothing set.
 
-    ``root_image`` is the OS volume as a *second*, read-only virtio-blk disk.
+    ``root_image`` is the OS volume as a *second*, read-only block device.
     Upstream's ``qemu_root_defconfig`` run attaches the OS image and the
     SystemOS image exactly this way (``run-qemu.py --os-root``), and the kernel
     finds the root by the volume UUID the board's ``[payload.adt]`` publishes.
@@ -476,6 +476,24 @@ def build_argv(
     operator adding a ``-drive`` by hand.  It is read-only for the same reason
     upstream's is: this is the shipped system volume, and a boot that writes to
     it is a different experiment with different consequences (PRD 4.2).
+
+    The root volume is **MMIO**, not PCI, and that is not a preference.  The
+    driver that would read it matches on the transport:
+    ``NativeVirtioBlock::probe`` (``vendor/UniXNU/drivers/NativeVirtioBlock/
+    NativeVirtioBlock.cpp:148-154``) returns ``nullptr`` unless the provider's
+    ``compatible`` is exactly the twelve bytes ``"virtio,mmio"``, so a
+    ``virtio-blk-pci`` device can never be bound by it however the kernel is
+    configured.  That is why upstream's ``--os-root`` spells
+    ``-device virtio-blk-device,drive=os`` and sets
+    ``-global virtio-mmio.force-legacy=false`` (``run-qemu.py:203-208``).  The
+    ESP *stays* on PCI, because it is EDK II that has to find and mount it
+    (``BdsDxe: loading Boot0001 ... from PciRoot(0x0)/Pci(0x1,0x0)``), and the
+    two are therefore different transports by necessity rather than by
+    oversight.
+
+    A first version of this parameter emitted the root volume on PCI as well.
+    It was wrong for the reason above and the mistake was only visible by
+    reading the driver's ``probe`` -- the argv was accepted by QEMU either way.
     """
     if not 1 <= int(qmp_port) <= 65535:
         raise UniPadError(
@@ -535,16 +553,23 @@ def build_argv(
         "-m", str(int(memory_mib)),
         "-no-reboot",
         # The ESP as a read-only FAT volume behind virtio-blk: the only disk
-        # form UniXNU boots.
+        # form UniXNU boots.  PCI, because EDK II enumerates the virtual PCI bus
+        # to find it (BdsDxe loads Boot0001 from PciRoot(0x0)/Pci(0x1,0x0)).
         "-drive", f"if=none,id=esp,format=raw,readonly=on,file=fat:{qpath(Path(esp))}",
         "-device", "virtio-blk-pci,drive=esp",
         # The OS root volume, when one is supplied.  Its own drive id, because
-        # two virtio-blk devices sharing one would be one device; and it is
-        # emitted *after* the ESP so the ESP keeps the device number the boot
-        # log and every earlier run already recorded.
+        # two block devices sharing one would be one device; and it is emitted
+        # *after* the ESP so the ESP keeps the device number the boot log and
+        # every earlier run already recorded.  MMIO, not PCI -- see the
+        # docstring: NativeVirtioBlock::probe matches only "virtio,mmio".
     ] + ([
+        # Upstream's own spelling (run-qemu.py:203-208).  Without this global the
+        # MMIO transport stays in legacy mode, which the driver's register
+        # offsets (mapDeviceMemoryWithIndex(0) must be at least 0x108) assume is
+        # not the case.
+        "-global", "virtio-mmio.force-legacy=false",
         "-drive", f"if=none,id=osroot,format=raw,readonly=on,file={qpath(root)}",
-        "-device", "virtio-blk-pci,drive=osroot",
+        "-device", "virtio-blk-device,drive=osroot",
     ] if root is not None else []) + [
         "-device", "ramfb",
         "-device", "qemu-xhci",

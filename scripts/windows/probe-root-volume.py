@@ -24,6 +24,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import socket
 import subprocess
@@ -43,6 +44,34 @@ DEVICE_DIR = REPO / "vendor/UniXNU-qemu"
 SOURCE_ESP = REPO / "local-private/boot7/run2/esp"
 KERNEL = REPO / "local-private/boot7/boot-inputs/unixnu-out/qemu/kernel/kernel.macho"
 KERNEL_SHA = "9d4b1ab14d74fdfa6afeac12871427e26441cab9f3e2efc97e42b103275643e0"
+
+#: Which board member a given image is, by the digest board.toml [ipsw.sha256]
+#: pins, and what role that member plays.  The digests are read out of the board
+#: at run time so a re-pin cannot leave them stale; the roles are a literal,
+#: because the board does not carry them -- they come from
+#: ``vendor/UniXNU-qemu/scripts/run-qemu.py:186`` (``044-76040-038.dmg`` is the
+#: ``os`` drive) and ``:196`` (``044-76034-038.dmg`` is the ``systemos`` drive).
+#: The first run of this script attached ``044-76034-038.dmg`` believing it was
+#: the root; it is the SystemOS cryptex, and the root-matching UUID belongs to
+#: ``044-76040-038.dmg``.  That is a second, independent defect from the missing
+#: driver, and it was invisible because nothing said which image it was.
+ROLES = {"044-76040-038.dmg": "os", "044-76034-038.dmg": "systemos"}
+
+
+def board_members() -> dict[str, str]:
+    import tomllib
+
+    board = tomllib.loads((DEVICE_DIR / "board.toml").read_text(encoding="utf-8"))
+    pins = board.get("ipsw", {}).get("sha256", {})
+    return {str(digest).lower(): name for name, digest in pins.items()}
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def free_port() -> int:
@@ -65,6 +94,21 @@ def main() -> int:
     if not root.is_file() or root.stat().st_size <= 0:
         print(f"root image unusable: {root}")
         return 2
+
+    # Name the image against the board's own pins.  A run that attached the wrong
+    # member is a run whose negative result means nothing, so the probe says which
+    # member it has rather than leaving the operator to work it out afterwards.
+    member = board_members().get(sha256_of(root))
+    if member is None:
+        print(f"NOTE: {root.name} matches no digest in board.toml [ipsw.sha256]; "
+              f"it is not a pinned IPSW member")
+    else:
+        role = ROLES.get(member, "unknown")
+        print(f"image is board member {member}, role {role}")
+        if role == "systemos":
+            print("WARNING: this is the SystemOS cryptex, not the OS root volume. "
+                  "The root-matching UUID belongs to the os member, so a successful "
+                  "mount is impossible with this image whatever the kernel can do.")
 
     run = args.run
     if run.exists():

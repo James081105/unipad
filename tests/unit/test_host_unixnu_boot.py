@@ -741,18 +741,26 @@ def test_an_empty_firmware_is_refused_the_same_way(
 # ---------------------------------------------------------------------------
 # the root volume
 # ---------------------------------------------------------------------------
-def test_the_root_volume_is_a_second_read_only_virtio_disk(
+def test_the_root_volume_is_a_second_read_only_mmio_disk(
     inputs: BootInputs, tmp_path: Path
 ) -> None:
-    """The OS volume is attached read-only, on its own drive id, after the ESP.
+    """The OS volume is attached read-only, over MMIO, on its own drive id.
 
-    Two properties, each with the reason it is asserted rather than assumed:
+    Three properties, each with the reason it is asserted rather than assumed:
 
     * ``readonly=on``.  This is the shipped system volume; a boot that writes to
       it is a different experiment with different consequences (PRD 4.2's
       "read-only property correct" row).
-    * Its own ``id``.  Two virtio-blk devices sharing one drive id is one device,
-      and the ESP would stop being the disk the firmware booted from.
+    * Its own ``id``.  Two block devices sharing one drive id is one device, and
+      the ESP would stop being the disk the firmware booted from.
+    * **MMIO, not PCI.**  ``NativeVirtioBlock::probe``
+      (``vendor/UniXNU/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp:148-154``)
+      returns ``nullptr`` unless the provider's ``compatible`` is exactly the
+      twelve bytes ``"virtio,mmio"``, so ``virtio-blk-pci`` can never be bound
+      however the kernel is configured.  This is the one assertion in the file
+      that was written *after* the code got it wrong: the first version emitted
+      PCI, QEMU accepted the argv without complaint, and the only thing that
+      revealed the mistake was reading the driver's ``probe``.
     """
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"\0" * (1 << 20))
@@ -766,13 +774,20 @@ def test_the_root_volume_is_a_second_read_only_virtio_disk(
     ), argv
     assert _values(argv, "-device") == [
         "virtio-blk-pci,drive=esp",
-        "virtio-blk-pci,drive=osroot",
+        "virtio-blk-device,drive=osroot",
         "ramfb",
         "qemu-xhci",
         "usb-kbd",
     ], argv
+    # The ESP stays on PCI: EDK II has to find it on the virtual PCI bus
+    # (BdsDxe loads Boot0001 from PciRoot(0x0)/Pci(0x1,0x0)), so the two disks
+    # are on different transports by necessity, not by oversight.
+    assert "virtio-blk-pci,drive=osroot" not in argv, argv
+    # ...and upstream's global, without which the MMIO transport stays in legacy
+    # mode and the driver's register offsets do not hold (run-qemu.py:203-208).
+    assert _flag(argv, "-global") == "virtio-mmio.force-legacy=false", argv
     # After the ESP, so the ESP keeps the device number every earlier run recorded.
-    assert argv.index("virtio-blk-pci,drive=esp") < argv.index("virtio-blk-pci,drive=osroot"), argv
+    assert argv.index("virtio-blk-pci,drive=esp") < argv.index("virtio-blk-device,drive=osroot"), argv
 
 
 def test_without_a_root_image_the_argv_is_exactly_what_it_was(
@@ -784,7 +799,7 @@ def test_without_a_root_image_the_argv_is_exactly_what_it_was(
     root drive with a different spelling, would still satisfy every assertion
     about the root drive itself while silently changing the machine every
     earlier run described.  So the no-root argv is asserted to be the root argv
-    with exactly four tokens removed.
+    with exactly six tokens removed -- the ``-global`` pair, and the drive pair.
     """
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"\0" * (1 << 20))
@@ -795,19 +810,20 @@ def test_without_a_root_image_the_argv_is_exactly_what_it_was(
     without = ub.build_argv(
         tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run"
     )
-    assert len(with_root) - len(without) == 4, (len(with_root), len(without))
-    # The four added tokens, removed, leave the argv exactly as it was: the flag
-    # before the drive spec, the drive spec, the flag before the device spec and
-    # the device spec.  A change that reordered anything would still pass every
-    # assertion above while changing the machine every earlier run described.
+    assert len(with_root) - len(without) == 6, (len(with_root), len(without))
+    # The six added tokens, removed, leave the argv exactly as it was.  A change
+    # that reordered anything would still pass every assertion above while
+    # changing the machine every earlier run described.
     added_at = next(i for i, token in enumerate(with_root) if "id=osroot" in token)
-    assert with_root[added_at - 1 : added_at + 3] == [
+    assert with_root[added_at - 3 : added_at + 3] == [
+        "-global",
+        "virtio-mmio.force-legacy=false",
         "-drive",
         with_root[added_at],
         "-device",
-        "virtio-blk-pci,drive=osroot",
-    ], with_root[added_at - 1 : added_at + 3]
-    assert with_root[: added_at - 1] + with_root[added_at + 3 :] == without, without
+        "virtio-blk-device,drive=osroot",
+    ], with_root[added_at - 3 : added_at + 3]
+    assert with_root[: added_at - 3] + with_root[added_at + 3 :] == without, without
 
 
 def test_a_missing_root_image_is_refused_before_qemu_starts(
