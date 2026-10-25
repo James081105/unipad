@@ -13,7 +13,18 @@ dependencies = [
 
 [project.optional-dependencies]
 inventory = ["psutil>=5.9"]  # optional richer host inventory; stdlib fallback exists
-dev = ["pytest>=8.0"]
+# PyYAML is a dev dependency, not an optional one, and the reason is a
+# measurement rather than a preference: tests/unit/test_workflow_contracts.py
+# imports it at module level (line 22) to parse the workflow files, so on a
+# runner without it the import kills *collection* of the whole unit stage.
+# Measured 2026-10-25 -- every preflight run since that test was added failed
+# with "ModuleNotFoundError: No module named 'yaml'" before executing a single
+# test, while the same suite passes on a developer host that happens to have
+# PyYAML installed.  Declaring it is the fix; the alternative (importing
+# lazily and pytest.skip, as tests/acceptance/test_p0p1_gate_main.py:460 does)
+# would turn that test into a check that never runs on CI, which is the exact
+# failure mode its own docstring exists to prevent.
+dev = ["pytest>=8.0", "pyyaml>=6.0"]
 
 [project.scripts]
 unipad = "unipad.controller.cli:main"

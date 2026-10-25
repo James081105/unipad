@@ -449,6 +449,19 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Measured 2026-10-25 (run 40161823987 and its predecessors): this job
+      # reached "Run integration checks (tests/integration)" on the bare
+      # runner interpreter and died with "No module named pytest".  So
+      # tests/integration had *never* executed on CI -- the two pin checks
+      # above passed every time, which is real signal about the clone, and the
+      # suite they exist to guard was not run at all.  A stage that cannot
+      # import its own tests is indistinguishable from one with no tests, and
+      # both look like a fast green.
+      - name: Install package (editable) and dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
       - name: Clone the pinned upstream repositories
         env:
           LOCK_PATH: config/sources.lock.json
