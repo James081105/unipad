@@ -43,6 +43,7 @@ from __future__ import annotations
 import binascii
 import plistlib
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -471,7 +472,12 @@ class UdifImage:
                 declared_sectors=self.sector_count,
             )
 
-    def write_raw(self, destination: Path, lzfse: LzfseDecoder) -> dict[str, object]:
+    def write_raw(
+        self,
+        destination: Path,
+        lzfse: LzfseDecoder,
+        progress: Optional[Callable[[int, int, float], None]] = None,
+    ) -> dict[str, object]:
         """Write the whole image to ``destination`` and verify what was written.
 
         The file is created at its full size first and every chunk is written at
@@ -487,6 +493,15 @@ class UdifImage:
         GPT check is the point: every chunk is written by offset, so a single
         wrong offset produces an image of exactly the right size with the wrong
         bytes in it, and only the CRC says so.
+
+        ``progress`` is called as ``(chunks_done, chunks_total, seconds_elapsed)``
+        after each chunk, and it exists because the LZFSE path is the
+        bottleneck by two orders of magnitude: measured on this host, the
+        host's own pure-Python LZFSE decoder runs at ~2 MB/s of output, so a
+        6 GB image is roughly an hour of pure CPU while the I/O side of the
+        same decode is ~31 s.  A loop that prints nothing per chunk gives an
+        operator no way to tell decode from a hang.  It is a callback rather
+        than a print so the caller decides where the output goes.
 
         A failure part-way through leaves **nothing** behind.  The overwrite
         guard runs before the file is created, so without this a recoverable
@@ -510,6 +525,7 @@ class UdifImage:
                 path=safe_location(destination.parent),
                 error="%s: %s" % (type(exc).__name__, exc.strerror or exc),
             ) from exc
+        chunks = [chunk for chunk in self.chunks() if not chunk.is_terminator]
         try:
             with destination.open("wb") as handle:
                 # Full size first, so a chunk that is shorter than the sectors it
@@ -519,17 +535,18 @@ class UdifImage:
                 # sparse on NTFS, which it does not do at all.
                 handle.truncate(self.raw_size)
                 written = 0
-                for chunk in self.chunks():
-                    if chunk.is_terminator:
-                        continue
+                begun = time.monotonic()
+                for index, chunk in enumerate(chunks, start=1):
                     if chunk.type == CHUNK_ZERO_FILL:
                         self._write_zero_fill(handle, chunk.byte_length)
                         written += chunk.byte_length
-                        continue
-                    produced = self.chunk_bytes(chunk, lzfse)
-                    handle.seek(chunk.byte_offset)
-                    handle.write(produced)
-                    written += len(produced)
+                    else:
+                        produced = self.chunk_bytes(chunk, lzfse)
+                        handle.seek(chunk.byte_offset)
+                        handle.write(produced)
+                        written += len(produced)
+                    if progress is not None:
+                        progress(index, len(chunks), time.monotonic() - begun)
         except BaseException:
             # BaseException, not Exception: a KeyboardInterrupt half-way through
             # a 6 GB write is exactly the case that would otherwise brick the
@@ -543,7 +560,7 @@ class UdifImage:
             "path": safe_location(destination),
             "size_bytes": self.raw_size,
             "sector_count": self.sector_count,
-            "chunks": len(list(self.chunks())),
+            "chunks": len(chunks),
             "bytes_written": written,
             "gpt": self.check_gpt(destination),
         }

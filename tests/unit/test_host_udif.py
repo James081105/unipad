@@ -807,3 +807,30 @@ def test_a_chunk_range_running_past_the_fork_is_refused(tmp_path: Path) -> None:
         UdifImage(path).write_raw(tmp_path / "out.raw", LzfseDecoder())
     assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
     assert "past the end of the data fork" in caught.value.message, caught.value
+
+
+def test_the_progress_callback_sees_every_chunk(tmp_path: Path) -> None:
+    """The LZFSE path is the bottleneck by two orders of magnitude, so it reports.
+
+    Measured on this host with the host's own pure-Python LZFSE decoder: ~2 MB/s
+    of output, which extrapolates to roughly an hour for a 6 GB image, while the
+    I/O side of the same decode is ~31 s.  A loop that prints nothing per chunk
+    gives an operator no way to tell decode from a hang, which is why the
+    callback exists rather than a print the caller cannot redirect.
+    """
+    image = UdifImage(_simple(tmp_path / "synthetic.dmg"))
+    seen: list[tuple[int, int, float]] = []
+
+    def progress(done: int, total: int, elapsed: float) -> None:
+        seen.append((done, total, elapsed))
+
+    record = image.write_raw(tmp_path / "out.raw", LzfseDecoder(), progress=progress)
+    assert [d for d, _t, _e in seen] == [1, 2, 3, 4], seen
+    assert {t for _d, t, _e in seen} == {4}, seen
+    assert all(e >= 0 for _d, _t, e in seen), seen
+    assert record["chunks"] == 4, record
+
+    # ...and it is optional, because a caller that does not want it must not be
+    # forced to pass a no-op.
+    again = image.write_raw(tmp_path / "out2.raw", LzfseDecoder())
+    assert again["chunks"] == 4, again
