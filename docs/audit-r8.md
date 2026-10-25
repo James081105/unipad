@@ -331,6 +331,8 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
 
+**CI：两个 job 从 2026-10-19 起每次 push 都红，本轮修好并在真 runner 上验证（run 40170192535，两个 job 全 success）。** 两个红都不是代码缺陷而是缺依赖声明：`tests/integration` 从来没有在 CI 上跑过一次（job 证明了 pin，然后在没有 pytest 的裸解释器上跑收集），`tests/unit` 收集不起来（`test_workflow_contracts.py` 在模块级 import `yaml`）。修的过程中还抓到自己引入的第二个缺陷——三个新测试用 `vendor/UniXNU-qemu`，而它是 git-excluded 的，unit 阶段跑在它不存在的 checkout 里；改成现搭合成 board，67 tests / 0 failures / **0 skipped**。**这一条是"代码完成 + CI 验证"，不是"验收通过"**：它证明的是门禁自己会跑，不证明 iPadOS 用户态能起来。
+
 真机阶段：**BLOCKED**，阻断项见第 6 节，全部指向同一件事——需要一个 macOS runner（或用户自有的 Mac）跑一次 `.github/workflows/build-macos.yml`。跑通之后，M0 的 `clean_build_artifacts` 缺口闭合，M2–M4/WP02–WP04 的 `built_unixnu_kernel_image` 根因才有可能消失，M5 之后的链条才第一次有可观察的对象。
 
 **而"跑一次"具体缺什么，本轮查清了（见 11.5(2)）**：不是缺 runner，是 runner 上 `build-os-root` 永远拿不到本地 IPSW——workflow 只调用一次 `build-macos.sh`、从不传 `--ipsw`，它自己的 IPSW 步骤取完 kernelcache 就把 6.8 GB 镜像删了。于是无链、内核恒 `qemu_defconfig`、第二个块设备永不被枚举。修法候选（保留 IPSW 并在链不再需要时删掉 / 同一 job 内跑两遍 / 只留链需要的成员）已派 teammate 评估，空间约束是 8 GiB 地板对约 14 GiB 空闲，不能靠抬高地板绕过。**在修好并真跑过一次之前，任何"根卷可挂载""launchd 已启动"的说法都是不诚实的。**
