@@ -394,7 +394,19 @@ def decode_lzfse_block(src, at, h, out, out_pos):
     # and it is the block, not a fragment.  A refusal here reddened
     # test_root_volume_probe_decoder.py on the first spread sample.
     n_lit = h['n_literals']
-    literals = bytearray(n_lit)
+    # The literal loop decodes four at a time and the encoder pads n_literals up
+    # to a multiple of four (lzfse_encode_base.c:191-196), so the last iteration
+    # can write up to three bytes past n_literals.  The C never notices because
+    # it writes into a LZFSE_LITERALS_PER_BLOCK + 64 buffer and reads back at
+    # most n_literals; `bytearray(n_lit)` here turns the same write into an
+    # IndexError, which is not in the UniPadError hierarchy and so escapes
+    # udif.LzfseDecoder.decode (udif.py:107-126) as a traceback mid-write.
+    # Reachable from a single bit flip in a real chunk (compressed[8] ^= 1
+    # changes n_literals 48 -> 49), which is exactly the corrupt-input path that
+    # has to be refused cleanly.  Rounding the allocation up is the faithful
+    # spelling; the three extra bytes are written and never read, because the
+    # LMD loop bounds every read by n_lit.
+    literals = bytearray((n_lit + 3) & ~3)
     if n_lit:
         lit_end = at + h['header_size'] + h['n_literal_payload_bytes']
         # buf_start is src_begin, i.e. offset 0 of the whole stream.

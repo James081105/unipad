@@ -581,6 +581,88 @@ def test_a_v1_block_with_matches_but_no_lmd_payload_is_still_refused() -> None:
     assert "underflow" in str(caught.value), caught.value
 
 
+def test_a_v1_block_whose_literal_count_is_not_a_multiple_of_four() -> None:
+    """``n_literals % 4 != 0`` decodes, rather than raising ``IndexError``.
+
+    The literal loop decodes four at a time and the encoder pads ``n_literals``
+    up to a multiple of four (lzfse_encode_base.c:191-196), so the last
+    iteration writes up to three bytes past the count.  The C never notices: it
+    writes into a ``LZFSE_LITERALS_PER_BLOCK + 64`` buffer and reads back at
+    most ``n_literals``.  A ``bytearray(n_literals)`` here turns the same write
+    into an ``IndexError``, which is not in the ``UniPadError`` hierarchy and so
+    escapes ``udif.LzfseDecoder.decode`` (udif.py:107-126) as a traceback
+    half-way through writing a 6 GB image.
+
+    Reachable from a single bit flip in a real chunk: ``compressed[8] ^= 1``
+    changes ``n_literals`` 48 -> 49 on the chunk at sector 2 of
+    ``local-private/out/components/044-76040-038.dmg``, and before the fix that
+    one bit produced ``IndexError: bytearray index out of range``.  Built here as
+    a synthetic ``bvx1`` block so the case is covered where the real image is
+    absent -- which is every CI run, and a guard that only holds on one host is
+    not a guard.
+
+    Five literals with a four-literal match: the fifth is decoded and never
+    read, exactly as in the C.
+    """
+    blob = bytearray(lzfse._V1_SIZEOF)
+
+    def field(offset: int, fmt: str, value: int) -> None:
+        struct.pack_into(fmt, blob, offset, value)
+
+    field(lzfse._V1["magic"], "<I", lzfse.MAGIC_LZFSE_V1)
+    field(lzfse._V1["n_raw_bytes"], "<I", 4)
+    field(lzfse._V1["n_payload_bytes"], "<I", 7)
+    field(lzfse._V1["n_literals"], "<I", 5)          # <-- not a multiple of four
+    field(lzfse._V1["n_matches"], "<I", 1)
+    field(lzfse._V1["n_literal_payload_bytes"], "<I", 0)
+    field(lzfse._V1["n_lmd_payload_bytes"], "<I", 7)
+    field(lzfse._V1["literal_bits"], "<i", 0)
+    field(lzfse._V1["lmd_bits"], "<i", 0)
+    field(lzfse._V1["l_state"], "<H", 0)
+    field(lzfse._V1["m_state"], "<H", 0)
+    field(lzfse._V1["d_state"], "<H", 0)
+    field(lzfse._V1["l_freq"] + 2 * 4, "<H", lzfse.L_STATES)   # L == 4
+    field(lzfse._V1["m_freq"], "<H", lzfse.M_STATES)           # M == 0
+    field(lzfse._V1["d_freq"] + 2 * 1, "<H", lzfse.D_STATES)   # D == 1
+    field(lzfse._V1["literal_freq"], "<H", 512)
+    field(lzfse._V1["literal_freq"] + 2, "<H", 512)
+
+    block = bytes(blob) + b"\x00" * 7
+    # The match copies four of the five literals; the block declares four raw
+    # bytes, so the fifth must neither be required nor corrupt the length check.
+    assert decode(block + _end(), 4) == b"\x00\x00\x00\x00"
+
+
+def test_a_v1_block_whose_literal_count_is_not_a_multiple_of_four_is_refused_when_it_overruns() -> None:
+    """The same shape, but the match asks for more literals than the count.
+
+    The rounded-up allocation must not become a licence to read the three bytes
+    that were only ever written: ``lit_pos + L > n_literals`` is still a refusal
+    (lzfse_decode_base.c:493-494), so a stream that names five literals and then
+    consumes six is corrupt rather than merely oddly padded.
+    """
+    blob = bytearray(_v1_block())
+    struct.pack_into("<I", blob, lzfse._V1["n_raw_bytes"], 40)
+    struct.pack_into("<I", blob, lzfse._V1["n_literals"], 5)
+    struct.pack_into("<I", blob, lzfse._V1["n_matches"], 1)
+    struct.pack_into("<I", blob, lzfse._V1["n_lmd_payload_bytes"], 7)
+    # L == 6, so the match asks for one more literal than the count names.
+    # _v1_block() already puts every L state on symbol 0; moving them to symbol
+    # 6 is what makes L_BASE_VALUE[6] == 6 rather than 0.  The D table moves to
+    # symbol 1 for the same reason: D_BASE_VALUE[1] == 1 is the only legal
+    # distance for a first match, and leaving it on symbol 0 would leave D at -1
+    # and trip the distance check before the literal check this test is about.
+    # n_raw is 40 rather than 4 so the block takes the ordinary path: the
+    # "careful path" near the end of a block raises a different refusal first.
+    struct.pack_into("<H", blob, lzfse._V1["l_freq"], 0)
+    struct.pack_into("<H", blob, lzfse._V1["l_freq"] + 2 * 6, lzfse.L_STATES)
+    struct.pack_into("<H", blob, lzfse._V1["d_freq"], 0)
+    struct.pack_into("<H", blob, lzfse._V1["d_freq"] + 2 * 1, lzfse.D_STATES)
+    with pytest.raises(DecodeError) as caught:
+        decode(bytes(blob) + b"\x00" * 7 + _end(), 40)
+    assert "literal stream exhausted" in str(caught.value), caught.value
+
+
 # ---------------------------------------------------------------------------
 # (b) uncompressed and end-of-stream blocks
 # ---------------------------------------------------------------------------
