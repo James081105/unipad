@@ -1933,6 +1933,80 @@ step_build_os_root() {
     return 0
 }
 
+# build_buttons_sink_stub STEP -- the optional board button sink, as an archive.
+#
+# NativeHidInput declares `native_buttons_set_sink` weak_import and guards every
+# use with &symbol, which is the idiom for a symbol a board may not provide.
+# This board provides no button driver, so nothing defines it -- and measured on
+# run 40222638377, the first kernel that links NativeHidInput.late.o at all, the
+# undefined reference is a hard link error rather than null:
+#
+#     Undefined symbols for architecture arm64:
+#       "_native_buttons_set_sink", referenced from: NativeHidInput::start(...)
+#
+# The sibling `native_touch_set_sink` is defined by the device repository's
+# package (TouchState.cpp:23), so it resolves; that contrast is what says the
+# problem is the missing definition and not the weak attribute as such.
+#
+# A no-op body is exactly the semantics the driver asked for: the sink is
+# called and nothing happens, which is what "no buttons" means.  It is built
+# here rather than in the device repository because that repository is pinned
+# and re-cloned every run, and a local edit would not survive (the same
+# reasoning as the chain step's display forcing).
+#
+# The archive is handed to the driver's link through XNU_EXTRA_LD_ARCHIVES,
+# which build-xnu-4k-baseline.sh:732 appends to the kernel's own archives --
+# an interface the vendor script already exposes for exactly this shape.
+build_buttons_sink_stub() {
+    local step="$1"
+    local out="$OUT_DIR/buttons-sink"
+    local archive="$out/libButtonsSink.a"
+    if [[ -f "$archive" ]]; then
+        return 0
+    fi
+    mkdir -p "$out"
+    local source="$out/ButtonsSink.c"
+    # The signature is the driver's own (NativeHidInput.cpp:15): a callback and
+    # a context.  Both are ignored -- the sink exists so the reference resolves,
+    # and this board has nothing to report through it.
+    cat >"$source" <<'STUB'
+/* The board button driver this board does not have.
+
+NativeHidInput.cpp:15 declares native_buttons_set_sink weak_import and guards
+every call with &symbol, so a board with no hardware buttons is supposed to
+leave it undefined and the driver is supposed to see null.  Measured on run
+40222638377: the undefined reference in the objcopy-staged NativeHidInput.late.o
+is a hard link error instead, so the reference is satisfied here with a body
+that does nothing -- behaviourally identical to absent, and the only lever this
+repository holds, because both the declaration and the staging live in pinned
+public repositories.
+*/
+void native_buttons_set_sink(void (*sink)(void *, unsigned int), void *context) {
+    (void)sink;
+    (void)context;
+}
+STUB
+    local object="$out/ButtonsSink.o"
+    local log="$OUT_DIR/${step}.buttons-sink.log"
+    # --sdk iphoneos and the version floor, the same shape the device
+    # repository's own drivers are built with (build-native-legacy-display.py:40
+    # uses `xcrun --sdk iphoneos clang -arch arm64 -mkernel
+    # -miphoneos-version-min=17.0`), so the object the kernel link sees is the
+    # same platform and deployment target as the object referencing it.
+    if ! xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
+            -c "$source" -o "$object" 2>&1 | tee "$log"; then
+        log "buttons sink: the stub did not compile; see $log"
+        return 1
+    fi
+    xcrun ar rcs "$archive" "$object" 2>&1 | tee -a "$log"
+    if [[ ! -f "$archive" ]]; then
+        log "buttons sink: no archive was produced; see $log"
+        return 1
+    fi
+    log "buttons sink: $(basename "$archive") built (the optional sink NativeHidInput imports)"
+    return 0
+}
+
 # build-kernel -- 'unixnu defconfig <name>' then 'unixnu build kernel'.
 #   cli.py:89-101  cmd_defconfig copies configs/<name> to out/<device>/.config
 #   cli.py:123-129 cmd_build runs kernel.build() then kernel.prelink()
@@ -1942,7 +2016,6 @@ step_build_os_root() {
 #                  logs the sha256 of what it wrote
 step_build_kernel() {
     local name='build-kernel'
-
     # (1) inputs.  The defconfig is named by board.toml [kernel] and must exist
     # in the device repository; the driver refuses a build without it
     # (cli.py:123-124, config.py:105-108).
@@ -1993,6 +2066,32 @@ step_build_kernel() {
     log_keg
     apple_step_gate "$name" "${need[@]}" || return 0
 
+    # (3b) the optional button sink.  qemu_root_defconfig is qemu_defconfig plus
+    #      CONFIG_XNU_NATIVE_LEGACY_DISPLAY, and that config pulls in
+    #      libNativeLegacyDisplay.late.a with -Wl,-force_load -- so this is the
+    #      first kernel that links NativeHidInput.late.o at all.  Measured on
+    #      run 40222638377, the first run to reach the kernel link:
+    #
+    #        Undefined symbols for architecture arm64:
+    #          "_native_buttons_set_sink", referenced from:
+    #              NativeHidInput::start(IOService*) in ...(NativeHidInput.late.o)
+    #
+    #      The driver declares it weak_import (NativeHidInput.cpp:15) and tests
+    #      it with &symbol before calling, which is the idiom for "optional".
+    #      Its sibling native_touch_set_sink is DEFINED in the device
+    #      repository's package (TouchState.cpp:23), so it resolves; nothing in
+    #      either pinned repository defines the buttons one, and the undefined
+    #      reference in the objcopy-staged .late.o is a hard error rather than
+    #      null.  This board has no hardware button driver, so the optional sink
+    #      is absent by design -- a no-op definition is behaviourally identical
+    #      to absent, and it is the only lever this repository holds: the
+    #      staging that loses the flag and the declaration itself both live in
+    #      pinned public repositories.
+    if [[ "$defconfig" == 'qemu_root_defconfig' ]]; then
+        if build_buttons_sink_stub "$name"; then
+            export XNU_EXTRA_LD_ARCHIVES="${XNU_EXTRA_LD_ARCHIVES:+$XNU_EXTRA_LD_ARCHIVES }$OUT_DIR/buttons-sink/libButtonsSink.a"
+        fi
+    fi
     # (3) run.  The defconfig first, because build kernel refuses without it.
     local -a extra=()
     if [[ -n "$KERNELCACHE_PATH" ]]; then extra+=(--kernelcache "$KERNELCACHE_PATH"); fi

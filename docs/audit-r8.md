@@ -426,6 +426,23 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **`--init` 被跳过这一语义的后果：未在任何真 runner 上测量。** 本机已量（缺失的子模块不会被重新克隆）。本 workflow 的顺序保证子模块先落盘，但如果将来有人把保护移到 `unixnu fetch` 之前，会得到「子模块永不初始化」——这一点只有注释与测试守着，没有门禁。
 - **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12 / 11.14。
 
+### 11.17 第八轮：第一次走到内核链接，死在一个本板没有的按钮驱动符号上（事实 54，2026-10-26）
+
+**(1) 子模块保护生效了，而且这一次越过了此前每一个阻断。** run 40222638377：archive 10/10 `build-platform-power.py` 越过，`build-xnu-4k-baseline.sh` 第一次真的去链接内核——**这个项目第一次走到内核链接**——然后 `Undefined symbols for architecture arm64: "_native_buttons_set_sink", referenced from: NativeHidInput::start(IOService*) in libNativeLegacyDisplay.late.a[14](NativeHidInput.late.o)`。
+
+**(2) 为什么以前没见过。** `qemu_root_defconfig` 与 `qemu_defconfig` 的唯一显示差别是 `CONFIG_XNU_NATIVE_LEGACY_DISPLAY`，它用 `-Wl,-force_load` 把整个显示 archive 拉进来——所以 `NativeHidInput.late.o` 是第一次被链接进任何内核。
+
+**(3) 根因不是声明写法，而对照就在同一个文件里。** `native_buttons_set_sink` 声明为 `weak_import` 且每次调用前用 `&symbol` 守，是标准写法；同一文件第 13 行的 `native_touch_set_sink` 写法完全一样却不报错——**差别只有一个：它在设备仓库 `package/TouchState.cpp:23` 有定义**。同一 run 里还有一组对照：`NativeRamBlock.cpp` 的五个 `native_ufs_store_*` 也是 `weak_import`、同样没有定义、在普通 `.o` 里却链接通过。所以可观测事实是：未定义的弱引用在普通对象里是 null，在 `llvm-objcopy` staging 过的 `.late.o` 里是硬错误。**这条因果是当时证据最强的解释，不是已证实的机制**——`llvm-objcopy` 是否真的丢掉 Mach-O 的弱标记，没有直接测量。
+
+**(4) 处置，以及为什么它只能是空实现。** 本板没有硬件按钮驱动，可选 sink 按设计缺席；空实现与缺席行为等价。而这是本仓库唯一抓得动的杠杆：声明与 staging 都在被钉死且每次重新克隆的驱动仓库里，本地编辑活不过一个 run。实现走 `XNU_EXTRA_LD_ARCHIVES`——`build-xnu-4k-baseline.sh:732` 本来就把它并进内核的 archive 列表，正是为这种形状留的接口。
+
+### 11.18 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核：仍未构建出来，连续第五轮。** 这一次连链接都没过，所以「空实现之后链接能过」是推断。验证它的 run 尚未触发。
+- **`llvm-objcopy` 丢掉 Mach-O 弱标记：未证实。** 有三组对照证据（同文件另一个可选符号有定义所以不报、五个 `native_ufs_store_*` 在普通 `.o` 里不报、`LegacyDisplayProbe.o` 未 objcopy 所以不报），但没有一次是直接测量 objcopy 前后符号表的弱位。如实记为「当时证据最强的解释」。
+- **空实现是否会被 `NativeHidInput` 真正调用：未测量。** 设计上会（`&symbol` 现在非空），而空体意味着什么都不发生。要等内核跑起来才能量。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12 / 11.14 / 11.16。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。

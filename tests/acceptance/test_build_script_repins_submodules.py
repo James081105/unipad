@@ -371,3 +371,74 @@ def test_a_protected_submodule_survives_the_drivers_own_reset(tmp_path: Path) ->
     assert again.returncode == 0, again.stdout + again.stderr
     _git(driver, "submodule", "update", "--init", "--recursive")
     assert _git(submodule, "rev-parse", "HEAD") == locked
+
+
+def test_the_buttons_sink_stub_satisfies_the_reference_the_link_reported() -> None:
+    """The stub must define exactly the symbol, with the driver's own signature.
+
+    Measured on run 40222638377, the first run to reach the kernel link at all::
+
+        Undefined symbols for architecture arm64:
+          "_native_buttons_set_sink", referenced from:
+              NativeHidInput::start(IOService*) in ...(NativeHidInput.late.o)
+
+    ``NativeHidInput.cpp:15`` declares it ``weak_import`` and guards every use
+    with ``&symbol``, which is the idiom for a symbol a board may not provide.
+    Its sibling ``native_touch_set_sink`` is DEFINED by the device repository's
+    package (``TouchState.cpp:23``), so it resolves -- and that contrast is what
+    says the problem is the missing definition rather than the attribute.  This
+    board has no button driver, so a no-op body is behaviourally identical to
+    the symbol being absent.
+
+    The stub's source is extracted from ``build-macos.sh`` rather than retyped,
+    so this is about the bytes the runner compiles.  What is checked is the part
+    the linker cares about: the name, the arity and the parameter types, because
+    a definition with a different signature would not satisfy a C++-mangled
+    caller's reference at all.
+    """
+    hid = VENDOR_DRIVER / "drivers" / "NativeHidInput" / "NativeHidInput.cpp"
+    if not hid.is_file():
+        pytest.skip("vendor/UniXNU is not present in this checkout")
+    source = _stub_source()
+    declaration = next(
+        line
+        for line in hid.read_text(encoding="utf-8").splitlines()
+        if "native_buttons_set_sink" in line and "weak_import" in line
+    )
+    # The driver's own parameter list, so the comparison is against it.
+    assert "void (*)(void *, uint32_t), void *" in declaration, declaration
+
+    definitions = [
+        line
+        for line in source.splitlines()
+        if "native_buttons_set_sink" in line and line.rstrip().endswith("{")
+    ]
+    assert len(definitions) == 1, (
+        "the stub defines the sink more than once, or not at all: "
+        f"{definitions}"
+    )
+    assert "void native_buttons_set_sink(" in definitions[0], (
+        f"the stub does not define native_buttons_set_sink: {definitions[0]!r}"
+    )
+    # uint32_t and unsigned int are the same width on arm64, and the C signature
+    # the driver declares uses uint32_t; a mismatch here would be a different
+    # symbol to the linker, not a compatible one.
+    assert "unsigned int" in source or "uint32_t" in source, source
+    assert "void *context" in source, source
+    # A body that does nothing is the point: the sink is called and nothing
+    # happens, which is what "this board has no buttons" means.
+    assert "(void)sink" in source and "(void)context" in source, (
+        "the stub uses its arguments, so it is not the no-op the driver's "
+        "optional-sink contract asks for"
+    )
+
+
+def _stub_source() -> str:
+    """The C ``build_buttons_sink_stub`` writes, extracted from the shell."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index("cat >\"$source\" <<'STUB'\n") + len("cat >\"$source\" <<'STUB'\n")
+    end = text.index("\nSTUB\n", start)
+    return text[start:end]
+
+
+VENDOR_DRIVER = ROOT / "vendor" / "UniXNU"
