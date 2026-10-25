@@ -2342,18 +2342,26 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
 ) -> None:
     """PRD 7.4: missing evidence is unverified, never success.
 
-    Two independent reasons a stage cannot run are in play at once -- the
+    Three independent reasons a stage cannot run are in play at once -- the
     Apple-format device tree needs qemu-system-aarch64 to dump the machine's own
-    device tree, and this board declares no [firmware] -- and neither may be
+    device tree, this board declares no [firmware], and the owner root chain's
+    first sub-step needs a kernel that has not been built yet -- and none may be
     folded into "ran".  The run itself succeeds (exit 0) and still reports ok=false.
 
-    The seed is NOT one of the two reasons here, and that is the point of this
+    The seed is NOT one of the three reasons here, and that is the point of this
     test's history: the scratch repository used to stub ``src/unipad`` out, so
     the seed derivation failed and the sub-step stopped at the seed gate.  With
     the real package in the fixture the derivation succeeds -- as it does on a
     real runner, where the pin is on disk -- and the gate that actually stops
     this run is QEMU.  The seed refusal is pinned separately in
     ``test_the_platform_seed_is_never_invented_when_it_cannot_be_derived``.
+
+    The third reason is the build-os-root ordering constraint, and it is the
+    interesting one: the chain has to run *before* the kernel that consumes it,
+    but the tree it lives in is what the kernel stage's 'unixnu defconfig'
+    assembles, so on a fresh workspace it can only be not_run.  That is recorded
+    rather than papered over -- the alternative is a kernel built from a chain
+    nobody observed.
     """
     ipsw = fresh_out.parent / "iPad.ipsw"
     ipsw.write_text("fake ipsw\n", encoding="utf-8")
@@ -2380,6 +2388,20 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert assemble["status"] == "not_run", assemble
     assert "no [firmware]" in assemble["reason"], assemble
 
+    # (2b) build-os-root: the chain has to run *before* the kernel that consumes
+    #      it, but on a fresh workspace nothing has been built yet, so its own
+    #      script is not even in the tree -- the tree is what 'unixnu defconfig'
+    #      assembles, and that is the kernel stage.  This is the ordering
+    #      constraint showing up at its earliest gate, and the reason names the
+    #      file, the upstream line that draws it and the stage that makes it, so
+    #      an operator reading build-report.json knows this is an ordering fact
+    #      rather than a broken host.
+    os_root = report_steps["build-os-root"]
+    assert os_root["status"] == "not_run", os_root
+    assert "build-os-root.py" in os_root["reason"], os_root
+    assert "tree.py:70-76" in os_root["reason"], os_root
+    assert "unixnu defconfig" in os_root["reason"], os_root
+
     # (3) the stages that DID run are recorded ran, with what they ran.
     for name in ("build-kernel", "build-bootloader", "build-devicetree"):
         assert report_steps[name]["status"] == "ran", report_steps[name]
@@ -2389,10 +2411,11 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert stage["ok"] is False, stage
     assert stage["status"] == "incomplete", stage
     assert stage["step_summary"].startswith("ran="), stage
-    assert "not_run=2" in stage["step_summary"], stage
-    assert len(stage["not_run_reasons"]) == 2, stage
+    assert "not_run=3" in stage["step_summary"], stage
+    assert len(stage["not_run_reasons"]) == 3, stage
     assert any("qemu-system-aarch64" in reason for reason in stage["not_run_reasons"])
     assert any("no [firmware]" in reason for reason in stage["not_run_reasons"])
+    assert any("build-os-root" in reason for reason in stage["not_run_reasons"])
     # (5) and the same ledger is what build-report.json carries, so the two files
     #     cannot disagree about what ran.
     assert scratch.stage_steps() == report_steps

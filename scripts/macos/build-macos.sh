@@ -24,6 +24,16 @@
 #                         -> kernel.build() then kernel.prelink(); prelink writes
 #                            out/<device>/kernel/kernel.macho and logs its sha256
 #                            (kernel.py:105-137)
+#     build-os-root     python3 <tree>/scripts/build-os-root.py
+#                         -> the device repository's own owner root chain, the one
+#                            qemu_root_defconfig is built from
+#                            (build-os-root.py:41-169, README:96-106).  Ten
+#                            sub-steps, each skipped when its output exists.  It
+#                            runs BEFORE build-kernel because the kernel stage is
+#                            what consumes it: the config names two of its
+#                            archives and takes the Data volume UUID from the
+#                            environment, and a kernel built before the chain
+#                            existed would have to be built again.
 #     build-bootloader  unixnu build package                    cli.py:134
 #                         -> package.build(): the EDK II build of package/, which
 #                            also leaves the CLANGPDB tool links the device's
@@ -1033,6 +1043,12 @@ plan_steps() {
     local n="$1"
     printf 'preflight\n'
     if (( n >= 1 )); then printf 'prepare-sources\n'; fi
+    # build-os-root sits immediately before build-kernel because the kernel stage
+    # is what consumes its output: qemu_root_defconfig names two of the archives
+    # it builds, and the Data volume UUID it reads from the environment.  Placing
+    # it anywhere later would mean the kernel was already built with the wrong
+    # config by the time the chain existed.
+    if (( n >= 2 )); then printf 'build-os-root\n'; fi
     if (( n >= 2 )); then printf 'build-kernel\n'; fi
     if (( n >= 3 )); then printf 'build-bootloader\n'; fi
     # build-payload sits here, immediately after the bootloader it loads as a
@@ -1503,6 +1519,203 @@ record_artifact() {
 # upstream driver with the arguments its own code expects; (4) records the
 # artifact it produced and its sha256.
 
+# ---------------------------------------------------------------------------
+# the OS root chain
+# ---------------------------------------------------------------------------
+# qemu_root_defconfig is qemu_defconfig plus the owner root chain: the original
+# iPadOS OS volume mounted as the root, SystemOS as a union over it, and a Data
+# volume at /private/var.  None of that is built by the kernel step -- it is made
+# by the device repository's own scripts/build-os-root.py, which qemu_root_defconfig
+# says so itself ("The archives are made outside the kernel step, from a kernel
+# built with qemu_defconfig", configs/qemu_root_defconfig:12).
+#
+# So the chain is a stage of its own, and it has to run before the kernel that
+# consumes it.  What it produces, and where:
+#
+#   .cache/firmware/owner-data/seed.json        the Data volume UUID
+#                                            (qemu_root_defconfig:14 -- it is
+#                                            not set in the config because every
+#                                            seed has its own)
+#   <tree>/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a
+#   <tree>/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a
+#                                            the two archives the config names
+#                                            in CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE
+#                                            and CONFIG_XNU_VERIFIED_ROOT_ARCHIVE
+#   <tree>/build/original-static-system-trust/original-static-system.bundle
+#                                            the payload's --trust-cache
+#   .cache/firmware/owner-data/owner-data-1g.dbr the payload's --data-ramdisk
+#
+# The two halves live in two different places on purpose, and that is upstream's
+# layout rather than this script's choice: tree.py:assemble symlinks
+# <tree>/.cache/firmware to <device>/.cache/firmware (so the seed and its UUID
+# are shared by every tree and survive in the device repository) and makes
+# <tree>/build a fresh directory per tree.  The paths below are therefore spelled
+# with $DEVICE_DIR for the first group and $(tree_dir) for the second, which is
+# the same split tree.py:48-56 draws.
+#
+# IT MUST BE RUN FROM THE TREE, NOT FROM THE DEVICE REPOSITORY.  build-os-root.py
+# derives ROOT from __file__ (line 41) and qemu_esp.py derives WORK from
+# ROOT.parent (line 14), so invoking $DEVICE_DIR/scripts/build-os-root.py would
+# put WORK at <repo>/vendor and look for the kernel at vendor/kernel/, and would
+# write its build/ outputs into the device repository.  The tree's own copy of
+# the script resolves both correctly, which is why the README runs it as
+# `cd out/qemu/tree && python3 scripts/build-os-root.py` (README:96).
+
+#: The Data seed's report.  The volume UUID is read out of it and exported for
+#: the kernel build, because qemu_root_defconfig does not carry it.  A function
+#: rather than a variable for the same reason tree_dir() and work_dir() are: the
+#: path is derived from $DEVICE_DIR, and a value captured before the caller has
+#: finished setting that up is a stale path nobody notices until a stage looks
+#: for a file that is not where the message says it is.
+os_root_seed_json() { printf '%s' "$DEVICE_DIR/.cache/firmware/owner-data/seed.json"; }
+
+# root_chain_present -- 0 when the kernel stage can build qemu_root_defconfig.
+#
+# Checks the two archives the config names plus the seed that carries the UUID:
+# without all three the kernel build would fail on a missing input rather than on
+# a wrong decision, and a not_run that names the missing file is the only honest
+# report.  The trust cache and the data ramdisk are the payload's inputs and are
+# checked by the stage that consumes them, not here.
+root_chain_present() {
+    [[ -f "$(os_root_seed_json)" ]] \
+        && [[ -f "$(tree_dir)/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" ]] \
+        && [[ -f "$(tree_dir)/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a" ]]
+}
+
+# os_root_missing -- the chain files that are absent, one per line.
+os_root_missing() {
+    local path
+    for path in \
+        "$(os_root_seed_json)" \
+        "$(tree_dir)/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" \
+        "$(tree_dir)/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"; do
+        [[ -f "$path" ]] || printf '%s\n' "$(shown_path "$path")"
+    done
+    return 0
+}
+
+# build-os-root -- the owner root chain, then what the kernel stage needs from it.
+#   build-os-root.py:41-46   ROOT from __file__, --ipsw from $UNIXNU_IPSW
+#   build-os-root.py:56-169  ten sub-steps, each skipped when its output exists
+#   build-storage-abi.py:31  the first one needs the kernel step's kernel.macho
+#   README:96-106            the chain, in order, and the UUID export
+step_build_os_root() {
+    local name='build-os-root'
+
+    # (1) the device repository's own script.  It is the chain: nothing here
+    #     reimplements a step of it, because a second implementation of "sign
+    #     every 4 KiB block of the OS image" is a second thing that can be wrong.
+    local script
+    script="$(tree_dir)/scripts/build-os-root.py"
+    if [[ ! -f "$script" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the device repository's build-os-root.py is not in the build tree ($(shown_path "$script")): the tree is assembled by 'unixnu defconfig', so build-kernel must have run first (tree.py:70-76 copies both repositories' scripts/ into the tree)"
+        return 0
+    fi
+
+    # (2) host and tools.  hdiutil and diskutil attach the OS image read-only,
+    #     grow the Data container and mount it to write SpringBoard's
+    #     preferences (build-os-root.py:70,104-131); the host verifier links
+    #     against OpenSSL 3, whose keg the script takes as --openssl-prefix
+    #     (build-os-root.py:44-45,63-65).  Neither exists off macOS.
+    local openssl_prefix=''
+    local candidate
+    for candidate in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+        if [[ -d "$candidate" ]]; then openssl_prefix="$candidate"; break; fi
+    done
+    local -a need=('hdiutil' 'diskutil' 'python3')
+    if [[ -n "$openssl_prefix" ]]; then
+        apple_step_gate "$name" "${need[@]}" "$openssl_prefix" || return 0
+    else
+        # The keg is absent, so there is nothing to hand --openssl-prefix and the
+        # script's own default (/opt/homebrew/...) would be wrong on an Intel Mac.
+        # Reported rather than guessed at.
+        apple_step_gate "$name" "${need[@]}" /opt/homebrew/opt/openssl@3 || return 0
+    fi
+
+    # (3) the IPSW.  The two disk images are extracted from it
+    #     (build-os-root.py:58-62) and the System trust cache is read out of it
+    #     (:164-168), so without a local image there is no OS volume to sign.
+    if [[ -z "$IPSW_PATH" ]]; then
+        ledger_add "$name" 'not_run' \
+            'the OS and SystemOS images and the System trust cache all come out of the IPSW: pass --ipsw FILE (board.toml [ipsw] url is https and this script performs no network access, PRD 8.1)'
+        return 0
+    fi
+    if [[ ! -f "$IPSW_PATH" ]]; then
+        die 'artifact_missing' "the given IPSW does not exist: $IPSW_PATH" \
+            "{\"ipsw\":\"$(json_escape "$IPSW_PATH")\"}" "$EXIT_FAILURE"
+    fi
+
+    # (4) the baseline kernel and payload.  This is the ordering constraint the
+    #     vendor chain itself documents and that the plan cannot satisfy in one
+    #     pass: build-storage-abi.py:31 refuses without WORK/kernel/kernel.macho,
+    #     and it boots that kernel from the payload volume to observe the storage
+    #     ABI (build-storage-abi.py:18).  Both are produced by build-kernel and
+    #     build-payload, which the plan runs *after* this stage.
+    #
+    #     So on a fresh workspace this stage is not_run and build-kernel builds
+    #     qemu_defconfig -- which is exactly the kernel the chain needs -- and a
+    #     second invocation of this script, with that kernel on disk, runs the
+    #     chain and then builds qemu_root_defconfig.  That is the sequence
+    #     README:96-98 spells out by hand, and it is recorded as not_run rather
+    #     than papered over, because the alternative is a kernel built from a
+    #     chain that was never observed.
+    local kernel payload
+    kernel="$(work_dir)/kernel/kernel.macho"
+    payload="$(work_dir)/payload/payload.img"
+    if [[ ! -f "$kernel" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the chain's first sub-step boots the kernel step's kernel.macho and refuses without it (build-storage-abi.py:31): $(shown_path "$kernel") is absent, so this stage needs a qemu_defconfig kernel built first. Run this script again after build-kernel and build-payload have produced it (README:96-98)"
+        return 0
+    fi
+    if [[ ! -f "$payload" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the storage-ABI observation boots the candidate from the payload volume (build-storage-abi.py:18, qemu_esp.py:27): $(shown_path "$payload") is absent, so build-payload must have produced it first"
+        return 0
+    fi
+
+    # (5) run, from the tree.  The script skips every sub-step whose output
+    #     already exists (build-os-root.py:56-169), so a second invocation spends
+    #     its time on what is actually missing rather than redoing the chain.
+    local os_root_log="$OUT_DIR/${name}.driver.log"
+    log "+ $PY $(shown_path "$script") --ipsw <given> --openssl-prefix $openssl_prefix (cwd $(tree_dir))"
+    if ! ( cd "$(tree_dir)" && "$PY" "$script" --ipsw "$IPSW_PATH" \
+            ${openssl_prefix:+--openssl-prefix "$openssl_prefix"} ) 2>&1 | tee "$os_root_log"; then
+        ledger_add "$name" 'failed' \
+            "build-os-root.py failed; see $(shown_path "$os_root_log")"
+        return 1
+    fi
+
+    # (6) what the kernel stage needs, published.  The UUID is read out of the
+    #     seed's own report rather than re-derived, because qemu_root_defconfig:14
+    #     says it comes from the environment and every seed has its own -- a
+    #     value guessed here would mount the wrong Data volume.
+    local uuid=''
+    if [[ -f "$(os_root_seed_json)" ]]; then
+        uuid="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["volume_uuid"])' \
+            "$(os_root_seed_json)" 2>>"$os_root_log")"
+    fi
+    if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        ledger_add "$name" 'failed' \
+            "the chain ran but $(shown_path "$(os_root_seed_json)") carries no volume_uuid the kernel build could use; see $(shown_path "$os_root_log")"
+        return 1
+    fi
+    local -a missing=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && missing+=("$line")
+    done < <(os_root_missing)
+    if (( ${#missing[@]} > 0 )); then
+        ledger_add "$name" 'failed' \
+            "the chain ran but did not produce: ${missing[*]}"
+        return 1
+    fi
+    log "os root: XNU_OWNER_DATA_VOLUME_UUID=$uuid (from $(shown_path "$(os_root_seed_json)"))"
+    ledger_add "$name" 'ran' \
+        "build-os-root.py: the owner root chain; the kernel stage below builds qemu_root_defconfig with XNU_OWNER_DATA_VOLUME_UUID from $(shown_path "$(os_root_seed_json)")"
+    return 0
+}
+
 # build-kernel -- 'unixnu defconfig <name>' then 'unixnu build kernel'.
 #   cli.py:89-101  cmd_defconfig copies configs/<name> to out/<device>/.config
 #   cli.py:123-129 cmd_build runs kernel.build() then kernel.prelink()
@@ -1521,10 +1734,30 @@ step_build_kernel() {
             "board.toml of $DEVICE_DIR has no [kernel] defconfig." \
             "{\"device\":\"$(json_escape "$DEVICE_DIR")\"}" "$EXIT_USAGE"
     fi
-    if [[ ! -f "$DEVICE_DIR/configs/$DEFCONFIG" ]]; then
+    # (1b) which defconfig.  board.toml [kernel] names qemu_defconfig, which is
+    #      the right answer for every run that has no owner root chain -- and the
+    #      wrong one for a run that has it, because qemu_root_defconfig is
+    #      qemu_defconfig plus the chain and the two are not interchangeable: the
+    #      guest either mounts the owner-signed OS volume as its root or stops at
+    #      "Failed to mount root device" (README:179).
+    #
+    #      The switch is on disk rather than on the in-process flag
+    #      step_build_os_root set, so a kernel built in a run where the chain was
+    #      already on disk from an earlier one still gets it.  It is not a second
+    #      spelling of the board's choice: the board's value is the default, and
+    #      this only overrides it when the chain it asks for exists.
+    local defconfig="$DEFCONFIG" defconfig_origin="board.toml [kernel] defconfig"
+    if root_chain_present; then
+        defconfig='qemu_root_defconfig'
+        defconfig_origin='the owner root chain build-os-root produced'
+        log "kernel: the root chain is present, so building $defconfig ($defconfig_origin)"
+    else
+        log "kernel: no owner root chain on disk, so building $defconfig ($defconfig_origin)"
+    fi
+    if [[ ! -f "$DEVICE_DIR/configs/$defconfig" ]]; then
         die 'artifact_missing' \
-            "defconfig not found: $DEVICE_DIR/configs/$DEFCONFIG" \
-            "{\"defconfig\":\"$(json_escape "$DEFCONFIG")\",\"expected\":\"$(json_escape "$DEVICE_DIR/configs/$DEFCONFIG")\"}" \
+            "defconfig not found: $DEVICE_DIR/configs/$defconfig" \
+            "{\"defconfig\":\"$(json_escape "$defconfig")\",\"expected\":\"$(json_escape "$DEVICE_DIR/configs/$defconfig")\"}" \
             "$EXIT_FAILURE"
     fi
     # kernel.prelink() takes the original kernelcache from --kernelcache, from
@@ -1547,8 +1780,27 @@ step_build_kernel() {
     local -a extra=()
     if [[ -n "$KERNELCACHE_PATH" ]]; then extra+=(--kernelcache "$KERNELCACHE_PATH"); fi
     if [[ -n "$IPSW_PATH" ]]; then extra+=(--ipsw "$IPSW_PATH"); fi
-    if ! run_driver "$name" 'defconfig' "$DEFCONFIG" ${extra[@]+"${extra[@]}"}; then
-        ledger_add "$name" 'failed' "unixnu defconfig $DEFCONFIG failed; see $OUT_DIR/${name}.driver.log"
+    # (3a) the Data volume UUID.  qemu_root_defconfig:14 does not set it and says
+    #      why -- every seed has its own -- so the kernel build reads it from the
+    #      environment and this is where it comes from.  Exported rather than
+    #      passed as an argument because that is the interface the config names,
+    #      and because run_driver builds the command line itself.
+    if [[ "$defconfig" == 'qemu_root_defconfig' ]]; then
+        local uuid=''
+        if [[ -f "$(os_root_seed_json)" ]]; then
+            uuid="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["volume_uuid"])' \
+                "$(os_root_seed_json)" 2>>"$OUT_DIR/${name}.driver.log")"
+        fi
+        if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+            ledger_add "$name" 'not_run' \
+                "the root chain is present but $(shown_path "$(os_root_seed_json)") carries no volume_uuid, and qemu_root_defconfig:14 takes it from the environment: the Data volume could not be mounted at /private/var"
+            return 0
+        fi
+        export XNU_OWNER_DATA_VOLUME_UUID="$uuid"
+        log "kernel: XNU_OWNER_DATA_VOLUME_UUID exported from $(shown_path "$(os_root_seed_json)")"
+    fi
+    if ! run_driver "$name" 'defconfig' "$defconfig" ${extra[@]+"${extra[@]}"}; then
+        ledger_add "$name" 'failed' "unixnu defconfig $defconfig failed; see $OUT_DIR/${name}.driver.log"
         return 1
     fi
 
@@ -2628,6 +2880,16 @@ main() {
                         ledger_add "$s" 'ran' \
                             'pinned repositories, module submodules and feed clones verified locally at the locked commits; nothing was fetched'
                     fi
+                fi
+                ;;
+            build-os-root)
+                step "$s"
+                if (( SOURCES_INCOMPLETE )); then
+                    ledger_add "$s" 'not_run' 'pinned sources absent (--skip-sources); the driver would have to fetch them'
+                elif step_build_os_root; then
+                    :
+                else
+                    stage_failed=1
                 fi
                 ;;
             build-kernel)
