@@ -544,7 +544,7 @@ def test_the_workflow_applies_the_divergence_where_the_sources_are_laid_down() -
     # what was moved.  The CALL is what carries the ordering; the definition is
     # further up the file by construction, and matching the bare name would find
     # the `def` and prove nothing.
-    position = text.index("divergences = apply_submodule_divergences()")
+    position = text.index("divergences = apply_submodule_divergences(")
     assert text.index('run_driver("fetch")') < position, (
         "the divergence is applied before the driver fetches the submodules, so "
         "there is nothing on disk to move"
