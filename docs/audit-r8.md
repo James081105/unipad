@@ -387,6 +387,27 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **`XNU_OWNER_DATA_VOLUME_UUID` 在容器从 32 MiB 长到 1 GiB 之后是否仍然有效：仍未核对。** 见 11.10。`build-macos.sh:1873` 会把它打进日志，下一遍核对。
 - **`build-platform-power.py` 这一次是真的执行了审计，还是仍然走了 no-op 桥：未经核实。** run 40206274286 里它死在第 50 行的检查上，这说明它**越过了** no-op 桥（否则不会到达那里），所以参考内核确实存在；但 `audit-amfi-pmgr-contract.py` 本身是否通过，要等内核cache就位的那一遍才知道。
 
+### 11.13 第六轮：第二遍构建死在它自己的第十个 archive，根因是 `unixnu` 每次都会把子模块重置回 gitlink（事实 52，2026-10-26）
+
+**(1) `--kernelcache-cache` 生效了，而这是可证的而不是推断的。** run 40209085545：链再次 `os_root_status=pass`（step 15 再次真的删掉两个卷），第二遍选中 `qemu_root_defconfig`、导出 UUID、建出前 9 个 archive。archive 10/10 `build-platform-power.py` **越过了**上一轮死掉的那行——它打印出了下一步 `+ bash .../build-xnu-4k-baseline.sh`，说明它读到了 `out/ipsw/21H461/kernelcache.decompressed`。
+
+**(2) 然后死在 `build-xnu-4k-baseline.sh:735`**：`Rebuild the owned Legacy archive after changing drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`。
+
+**(3) 根因是驱动自己的一个行为，而它把洞掩藏了两轮。** `cli.py:79-86` 的 `prepare()` 第一句是 `feeds.update_submodules(ctx)`，后者跑 `git submodule update --init --recursive`——把**每一个**模块子模块重置到驱动自己 gitlink 记录的提交。所以链在 `eb9c949` 建好的 Legacy archive 与第二遍 `unixnu build kernel` 之后的源不再一致。**第一遍里 archive 与源在同一次调用内产生，必然一致；第二遍才第一次出现「archive 是上一轮建的、源是这一轮重置的」这个组合。** 事实 45 的「跑两遍」让链第一次能跑，也让第十个 archive 第一次真正执行到（事实 51），并让子模块重置第一次有机会破坏一个已经建好的 archive——**一个修法的副作用要到两轮之后才显形**。
+
+**(4) 修法是把「应用锁里的子模块提交」收敛成唯一实现，并放在每次驱动调用之后。** 新增 `src/unipad/host/source_pins.py`；`build-macos.sh` 的 `run_driver` 在驱动返回后调用它，不管子命令是什么——因为枚举「哪些子命令会重置」本身就是又一个要靠记住的事。workflow 的 acquisition 步骤改为调用同一个模块：两份「哪个提交」正是本仓库反复踩的第二个知道 sha 的地方。
+
+**(5) 重构本地就抓到两个我自己的缺陷，都在推到 runner 之前。** (a) 删旧函数体时把 `moved = []` 一起删了；(b) acquisition 测试期望的是**步骤自己的** `SourcePinError`，而模块抛自己的——修法是把模块的 `UniPadError` 包成步骤的类型，因为步骤对调用方的契约是它自己的类型。**这两个都是「重构一段能跑的代码」的典型代价，而它们是那个行为测试抓到的，不是 code review 抓到的**——这再次说明 `test_acquire_submodule_divergences.py` 跑步骤自己的代码而不是读它，是对的。
+
+**(6) 新测试也抓到我自己的一个缺陷。** 禁用列表里写了 `submodule`，而函数名就叫 `pin_module_submodules`——它以自己的名字失败。这与 11.7(5)、11.9(5)、11.11(5) 是同一类错误**第四次**。四次分别是：匹配到函数定义、`StopIteration`、消息里的 `NameError`、禁用列表里的函数名。**共同点很一致：写「证明它有牙齿」的那一步时，没有真的去看失败信息指的是不是那个契约。**
+
+### 11.14 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核：仍未构建出来，这是连续第三轮。** run 40209085545 的 step 16 以 `stage build-kernel failed` 结束。三次死因各不相同（相对 refer 路径、kernelcache 缓存缺失、子模块重置），每一次都由前一次的修法暴露出来；**「下一次能过」始终是推断**，验证它的 run 尚未触发。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12。
+- **`XNU_OWNER_DATA_VOLUME_UUID` 在 32 MiB → 1 GiB 之后是否仍然有效：仍未核对。** 见 11.10。三轮了，每次都被下一个阻断挤掉；`build-macos.sh:1873` 会把它打进日志，内核真正建出来的那一遍必须核对。
+- **`run_driver` 里的 re-pin 在真 runner 上的开销未测量。** 每个驱动调用多 21 次 `git rev-parse`（锁里的子模块数），只有真发生分歧的才 fetch。设计上是幂等且廉价的，但没有量过。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。

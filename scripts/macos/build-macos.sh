@@ -1563,10 +1563,59 @@ run_driver() {
     local -a cmd=("$PY" "$DRIVER" "$sub" -D "$DEVICE_DIR" --out "$UNIXNU_OUT" -j "$JOBS" "$@")
     local log_file="$OUT_DIR/${step}.driver.log"
     log "+ ${cmd[*]}"
-    if "${cmd[@]}" 2>&1 | tee "$log_file"; then
+    local status=0
+    "${cmd[@]}" 2>&1 | tee "$log_file" || status=$?
+    # ...and put the module submodules back where the lock pins them.
+    #
+    # Every driver subcommand that reaches prepare() runs
+    # `git submodule update --init --recursive` (cli.py:79-86 ->
+    # feeds.py:159-165), which resets EVERY module submodule to the commit the
+    # DRIVER's gitlink records -- including the ones sources.lock.json
+    # deliberately pins elsewhere.  Measured on run 40209085545: the owner root
+    # chain built the Legacy display archive at the locked eb9c949, the second
+    # build pass's `unixnu build kernel` reset the checkout to the gitlink's
+    # c031d882, and build-xnu-4k-baseline.sh:735 then refused to link with
+    # "Rebuild the owned Legacy archive after changing
+    # drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp" -- nine steps from
+    # anything that looked like a submodule problem.
+    #
+    # So it is re-applied HERE, after every driver call whatever the
+    # subcommand, rather than remembered by each caller: a caller that forgets
+    # is the same defect one level up, and the chain step's own forcing (which
+    # runs once, before build-os-root.py) cannot see a reset that happens
+    # afterwards.  It is idempotent -- a rev-parse per pinned submodule, and a
+    # fetch only for one that actually moved -- so it costs nothing on the
+    # common path.  A pin that cannot be applied is a refusal, not a warning:
+    # the build would otherwise not be the pinned one.
+    pin_module_submodules "$step"
+    return "$status"
+}
+
+# pin_module_submodules STEP -- put every module submodule of the driver
+# repository at the commit config/sources.lock.json pins.
+#
+# The logic lives in unipad.host.source_pins, not here, because the workflow's
+# acquisition step applies the same pins before `unixnu fetch` initialises the
+# submodules from the gitlink -- and two implementations of "which commit" is
+# the second-place-that-knows-a-sha defect this project keeps hitting (PRD 8.1).
+pin_module_submodules() {
+    local step="$1"
+    local log_file="$OUT_DIR/${step}.pins.log"
+    if run_unipad -m unipad.host.source_pins \
+            --lock "$LOCK_PATH" --driver "$UNIXNU_DIR" --quiet \
+            >"$log_file" 2>&1; then
+        # --quiet prints nothing when nothing moved, so a non-empty log IS the
+        # "something moved" signal and there is no second thing to parse.
+        if [[ -s "$log_file" ]]; then
+            sed 's/^/pins: /' "$log_file"
+        fi
         return 0
     fi
-    return 1
+    sed 's/^/pins: /' "$log_file" >&2 || true
+    die 'verification_failed' \
+        'the module submodules could not be put at the commits sources.lock.json pins, so this build would not be the pinned one' \
+        "{\"log\":\"$(json_escape "$log_file")\",\"lock\":\"$(json_escape "$LOCK_PATH")\",\"driver\":\"$(json_escape "$UNIXNU_DIR")\"}" \
+        "$EXIT_FAILURE"
 }
 
 # shown_path PATH -- how the manifest records PATH.

@@ -44,6 +44,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -92,7 +93,17 @@ def _load_step(tmp_path: Path) -> Any:
     ``__name__`` is not ``__main__``, so the ``sys.exit(main())`` at the bottom
     never fires -- which is the whole point: the module is loaded for its
     functions, not for its behaviour as a script.
+
+    ``src`` goes on ``sys.path`` because the step's
+    ``apply_submodule_divergences`` delegates to ``unipad.host.source_pins``
+    rather than carrying a second implementation: the step's own shell sets
+    ``PYTHONPATH=src``, and this import is what stands in for it.  Without it
+    the load fails with ``ModuleNotFoundError`` and every test here skips for a
+    reason that has nothing to do with what they assert.
     """
+    source_root = str(ROOT / "src")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
     module_path = tmp_path / "acquisition_step.py"
     module_path.write_text(_step_python(), encoding="utf-8")
     spec = importlib.util.spec_from_file_location("unipad_acquisition_step", module_path)

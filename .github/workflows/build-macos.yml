@@ -867,41 +867,46 @@ jobs:
               A submodule the driver never fetched is skipped: an absent
               directory is not a divergence, and inventing a checkout here would
               put material in vendor/ that no pin asked for.
+
+              The implementation is unipad.host.source_pins, not this body,
+              because build-macos.sh applies the SAME pins after every driver
+              call -- measured on run 40209085545, where `unixnu build kernel`
+              reset every module submodule to the gitlink and the link script
+              refused with "Rebuild the owned Legacy archive after changing
+              drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp".  Two
+              implementations of "which commit" is the
+              second-place-that-knows-a-sha defect this project keeps hitting,
+              so there is one, and both callers use it.  This step's shell sets
+              PYTHONPATH=src, which is how the import resolves here.
               """
-              moved = []
+              from unipad.errors import UniPadError
+              from unipad.host.source_pins import apply_divergences, read_pins
+
               try:
-                  lock = json.loads(Path(LOCK_PATH).read_text(encoding="utf-8"))
-              except (OSError, ValueError) as error:
-                  raise SourcePinError(f"{LOCK_PATH}: {error.__class__.__name__}")
-              root = Path(driver_root)
-              for entry in lock.get("submodules") or []:
-                  path, commit = entry.get("path"), entry.get("commit")
-                  if not path or not commit:
-                      continue
-                  directory = root / path
-                  if not (directory / ".git").exists():
-                      continue
-                  head = _head_of(directory)
-                  if head == commit:
-                      continue
-                  gitlink = entry.get("gitlink_commit") or "the gitlink"
-                  print(f"== {path}: {gitlink} -> {commit} (the divergence the lock records)")
-                  _run_git(
-                      ["-C", str(directory), "fetch", "-q", "--depth", "1", "origin", commit]
+                  pins = read_pins(Path(LOCK_PATH))
+                  records = apply_divergences(Path(driver_root), pins)
+              except UniPadError as error:
+                  # Re-raised as THIS step's error type, because the step's
+                  # contract with its caller is SourcePinError and a caller
+                  # catching it must not have to know which module did the
+                  # work.  The message is the module's, unchanged.
+                  raise SourcePinError(str(error)) from error
+              moved = []
+              for record in records:
+                  gitlink = record.get("gitlink_commit")
+                  print(
+                      f"== {record['path']}: "
+                      f"{gitlink or 'the gitlink'} -> {record['commit']} "
+                      "(the divergence the lock records)"
                   )
-                  _run_git(["-C", str(directory), "checkout", "-q", "--detach", "FETCH_HEAD"])
-                  head = _head_of(directory)
-                  if head != commit:
-                      raise SourcePinError(
-                          f"{path}: the checkout is at {head} but the lock pins {commit}"
-                      )
-                  moved.append(
-                      {
-                          "path": path,
-                          "gitlink_commit": entry.get("gitlink_commit"),
-                          "commit": commit,
-                      }
-                  )
+                  moved_record = {
+                      "path": record["path"],
+                      "gitlink_commit": gitlink,
+                      "commit": record["commit"],
+                  }
+                  if record.get("from"):
+                      moved_record["from"] = record["from"]
+                  moved.append(moved_record)
               return moved
 
 
