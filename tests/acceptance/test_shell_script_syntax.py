@@ -105,6 +105,43 @@ def test_the_shell_script_parses(script: Path) -> None:
     )
 
 
+def _git_tracks() -> set[Path] | None:
+    """Every ``*.sh`` git tracks, or ``None`` when git cannot answer.
+
+    The repository is what git tracks, and that is the definition this guard
+    wants: a script nobody committed is not a script we ship.
+
+    The alternative -- excluding scratch directories by *name* -- is what this
+    function replaces, and it failed the way every name-based exclusion
+    eventually fails.  Measured 2026-10-25: an agent's scratch worktree root
+    holding eight copies of ``build-macos.sh`` reddened this test on a tree
+    whose committed content was entirely fine.  ``vendor/`` and
+    ``local-private/`` are excluded for exactly the reason this docstring
+    gives, and this was the same shape arriving through a fourth door: the
+    next agent picks the next directory name, and the guard reddens again for
+    a change nobody made.
+
+    ``None`` rather than an empty set when git is unavailable, so the caller
+    can fall back instead of concluding the repository ships no scripts at all
+    -- which would turn a missing git into a silently vacuous guard.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    result = subprocess.run(
+        [git, "ls-files", "-z", "*.sh"],
+        capture_output=True,
+        cwd=ROOT,
+    )
+    if result.returncode != 0:
+        return None
+    return {
+        (ROOT / name.decode("utf-8")).resolve()
+        for name in result.stdout.split(b"\0")
+        if name
+    }
+
+
 def test_the_guard_covers_every_shell_script() -> None:
     """A new script that no test names is a script nobody has parsed.
 
@@ -112,26 +149,38 @@ def test_the_guard_covers_every_shell_script() -> None:
     a shell script somewhere the glob cannot see, which is the only way this
     file can silently stop covering something.
 
-    ``vendor/`` is excluded, and the reason is not convenience: it holds the
-    *fetched* upstream repositories, at the commits ``config/sources.lock.json``
-    pins.  They are not this repository's scripts, their content changes
-    whenever a pin moves, and parsing them would make this guard fail for a
-    reason no change here caused -- which is exactly the "fails on files you
-    never touched" shape that trains people to ignore it.  ``local-private/``
-    is excluded for the same reason (it is gitignored host material).
+    "The repository has grown one" means *git tracks it*, which is what
+    :func:`_git_tracks` answers.  Two directories hold shell scripts that are
+    deliberately not ours and would otherwise be parsed: ``vendor/`` holds the
+    *fetched* upstream repositories at the commits ``config/sources.lock.json``
+    pins -- their content changes whenever a pin moves, so parsing them would
+    redden this guard for a reason no change here caused -- and
+    ``local-private/`` is gitignored host material.  Neither is in git's index,
+    so neither is in ``on_disk``.
 
     What this means, stated plainly: the guard covers the scripts *we* ship.  A
     pin bump that breaks an upstream script is the build step's problem, and it
     reports it as a build failure with the script named, not as a coverage gap
-    here.
+    here.  Scratch in the working tree is nobody's script either, and the
+    git-tracked definition is what keeps an agent's worktree from reddening a
+    guard over content that was never committed -- measured 2026-10-25, eight
+    copies of ``build-macos.sh`` under one agent's scratch root.
     """
-    on_disk = {
-        path
-        for path in ROOT.rglob("*.sh")
-        if ".git" not in path.parts
-        and "local-private" not in path.parts
-        and "vendor" not in path.parts
-    }
+    tracked = _git_tracks()
+    if tracked is not None:
+        on_disk = tracked
+    else:
+        # git could not answer, so fall back to naming what is not ours.  This
+        # is the weaker definition and it is why the fallback exists at all:
+        # without it a host with no git on PATH would run a guard that covers
+        # nothing and reports success.
+        on_disk = {
+            path
+            for path in ROOT.rglob("*.sh")
+            if ".git" not in path.parts
+            and "local-private" not in path.parts
+            and "vendor" not in path.parts
+        }
     named = set(SHELL_SCRIPTS)
     assert on_disk == named, (
         "shell scripts exist that this module does not check: "
