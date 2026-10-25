@@ -441,6 +441,7 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **`qemu_root_defconfig` 内核：仍未构建出来，连续第五轮。** 这一次连链接都没过，所以「空实现之后链接能过」是推断。验证它的 run 尚未触发。
 - **`llvm-objcopy` 丢掉 Mach-O 弱标记：未证实。** 有三组对照证据（同文件另一个可选符号有定义所以不报、五个 `native_ufs_store_*` 在普通 `.o` 里不报、`LegacyDisplayProbe.o` 未 objcopy 所以不报），但没有一次是直接测量 objcopy 前后符号表的弱位。如实记为「当时证据最强的解释」。
 - **空实现是否会被 `NativeHidInput` 真正调用：未测量。** 设计上会（`&symbol` 现在非空），而空体意味着什么都不发生。要等内核跑起来才能量。
+- **run 40238050858 暴露的 heredoc 缺陷：已修并已有编译门禁，但未在 runner 上复验。** `build-macos.sh` 里喂给解释器的每个 heredoc 现在都会被真编译（`test_build_macos_python_syntax.py`），而该门禁本身只在本机量过。
 - **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12 / 11.14 / 11.16。
 
 ## 11. 结论与下一步

@@ -2058,9 +2058,7 @@ for index, line in enumerate(lines):
         if relative in value.split():
             sys.exit(0)
         lines[index] = f'{key}"{value} {relative}"'
-        config.write_text("
-".join(lines) + "
-", encoding="utf-8")
+        config.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"config: {key} now also names {relative}")
         sys.exit(0)
 print(f"config: {key} is not in the generated config, so nothing was appended", file=sys.stderr)
