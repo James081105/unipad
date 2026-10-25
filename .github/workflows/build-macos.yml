@@ -1381,6 +1381,14 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$VOLUMES_DIR" "$REFER_DIR" "$TRUSTCACHE_DIR"
+          # The one number that decides whether this step can finish at all.  The
+          # chain's own inputs are 7.88 GiB of volumes and the image is 6.37 GiB,
+          # against a runner with ~14 GiB free and a build tree already on disk,
+          # so an ENOSPC here is a live possibility rather than a hypothetical
+          # one -- and a bare "No space left on device" six minutes into a paid
+          # macOS job does not say how much was missing.  Print it before, and
+          # again after, so the log carries the delta the step actually spent.
+          df -k . | sed 's/^/chain ipsw: /'
           # --kernelcache is required by the module's contract (the Mach-O has to
           # outlive the workspace), so it is pointed at the file the first
           # acquisition already published: the copy is re-hashed against the same
@@ -1408,6 +1416,13 @@ jobs:
             [ -f "$volume" ] && volumes=$((volumes + 1))
           done
           echo "chain_volumes=$volumes" >> "$GITHUB_OUTPUT"
+          # ...and the same number again, so the log carries what the step cost
+          # rather than only what it started with.  A reader comparing the two
+          # lines can tell an extraction that died early from one that ran out of
+          # room at the last volume, which are different failures with the same
+          # exit status.
+          df -k . | sed 's/^/chain ipsw (after): /'
+          du -sh "$VOLUMES_DIR" 2>/dev/null | sed 's/^/chain ipsw volumes: /' || true
           if [ "$status" -eq 0 ] && [ "$volumes" -eq 2 ]; then
             echo "== chain ipsw: PASS (both volumes published, image discarded)"
           elif [ "$status" -eq 0 ]; then
@@ -1435,6 +1450,12 @@ jobs:
           OUT_ROOT: build-output/unixnu-out
         run: |
           set -euo pipefail
+          # And again before the chain signs them, because this is the step that
+          # would otherwise fail with an ENOSPC that says nothing about how much
+          # was missing.  The volumes have been moved (not copied) by this point,
+          # so what is printed here is the filesystem the chain is about to work
+          # on, with its own build tree and the image already gone.
+          df -k . | sed 's/^/os root: /'
           # (1) where the chain reads the two volumes.  .cache/firmware of the
           #     DEVICE repository, not of the tree: tree.py:assemble symlinks
           #     <tree>/.cache/firmware at it precisely so the seed and its UUID
