@@ -461,13 +461,27 @@ class HostView:
 
 
 def default_view() -> HostView:
-    """The view of this host: the repo, its run/artifact dirs, and the boot logs."""
+    """The view of this host: the repo, its run/artifact dirs, and the boot logs.
+
+    The boot roots are listed individually rather than as ``local-private``
+    because the whole tree is gigabytes of IPSW extracts and would blow
+    ``max_files`` before the gate reached anything.  ``boot-inputs`` is the
+    directory the macOS runner's payload build writes and the one every real
+    boot on this host has read its kernel, device tree and EFI loaders from --
+    it was missing, so the gate could not see the kernel it was booting and
+    reported "no built UniXNU kernel image" while one ran.  ``out/components``
+    is where the IPSW members the board pins by digest live, which is what lets
+    a probe say *which* image an experiment attached.
+    """
     root = _repo_root()
     roots = [
         root,
         root / "runs",
         root / "artifacts",
         root / "local-private" / "out" / "real-boot",
+        root / "local-private" / "out" / "components",
+        root / "local-private" / "boot7" / "boot-inputs",
+        root / "local-private" / "boot7",
     ]
     return HostView(roots=tuple(path for path in roots if path.is_dir()), repo_root=root)
 
@@ -920,33 +934,60 @@ def _probe_edk2_firmware_boot(view: HostView) -> Observation:
 
 @_probe("p.esp_efi_chain", "a real QEMU run mounted the FAT ESP and started BOOTAA64.EFI")
 def _probe_esp_efi_chain(view: HostView) -> Observation:
-    """docs/implementation-plan.md Tier-1 table: "ESP -> BOOTAA64.EFI -> 访客代码"
-    is VERIFIED-ON-HOST -- the real firmware enumerated virtual PCI, found
-    virtio-blk, mounted the FAT ESP and started BOOTAA64.EFI, and our guest code
-    printed MiniEfi: alive.  The same table is explicit that the payload which
-    printed is our minimal test payload, not UniXNU, which is why this probe also
-    records whether DarwinBoot appears anywhere in that log.
+    """docs/implementation-plan.md Tier-1 table: "ESP -> BOOTAA64.EFI -> 访客代码".
+
+    The real firmware enumerated virtual PCI, found virtio-blk, mounted the FAT
+    ESP and started BOOTAA64.EFI.  What that log then shows depends on which
+    payload the ESP carried, and this probe used to stop at the first log whose
+    payload printed a name -- which was an old experiment's *test* payload
+    (``MiniEfi: alive``), so ``darwinboot`` came out False on a host where
+    DarwinBoot had since run for real.  The veto on PRD 209 ("仅打印组件名称")
+    reads that fact, so a stale selection turned a real handoff into a refusal.
+
+    It now prefers a log where DarwinBoot actually ran, and records which
+    literal identified the payload either way.  ``MiniEfi: alive`` is still
+    recognised, because it is a real historical fact about this host and
+    discarding it would be the same mistake in the other direction; it just no
+    longer wins by being sorted first.
     """
+    best: Optional[Observation] = None
     for relative in view.find("**/serial*.log"):
         text = view.read_text(relative)
         if not text.strip():
             continue
         load_at = _marker_hits(text, "BdsDxe: loading Boot0001")
-        payload_at = _marker_hits(text, "MiniEfi: alive")
-        if load_at and payload_at:
-            return Observation(
-                "p.esp_efi_chain",
-                True,
-                "the ESP to BOOTAA64.EFI chain ran in %s; the payload printed at line %d"
-                % (relative, payload_at),
-                refs=(_ref(view, relative, "serial_log"),),
-                facts={
-                    "log": relative,
-                    "payload_line": payload_at,
-                    "payload_literal": "MiniEfi: alive",
-                    "darwinboot": _marker_hits(text, "DarwinBoot") > 0,
-                },
-            )
+        if not load_at:
+            continue
+        # The payload's own marker, whichever one it printed.  DarwinBoot's is
+        # spelled in capitals in the log; a case-insensitive match would also
+        # catch a comment mentioning it, which is not the same claim.
+        darwinboot_at = _marker_hits(text, "DARWINBOOT:")
+        miniefi_at = _marker_hits(text, "MiniEfi:")
+        if not (darwinboot_at or miniefi_at):
+            continue
+        observation = Observation(
+            "p.esp_efi_chain",
+            True,
+            "the ESP to BOOTAA64.EFI chain ran in %s; %s printed at line %d"
+            % (
+                relative,
+                "DARWINBOOT" if darwinboot_at else "the test payload",
+                darwinboot_at or miniefi_at,
+            ),
+            refs=(_ref(view, relative, "serial_log"),),
+            facts={
+                "log": relative,
+                "payload_line": darwinboot_at or miniefi_at,
+                "payload_literal": "DARWINBOOT:" if darwinboot_at else "MiniEfi: alive",
+                "darwinboot": darwinboot_at > 0,
+            },
+        )
+        if darwinboot_at:
+            return observation
+        if best is None:
+            best = observation
+    if best is not None:
+        return best
     return Observation(
         "p.esp_efi_chain",
         False,
@@ -1156,21 +1197,46 @@ _SPARSE_INDEX_SYMBOL = b"_kalloc_sparse_prelink_index_version"
 #: copy of it.  ``None`` when it is absent, and the probe says so.
 _STOCK_KERNELCACHE = "local-private/out/lzfse/kernelcache-arm64.macho"
 
-#: Bytes read from the tail of a candidate when looking for the symbol: the
-#: Mach-O string table lives in __LINKEDIT at the end of the image.
-_SYMBOL_SCAN_BYTES = 8 << 20
+#: Bytes read per chunk when looking for the symbol.  The scan is chunked rather
+#: than one ``read()`` so a 52 MB image costs 52 MB of I/O and a bounded amount
+#: of memory, and the chunks overlap by one byte less than the needle so a symbol
+#: straddling a boundary is still found.
+_SCAN_CHUNK_BYTES = 4 << 20
 
 
 def _has_sparse_index_symbol(path: Path) -> bool:
+    """Whether the whole file carries the symbol, not merely its tail.
+
+    This used to read the last 8 MiB, on the reasoning that the Mach-O string
+    table lives in ``__LINKEDIT`` at the end of the image.  That is true of a
+    *linked* image and false of the prelinked kernel this host boots: its symbol
+    sits at offset 17,058,661 of 51,859,456 bytes, and an 8 MiB tail window
+    starts at 43,470,848 -- so the scan reported "no kalloc sparse-index symbol"
+    for a kernel that has one.  The rejection was a false negative, and it was
+    indistinguishable from a real one because both produce the same slug.
+
+    Measured 2026-10-25: the stock kernelcache has zero occurrences anywhere in
+    its 46,415,872 bytes, so *its* rejection was correct and stays correct.  Only
+    the window was wrong, and the fix is to scan everything.
+    """
+    needle = _SPARSE_INDEX_SYMBOL
+    carry = len(needle) - 1
     try:
-        size = path.stat().st_size
         with path.open("rb") as handle:
-            if size > _SYMBOL_SCAN_BYTES:
-                handle.seek(-_SYMBOL_SCAN_BYTES, os.SEEK_END)
-            blob = handle.read(_SYMBOL_SCAN_BYTES)
+            tail = b""
+            while True:
+                chunk = handle.read(_SCAN_CHUNK_BYTES)
+                if not chunk:
+                    return False
+                # ``tail`` is at most ``len(needle) - 1`` bytes, so this
+                # concatenation is one extra chunk-sized copy per iteration and
+                # nothing more; it is what keeps a symbol that straddles a
+                # boundary from being missed.
+                if needle in tail + chunk:
+                    return True
+                tail = chunk[-carry:] if carry else b""
     except OSError:
         return False
-    return _SPARSE_INDEX_SYMBOL in blob
 
 
 @_probe("p.unixnu_kernel_image", "a UniXNU kernel image built from the pinned sources exists")
@@ -1864,10 +1930,14 @@ ONSITE_STATUSES = ONSITE_STATUSES
 _KERNEL_BLOCKER = Blocker(
     blocker_id="built_unixnu_kernel_image",
     reason=(
-        "no UniXNU kernel image built from the pinned sources exists on this host: "
-        "board.toml names mach.development.bcm2837..., upstream/UniXNU/build/ is empty, "
-        "and the Apple kernelcache is excluded as a substitute by four gates in "
-        "emit_prelink.py plus its own output = bytearray(native_data)"
+        "no UniXNU kernel image built from the pinned sources exists on this host. "
+        "This used to be true and was recorded as the reason several milestones were "
+        "BLOCKED; it is no longer true -- a prelinked UniXNU kernel with the "
+        "admission symbols emit_prelink.py requires is present and boots, and the "
+        "probe below is what found it.  It stays declared because the mechanism is "
+        "the point: the moment such an image is absent again, every milestone that "
+        "names this blocker goes back to BLOCKED with a reason, rather than quietly "
+        "becoming UNVERIFIED"
     ),
     satisfied_by="unixnu_kernel_image",
 )

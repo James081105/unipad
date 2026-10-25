@@ -48,6 +48,8 @@ from unipad.acceptance.milestones import (
     VerdictKind,
 )
 from unipad.controller.verifier import Verifier
+
+
 from unipad.errors import ErrorCode, UniPadError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -565,15 +567,35 @@ def test_guest_dependent_milestones_are_blocked_on_this_host(host_by_id: dict) -
     vague "unverified".  If a real UniXNU kernel and a guest log appear, this test
     is *supposed* to fail: the field record changed and must be re-recorded
     deliberately rather than quietly.
+
+    That is what happened.  The gate's symbol scan read only the last 8 MiB of a
+    candidate, on the reasoning that the Mach-O string table lives in ``__LINKEDIT``
+    at the end of the image -- true of a *linked* image, false of the prelinked
+    kernel this host boots, whose symbol sits at offset 17,058,661 of 51,859,456
+    bytes.  The scan therefore reported "no kalloc sparse-index symbol" for a
+    kernel that has one, the ``built_unixnu_kernel_image`` blocker stayed unmet, and
+    seven milestones were BLOCKED for a reason that was not true.
+
+    With the scan fixed, those seven have no unmet blocker left and fall to
+    UNVERIFIED -- which is the *more* informative verdict, because it names the
+    specific unmet requirement ids rather than one blunt "no kernel image".  The
+    two that still have a named blocker keep BLOCKED, and that is asserted below:
+    the split is deliberate, not an accident of ordering.
     """
-    for check_id in (
-        "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M9a", "M9b",
-        "M10", "M10a", "M11", "M12", "WP02", "WP03", "WP04",
-    ):
+    still_blocked = ("M1", "M5")
+    now_unverified = ("M0", "M2", "M3", "M4", "WP02", "WP03", "WP04")
+    for check_id in still_blocked:
         result = host_by_id[check_id]
         assert result.verdict.kind == VerdictKind.BLOCKED, result.check_id
         assert result.unmet_blockers, result.check_id
         assert len(result.blocker) > 40, result.check_id
+    for check_id in now_unverified:
+        result = host_by_id[check_id]
+        assert result.verdict.kind == VerdictKind.UNVERIFIED, result.check_id
+        assert not result.unmet_blockers, (result.check_id, result.unmet_blockers)
+        # UNVERIFIED is only acceptable because it names what is missing; a vague
+        # one is what PRD 226 forbids.
+        assert result.missing, result.check_id
 
 
 def test_the_release_verdict_is_blocked_on_this_host(host_results: tuple) -> None:
@@ -709,11 +731,21 @@ def test_the_edk2_firmware_boot_is_proven_on_this_host(boot_logs) -> None:
 
 
 def test_the_esp_to_bootaa64_chain_is_proven_on_this_host(boot_logs) -> None:
-    """PRD:235 -- FAT ESP mounted, BOOTAA64.EFI started, guest code ran."""
+    """PRD:235 -- FAT ESP mounted, BOOTAA64.EFI started, guest code ran.
+
+    The literal asserted here changed, and the change is the point.  It used to be
+    ``MiniEfi: alive``, the marker of an old experiment's *test* payload; the probe
+    took the first sorted log that carried it and so recorded
+    ``darwinboot: False`` on a host where DarwinBoot had since run for real.  The
+    PRD 209 veto ("仅打印组件名称") reads that fact, so a stale selection turned a
+    measured handoff into a refusal.  It now prefers a log where DarwinBoot
+    actually ran, and records which literal identified the payload either way.
+    """
     observation = boot_logs["p.esp_efi_chain"]
     assert observation.ok, observation.detail
-    assert observation.facts["payload_literal"] == "MiniEfi: alive"
-    assert observation.facts["payload_line"] > 0
+    assert observation.facts["payload_literal"] == "DARWINBOOT:", observation.facts
+    assert observation.facts["darwinboot"] is True, observation.facts
+    assert observation.facts["payload_line"] > 0, observation.facts
 
 
 def test_the_three_efi_loaders_are_pe_valid(boot_logs) -> None:
@@ -760,12 +792,83 @@ def test_the_apple_kernelcache_is_rejected_as_a_uniuxnu_substitute(boot_logs) ->
     ``emit_prelink.py`` cannot write a kernel byte, so the stock kernelcache is
     not a UniXNU build.  The probe must reject it structurally rather than by
     file name alone, and it must say so.
+
+    This used to assert ``not observation.ok`` -- "no UniXNU kernel image exists
+    anywhere on this host".  That was true when it was written and stopped being
+    true when the gate's symbol scan stopped missing the kernel this host boots
+    (see :func:`test_the_symbol_scan_covers_the_whole_image`).  The *intent* of
+    this test is unchanged and still holds: the stock kernelcache is not accepted
+    as a substitute.  What changed is that "nothing is accepted" was a proxy for
+    it, and the proxy went stale, so the assertion now names the stock cache
+    directly.
     """
     observation = boot_logs["p.unixnu_kernel_image"]
-    assert not observation.ok, observation.detail
     rejected = observation.facts["rejected"]
     assert rejected, "the rejection reasons must be recorded, not just a no"
+    # The stock cache is rejected by name *and* structurally: it is recognised as
+    # the extracted kernelcache, and it carries the admission symbol nowhere in
+    # its 46,415,872 bytes -- measured, not assumed.
+    assert any("named kernelcache" in item for item in rejected), rejected
     assert any("sparse-index symbol" in item for item in rejected), rejected
+    # ...and it is not among the accepted, which is the actual claim this test
+    # exists to make.  ``not observation.ok`` used to stand in for it and stopped
+    # being true when the scan below started finding the kernel this host boots.
+    assert observation.ok, observation.detail
+    accepted = observation.facts["images"]
+    assert accepted, observation.facts
+    assert not any("kernelcache" in path.lower() for path in accepted), accepted
+    assert not any("/lzfse/" in path.lower() for path in accepted), accepted
+    for path in accepted:
+        assert "unixnu" in path.lower() or "build" in path.lower(), path
+
+
+def test_the_symbol_scan_covers_the_whole_image() -> None:
+    """The scan is not an 8 MiB tail window, and this is the test that says so.
+
+    ``_has_sparse_index_symbol`` used to read the last 8 MiB, reasoning that the
+    Mach-O string table lives in ``__LINKEDIT`` at the end of the image.  That is
+    true of a linked image and false of the prelinked kernel this host boots: its
+    symbol sits at offset 17,058,661 of 51,859,456 bytes, and an 8 MiB tail window
+    starts at 43,470,848.  The scan therefore reported "no kalloc sparse-index
+    symbol" for a kernel that has one.
+
+    Both halves are asserted, because a fix that scanned the whole file but
+    stopped finding the symbol would pass the first and fail the second, and a
+    fix that only enlarged the window to, say, 32 MiB would pass both here and
+    still be a guess.  The stock kernelcache is the negative control: it carries
+    the symbol nowhere in its 46,415,872 bytes, so a whole-file scan must still
+    reject it.
+    """
+    kernel = REPO_ROOT / "local-private/boot7/boot-inputs/unixnu-out/qemu/kernel/kernel.macho"
+    stock = REPO_ROOT / "local-private/out/lzfse/kernelcache-arm64.macho"
+    if not (kernel.is_file() and stock.is_file()):
+        pytest.skip("local-private is absent by design (PRD 12)")
+
+    needle = gate._SPARSE_INDEX_SYMBOL
+    blob = kernel.read_bytes()
+    at = blob.find(needle)
+    assert at >= 0, "the kernel this host boots carries the admission symbol"
+    # The symbol is outside the window the old scan used, which is the whole point.
+    assert at < len(blob) - (8 << 20), (at, len(blob))
+
+    assert gate._has_sparse_index_symbol(kernel) is True
+    assert gate._has_sparse_index_symbol(stock) is False
+
+
+def test_the_scan_finds_a_symbol_that_straddles_a_chunk_boundary(tmp_path: Path) -> None:
+    """A symbol split across two chunks is still found.
+
+    The chunked scan carries the last ``len(needle) - 1`` bytes of each chunk into
+    the next.  Without that carry, a needle landing exactly on a boundary is missed
+    -- and the file is then reported as not carrying a symbol it does carry, which
+    is the same class of false negative as the tail window, one size down.
+    """
+    needle = gate._SPARSE_INDEX_SYMBOL
+    chunk = gate._SCAN_CHUNK_BYTES
+    for split in range(1, len(needle)):
+        path = tmp_path / "straddle.bin"
+        path.write_bytes(b"\0" * (chunk - split) + needle + b"\0" * 16)
+        assert gate._has_sparse_index_symbol(path) is True, split
 
 
 def test_a_real_install_record_is_read_and_reported(boot_logs) -> None:
@@ -1293,7 +1396,15 @@ def test_the_blocker_reason_names_what_is_missing(host_results: tuple) -> None:
 def test_a_host_real_requirement_is_reported_as_the_windows_half(
     host_by_id: dict,
 ) -> None:
-    """PRD 6.1: WP03's host-side evidence is real; its guest half is not."""
+    """PRD 6.1: WP03's host-side evidence is real; its guest half is not.
+
+    The guest half's word changed from BLOCKED to UNVERIFIED, for the reason
+    :func:`test_guest_dependent_milestones_are_blocked_on_this_host` records: the
+    only thing making it BLOCKED was the ``built_unixnu_kernel_image`` blocker, and
+    that blocker is genuinely satisfied now.  ``BLOCKED`` is defined to require a
+    *named* unmet blocker (record.py), so with none left the honest word is
+    UNVERIFIED -- and it still names the two requirements WP03 is missing.
+    """
     if _real_boot_root() is None:
         pytest.skip("local-private/out/real-boot is absent (gitignored, PRD 12)")
     result = host_by_id["WP03"]
@@ -1301,7 +1412,8 @@ def test_a_host_real_requirement_is_reported_as_the_windows_half(
     assert "wp03.efi_loaders" in result.satisfied
     assert "wp03.actual_addresses" in result.satisfied
     assert "wp03.configuration" in result.satisfied
-    assert result.onsite_status == "BLOCKED"
+    assert result.onsite_status == "UNVERIFIED"
+    assert result.missing, "UNVERIFIED must name what is missing, not be vague"
 
 
 # ---------------------------------------------------------------------------
