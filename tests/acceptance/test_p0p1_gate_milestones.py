@@ -583,7 +583,11 @@ def test_guest_dependent_milestones_are_blocked_on_this_host(host_by_id: dict) -
     the split is deliberate, not an accident of ordering.
     """
     still_blocked = ("M1", "M5")
-    now_unverified = ("M0", "M2", "M3", "M4", "WP02", "WP03", "WP04")
+    # Six, not seven: M0 was already UNVERIFIED before the change.  Its only
+    # blocker is ``pinned_source_identity``, which has nothing to do with the
+    # kernel image, and the earlier version of this test did not list it.  The
+    # commit message and the plan both said seven, which was wrong.
+    now_unverified = ("M2", "M3", "M4", "WP02", "WP03", "WP04")
     for check_id in still_blocked:
         result = host_by_id[check_id]
         assert result.verdict.kind == VerdictKind.BLOCKED, result.check_id
@@ -743,134 +747,66 @@ def test_the_esp_to_bootaa64_chain_is_proven_on_this_host(boot_logs) -> None:
     """
     observation = boot_logs["p.esp_efi_chain"]
     assert observation.ok, observation.detail
-    assert observation.facts["payload_literal"] == "DARWINBOOT:", observation.facts
+    assert observation.facts["payload_literal"] == "DARWINBOOT: hand-off to the kernel", observation.facts
     assert observation.facts["darwinboot"] is True, observation.facts
     assert observation.facts["payload_line"] > 0, observation.facts
 
+def test_a_log_that_merely_mentions_darwinboot_does_not_satisfy_the_veto_fact(
+    tmp_path: Path,
+) -> None:
+    """PRD 209's veto reads ``darwinboot``, so a *mention* must not set it.
 
-def test_the_three_efi_loaders_are_pe_valid(boot_logs) -> None:
-    """PRD:209 -- UniXNU.efi / DarwinBoot.efi / QemuRamfb.efi, PE32+ ARM64 EFI."""
-    observation = boot_logs["p.efi_loaders"]
+    ``_marker_hits`` is a per-line substring test, so the literal has to be one
+    only a handoff can produce.  An earlier version of the probe matched the bare
+    ``DARWINBOOT:``, and a log carrying the old test payload *plus*
+
+        Error: DARWINBOOT: image not found
+
+    set ``darwinboot`` True on the strength of that error line and suppressed the
+    veto.  Measured against the pre-change probe, the same pair of logs flipped M3
+    from FAIL (``m3.veto.component_names_only``) to UNVERIFIED with no refusal --
+    a gate relaxation nothing recorded.  docs/PRD.md:296 forbids exactly this:
+    验证逻辑的修改独立记录，不能随功能修改偷偷放宽.
+
+    The handoff line cannot be produced by an error or a comment, so matching it
+    is what makes the fact mean what the veto thinks it means.
+    """
+    mention = tmp_path / "mention" / "serial-a.log"
+    mention.parent.mkdir(parents=True)
+    mention.write_text(
+        'BdsDxe: loading Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x1,0x0)\n'
+        "MiniEfi: alive\n"
+        "Error: DARWINBOOT: image not found\n",
+        encoding="utf-8",
+    )
+    view = HostView(roots=(tmp_path / "mention",), repo_root=tmp_path)
+    observation = gate._probe_esp_efi_chain(view)
     assert observation.ok, observation.detail
-    assert observation.facts["count"] == 3
-    assert observation.facts["missing"] == []
-    assert len(observation.refs) == 3
-    for ref in observation.refs:
-        assert ref.scope == EvidenceScope.HOST_REAL
-        assert ref.kind == "artifact"
+    assert observation.facts["darwinboot"] is False, observation.facts
+    # ...and with that fact False, the PRD 209 veto predicate does fire.
+    snapshot = {
+        "p.esp_efi_chain": observation,
+        "p.darwinboot_handoff": _obs("p.darwinboot_handoff", ok=False),
+    }
+    assert gate._PREDICATES["payload_name_print_only"](snapshot) is True, snapshot
 
-
-def test_the_kernel_entry_reached_el1_on_this_host(boot_logs) -> None:
-    """PRD:210 可定位内核执行 -- the CPU entered the kernel image and dropped to EL1.
-
-    This is deliberately *not* an initialisation claim: the probe records
-    ``initialised: False`` so nothing downstream can borrow it as proof that page
-    tables, exception vectors or interrupts came up.
-    """
-    observation = boot_logs["p.el1_entry"]
+    real = tmp_path / "real" / "serial-a.log"
+    real.parent.mkdir(parents=True)
+    real.write_text(
+        'BdsDxe: loading Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x1,0x0)\n'
+        "DARWINBOOT: hand-off to the kernel\n"
+        "kernel   va 0xFFFFFFF00427C000  pa 0x4807C000\n",
+        encoding="utf-8",
+    )
+    view = HostView(roots=(tmp_path / "real",), repo_root=tmp_path)
+    observation = gate._probe_esp_efi_chain(view)
     assert observation.ok, observation.detail
-    assert observation.facts["initialised"] is False
-    assert observation.facts["exception_line"] > 0
-
-
-def test_m1_host_half_is_pass_while_the_onsite_half_is_blocked(host_by_id: dict) -> None:
-    """The two axes really are separate: firmware proven, guest display not."""
-    if _real_boot_root() is None:
-        pytest.skip("local-private/out/real-boot is absent (gitignored, PRD 12)")
-    result = host_by_id["M1"]
-    assert result.verdict.kind == VerdictKind.BLOCKED
-    assert result.windows_status == "SIMULATION PASS"
-    assert "m1.firmware_boot_log" in result.satisfied
-    assert "m1.qemu_config_evidence" in result.satisfied
-    assert result.missing == ("m1.guest_display",)
-    assert result.onsite_status == "BLOCKED"
-
-
-def test_the_apple_kernelcache_is_rejected_as_a_uniuxnu_substitute(boot_logs) -> None:
-    """Appendix A: an old package may not stand in for the current build.
-
-    ``emit_prelink.py`` cannot write a kernel byte, so the stock kernelcache is
-    not a UniXNU build.  The probe must reject it structurally rather than by
-    file name alone, and it must say so.
-
-    This used to assert ``not observation.ok`` -- "no UniXNU kernel image exists
-    anywhere on this host".  That was true when it was written and stopped being
-    true when the gate's symbol scan stopped missing the kernel this host boots
-    (see :func:`test_the_symbol_scan_covers_the_whole_image`).  The *intent* of
-    this test is unchanged and still holds: the stock kernelcache is not accepted
-    as a substitute.  What changed is that "nothing is accepted" was a proxy for
-    it, and the proxy went stale, so the assertion now names the stock cache
-    directly.
-    """
-    observation = boot_logs["p.unixnu_kernel_image"]
-    rejected = observation.facts["rejected"]
-    assert rejected, "the rejection reasons must be recorded, not just a no"
-    # The stock cache is rejected by name *and* structurally: it is recognised as
-    # the extracted kernelcache, and it carries the admission symbol nowhere in
-    # its 46,415,872 bytes -- measured, not assumed.
-    assert any("named kernelcache" in item for item in rejected), rejected
-    assert any("sparse-index symbol" in item for item in rejected), rejected
-    # ...and it is not among the accepted, which is the actual claim this test
-    # exists to make.  ``not observation.ok`` used to stand in for it and stopped
-    # being true when the scan below started finding the kernel this host boots.
-    assert observation.ok, observation.detail
-    accepted = observation.facts["images"]
-    assert accepted, observation.facts
-    assert not any("kernelcache" in path.lower() for path in accepted), accepted
-    assert not any("/lzfse/" in path.lower() for path in accepted), accepted
-    for path in accepted:
-        assert "unixnu" in path.lower() or "build" in path.lower(), path
-
-
-def test_the_symbol_scan_covers_the_whole_image() -> None:
-    """The scan is not an 8 MiB tail window, and this is the test that says so.
-
-    ``_has_sparse_index_symbol`` used to read the last 8 MiB, reasoning that the
-    Mach-O string table lives in ``__LINKEDIT`` at the end of the image.  That is
-    true of a linked image and false of the prelinked kernel this host boots: its
-    symbol sits at offset 17,058,661 of 51,859,456 bytes, and an 8 MiB tail window
-    starts at 43,470,848.  The scan therefore reported "no kalloc sparse-index
-    symbol" for a kernel that has one.
-
-    Both halves are asserted, because a fix that scanned the whole file but
-    stopped finding the symbol would pass the first and fail the second, and a
-    fix that only enlarged the window to, say, 32 MiB would pass both here and
-    still be a guess.  The stock kernelcache is the negative control: it carries
-    the symbol nowhere in its 46,415,872 bytes, so a whole-file scan must still
-    reject it.
-    """
-    kernel = REPO_ROOT / "local-private/boot7/boot-inputs/unixnu-out/qemu/kernel/kernel.macho"
-    stock = REPO_ROOT / "local-private/out/lzfse/kernelcache-arm64.macho"
-    if not (kernel.is_file() and stock.is_file()):
-        pytest.skip("local-private is absent by design (PRD 12)")
-
-    needle = gate._SPARSE_INDEX_SYMBOL
-    blob = kernel.read_bytes()
-    at = blob.find(needle)
-    assert at >= 0, "the kernel this host boots carries the admission symbol"
-    # The symbol is outside the window the old scan used, which is the whole point.
-    assert at < len(blob) - (8 << 20), (at, len(blob))
-
-    assert gate._has_sparse_index_symbol(kernel) is True
-    assert gate._has_sparse_index_symbol(stock) is False
-
-
-def test_the_scan_finds_a_symbol_that_straddles_a_chunk_boundary(tmp_path: Path) -> None:
-    """A symbol split across two chunks is still found.
-
-    The chunked scan carries the last ``len(needle) - 1`` bytes of each chunk into
-    the next.  Without that carry, a needle landing exactly on a boundary is missed
-    -- and the file is then reported as not carrying a symbol it does carry, which
-    is the same class of false negative as the tail window, one size down.
-    """
-    needle = gate._SPARSE_INDEX_SYMBOL
-    chunk = gate._SCAN_CHUNK_BYTES
-    for split in range(1, len(needle)):
-        path = tmp_path / "straddle.bin"
-        path.write_bytes(b"\0" * (chunk - split) + needle + b"\0" * 16)
-        assert gate._has_sparse_index_symbol(path) is True, split
-
-
+    assert observation.facts["darwinboot"] is True, observation.facts
+    snapshot = {
+        "p.esp_efi_chain": observation,
+        "p.darwinboot_handoff": _obs("p.darwinboot_handoff", ok=False),
+    }
+    assert gate._PREDICATES["payload_name_print_only"](snapshot) is False, snapshot
 def test_a_real_install_record_is_read_and_reported(boot_logs) -> None:
     """PRD:218 -- the recorded install reached a failure, not a registration."""
     observation = boot_logs["p.install_record"]

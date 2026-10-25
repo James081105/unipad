@@ -465,13 +465,14 @@ def default_view() -> HostView:
 
     The boot roots are listed individually rather than as ``local-private``
     because the whole tree is gigabytes of IPSW extracts and would blow
-    ``max_files`` before the gate reached anything.  ``boot-inputs`` is the
-    directory the macOS runner's payload build writes and the one every real
-    boot on this host has read its kernel, device tree and EFI loaders from --
-    it was missing, so the gate could not see the kernel it was booting and
-    reported "no built UniXNU kernel image" while one ran.  ``out/components``
-    is where the IPSW members the board pins by digest live, which is what lets
-    a probe say *which* image an experiment attached.
+    ``max_files`` before the gate reached anything.  ``boot7`` is the directory
+    every real boot on this host has read its kernel, device tree and EFI
+    loaders from -- it was missing, so the gate could not see the kernel it
+    was booting and reported "no built UniXNU kernel image" while one ran.
+    ``out/components`` is where the IPSW members the board pins by digest
+    live, which is what lets a probe say *which* image an experiment attached.
+    ``boot-inputs`` is deliberately not a separate root: it lies wholly inside
+    ``boot7`` (436 of its 518 files), so listing both walks the same tree twice.
     """
     root = _repo_root()
     roots = [
@@ -480,7 +481,6 @@ def default_view() -> HostView:
         root / "artifacts",
         root / "local-private" / "out" / "real-boot",
         root / "local-private" / "out" / "components",
-        root / "local-private" / "boot7" / "boot-inputs",
         root / "local-private" / "boot7",
     ]
     return HostView(roots=tuple(path for path in roots if path.is_dir()), repo_root=root)
@@ -933,6 +933,7 @@ def _probe_edk2_firmware_boot(view: HostView) -> Observation:
 
 
 @_probe("p.esp_efi_chain", "a real QEMU run mounted the FAT ESP and started BOOTAA64.EFI")
+@_probe("p.esp_efi_chain", "the ESP to BOOTAA64.EFI chain ran, and whether DarwinBoot handed off")
 def _probe_esp_efi_chain(view: HostView) -> Observation:
     """docs/implementation-plan.md Tier-1 table: "ESP -> BOOTAA64.EFI -> 访客代码".
 
@@ -944,11 +945,15 @@ def _probe_esp_efi_chain(view: HostView) -> Observation:
     DarwinBoot had since run for real.  The veto on PRD 209 ("仅打印组件名称")
     reads that fact, so a stale selection turned a real handoff into a refusal.
 
-    It now prefers a log where DarwinBoot actually ran, and records which
-    literal identified the payload either way.  ``MiniEfi: alive`` is still
-    recognised, because it is a real historical fact about this host and
-    discarding it would be the same mistake in the other direction; it just no
-    longer wins by being sorted first.
+    It now prefers a log carrying the handoff line itself.  The literal is
+    ``DARWINBOOT: hand-off to the kernel`` and **not** the bare ``DARWINBOOT:``
+    an earlier version of this probe used: ``_marker_hits`` is a per-line
+    substring test, so the short form is satisfied by ``Error: DARWINBOOT: image
+    not found`` or by a comment mentioning the loader -- and a mention is exactly
+    what PRD 209's veto exists to refuse.  Measured: with the short form, a log
+    containing only that error line set ``darwinboot`` True and suppressed the
+    veto, where the previous probe correctly recorded False.  The handoff line
+    cannot be produced by anything but a handoff.
     """
     best: Optional[Observation] = None
     for relative in view.find("**/serial*.log"):
@@ -958,31 +963,30 @@ def _probe_esp_efi_chain(view: HostView) -> Observation:
         load_at = _marker_hits(text, "BdsDxe: loading Boot0001")
         if not load_at:
             continue
-        # The payload's own marker, whichever one it printed.  DarwinBoot's is
-        # spelled in capitals in the log; a case-insensitive match would also
-        # catch a comment mentioning it, which is not the same claim.
-        darwinboot_at = _marker_hits(text, "DARWINBOOT:")
+        handoff_at = _marker_hits(text, "DARWINBOOT: hand-off to the kernel")
         miniefi_at = _marker_hits(text, "MiniEfi:")
-        if not (darwinboot_at or miniefi_at):
+        if not (handoff_at or miniefi_at):
             continue
         observation = Observation(
             "p.esp_efi_chain",
             True,
-            "the ESP to BOOTAA64.EFI chain ran in %s; %s printed at line %d"
+            "the ESP to BOOTAA64.EFI chain ran in %s; %s at line %d"
             % (
                 relative,
-                "DARWINBOOT" if darwinboot_at else "the test payload",
-                darwinboot_at or miniefi_at,
+                "DarwinBoot handed off to the kernel" if handoff_at
+                else "the test payload printed",
+                handoff_at or miniefi_at,
             ),
             refs=(_ref(view, relative, "serial_log"),),
             facts={
                 "log": relative,
-                "payload_line": darwinboot_at or miniefi_at,
-                "payload_literal": "DARWINBOOT:" if darwinboot_at else "MiniEfi: alive",
-                "darwinboot": darwinboot_at > 0,
+                "payload_line": handoff_at or miniefi_at,
+                "payload_literal": "DARWINBOOT: hand-off to the kernel" if handoff_at
+                else "MiniEfi: alive",
+                "darwinboot": handoff_at > 0,
             },
         )
-        if darwinboot_at:
+        if handoff_at:
             return observation
         if best is None:
             best = observation
@@ -1249,9 +1253,16 @@ def _probe_unixnu_kernel_image(view: HostView) -> Observation:
     ``_native_prelink_security_init_version``, its prelink segment is non-empty
     where ``append_segment`` requires an empty placeholder, and its rebased
     components collide with the native segment.  So a kernel image counts here
-    only when it carries the symbol the patch adds, and only when it is not
-    byte-identical to the kernelcache extracted from the IPSW.  Both rejections
-    are structural, so tomorrow a real UniXNU build passes without a code change.
+    only when it carries the symbol the patch adds.
+
+    There used to be a second rejection here -- "byte-identical to the stock
+    kernelcache" -- and it was removed because it cannot fire.  To reach it a
+    candidate must already carry ``_kalloc_sparse_prelink_index_version``, and the
+    stock kernelcache carries it zero times anywhere in its 46,415,872 bytes, so
+    no copy of it can get that far: the symbol check strictly dominates it.  It
+    read as a second structural protection while being unreachable, which is the
+    kind of claim this module is supposed not to make.  The name and provenance
+    guards below it *are* reachable and are tested.
     """
     stock_path = view.repo_root / _STOCK_KERNELCACHE
     stock_sha = view.sha256(_STOCK_KERNELCACHE) if stock_path.is_file() else None
@@ -1278,9 +1289,6 @@ def _probe_unixnu_kernel_image(view: HostView) -> Observation:
             continue
         if not _has_sparse_index_symbol(path):
             rejected.append(relative + " (no kalloc sparse-index symbol)")
-            continue
-        if stock_sha and stock_size == size and view.sha256(relative) == stock_sha:
-            rejected.append(relative + " (byte-identical to the stock kernelcache)")
             continue
         accepted.append(relative)
         refs.append(_ref(view, relative, "artifact"))
@@ -2113,9 +2121,14 @@ _register(
         blockers=(
             Blocker(
                 blocker_id="target_guest_boot_chain",
-                reason="the target-guest boot chain does not exist on this host (no "
-                       "built UniXNU kernel image, no XNU initialisation), so no actual "
-                       "guest display can be produced for the pass evidence",
+                reason="the target-guest boot chain does not exist on this host: no "
+                       "guest display has been witnessed in a guest channel.  The "
+                       "kernel image and XNU initialisation that used to be named "
+                       "here are no longer missing -- a prelinked UniXNU kernel is "
+                       "present and boots, and it initialises to the BSD stage "
+                       "(implementation-plan.md fact 37) -- so naming them would "
+                       "repeat the untrue reason this file was corrected for "
+                       "elsewhere",
                 satisfied_by="guest_boot_chain",
             ),
         ),
