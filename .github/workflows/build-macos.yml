@@ -87,12 +87,15 @@ jobs:
       # This repository declares NO submodules: there is no .gitmodules and
       # `git submodule status` is empty, so `submodules: recursive` fetches
       # nothing and reads as though the sources had been handled.  They have
-      # not.  The two pinned upstreams are placed under vendor/ by the
+      # not.  The pinned upstreams are placed under vendor/ by the
       # acquisition step below, at the commits recorded in
       # config/sources.lock.json.  They are deliberately NOT .gitmodules
       # entries: that would make every pin exist twice, once as a gitlink in
       # the index and once in the lock -- exactly the divergence this project
       # has already been bitten by (call-chain 7.4, standards R-1).
+      #
+      # Three of them, not two: UniXNU (the driver), UniXNU-qemu (the board)
+      # and uefi-sheng (Mu-Silicium, the panic screen's font header).
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -287,8 +290,9 @@ jobs:
       # the ones the lock promised.  Three phases, all inside one step so that
       # "read the lock", "fetch" and "compare" cannot drift apart:
       #
-      #   1. acquire    -- the two checkouts the upstream driver cannot fetch
-      #                    for itself, at the commits in sources.lock.json.
+      #   1. acquire    -- the three checkouts the upstream driver cannot fetch
+      #                    for itself (UniXNU, UniXNU-qemu and the Mu-Silicium
+      #                    uefi-sheng), at the commits in sources.lock.json.
       #   2. assemble   -- the driver fetches everything else: the module
       #                    submodules (DarwinBoot, the Native* drivers, the
       #                    kits) and the feeds.toml references (xnu,
@@ -338,10 +342,11 @@ jobs:
           unixnu.lock, so both are the driver's own output rather than a
           second implementation of it.
 
-          Only the two repositories the driver cannot clone are cloned here:
+          Only the repositories the driver cannot clone are cloned here:
           scripts/unixnu/config.py Context.__init__ raises "no device
-          repository" without -D, and cli.py has no subcommand that clones
-          either the device repository or its own root.
+          repository" without -D, and cli.py has no subcommand that clones the
+          device repository, its own root, or the Mu-Silicium checkout -- the
+          driver only ever *reads* --uefi (cli.py:24), it never fetches it.
 
           HONESTY: a real clone from github.com cannot be exercised on the
           Windows code-stage host (github.com over the git protocol is blocked;
@@ -371,7 +376,25 @@ jobs:
           PRIVATE_COMPONENT = "local-private"
 
           # (key in sources.lock.json, directory under vendor/)
-          ACQUISITIONS = (("unixnu", "UniXNU"), ("device_repo", "UniXNU-qemu"))
+          #
+          # THREE, not two, and the third is not a feed.  uefi-sheng is the
+          # Mu-Silicium checkout the payload step's panic screen takes exactly
+          # one file from: patch-xnu-entry-probe.py:183 compiles
+          # xnu-panic-screen.c with -I(UNIXNU_UEFI or <tree>/uefi-sheng)/Silicon/
+          # Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib, and the
+          # assembled tree never contains uefi-sheng/ (tree.py:assemble creates
+          # only drivers/ kits/ patches/ refer/ build/ .cache/ package/
+          # scripts/).  Measured on runs 40094234507 and 40096928333: without
+          # this checkout the driver dies in clang with "fatal error: 'Font.h'
+          # file not found" and build-payload records failed.  It is pinned
+          # here as its own lock key rather than in `feeds` because the driver's
+          # cross-check would then demand it in the device repository's
+          # unixnu.lock, where no feeds.toml will ever name it.
+          ACQUISITIONS = (
+              ("unixnu", "UniXNU"),
+              ("device_repo", "UniXNU-qemu"),
+              ("uefi_sheng", "uefi-sheng"),
+          )
 
           # The module kinds scripts/unixnu/config.py KINDS knows about; the
           # status header lines ("device", "output", "config") are not among
@@ -460,6 +483,12 @@ jobs:
                   f"device_commit={pins['device_repo']['commit']}",
                   f"unixnu_repo={pins['unixnu']['repo']}",
                   f"device_repo={pins['device_repo']['repo']}",
+                  # The third checkout, for the same reason the other two are:
+                  # the build step must hand the driver the pin the lock
+                  # resolved, and a manifest that attests to a commit nobody
+                  # fetched is the divergence this step exists to prevent.
+                  f"uefi_sheng_commit={pins['uefi_sheng']['commit']}",
+                  f"uefi_sheng_repo={pins['uefi_sheng']['repo']}",
                   f"lock_sha256={lock_sha}",
                   f"lock_frozen={'true' if frozen else 'false'}",
               ]
@@ -1205,6 +1234,29 @@ jobs:
           else
             echo "::notice::BUILD_PAYLOAD is off; no payload.img will be produced and the boot input set stays incomplete"
           fi
+          # The Mu-Silicium checkout, forwarded as --uefi.  Either spelling
+          # reaches the patcher -- cli.py:136 sets ctx.uefi from --uefi or from
+          # UNIXNU_UEFI (config.py:110-117) and payload.py:142 forwards it as
+          # UNIXNU_UEFI -- but the flag is what this workflow passes, because it
+          # lands in the driver's argv.log and so names the checkout the font
+          # came from, and because need_uefi() (cli.py:67-73) reads the same
+          # option for the firmware and boot-image stages.
+          # Measured on runs 40094234507 and 40096928333: with neither spelling
+          # and no vendor/uefi-sheng, board.toml [payload] panic_screen = true
+          # (UniXNU-qemu/board.toml:94) makes the patcher compile
+          # xnu-panic-screen.c, whose one include is "Font.h"
+          # (xnu-panic-screen.c:294) out of this checkout, and the step died in
+          # clang with "fatal error: 'Font.h' file not found".  The acquisition
+          # step above places the pinned commit at vendor/uefi-sheng;
+          # build-macos.sh verifies the font header's sha256 against
+          # sources.lock.json before it runs the driver.
+          declare -a uefi_args=()
+          if [ -d vendor/uefi-sheng ]; then
+            uefi_args+=(--uefi vendor/uefi-sheng)
+            echo "build: using the Mu-Silicium checkout for the panic screen font (vendor/uefi-sheng)"
+          else
+            echo "::warning::vendor/uefi-sheng is absent; build-payload's panic screen has no font header and will record failed"
+          fi
           bash scripts/macos/build-macos.sh \
             --experiment "$EXPERIMENT_ID" \
             --stage "$STAGE" \
@@ -1212,6 +1264,7 @@ jobs:
             --out "$BUILD_OUTPUT_DIR" \
             --unixnu vendor/UniXNU \
             --device vendor/UniXNU-qemu \
+            ${uefi_args[@]+"${uefi_args[@]}"} \
             ${kernel_args[@]+"${kernel_args[@]}"} \
             ${payload_args[@]+"${payload_args[@]}"} \
             2>&1 | tee "$BUILD_LOG"
@@ -1233,6 +1286,333 @@ jobs:
             echo "::warning::no payload.img was produced; see the build-payload entry in build-report.json"
           fi
 
+      # ---------------------------------------------------------------------
+      # The owner root chain, between the two build passes.
+      # ---------------------------------------------------------------------
+      # WHY THERE ARE TWO PASSES AT ALL.  build-os-root.py's FIRST sub-step boots
+      # the kernel step's kernel.macho in QEMU to qualify the storage ABI
+      # (build-storage-abi.py:18,31), and the storage-ABI observation boots the
+      # candidate from the payload volume (qemu_esp.py:27) -- so the chain cannot
+      # start until build-kernel and build-payload have produced theirs, and
+      # build-macos.sh's plan puts build-os-root BEFORE both of them.  That is
+      # not a bug in the plan: the vendor chain itself documents the sequence
+      # (README:96-98), and step_build_os_root's own comment spells it out -- on a
+      # fresh workspace the stage records not_run, build-kernel builds the board's
+      # qemu_defconfig, and a SECOND invocation of the script then runs the chain
+      # and builds qemu_root_defconfig.  The workflow used to make exactly one
+      # invocation, so the chain could never run and every kernel the runner ever
+      # produced was a qemu_defconfig kernel without CONFIG_XNU_NATIVE_VIRTIO_BLOCK
+      # -- measured on this host: such a kernel reaches mountroot, matches the
+      # board's UUID and has APFS loaded, and enumerates nothing, because no
+      # kernel.macho built here carries NativeVirtioBlock.
+      #
+      # WHY THE CHAIN RUNS OUTSIDE build-macos.sh.  The chain's inputs are the OS
+      # and SystemOS volumes -- 4.80 GiB and 3.08 GiB, the zip entries' file_size
+      # values in the pinned image -- and DEFAULT_MIN_FREE_GB=8 is checked at
+      # build-macos.sh's own preflight, before any stage runs.  On a ~14 GiB macOS
+      # runner those two facts are incompatible: the volumes plus the build tree
+      # leave less than the floor, so a build-macos.sh invocation that had the
+      # volumes on disk would die at preflight having done nothing.  Running
+      # build-os-root.py directly -- which is what README:96 does, and what its
+      # own header documents -- keeps the floor where it is and lets the chain run
+      # on the space that is actually there.  The second invocation below then
+      # finds the chain's outputs on disk, spends no volumes, and records the
+      # stage as 'skipped' rather than 'ran', because that invocation did not run
+      # it.
+      #
+      # WHAT IT COSTS (PRD 8.4).  One more 6.37 GiB download of the pinned image,
+      # ~8.5 GiB of extraction and hashing, the chain itself (it boots QEMU once
+      # under the lock's accelerator and signs every 4 KiB block of both volumes),
+      # and a second kernel build -- the dominant cost, because qemu_root_defconfig
+      # is a different config and therefore a full XNU rebuild rather than an
+      # incremental one.  macOS minutes are billed at 10x, so this is the
+      # expensive half of the job and it is spent on purpose: without it there is
+      # no kernel that can mount a root volume at all.
+
+      # The chain's host verifier links against OpenSSL 3 (build-os-root.py:44-45,63-65
+      # takes it as --openssl-prefix).  A GitHub macOS runner ships Xcode's ld and
+      # has no Homebrew OpenSSL, so without this keg step_build_os_root's own gate
+      # would record not_run naming it -- and so would this step's chain run.
+      - name: Install OpenSSL 3 (the root chain's host verifier)
+        run: |
+          set -euo pipefail
+          keg=''
+          for candidate in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+            if [ -d "$candidate" ]; then keg="$candidate"; break; fi
+          done
+          if [ -z "$keg" ]; then
+            echo "openssl@3 absent; installing it"
+            brew install openssl@3
+          fi
+          for candidate in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+            if [ -d "$candidate" ]; then keg="$candidate"; break; fi
+          done
+          if [ -z "$keg" ]; then
+            echo "::error::no openssl@3 keg on disk after brew install openssl@3"
+            exit 1
+          fi
+          echo "OPENSSL_PREFIX=$keg" >> "$GITHUB_ENV"
+          echo "root chain verifier: $keg"
+
+      # The four members build-os-root.py reads out of the image, published from
+      # a fresh acquisition.  continue-on-error for the same reason the first
+      # acquisition is: a blocked chain must not take the rest of the job down,
+      # and the reason has to survive into the log rather than into a failed
+      # step nobody reads.
+      #
+      # The image is downloaded a SECOND time, and that is deliberate rather than
+      # wasteful: the first acquisition deletes it the moment extraction finishes
+      # (unipad.host.ipsw.acquire), and 6.37 GiB cannot be kept across the first
+      # build pass anyway -- the runner has ~14 GiB free and the build tree is
+      # already most of the rest of it.  What survives this step is the members,
+      # not the image.
+      - name: Publish the owner root chain's IPSW members
+        id: chain_ipsw
+        continue-on-error: true
+        env:
+          LOCK_PATH: config/sources.lock.json
+          DEVICE_REPO: vendor/UniXNU-qemu
+          IPSW_WORK_DIR: ipsw-work
+          VOLUMES_DIR: ipsw-work/volumes
+          TRUSTCACHE_DIR: build-output/unixnu-out/ipsw
+          REFER_DIR: ipsw-work/refer
+          SUMMARY_PATH: ipsw-work/chain-summary.json
+          PYTHONPATH: src
+        run: |
+          set -uo pipefail
+          mkdir -p "$VOLUMES_DIR" "$REFER_DIR" "$TRUSTCACHE_DIR"
+          # --kernelcache is required by the module's contract (the Mach-O has to
+          # outlive the workspace), so it is pointed at the file the first
+          # acquisition already published: the copy is re-hashed against the same
+          # digest, so this is a verified no-op rather than a second decode.
+          python3 -m unipad.host.ipsw \
+            --lock "$LOCK_PATH" \
+            --device "$DEVICE_REPO" \
+            --work "$IPSW_WORK_DIR/chain-work" \
+            --kernelcache "$IPSW_WORK_DIR/kernelcache.macho" \
+            --os-volume "$VOLUMES_DIR" \
+            --systemos-volume "$VOLUMES_DIR" \
+            --static-trustcache "$TRUSTCACHE_DIR" \
+            --refer-ipsw "$REFER_DIR" \
+            --summary "$SUMMARY_PATH" \
+            | tee "$IPSW_WORK_DIR/chain.log"
+          status=$?
+          echo "chain_ipsw_status=$status" >> "$GITHUB_OUTPUT"
+          # The image is deleted by the module the moment extraction finishes.
+          # What is left is the two volumes, the StaticTrustCache IM4P at the
+          # path build-os-root.py:150 reads it from, and the reconstructed refer
+          # image -- which is why the next step can be skipped on this status
+          # rather than on a guess about what was published.
+          volumes=0
+          for volume in "$VOLUMES_DIR"/*.dmg; do
+            [ -f "$volume" ] && volumes=$((volumes + 1))
+          done
+          echo "chain_volumes=$volumes" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ] && [ "$volumes" -eq 2 ]; then
+            echo "== chain ipsw: PASS (both volumes published, image discarded)"
+          elif [ "$status" -eq 0 ]; then
+            echo "::error::the chain acquisition exited 0 but published $volumes volume(s), not 2"
+            exit 1
+          else
+            echo "::warning::the chain acquisition failed (exit $status); the owner root chain will not run. See $SUMMARY_PATH"
+          fi
+          exit 0
+
+      # The chain itself, the way README:96-98 runs it: from the build tree, with
+      # --ipsw naming the reconstructed refer image.  Skipped -- loudly, with the
+      # reason -- unless the previous step actually published both volumes, so a
+      # missing input is a notice rather than a chain that dies halfway through
+      # signing the OS volume.
+      - name: Build the owner root chain (build-os-root.py)
+        id: os_root
+        if: steps.chain_ipsw.outputs.chain_volumes == '2'
+        env:
+          DEVICE_REPO: vendor/UniXNU-qemu
+          IPSW_WORK_DIR: ipsw-work
+          VOLUMES_DIR: ipsw-work/volumes
+          REFER_DIR: ipsw-work/refer
+          OPENSSL_PREFIX: ${{ env.OPENSSL_PREFIX }}
+          OUT_ROOT: build-output/unixnu-out
+        run: |
+          set -euo pipefail
+          # (1) where the chain reads the two volumes.  .cache/firmware of the
+          #     DEVICE repository, not of the tree: tree.py:assemble symlinks
+          #     <tree>/.cache/firmware at it precisely so the seed and its UUID
+          #     are shared by every tree and survive in the device repository.
+          #     The vendor repository's own .gitignore covers /.cache/, so these
+          #     are not tracked and cannot be committed by accident.
+          volumes="$DEVICE_REPO/.cache/firmware/target-volumes"
+          mkdir -p "$volumes"
+          # Moved, not copied: 7.88 GiB renamed within one filesystem is free,
+          # and a copy would need 7.88 GiB that is not there.
+          for volume in "$VOLUMES_DIR"/*.dmg; do
+            [ -f "$volume" ] || continue
+            mv "$volume" "$volumes/"
+            echo "chain: placed $(basename "$volume") ($(wc -c <"$volumes/$(basename "$volume")" | tr -d ' ') bytes) at $volumes"
+          done
+          # (2) the refer image.  build-os-root.py symlinks <tree>/refer/<name>
+          #     at --ipsw and build-original-system-trust.py opens that path, so
+          #     the name has to be the one the chain hard-codes -- which is why
+          #     the module names the reconstruction after the lock's ipsw.name
+          #     rather than after anything this step would have to spell out.
+          refer="$(ls "$REFER_DIR"/*.ipsw 2>/dev/null | head -n 1 || true)"
+          if [ -z "$refer" ]; then
+            echo "::error::no reconstructed refer image under $REFER_DIR; the System trust cache cannot be bundled"
+            exit 1
+          fi
+          # (3) the tree, and the QEMU the storage-ABI observation boots once.
+          tree="$(ls -d "$OUT_ROOT"/*/tree 2>/dev/null | head -n 1 || true)"
+          if [ -z "$tree" ]; then
+            echo "::error::no assembled build tree under $OUT_ROOT; build-kernel must have run first"
+            exit 1
+          fi
+          if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
+            echo "qemu-system-aarch64 absent; installing it (build-storage-abi.py:18 boots the candidate once)"
+            brew install qemu
+          fi
+          # (4) run it.  From the tree, not from the device repository:
+          #     build-os-root.py derives ROOT from __file__ and qemu_esp.py
+          #     derives WORK from ROOT.parent, so running the device repository's
+          #     copy would look for the kernel at vendor/kernel/ and write its
+          #     outputs into the checkout.
+          log="$IPSW_WORK_DIR/os-root.log"
+          echo "chain: running build-os-root.py --ipsw $refer --openssl-prefix $OPENSSL_PREFIX (cwd $tree)"
+          if ! ( cd "$tree" && python3 scripts/build-os-root.py \
+                   --ipsw "$refer" --openssl-prefix "$OPENSSL_PREFIX" ) 2>&1 | tee "$log"; then
+            echo "::error::build-os-root.py failed; see $log"
+            exit 1
+          fi
+          # (5) the three inputs the kernel stage switches on, and the two the
+          #     payload stage needs.  Named here so a chain that "succeeded" but
+          #     left nothing is a failure rather than a silent one.
+          seed="$DEVICE_REPO/.cache/firmware/owner-data/seed.json"
+          for wanted in \
+            "$seed" \
+            "$tree/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" \
+            "$tree/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a" \
+            "$tree/build/original-static-system-trust/original-static-system.bundle" \
+            "$DEVICE_REPO/.cache/firmware/owner-data/owner-data-1g.dbr"; do
+            if [ ! -f "$wanted" ]; then
+              echo "::error::the chain ran but did not produce $wanted"
+              exit 1
+            fi
+            echo "chain: produced $(basename "$wanted")"
+          done
+          echo "os_root_status=pass" >> "$GITHUB_OUTPUT"
+          echo "== os root: PASS (the owner root chain is on disk; build-kernel below builds qemu_root_defconfig)"
+        continue-on-error: true
+
+      # The volumes are the chain's inputs and nothing else's, and they are 7.88
+      # GiB.  Deleting them here -- before the second build pass, whose preflight
+      # checks the same filesystem -- is what makes that pass possible at all,
+      # and it is also the last moment they are needed: the chain has signed both
+      # of them and detached them, and the kernel stage consumes the archives and
+      # the seed, never the DMGs.
+      - name: Remove the root chain's disk volumes
+        if: always() && steps.os_root.outputs.os_root_status == 'pass'
+        run: |
+          set -euo pipefail
+          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
+          if [ -d "$volumes" ]; then
+            du -sh "$volumes" 2>/dev/null || true
+            rm -f "$volumes"/*.dmg
+            echo "removed the OS and SystemOS volumes from $volumes (Apple firmware material, PRD 12)"
+          fi
+          left=0
+          for volume in "$volumes"/*.dmg; do
+            [ -f "$volume" ] && left=$((left + 1))
+          done
+          if [ "$left" -ne 0 ]; then
+            echo "::error::$left disk volume(s) survived removal; Apple firmware material would stay on the runner"
+            exit 1
+          fi
+
+      # The second invocation the chain's own comment asks for.  Same command,
+      # same inputs, same stage: the plan is a pure function of the stage, so the
+      # only thing that has changed is what is on disk -- and that is exactly what
+      # step_build_kernel's defconfig switch keys on.  build-os-root records
+      # 'skipped' here (its outputs are already on disk and re-running it would
+      # spend the volumes' disk again), build-kernel builds qemu_root_defconfig,
+      # and build-payload rebuilds the ESP around the kernel that can mount a root
+      # volume.
+      - name: Run macOS build again (qemu_root_defconfig, PRD 8.1 root chain)
+        id: build_root
+        if: steps.os_root.outputs.os_root_status == 'pass'
+        env:
+          EXPERIMENT_ID: ${{ inputs.experiment_id }}
+          UNIXNU_COMMIT: ${{ steps.sources.outputs.unixnu_commit || inputs.unixnu_commit }}
+          DEVICE_COMMIT: ${{ steps.sources.outputs.device_commit || inputs.device_commit }}
+          STAGE: ${{ inputs.stage }}
+          SYSTEM_BUILD: ${{ inputs.system_build }}
+          PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          BUILD_OUTPUT_DIR: build-output
+          STAGE_DIR: staged
+          BUILD_LOG: macos-build-root.log
+          TOOLCHAIN_CACHE_DIR: ~/.cache/unipad-macos-build
+          DEVICETREE_PATH: ipsw-work/devicetree
+          KERNELCACHE_PATH: ipsw-work/kernelcache.macho
+          BUILD_PAYLOAD: '1'
+        run: |
+          set -euo pipefail
+          started=$(date -u +%s)
+          echo "started_at=$started" >> "$GITHUB_OUTPUT"
+          # The first pass's own ledger, kept before this one overwrites it.
+          #
+          # Both passes write the same paths -- build-report.json,
+          # stage-result.json, build.log -- because they share one --out and one
+          # build tree, which is the whole point.  What that costs is the first
+          # pass's record, and the first pass's record is the one that says
+          # build-os-root was not_run and build-kernel built qemu_defconfig.
+          # Losing it would leave the run able to show only its final state, so
+          # the fact that the chain was ever absent would stop being visible.
+          #
+          # They are copied to the repository root rather than beside the
+          # originals for two reasons: the staging step scans BUILD_OUTPUT_DIR
+          # only, and these are evidence rather than deliverables; and a second
+          # build-report.json inside that directory would be a name the staging
+          # step's GENERATED list already claims.
+          for record in build-report.json stage-result.json; do
+            if [ -f "$BUILD_OUTPUT_DIR/$record" ]; then
+              cp "$BUILD_OUTPUT_DIR/$record" "first-pass-$record"
+              echo "kept the first pass's $record at first-pass-$record"
+            fi
+          done
+          declare -a kernel_args=()
+          if [ -f "$KERNELCACHE_PATH" ]; then
+            kernel_args+=(--kernelcache "$KERNELCACHE_PATH")
+          fi
+          if [ -f "$DEVICETREE_PATH" ]; then
+            kernel_args+=(--devicetree "$DEVICETREE_PATH")
+          fi
+          declare -a payload_args=()
+          if [ "${BUILD_PAYLOAD:-0}" = '1' ]; then payload_args+=(--payload); fi
+          declare -a uefi_args=()
+          if [ -d vendor/uefi-sheng ]; then uefi_args+=(--uefi vendor/uefi-sheng); fi
+          bash scripts/macos/build-macos.sh \
+            --experiment "$EXPERIMENT_ID" \
+            --stage "$STAGE" \
+            --target "$PAYLOAD_TARGET" \
+            --out "$BUILD_OUTPUT_DIR" \
+            --unixnu vendor/UniXNU \
+            --device vendor/UniXNU-qemu \
+            ${uefi_args[@]+"${uefi_args[@]}"} \
+            ${kernel_args[@]+"${kernel_args[@]}"} \
+            ${payload_args[@]+"${payload_args[@]}"} \
+            2>&1 | tee "$BUILD_LOG"
+          finished=$(date -u +%s)
+          echo "finished_at=$finished" >> "$GITHUB_OUTPUT"
+          echo "root-chain build duration: $((finished - started))s"
+          # The defconfig the kernel was actually built with, read back out of
+          # the run's own log rather than asserted: a reader of the job summary
+          # should not have to trust this step's opinion of what happened.
+          if grep -q 'building qemu_root_defconfig' "$BUILD_LOG"; then
+            echo "root_kernel=true" >> "$GITHUB_OUTPUT"
+            echo "build: the kernel was built from qemu_root_defconfig (the owner root chain is on disk)"
+          else
+            echo "root_kernel=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::no qemu_root_defconfig line in $BUILD_LOG; see the build-os-root and build-kernel entries in build-report.json"
+          fi
+
       # The build log is evidence, and it is the evidence that matters most when
       # the build fails -- which is exactly when the staging step below is
       # skipped and nothing is uploaded.  Without this, a link failure is a
@@ -1249,7 +1629,12 @@ jobs:
             build-output/unixnu-out/*/logs/
             build-output/build.log
             macos-build.log
+            macos-build-root.log
+            first-pass-build-report.json
+            first-pass-stage-result.json
             ipsw-work/ipsw.log
+            ipsw-work/chain.log
+            ipsw-work/os-root.log
           retention-days: 30
           if-no-files-found: warn
 
@@ -1262,6 +1647,22 @@ jobs:
       # an `if: always()` step still runs at its position in the sequence, so
       # placing it next to the acquisition would delete the kernelcache before
       # the build that needs it.  The first draft did exactly that.
+      #
+      # What else leaves with it, and why each is here rather than trusted to a
+      # pattern:
+      #
+      # * ``build-output/unixnu-out/ipsw/`` -- the StaticTrustCache IM4P the chain
+      #   reads from beside the driver's own cache.  It is inside BUILD_OUTPUT_DIR,
+      #   so the staging step would see it; its suffix is in that step's
+      #   PRIVATE_PATTERNS and it is excluded there, but an exclusion is a record
+      #   of a file that existed, and the file should not exist at all.
+      # * ``vendor/UniXNU-qemu/.cache/firmware/target-volumes/*.dmg`` -- the OS and
+      #   SystemOS volumes.  The step above removes them when the chain succeeded;
+      #   this is the unconditional version, for the run where it did not.
+      # * ``vendor/UniXNU-qemu/.cache/firmware/owner-data/`` -- the Data seed and
+      #   its report, both derived from the OS volume's initial /private/var.
+      #   Outside BUILD_OUTPUT_DIR so the staging step never sees it, which makes
+      #   this the only thing standing between it and the runner's disk.
       - name: Remove the extracted firmware material
         if: always()
         run: |
@@ -1274,6 +1675,29 @@ jobs:
           if [ -e ipsw-work ]; then
             echo "::error::ipsw-work/ could not be removed; Apple firmware material would survive the job"
             exit 1
+          fi
+          if [ -d build-output/unixnu-out/ipsw ]; then
+            rm -rf build-output/unixnu-out/ipsw
+            echo "removed build-output/unixnu-out/ipsw/ (the StaticTrustCache IM4P, PRD 12)"
+          fi
+          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
+          if [ -d "$volumes" ]; then
+            rm -f "$volumes"/*.dmg
+            echo "removed the OS and SystemOS volumes from $volumes (Apple firmware material, PRD 12)"
+          fi
+          left=0
+          for volume in "$volumes"/*.dmg; do
+            [ -f "$volume" ] && left=$((left + 1))
+          done
+          if [ "$left" -ne 0 ]; then
+            echo "::error::$left disk volume(s) survived removal; Apple firmware material would survive the job"
+            exit 1
+          fi
+          owner="vendor/UniXNU-qemu/.cache/firmware/owner-data"
+          if [ -d "$owner" ]; then
+            du -sh "$owner" 2>/dev/null || true
+            rm -rf "$owner"
+            echo "removed $owner/ (the owner Data seed, derived from the OS volume, PRD 12)"
           fi
 
       # PRD 8.2 step 4 / 8.3: stage ONLY allowlisted roles, hash everything, and

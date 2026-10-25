@@ -4,11 +4,11 @@ Why this file exists
 --------------------
 ``rev-mutation`` applied 15 mutations to the delivered macOS build pipeline and
 reported six survivors: the whole suite stayed green while the behaviour was
-broken.  Four of those six are closed here.  A test that still passes after the
+broken.  Five of those six are closed here.  A test that still passes after the
 code is broken is not evidence, so each one of these tests was written by
 breaking the thing it names and watching an earlier attempt stay green.
 
-The four, and the mutation each one catches:
+The five, and the mutation each one catches:
 
 1. ``scripts/macos/build-macos.sh`` refuses an ``http(s)`` ``--ipsw`` with
    ``network_refused``.  Deleting the whole guard changed nothing observable:
@@ -37,6 +37,15 @@ The four, and the mutation each one catches:
    now names exactly which test proves what and says plainly what is left
    unproven, and two tests below keep it honest.
 
+5. The second build pass decides ``root_kernel=true`` by grepping its own log
+   for a literal that only the kernel stage emits -- and it reaches it through a
+   shell variable, so the literal appears in the text of NEITHER file and
+   ``grep -rn`` cannot see the coupling at all.  Rewording the log line, or the
+   workflow's pattern, left every run reporting the wrong verdict beside a
+   ``::warning::`` while the kernel was built correctly.  The test runs the real
+   script both ways and asks the workflow's own pattern of each pass's log, so
+   it holds in both directions and carries no literal of its own to drift.
+
 What is still unproven here
 ---------------------------
 Everything that needs a macOS host: the Apple toolchain, a real clone from
@@ -49,6 +58,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -58,17 +69,24 @@ import pytest
 # resolves its interpreter with `command -v python3` at load time and ignores a
 # PY environment variable, so PATH is the only way to hand it one -- and
 # test_p0p1_gate_main owns the "extract a step's Python verbatim from the YAML"
-# machinery.  Both are imported, not copied: a second copy of either is the
-# divergence class this repository keeps hitting.
+# machinery, and test_os_root_chain owns the workspace in which the owner root
+# chain is either on disk or not.  All three are imported, not copied: a second
+# copy of any of them is the divergence class this repository keeps hitting.
 from acceptance.test_build_script_gates import (
     _error_code,
     _error_message,
     _run,
     _write_lock,
 )
+from acceptance.test_os_root_chain import (
+    _bash,
+    _python_on_path,
+    _scratch,
+)
 from acceptance.test_p0p1_gate_main import (
     LOCK_PATH,
     STAGING_STEP,
+    _step,
     _step_python,
 )
 
@@ -482,6 +500,7 @@ def test_the_header_names_the_tests_that_prove_what_it_claims() -> None:
         "tests/acceptance/test_build_script_gates.py",
         "tests/acceptance/test_macos_pipeline_gates.py",
         "tests/acceptance/test_p0p1_gate_main.py",
+        "tests/acceptance/test_payload_font_header.py",
         "tests/acceptance/test_shell_script_syntax.py",
         "tests/acceptance/test_workflow_python_syntax.py",
     }
@@ -600,3 +619,133 @@ def test_the_guard_would_catch_a_real_leftover(tmp_path: Path) -> None:
         if _MUTATION_MARKER.search(line)
     ]
     assert found == ["delivered.py:2"], found
+
+
+# ---------------------------------------------------------------------------
+# 5. The second pass's root_kernel verdict and the kernel stage's log line
+# ---------------------------------------------------------------------------
+
+#: The step that decides, out of the second pass's own build log, whether the
+#: kernel it built came from ``qemu_root_defconfig``.
+ROOT_BUILD_STEP = "Run macOS build again (qemu_root_defconfig, PRD 8.1 root chain)"
+
+
+def _root_kernel_pattern() -> str:
+    """The pattern that step greps its build log for, read out of the workflow.
+
+    Read rather than restated.  A literal in this file would be a third spelling
+    of one fact -- the shape this whole file exists to police, and the shape
+    ``step_build_payload`` polices for ``FONT_RELATIVE`` against the lock's
+    ``uefi_sheng.font_header.path``.
+    """
+    run = _step(ROOT_BUILD_STEP)["run"]
+    patterns = re.findall(r"""grep -q ['"]([^'"]+)['"]""", run)
+    assert len(patterns) == 1, (patterns, run)
+    return patterns[0]
+
+
+def _root_pass(tmp_path: Path, *, chain: bool) -> subprocess.CompletedProcess:
+    """The second build pass, run for real, with or without the owner root chain.
+
+    ``test_os_root_chain`` owns the workspace -- which three files
+    ``root_chain_present()`` checks, and where they sit relative to ``tree_dir()``
+    -- and importing it rather than restating it is what stops this test drifting
+    away from that one.  The single addition is ``--min-free-gb 0``: the script's
+    ``DEFAULT_MIN_FREE_GB=8`` gate measures the host's free disk, not the
+    behaviour under test, and on a host with ~5 GiB free it refuses the whole run
+    before a stage is planned -- which would make this test fail everywhere and
+    prove nothing about the coupling.
+    """
+    lock, device, out = _scratch(tmp_path, chain=chain)
+    return subprocess.run(
+        [
+            _bash(),
+            SCRIPT.as_posix(),
+            "--stage",
+            "M2",
+            "--experiment",
+            "root-kernel-grep",
+            "--lock",
+            lock.as_posix(),
+            "--out",
+            out.as_posix(),
+            "--unixnu",
+            (tmp_path / "ws" / "unixnu").as_posix(),
+            "--device",
+            device.as_posix(),
+            "--min-free-gb",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        env=_python_on_path(tmp_path),
+        cwd=str(tmp_path),
+        timeout=600,
+    )
+
+
+def _defconfig_lines(text: str) -> list[str]:
+    """The kernel stage's own account of which defconfig it chose, and why."""
+    return [line for line in text.splitlines() if "kernel:" in line and "defconfig" in line]
+
+
+def _grep_q(pattern: str, text: str) -> int:
+    """``grep -q PATTERN`` over TEXT: the question the workflow asks of its log."""
+    located = shutil.which("grep")
+    if located is None:  # pragma: no cover - a host with bash has grep
+        pytest.skip("no grep on this host, so the workflow's own test cannot be run")
+    return subprocess.run([located, "-q", "--", pattern], input=text, text=True).returncode
+
+
+def test_the_root_kernel_grep_and_the_kernel_stage_agree_in_both_directions(
+    tmp_path: Path,
+) -> None:
+    """``root_kernel=true`` is only as good as the log line it is read from.
+
+    That output is what tells a reader of the job whether the second pass built
+    ``qemu_root_defconfig`` -- the kernel that mounts the owner-signed OS volume
+    -- or quietly fell back to ``qemu_defconfig`` and stopped at "Failed to mount
+    root device".  It is decided by grepping the pass's own log for a string only
+    the kernel stage emits, so the two files share one fact with no common
+    spelling: the workflow holds the literal, the script holds a shell variable
+    that interpolates it.  ``grep -rn`` for the literal in the script finds
+    nothing at all, so nothing in the repository can see the coupling.
+
+    Reword the log line and every run reports ``root_kernel=false`` beside a
+    ``::warning::`` while the kernel is built correctly; change the workflow's
+    literal and the same happens in reverse.  Both directions are pinned here by
+    running the real script both ways -- the chain on disk and off it -- and
+    asking the workflow's own pattern of each run's log.  There is deliberately
+    no literal in this test: the pattern comes from the workflow and the log from
+    the script, so the assertion is the comparison rather than a third copy of
+    the string.
+    """
+    pattern = _root_kernel_pattern()
+
+    with_chain = _root_pass(tmp_path / "with-chain", chain=True)
+    assert _defconfig_lines(with_chain.stdout), (
+        "the kernel stage never chose a defconfig, so this test proves nothing "
+        "about the coupling: " + with_chain.stdout
+    )
+    without_chain = _root_pass(tmp_path / "without-chain", chain=False)
+    assert _defconfig_lines(without_chain.stdout), (
+        "the kernel stage never chose a defconfig, so this test proves nothing "
+        "about the coupling: " + without_chain.stdout
+    )
+
+    # The chain on disk: the stage switches to qemu_root_defconfig and says so,
+    # and the workflow's grep must find it.  Were the stage never reached, both
+    # runs would answer 1 and this is the assertion that fails -- so a green here
+    # cannot be a vacuous one.
+    assert _grep_q(pattern, with_chain.stdout) == 0, (
+        f"the workflow greps {pattern!r} but the root-chain pass did not log it: "
+        f"{_defconfig_lines(with_chain.stdout)}"
+    )
+
+    # ...and no chain: the board's own defconfig, which must NOT satisfy the same
+    # grep.  This is the half that catches a log line naming the root defconfig
+    # unconditionally, which would report a root kernel that was never built.
+    assert _grep_q(pattern, without_chain.stdout) == 1, (
+        f"the workflow greps {pattern!r} and a pass with no owner root chain "
+        f"matched it anyway: {_defconfig_lines(without_chain.stdout)}"
+    )

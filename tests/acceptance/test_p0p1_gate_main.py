@@ -1184,10 +1184,21 @@ def test_the_step_passes_when_the_driver_agrees_with_the_lock(
 
     assert module.main() == 0
 
-    # The two pins were handed to git, and only those two.
+    # The pins were handed to git, and ONLY the pins -- three of them since
+    # uefi-sheng was added, and nothing else.  The "and only those" half is the
+    # load-bearing one: a checkout nobody pinned reaching git is the silent
+    # divergence this step exists to prevent.
     assert [item[1] for item in acquired] == [
         lock["unixnu"]["commit"],
         lock["device_repo"]["commit"],
+        lock["uefi_sheng"]["commit"],
+    ]
+    # ...and each one to the directory ACQUISITIONS names, so the build step's
+    # --uefi and this step's clone cannot drift apart.
+    assert [item[2] for item in acquired] == [
+        str(tmp_path / "repo" / "vendor" / "UniXNU"),
+        str(tmp_path / "repo" / "vendor" / "UniXNU-qemu"),
+        str(tmp_path / "repo" / "vendor" / "uefi-sheng"),
     ]
     assert driven == ["fetch", "tree"], driven
     status_calls = [call for call in recorder.calls if "status" in call]
@@ -1210,7 +1221,11 @@ def test_the_step_passes_when_the_driver_agrees_with_the_lock(
     assert [item["directory"] for item in acquisition["acquisitions"]] == [
         "UniXNU",
         "UniXNU-qemu",
+        "uefi-sheng",
     ]
+    # uefi-sheng is a pinned CHECKOUT, not a feed: it must not appear in the
+    # driver's own lock, or the cross-check would demand it there on every run.
+    assert "uefi_sheng" not in report["driver_lock"], report["driver_lock"]
 
 
 def test_the_step_fails_when_the_driver_resolves_a_different_commit(
@@ -1581,7 +1596,8 @@ def test_the_build_step_passes_the_arguments_the_script_requires() -> None:
     run = _build_step_run()
     assert '--stage "$STAGE"' in run
     assert '--experiment "$EXPERIMENT_ID"' in run
-    # The two checkouts this step placed are the two the script looks for.
+    # The two checkouts prepare-sources looks for are the two named here; the
+    # third (Mu-Silicium, --uefi) is asserted in test_payload_font_header.py.
     assert "--unixnu vendor/UniXNU" in run
     assert "--device vendor/UniXNU-qemu" in run
     assert "readonly UNIXNU_DIR_DEFAULT='vendor/UniXNU'" in script

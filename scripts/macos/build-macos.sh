@@ -60,6 +60,12 @@
 #                            Payloads/DarwinBoot.efi as a [[driver]] when the
 #                            board's [payload] loader is "driver"
 #                            (payload.py:84-193).  Opt-in: --payload.
+#                            The panic-screen patch compiles the device repo's
+#                            scripts/xnu-panic-screen.c, whose one include is
+#                            "Font.h" (xnu-panic-screen.c:294) out of the
+#                            Mu-Silicium checkout -- so this stage also forwards
+#                            --uefi (cli.py:136 -> payload.py:142).  Without it
+#                            the stage cannot draw a panic message at all.
 #     assemble-image    unixnu bootimg --fd ... --dtb ...       cli.py:142-153
 #                         -> bootimg.build(): gzip(BootShim + firmware volume)
 #                            with the device tree appended (bootimg.py:71-114)
@@ -122,6 +128,12 @@
 #          not_run with its reason while the run reports ok=false, and the
 #          refusals (network, wrong accelerator, malformed input, absent pinned
 #          source).  Section 6 of that file.
+#     tests/acceptance/test_payload_font_header.py
+#       -- the panic screen's font header: that the lock pins the Mu-Silicium
+#          checkout it comes from, that the workflow acquires it and forwards it
+#          as --uefi, and -- run against the same scratch repository -- that
+#          build-payload hands the driver --uefi and refuses, by digest, when
+#          the font is absent or is not the bytes the lock pinned.
 #     tests/acceptance/test_workflow_python_syntax.py
 #       -- that every Python block the workflow ships compiles.
 #
@@ -189,6 +201,28 @@ else PY=''; fi
 # --unixnu / --device override the location, never the pin.
 readonly UNIXNU_DIR_DEFAULT='vendor/UniXNU'
 readonly DEVICE_DIR_DEFAULT='vendor/UniXNU-qemu'
+# NOTE there is deliberately no UEFI_DIR_DEFAULT.  --uefi is opt-in for the same
+# reason assemble-image makes it one: an empty value there is a recorded
+# not_run, while a default that points at a directory a caller does not have
+# turns the same situation into a hard config_invalid that stops the whole run.
+# The runner that HAS the third pinned checkout passes it; see the acquisition
+# step of .github/workflows/build-macos.yml and config/sources.lock.json
+# uefi_sheng.
+
+#: Where the panic screen's font header sits INSIDE a Mu-Silicium checkout, and
+#: therefore where patch-xnu-entry-probe.py:183 tells clang to look for it:
+#:   font_dir = Path(UNIXNU_UEFI or ROOT/'uefi-sheng')
+#:             / 'Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib'
+#: and the source's one include is `#include "Font.h"` (xnu-panic-screen.c:294).
+#:
+#: Spelled here rather than read from the lock on purpose.  The lock's
+#: uefi_sheng.font_header.path is the SAME path from the other side, and the two
+#: are compared in step_build_payload: if upstream ever moves the font, the
+#: check must fail naming both spellings rather than quietly following the lock
+#: and leaving the compiler looking where upstream no longer puts it.  Two
+#: independent spellings that must agree; one spelling trusted by both is the
+#: divergence class this script spends its length avoiding.
+readonly FONT_RELATIVE='Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h'
 
 # Where a Homebrew LLVM keg would live.  NOT a requirement of any step: the
 # driver resolves it itself.  util.tool() (util.py:33-38) looks on PATH first and
@@ -396,8 +430,18 @@ Options:
                            scripts/unixnu/).  Default <repo>/vendor/UniXNU.
   --device <dir>           The pinned device repository (its board.toml).
                            Default <repo>/vendor/UniXNU-qemu.
-  --uefi <dir>             Mu-Silicium checkout, for the firmware volume and
-                           the boot image (--uefi of the driver, cli.py:24).
+  --uefi <dir>             Mu-Silicium checkout (uefi-sheng), pinned as
+                           uefi_sheng in the lock file.  Two consumers:
+                           build-payload's panic screen, whose font header is
+                           the ONLY file it takes from there
+                           (patch-xnu-entry-probe.py:183, xnu-panic-screen.c:294),
+                           and assemble-image, which needs the whole checkout
+                           (cli.py:67-73 need_uefi).  The runner passes
+                           vendor/uefi-sheng.  UNIXNU_UEFI=DIR is the
+                           environment spelling and reaches the same place
+                           (cli.py:136 -> config.py:110-117 -> payload.py:142);
+                           the flag is preferred because it lands in the
+                           driver's argv.log.
   --ipsw <file>            The LOCAL IPSW.  An https:// URL is refused: the
                            driver's default is board.toml [ipsw] url and this
                            script performs no network access.
@@ -656,9 +700,13 @@ fi
 if [[ -n "$UEFI_DIR" && "$UEFI_DIR" != /* && ! "$UEFI_DIR" =~ ^[A-Za-z]:[/\\] ]]; then
     UEFI_DIR="$REPO_ROOT/$UEFI_DIR"
 fi
-# Strip a trailing slash so "$DIR/..." never doubles up.
+# Strip a trailing slash so "$DIR/..." never doubles up.  UEFI_DIR is guarded on
+# non-empty because it is the one path that may legitimately be absent (no
+# --uefi at all), and `[[ "" == */ ]]` is already false, so the guard costs
+# nothing and states the intent.
 while [[ "$UNIXNU_DIR" == */ && ${#UNIXNU_DIR} -gt 1 ]]; do UNIXNU_DIR="${UNIXNU_DIR%/}"; done
 while [[ "$DEVICE_DIR" == */ && ${#DEVICE_DIR} -gt 1 ]]; do DEVICE_DIR="${DEVICE_DIR%/}"; done
+while [[ -n "$UEFI_DIR" && "$UEFI_DIR" == */ && ${#UEFI_DIR} -gt 1 ]]; do UEFI_DIR="${UEFI_DIR%/}"; done
 
 STAGE_NUMBER="${STAGE#M}"
 if [[ -z "$RUN_ID" ]]; then
@@ -700,6 +748,16 @@ WANTED = (
     ('qemu_accel', ('tools', 'qemu', 'accel')),
     ('ipsw_sha256', ('ipsw', 'sha256')),
     ('ipsw_name', ('ipsw', 'name')),
+    # The third pinned checkout and the one file the payload stage reads from
+    # it.  Both are OPTIONAL: the font is only needed when board.toml
+    # [payload] panic_screen is set, and a lock that has never needed a panic
+    # screen must not be refused for lacking a pin it does not use.  What is
+    # NOT optional is their SHAPE once present -- see the check in
+    # validate_lock().
+    ('uefi_sheng_commit', ('uefi_sheng', 'commit')),
+    ('uefi_sheng_repo', ('uefi_sheng', 'repo')),
+    ('font_path', ('uefi_sheng', 'font_header', 'path')),
+    ('font_sha256', ('uefi_sheng', 'font_header', 'sha256')),
 )
 try:
     with open(sys.argv[1], 'r', encoding='utf-8') as handle:
@@ -747,6 +805,13 @@ LOCK_DEVICE_COMMIT=''
 LOCK_QEMU_ACCEL=''
 LOCK_IPSW_SHA256=''
 LOCK_IPSW_NAME=''
+#: The third pinned checkout (Mu-Silicium, uefi-sheng) and the panic screen's
+#: font header inside it.  Empty when the lock does not pin one; the payload
+#: stage is the only consumer and it says so when it needs one that is absent.
+LOCK_UEFI_SHENG_REPO=''
+LOCK_UEFI_SHENG_COMMIT=''
+LOCK_FONT_PATH=''
+LOCK_FONT_SHA256=''
 
 validate_lock() {
     if [[ ! -f "$LOCK_PATH" ]]; then
@@ -784,6 +849,10 @@ validate_lock() {
             qemu_accel)     LOCK_QEMU_ACCEL="$value" ;;
             ipsw_sha256)    LOCK_IPSW_SHA256="$value" ;;
             ipsw_name)      LOCK_IPSW_NAME="$value" ;;
+            uefi_sheng_repo)   LOCK_UEFI_SHENG_REPO="$value" ;;
+            uefi_sheng_commit) LOCK_UEFI_SHENG_COMMIT="$value" ;;
+            font_path)         LOCK_FONT_PATH="$value" ;;
+            font_sha256)       LOCK_FONT_SHA256="$value" ;;
         esac
     done < <(read_lock_fields)
 
@@ -823,6 +892,36 @@ validate_lock() {
         die 'config_invalid' \
             "device_repo.commit is not a pinned commit in $LOCK_PATH." \
             "{\"device_repo_commit\":\"$(json_escape "$LOCK_DEVICE_COMMIT")\"}" "$EXIT_USAGE"
+    fi
+
+    # The Mu-Silicium pin is optional -- a lock that never needed a panic screen
+    # must not be refused for lacking one -- but a HALF pin is a refusal.  A
+    # commit with no recorded font digest, or a digest with no commit, would let
+    # the payload stage verify the font bytes against nothing and report the
+    # file as checked, which is worse than not checking at all.  Measured shape:
+    # config/sources.lock.json uefi_sheng {repo, ref, commit, font_header{path,
+    # sha256}}.
+    if [[ -n "$LOCK_UEFI_SHENG_COMMIT$LOCK_UEFI_SHENG_REPO$LOCK_FONT_PATH$LOCK_FONT_SHA256" ]]; then
+        if [[ ! "$LOCK_UEFI_SHENG_COMMIT" =~ $COMMIT_PATTERN ]]; then
+            die 'config_invalid' \
+                "uefi_sheng.commit is not a pinned commit in $LOCK_PATH." \
+                "{\"uefi_sheng_commit\":\"$(json_escape "$LOCK_UEFI_SHENG_COMMIT")\"}" "$EXIT_USAGE"
+        fi
+        if [[ -z "$LOCK_UEFI_SHENG_REPO" ]]; then
+            die 'config_invalid' \
+                "uefi_sheng.commit is pinned but uefi_sheng.repo is not: $LOCK_PATH (an acquisition with no remote)." \
+                '{}' "$EXIT_USAGE"
+        fi
+        if [[ -z "$LOCK_FONT_PATH" || -z "$LOCK_FONT_SHA256" ]]; then
+            die 'config_invalid' \
+                "uefi_sheng is pinned but its font_header.path/sha256 is not: $LOCK_PATH. Without the digest the payload stage cannot prove it read the font the lock promised." \
+                "{\"font_path\":\"$(json_escape "$LOCK_FONT_PATH")\",\"font_sha256\":\"$(json_escape "$LOCK_FONT_SHA256")\"}" "$EXIT_USAGE"
+        fi
+        if [[ ! "$LOCK_FONT_SHA256" =~ $SHA256_PATTERN ]]; then
+            die 'config_invalid' \
+                "uefi_sheng.font_header.sha256 is not a sha256 in $LOCK_PATH." \
+                "{\"font_sha256\":\"$(json_escape "$LOCK_FONT_SHA256")\"}" "$EXIT_USAGE"
+        fi
     fi
 
     # PRD 8.3: HVF payloads must never be produced for / fetched by the TCG
@@ -1569,6 +1668,21 @@ record_artifact() {
 #: for a file that is not where the message says it is.
 os_root_seed_json() { printf '%s' "$DEVICE_DIR/.cache/firmware/owner-data/seed.json"; }
 
+# os_root_chain_paths -- the three files the owner root chain produces, one per line.
+#
+# One spelling, because there were about to be three: root_chain_present(),
+# os_root_missing() and the new os_root_present() each named the seed and the two
+# archives, and three copies of a path list is three places for it to drift --
+# the divergence class this script spends its length avoiding (call-chain 7.4,
+# standards R-1).  Each of the three is now a filter over this.
+os_root_chain_paths() {
+    printf '%s\n' \
+        "$(os_root_seed_json)" \
+        "$(tree_dir)/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" \
+        "$(tree_dir)/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"
+    return 0
+}
+
 # root_chain_present -- 0 when the kernel stage can build qemu_root_defconfig.
 #
 # Checks the two archives the config names plus the seed that carries the UUID:
@@ -1577,20 +1691,31 @@ os_root_seed_json() { printf '%s' "$DEVICE_DIR/.cache/firmware/owner-data/seed.j
 # report.  The trust cache and the data ramdisk are the payload's inputs and are
 # checked by the stage that consumes them, not here.
 root_chain_present() {
-    [[ -f "$(os_root_seed_json)" ]] \
-        && [[ -f "$(tree_dir)/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" ]] \
-        && [[ -f "$(tree_dir)/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a" ]]
+    local path
+    while IFS= read -r path; do
+        [[ -f "$path" ]] || return 1
+    done < <(os_root_chain_paths)
+    return 0
 }
 
 # os_root_missing -- the chain files that are absent, one per line.
 os_root_missing() {
     local path
-    for path in \
-        "$(os_root_seed_json)" \
-        "$(tree_dir)/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a" \
-        "$(tree_dir)/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"; do
+    while IFS= read -r path; do
         [[ -f "$path" ]] || printf '%s\n' "$(shown_path "$path")"
-    done
+    done < <(os_root_chain_paths)
+    return 0
+}
+
+# os_root_present -- the chain files that are on disk, one per line.
+# The mirror of os_root_missing, for the one message that has to name what IS
+# there: a reader of the ledger is trying to work out whether this run did the
+# work or inherited it, and "not missing" is not an answer to that.
+os_root_present() {
+    local path
+    while IFS= read -r path; do
+        [[ -f "$path" ]] && printf '%s\n' "$(shown_path "$path")"
+    done < <(os_root_chain_paths)
     return 0
 }
 
@@ -1601,6 +1726,41 @@ os_root_missing() {
 #   README:96-106            the chain, in order, and the UUID export
 step_build_os_root() {
     local name='build-os-root'
+
+    # (0) the chain may already have run, and if it has there is nothing here to
+    #     add.  build-os-root.py skips every sub-step whose output exists (its own
+    #     header says so, :56-169), so the only thing a second invocation of it
+    #     buys is the two disk images' disk space again -- and on a GitHub macOS
+    #     runner that is precisely what there is not room for.  Measured against
+    #     the real image (the zip entries' file_size in
+    #     iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw): the OS volume is
+    #     5,157,406,069 bytes and the SystemOS volume 3,303,014,400, so the
+    #     chain's own inputs are 7.88 GiB before the build tree is counted, and
+    #     DEFAULT_MIN_FREE_GB=8 against a runner's ~14 GiB leaves no room for the
+    #     image as well.  These are the MEMBER sizes, which is what extraction
+    #     costs and what then sits on disk; 044-76040-038.dmg is a UDIF container
+    #     that decodes to 6,077,580,800 bytes, and hdiutil reads it in place, so
+    #     the decoded size is never what occupies the filesystem here.
+    #     So the workflow runs the chain *between* two invocations of this script
+    #     -- the sequence README:96-98 spells out by hand and that step (4) below
+    #     describes -- and deletes the volumes when it is done with them.
+    #
+    #     Recorded 'skipped' and not 'ran', because this invocation did not run
+    #     it: the workflow step that did carries the chain's own log, and a 'ran'
+    #     here would be this script claiming work it did not do.  What it does
+    #     claim is that the chain's outputs are on disk, which is exactly what
+    #     root_chain_present() checks rather than assumes -- and what the kernel
+    #     stage below switches on.
+    if root_chain_present; then
+        local -a present=()
+        local line
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && present+=("$line")
+        done < <(os_root_present)
+        ledger_add "$name" 'skipped' \
+            "the owner root chain is already on disk (${present[*]}): build-os-root.py skips every sub-step whose output exists, so re-running it here would spend the OS and SystemOS volumes' 7.88 GiB again for nothing. The workflow ran the chain between two invocations of this script (README:96-98) and deleted the volumes afterwards; build-kernel below builds qemu_root_defconfig from what the chain left"
+        return 0
+    fi
 
     # (1) the device repository's own script.  It is the chain: nothing here
     #     reimplements a step of it, because a second implementation of "sign
@@ -2083,37 +2243,98 @@ step_build_payload() {
     apple_step_gate "$name" "${need[@]}" || return 0
 
     # (2b) the panic screen's font header, BEFORE the driver is allowed to die on
-    #     it.  board.toml [payload] panic_screen = true, so payload.py:130-136
-    #     runs the device repo's patch-xnu-entry-probe.py, which compiles
-    #     scripts/xnu-panic-screen.c -- and that file includes "Font.h"
-    #     (xnu-panic-screen.c:294) from a Mu-Silicium checkout that is NOT a feed
-    #     and NOT in either pinned repository.  patch-xnu-entry-probe.py:183
-    #     reads UNIXNU_UEFI (which payload.py:139 sets from ctx.uefi, and ctx.uefi
-    #     is None for the payload step) and otherwise falls back to
-    #     <tree>/uefi-sheng, which the assembled tree never contains.
+    #     it.  board.toml [payload] panic_screen = true (UniXNU-qemu/board.toml:94),
+    #     so payload.py:130-136 runs the device repo's patch-xnu-entry-probe.py,
+    #     which compiles scripts/xnu-panic-screen.c -- and that file's ONLY include
+    #     is "Font.h" (xnu-panic-screen.c:294), taken from
+    #     (UNIXNU_UEFI or <tree>/uefi-sheng)/Silicon/Silicium/SiliciumPkg/Library/
+    #     FrameBufferSerialPortLib (patch-xnu-entry-probe.py:183).  The assembled
+    #     tree never contains uefi-sheng/ -- tree.py:assemble creates only
+    #     drivers/ kits/ patches/ refer/ build/ .cache/ package/ scripts/ -- so
+    #     without either spelling the font directory does not exist at all.
     #
-    #     Measured on run 40094234507: the step reached the driver and died in
-    #     clang with "fatal error: 'Font.h' file not found", which names the
-    #     include and not the reason -- the same shape as the firmware's "The
-    #     image is not an application."  So it is checked here, where the ledger
-    #     can say what is missing and what it costs.
+    #     Measured on run 40094234507 (and again on 40096928333): the step reached
+    #     the driver and died in clang with "fatal error: 'Font.h' file not
+    #     found", which names the include and not the reason -- the same shape as
+    #     the firmware's "The image is not an application."  So it is checked here,
+    #     where the ledger can say what is missing and what it costs.
     #
-    #     What it costs: the panic screen only.  The entry probe (stage bars,
-    #     --no-reset) is the other half of the same patch and is wanted with
-    #     either setting (payload.py:128-129), so a kernel patched without the
-    #     font still boots; it just cannot draw a panic message.  This stage is
-    #     recorded failed rather than worked around, because the board asked for
-    #     the screen and the file it needs is not on this host.
+    #     WHY THERE ARE TWO CHANNELS, and why this script uses the flag.  Both
+    #     reach the patcher: cli.py:136 sets ctx.uefi from ctx.option('uefi',
+    #     'UNIXNU_UEFI'), which reads --uefi first and the UNIXNU_UEFI
+    #     environment variable second (config.py:110-117), and payload.py:142
+    #     then runs the patcher with UNIXNU_UEFI=str(ctx.uefi).  Measured on this
+    #     host against the real config.py: with UNIXNU_UEFI exported and no flag,
+    #     ctx.uefi is that path and the patcher receives it; with neither,
+    #     ctx.uefi is None and the patcher receives ''.  So the earlier advice
+    #     "point UNIXNU_UEFI at a Mu-Silicium checkout" was workable -- it was
+    #     simply never done, by anything.
+    #
+    #     --uefi is what this script passes anyway, for three reasons: it lands
+    #     in the driver's own argv.log so the run's evidence names the checkout
+    #     instead of an inherited variable nobody recorded; need_uefi()
+    #     (cli.py:67-73) reads the same option for the firmware and boot-image
+    #     stages, so one spelling serves every consumer; and a flag is testable
+    #     where an exported variable is ambient state.
+    #
+    #     What it costs when it is missing: the panic screen only.  The entry
+    #     probe (stage bars, --no-reset) is the other half of the same patch and
+    #     is wanted with either setting (payload.py:128-129), so a kernel patched
+    #     without the font still boots; it just cannot draw a panic message.  The
+    #     stage is recorded failed rather than worked around, because the board
+    #     asked for the screen and the file it needs is not on this host.
     if [[ "$PAYLOAD_PANIC_SCREEN" == 'yes' ]]; then
-        local uefi_root="${UNIXNU_UEFI:-$(tree_dir)/uefi-sheng}"
-        local font="$uefi_root/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
+        # --uefi first, then the patch script's own fallback.  The fallback is
+        # spelled the same way patch-xnu-entry-probe.py:183 spells it
+        # (ROOT/'uefi-sheng', where ROOT is the tree the script was copied into),
+        # so the path this check names is the path the compiler would be given.
+        local uefi_root="$UEFI_DIR"
+        [[ -n "$uefi_root" ]] || uefi_root="$(tree_dir)/uefi-sheng"
+        # The lock and upstream must agree about where the font is.  A lock that
+        # names another path is not a shorter route to the same file: it means
+        # one of the two moved, and the compiler still uses FONT_RELATIVE.
+        if [[ -n "$LOCK_FONT_PATH" && "$LOCK_FONT_PATH" != "$FONT_RELATIVE" ]]; then
+            ledger_add "$name" 'failed' \
+                "the lock and the panic-screen patcher disagree about where Font.h is: $LOCK_PATH uefi_sheng.font_header.path is '$LOCK_FONT_PATH', patch-xnu-entry-probe.py:183 puts it at '$FONT_RELATIVE'. Re-pin the lock against the upstream script; this check cannot pick one for you"
+            log "payload: FAIL the locked font path '$LOCK_FONT_PATH' is not '$FONT_RELATIVE'; see the ledger entry"
+            return 1
+        fi
+        local font="$uefi_root/$FONT_RELATIVE"
         if [[ ! -f "$font" ]]; then
             ledger_add "$name" 'failed' \
-                "the panic screen's font header is not on this host: $font (xnu-panic-screen.c:294 includes \"Font.h\"; patch-xnu-entry-probe.py:183 reads UNIXNU_UEFI and otherwise <tree>/uefi-sheng, and Mu-Silicium is neither a feed nor part of either pinned repository). Point UNIXNU_UEFI at a Mu-Silicium checkout to build the payload with board.toml [payload] panic_screen"
+                "the panic screen's font header is not on this host: $font (xnu-panic-screen.c:294 includes \"Font.h\" and patch-xnu-entry-probe.py:183 takes it from UNIXNU_UEFI or <tree>/uefi-sheng, and neither exists here). The font lives in the Mu-Silicium checkout pinned as uefi_sheng in $LOCK_PATH; pass --uefi DIR pointing at it, or export UNIXNU_UEFI=DIR (cli.py:136 reads either), and the workflow passes vendor/uefi-sheng"
             log "payload: FAIL $font is missing; see the ledger entry"
             return 1
         fi
-        log "payload: panic-screen font $font"
+        # The file is not enough: it must be the bytes the lock promised.  A
+        # checkout at another commit can carry a Font.h that compiles and is not
+        # this one, and a panic screen drawn from someone else's glyph table is
+        # not reproducible.  The digest is recorded rather than derived here
+        # (sources.lock.json uefi_sheng.font_header.sha256) so the lock stays the
+        # single place that knows it.
+        local font_sha=''
+        font_sha="$(sha256_of "$font" 2>/dev/null || true)"
+        if [[ -n "$LOCK_FONT_SHA256" ]]; then
+            if [[ ! "$font_sha" =~ $SHA256_PATTERN ]]; then
+                ledger_add "$name" 'failed' \
+                    "could not compute the SHA-256 of the panic screen's font header: $font"
+                log "payload: FAIL $font is unreadable; see the ledger entry"
+                return 1
+            fi
+            if [[ "$font_sha" != "$LOCK_FONT_SHA256" ]]; then
+                ledger_add "$name" 'failed' \
+                    "the panic screen's font header is not the one the lock pins: $font has sha256 $font_sha, sources.lock.json uefi_sheng.font_header.sha256 is $LOCK_FONT_SHA256 (uefi_sheng.commit $LOCK_UEFI_SHENG_COMMIT). Re-pin uefi_sheng or restore the pinned checkout; building the panic screen from another glyph table is not this build"
+                log "payload: FAIL $font sha256=$font_sha != locked $LOCK_FONT_SHA256; see the ledger entry"
+                return 1
+            fi
+        fi
+        if [[ -n "$LOCK_UEFI_SHENG_COMMIT" ]]; then
+            local font_head=''
+            font_head="$(head_of "$uefi_root")"
+            log "payload: panic-screen font $font sha256=${font_sha:-<none>}${font_head:+ (checkout at ${font_head:0:12}, lock pins ${LOCK_UEFI_SHENG_COMMIT:0:12})}"
+        else
+            log "payload: panic-screen font $font sha256=${font_sha:-<none>} (no digest pinned in $LOCK_PATH; the file's presence is all that was checked)"
+        fi
     fi
 
     # (3) the two Homebrew packages the step cannot run without.  Neither is a
@@ -2176,9 +2397,23 @@ step_build_payload() {
     #     run-qemu.py:120-125 refuses a tree whose timebase does not match the
     #     accelerator it is about to run.  The payload target is the lock's own
     #     accelerator (validate_lock refuses a mismatch), so it is the right one.
-    log "+ unixnu build payload -D $DEVICE_DIR --out $UNIXNU_OUT --kernel $kernel --unique-chip-id <seed sha256 $PLATFORM_SEED_SHA256>"
+    #
+    #     --uefi is passed when this run has one.  It is the channel this script
+    #     prefers, and the one whose use is recorded: cli.py:136 sets ctx.uefi
+    #     from --uefi (or from UNIXNU_UEFI, config.py:110-117) and payload.py:142
+    #     forwards it to the patcher as UNIXNU_UEFI, so the driver's argv.log
+    #     names the checkout the font came from.  It is omitted rather than
+    #     passed empty when the caller gave none, because `--uefi ''` would make
+    #     ctx.option() fall through to the environment anyway and would put a
+    #     misleading empty argument in the log.
+    local -a uefi_args=()
+    if [[ -n "$UEFI_DIR" ]]; then
+        uefi_args+=(--uefi "$UEFI_DIR")
+    fi
+    log "+ unixnu build payload -D $DEVICE_DIR --out $UNIXNU_OUT --kernel $kernel --unique-chip-id <seed sha256 $PLATFORM_SEED_SHA256>${uefi_args:+ ${uefi_args[*]}}"
     if ! ( export UNIXNU_QEMU_ACCEL="$TARGET"
-           run_driver "$name" 'build' 'payload' --kernel "$kernel" --unique-chip-id "$seed" ); then
+           run_driver "$name" 'build' 'payload' --kernel "$kernel" --unique-chip-id "$seed" \
+               ${uefi_args+"${uefi_args[@]}"} ); then
         ledger_add "$name" 'failed' "unixnu build payload failed; see $OUT_DIR/${name}.driver.log"
         return 1
     fi
@@ -2723,6 +2958,16 @@ main() {
         log 'lock: NOT FROZEN -- the pinned commits above are this run'"'"'s freeze candidates, recorded verbatim in artifact-manifest.json'
     fi
     log "lock: qemu accel=$LOCK_QEMU_ACCEL ipsw.sha256=${LOCK_IPSW_SHA256:-<empty>}"
+    # The third pinned checkout, and what its absence costs.  Printed here
+    # rather than only inside build-payload so a reader of the log sees before
+    # the run whether the panic screen's font header has a source at all --
+    # measured need: runs 40094234507 and 40096928333 reached the driver and
+    # died in clang with "fatal error: 'Font.h' file not found" for want of it.
+    if [[ -n "$UEFI_DIR" ]]; then
+        log "uefi:     $UEFI_DIR (Mu-Silicium; the panic screen's Font.h comes from here)"
+    else
+        log 'uefi:     <none: no --uefi>. If board.toml [payload] panic_screen is set, build-payload will record failed: its font header has no source'
+    fi
 
     require_tools
     log "tools: $TOOL_XCODEBUILD"
