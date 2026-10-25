@@ -91,7 +91,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -607,6 +607,12 @@ class RootChainRequest:
     systemos_volume_dir: Path | None = None
     #: Where the StaticTrustCache IM4P goes, as ``<dir>/<build>/<member leaf>``.
     static_trustcache_dir: Path | None = None
+    #: Where the driver's own IPSW cache gets its ``kernelcache.decompressed``,
+    #: as ``<dir>/<build>/kernelcache.decompressed``.  This is the one input
+    #: that is *not* read by ``build-os-root.py``: it is read by
+    #: ``build-platform-power.py``, the kernel archive that only runs once a
+    #: reference kernel exists.  See :func:`publish_kernelcache_cache`.
+    kernelcache_cache_dir: Path | None = None
     #: Where the reconstructed refer image goes, as ``<dir>/<ipsw.name>``.
     refer_ipsw_dir: Path | None = None
 
@@ -621,6 +627,10 @@ class RootChain:
     systemos_volume_sha256: str = ""
     static_trustcache: Path | None = None
     refer_ipsw: Path | None = None
+    #: The decompressed kernelcache placed in the driver's own IPSW cache, when
+    #: the caller asked for it.  Not one of the chain's four members, and not
+    #: part of :attr:`published`: the owner root chain does not read it.
+    kernelcache_cache: Path | None = None
     #: The members the reconstructed image really carries.  Two, not four: the
     #: DMGs are published as files rather than duplicated inside a zip, so a
     #: reader of the record can see that the image is a member set and not the
@@ -1328,6 +1338,81 @@ def publish_root_chain(
     )
 
 
+def publish_kernelcache_cache(
+    source: Path,
+    digest: str,
+    board: BoardIpsw,
+    directory: Path,
+) -> Path:
+    """Lay the decompressed kernelcache where ``unixnu ipsw fetch`` would have.
+
+    ``vendor/UniXNU-qemu/scripts/build-platform-power.py`` is the kernel archive
+    that reads the *original* kernelcache to audit the AMFI/PMGR contract, and it
+    takes it from the driver's own IPSW cache:
+
+        original = ROOT / '.cache/firmware/kernelcache.macho/kernelcache.release.ipad7.decompressed'
+        if not original.exists():
+            cached = [path for path in ROOT.parents[1].glob('ipsw/*/kernelcache.decompressed')
+                      if hashlib.sha256(path.read_bytes()).hexdigest() == ORIGINAL_KERNELCACHE_SHA256]
+            require(cached, 'The original kernelcache is not in the IPSW cache; run "unixnu ipsw fetch"')
+
+    That check is reached only once a *reference* kernel exists -- the archive
+    starts by linking a no-op ``sheng_pmgr_run`` when ``ROOT.parent/'kernel/
+    kernel.macho'`` is absent, and exits 0 without ever looking.  So a first
+    build pass passes this archive and a second pass, which now has a reference
+    kernel, is the first one that needs the file.  Measured on run 40206274286:
+    nine of the ten kernel archives built, and the tenth died on exactly this
+    line, because nothing in this workflow runs ``unixnu ipsw fetch`` -- it
+    extracts the kernelcache itself (``_kernelcache_macho``) and never puts it
+    in the driver's cache.
+
+    The destination is ``<directory>/<board.build>/kernelcache.decompressed``,
+    which is ``unixnu/ipsw.py:116,201``'s own spelling: ``source.cache`` is
+    ``out/ipsw/<build>`` and the leaf is ``kernelcache.decompressed``.  Upstream
+    accepts an already-correct file without re-running ``compression_tool``
+    (``if out.is_file() and sha256_file(out) == pin: return out``), so this is
+    the one thing that makes the second pass self-sufficient.
+
+    ``digest`` must be the one ``_kernelcache_macho`` proved against
+    ``board.toml [kernel.prelink] kernelcache_sha256``.  It is re-checked here
+    rather than trusted, because the file is about to be read by a build stage
+    that has no pin of its own for it, and because the caller is handing over a
+    path rather than the bytes.
+    """
+    if digest != board.kernelcache_sha256:
+        raise UniPadError(
+            ErrorCode.IMAGE_HASH_MISMATCH,
+            "the kernelcache offered to the driver's cache is not the one "
+            "board.toml [kernel.prelink] declares, so it is not the kernelcache "
+            "this board was qualified against",
+            actual_sha256=digest,
+            pinned_sha256=board.kernelcache_sha256,
+        )
+    if sha256_file(source) != digest:
+        raise UniPadError(
+            ErrorCode.VERIFICATION_FAILED,
+            "the kernelcache source does not hash to the digest it was verified "
+            "with, so it changed between verification and publication",
+            source=str(source),
+        )
+    destination = directory / board.build / "kernelcache.decompressed"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and sha256_file(destination) == digest:
+        # Already there and already right: the driver's cache outlives one
+        # acquisition, and re-copying a 50 MB file to reach the same bytes is
+        # work with no outcome.
+        return destination
+    shutil.copyfile(source, destination)
+    if sha256_file(destination) != digest:
+        raise UniPadError(
+            ErrorCode.VERIFICATION_FAILED,
+            "the published kernelcache does not hash to the digest it was "
+            "verified with",
+            destination=str(destination),
+        )
+    return destination
+
+
 def _verify_components(
     found: dict[str, tuple[str, Path]], pins: dict[str, str]
 ) -> dict[str, str]:
@@ -1641,6 +1726,20 @@ def acquire(
     )
     cache, member, cache_digest = _kernelcache_macho(found, board, workspace)
 
+    # The driver's own IPSW cache, once the verified kernelcache exists.  After
+    # ``_kernelcache_macho`` and not inside ``publish_root_chain``, because the
+    # verification this re-checks lives there and re-deriving it would be a
+    # second place that knows how to decode an IM4P.
+    kernelcache_cache: Path | None = None
+    if (
+        root_chain_request is not None
+        and root_chain_request.kernelcache_cache_dir is not None
+    ):
+        kernelcache_cache = publish_kernelcache_cache(
+            cache, cache_digest, board, root_chain_request.kernelcache_cache_dir
+        )
+        root_chain = replace(root_chain, kernelcache_cache=kernelcache_cache)
+
     return Acquisition(
         image_sha256=pin.sha256,
         image_bytes=image_bytes,
@@ -1848,6 +1947,16 @@ def main(argv: list[str] | None = None) -> int:
         "'unixnu ipsw fetch' would have left it",
     )
     parser.add_argument(
+        "--kernelcache-cache",
+        default=None,
+        metavar="DIR",
+        help="also publish the decompressed kernelcache as "
+        "DIR/<build>/kernelcache.decompressed, the driver's own IPSW cache, "
+        "which build-platform-power.py reads on any build pass that already "
+        "has a reference kernel.  Nothing in this workflow runs 'unixnu ipsw "
+        "fetch', so without this the second pass has no kernelcache to audit",
+    )
+    parser.add_argument(
         "--refer-ipsw",
         default=None,
         metavar="DIR",
@@ -1871,6 +1980,9 @@ def main(argv: list[str] | None = None) -> int:
         systemos_volume_dir=Path(args.systemos_volume) if args.systemos_volume else None,
         static_trustcache_dir=Path(args.static_trustcache)
         if args.static_trustcache
+        else None,
+        kernelcache_cache_dir=Path(args.kernelcache_cache)
+        if args.kernelcache_cache
         else None,
         refer_ipsw_dir=Path(args.refer_ipsw) if args.refer_ipsw else None,
     )

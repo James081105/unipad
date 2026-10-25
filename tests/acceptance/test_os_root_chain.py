@@ -415,6 +415,20 @@ def test_the_workflow_runs_the_chain_between_two_build_passes() -> None:
     # The chain's members, published from the image rather than the image kept.
     for flag in ("--os-volume", "--systemos-volume", "--static-trustcache", "--refer-ipsw"):
         assert flag in text, f"the workflow never asks for {flag}"
+    # ...and the driver's own IPSW cache, which is not one of the chain's
+    # members: build-platform-power.py reads it on any build pass that already
+    # has a reference kernel.  Measured on run 40206274286, which got
+    # os_root_status=pass for the first time and then died in the second pass
+    # on archive 10 of 10 with "The original kernelcache is not in the IPSW
+    # cache; run \"unixnu ipsw fetch\"" -- the first pass passes that archive
+    # because it links a no-op bridge when no reference kernel exists, so the
+    # second pass is the first one that needs the file, and nothing here runs
+    # `unixnu ipsw fetch`.
+    assert "--kernelcache-cache" in text, (
+        "the workflow never populates the driver's IPSW cache, so the second "
+        "build pass -- the one that builds qemu_root_defconfig -- dies on "
+        "build-platform-power.py with no original kernelcache to audit"
+    )
     # The chain itself, run the way README:96 runs it.
     assert "scripts/build-os-root.py" in text, (
         "the workflow never runs build-os-root.py, so the owner root chain is "

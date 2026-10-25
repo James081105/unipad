@@ -1533,3 +1533,146 @@ def test_a_volume_that_is_already_there_and_wrong_is_refused(
     error = caught.value
     assert error.code is ipsw.ErrorCode.VERIFICATION_FAILED, error
     assert (volumes / OS_VOLUME_MEMBER).read_bytes() == b"something else entirely"
+
+
+# ---------------------------------------------------------------------------
+# the driver's own IPSW cache
+# ---------------------------------------------------------------------------
+def test_the_kernelcache_lands_in_the_drivers_own_ipsw_cache(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The file ``build-platform-power.py`` reads on any pass after the first.
+
+    Measured on run 40206274286, which is the run that got the whole owner root
+    chain to ``os_root_status=pass`` for the first time and then died in the
+    second build pass on archive 10 of 10::
+
+        The original kernelcache is not in the IPSW cache; run "unixnu ipsw fetch"
+
+    The archive starts by linking a no-op ``sheng_pmgr_run`` when no reference
+    kernel exists and exits 0 without ever reaching that line -- so the FIRST
+    pass passes it and the SECOND pass, which now has
+    ``kernel/kernel.macho``, is the first one that needs the file.  Nothing in
+    this workflow runs ``unixnu ipsw fetch``: the acquisition extracts and
+    decompresses the kernelcache itself and never puts it in the driver's cache.
+
+    The destination is ``unixnu/ipsw.py:116,201``'s own spelling -- ``out/ipsw/
+    <build>/kernelcache.decompressed`` -- and upstream accepts an
+    already-correct file without re-running ``compression_tool``.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    cache_dir = tmp_path / "out" / "ipsw"
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--image", str(image),
+        "--kernelcache-cache", str(cache_dir),
+        "--summary", str(tmp_path / "summary.json"),
+    )
+    assert code == 0, payload
+    cached = cache_dir / BUILD / "kernelcache.decompressed"
+    assert cached.is_file(), payload
+    assert _sha(cached.read_bytes()) == payload["kernelcache_sha256"], payload
+    assert payload["kernelcache_sha256"] == _sha(MACHO), payload
+    # ...and it is the SAME bytes the build was handed, not a second decode.
+    assert (tmp_path / "out" / "kernelcache.macho").read_bytes() == cached.read_bytes()
+
+
+def test_the_kernelcache_cache_is_not_part_of_the_root_chain(
+    tmp_path: Path, stub_decode
+) -> None:
+    """``published`` must not move because of a file the chain never reads.
+
+    ``build-platform-power.py`` is a kernel archive, not one of
+    ``build-os-root.py``'s four members.  A record that counted it as part of
+    the chain would let a caller believe the chain had been published when only
+    its kernelcache had.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--image", str(image),
+        "--kernelcache-cache", str(tmp_path / "out" / "ipsw"),
+        "--summary", str(tmp_path / "summary.json"),
+    )
+    assert code == 0, payload
+    assert payload["root_chain"]["published"] is False, payload
+
+
+def test_a_kernelcache_the_board_never_declared_is_refused(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The cache is about to be read by a stage with no pin of its own.
+
+    ``build-platform-power.py`` compares the file against a digest it carries
+    itself and refuses -- but that is *after* the kernel archive has been
+    linked, on a paid runner, with a reference kernel already built.  The
+    module knows the pin, so it refuses here instead.
+    """
+    image = _chain_image(tmp_path)
+    wrong = _sha(b"some other kernelcache")
+    lock, device = _write_declarations(
+        tmp_path, image=image, kernelcache_sha256=wrong
+    )
+    with pytest.raises(ipsw.UniPadError):
+        workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(
+                    kernelcache_cache_dir=tmp_path / "out" / "ipsw"
+                ),
+            )
+
+
+def test_a_cache_that_already_holds_the_right_bytes_is_left_alone(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The driver's cache outlives one acquisition.
+
+    Re-copying a ~50 MB file to reach the same bytes is work with no outcome,
+    and the copy is what would make a second acquisition of the same image
+    look like it did something.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    cache_dir = tmp_path / "out" / "ipsw"
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--image", str(image),
+        "--kernelcache-cache", str(cache_dir),
+        "--summary", str(tmp_path / "summary.json"),
+    )
+    assert code == 0, payload
+    cached = cache_dir / BUILD / "kernelcache.decompressed"
+    first = cached.stat().st_mtime_ns
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work2"),
+        "--kernelcache", str(tmp_path / "out2" / "kernelcache.macho"),
+        "--image", str(image),
+        "--kernelcache-cache", str(cache_dir),
+        "--summary", str(tmp_path / "summary2.json"),
+    )
+    assert code == 0, payload
+    assert cached.stat().st_mtime_ns == first, (
+        "an already-correct cache entry was rewritten"
+    )

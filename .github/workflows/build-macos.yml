@@ -1457,6 +1457,11 @@ jobs:
           IPSW_WORK_DIR: ipsw-work
           VOLUMES_DIR: ipsw-work/volumes
           TRUSTCACHE_DIR: build-output/unixnu-out/ipsw
+          # The driver's own IPSW cache, which is the same directory: unixnu's
+          # cache is out/ipsw/<build> (unixnu/ipsw.py:116) and so is where the
+          # StaticTrustCache IM4P is published.  The kernelcache is a different
+          # reader, not a different place.
+          KERNELCACHE_CACHE_DIR: build-output/unixnu-out/ipsw
           REFER_DIR: ipsw-work/refer
           SUMMARY_PATH: ipsw-work/chain-summary.json
           PYTHONPATH: src
@@ -1483,6 +1488,7 @@ jobs:
             --os-volume "$VOLUMES_DIR" \
             --systemos-volume "$VOLUMES_DIR" \
             --static-trustcache "$TRUSTCACHE_DIR" \
+            --kernelcache-cache "$KERNELCACHE_CACHE_DIR" \
             --refer-ipsw "$REFER_DIR" \
             --summary "$SUMMARY_PATH" \
             | tee "$IPSW_WORK_DIR/chain.log"
@@ -1897,10 +1903,12 @@ jobs:
       # pattern:
       #
       # * ``build-output/unixnu-out/ipsw/`` -- the StaticTrustCache IM4P the chain
-      #   reads from beside the driver's own cache.  It is inside BUILD_OUTPUT_DIR,
-      #   so the staging step would see it; its suffix is in that step's
-      #   PRIVATE_PATTERNS and it is excluded there, but an exclusion is a record
-      #   of a file that existed, and the file should not exist at all.
+      #   reads from beside the driver's own cache, and the decompressed original
+      #   kernelcache published there for ``build-platform-power.py``.  It is
+      #   inside BUILD_OUTPUT_DIR, so the staging step would see it; both are
+      #   excluded there by name (``*.trustcache``, ``*.decompressed``), but an
+      #   exclusion is a record of a file that existed, and the file should not
+      #   exist at all.
       # * ``vendor/UniXNU-qemu/.cache/firmware/target-volumes/*.dmg`` -- the OS and
       #   SystemOS volumes.  The step above removes them when the chain succeeded;
       #   this is the unconditional version, for the run where it did not.
@@ -2023,6 +2031,17 @@ jobs:
               "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
               "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
               "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+              # The decompressed original kernelcache, which the chain's
+              # acquisition publishes into out/ipsw/<build>/ so that
+              # build-platform-power.py can audit the AMFI/PMGR contract on any
+              # pass that already has a reference kernel.  It is an Apple
+              # binary, and ROLE_RULES maps "kernelcache" to the allowlisted
+              # role "kernel" -- so without this line the default-deny below
+              # would let it through on name alone, and the only thing standing
+              # between it and the artifact upload would be the ordering of the
+              # step that removes out/ipsw/.  PRD 12 does not get to rest on a
+              # step order.
+              "*.decompressed",
           )
           METADATA_SUFFIXES = {".json", ".txt", ".log", ".md", ".cfg", ".toml", ".csv", ".plist"}
           ROLE_RULES = (

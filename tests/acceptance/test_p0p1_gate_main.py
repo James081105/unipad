@@ -2767,3 +2767,92 @@ def test_the_apple_device_tree_refuses_to_depend_on_qemu(
     assert "not a macOS build input" not in adt["reason"], adt
     assert "adt" not in {entry["name"] for entry in scratch.manifest()["artifacts"]}
 
+
+
+def test_the_decompressed_kernelcache_is_never_an_uploadable_artifact(
+    tmp_path: Path,
+) -> None:
+    """PRD 12, against the staging step's own code rather than its pattern list.
+
+    The chain's acquisition now publishes the decompressed original kernelcache
+    into ``out/ipsw/<build>/`` so that ``build-platform-power.py`` can audit the
+    AMFI/PMGR contract on any build pass that already has a reference kernel
+    (measured on run 40206274286: nine of ten kernel archives built, and the
+    tenth died with "The original kernelcache is not in the IPSW cache").
+
+    That file is an Apple binary sitting *inside* BUILD_OUTPUT_DIR, and
+    ``ROLE_RULES`` maps "kernelcache" to the allowlisted role ``kernel`` -- so
+    the default-deny below would wave it through on name alone unless its
+    suffix is in ``PRIVATE_PATTERNS``.  Reading the pattern tuple would only
+    prove a string is present; this runs the step and reads what it decided.
+
+    Why this matters beyond tidiness: the step that removes ``out/ipsw/`` runs
+    *before* this one today, so the ordering happens to be safe.  PRD 12 does
+    not get to rest on a step order.
+    """
+    code = _step_python(STAGING_STEP)
+    out = tmp_path / "build-output"
+    # One real deliverable, so the step does not refuse the whole build for
+    # having produced nothing (PRD 7.4) -- which is a different failure and
+    # would tell us nothing about the file under test.
+    kernel = out / "unixnu-out" / "qemu" / "kernel" / "kernel.macho"
+    kernel.parent.mkdir(parents=True)
+    kernel.write_bytes(b"synthetic kernel\n")
+    # The file under test, at the exact path the acquisition publishes.
+    cached = out / "unixnu-out" / "ipsw" / "21H461" / "kernelcache.decompressed"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"synthetic decompressed Apple kernelcache\n")
+    build_log = tmp_path / "macos-build.log"
+    build_log.write_text("synthetic build log\n")
+
+    script = tmp_path / "stage.py"
+    script.write_text(code, encoding="utf-8")
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "BUILD_OUTPUT_DIR": str(out),
+            "STAGE_DIR": str(tmp_path / "staged"),
+            "BUILD_LOG": str(build_log),
+            "REPORT_DIR": str(tmp_path / "build"),
+            "PAYLOAD_TARGET": "tcg",
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, (
+        "the staging step refused a build that has a deliverable:\n"
+        + (result.stdout + result.stderr)[-2000:]
+    )
+    report = json.loads(
+        (tmp_path / "build" / "staging-report.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "pass", report
+    excluded = {item["path"]: item for item in report["excluded"]}
+    # The staged set, spelled from the disk rather than from a key this step's
+    # report does not carry: the first draft of this assertion read
+    # ``manifest["artifacts"]`` after the manifest had been replaced by the
+    # report, so removing the pattern made the test fail with a NameError
+    # inside its own message -- red for the wrong reason, which is the failure
+    # mode this whole file exists to prevent.
+    staged = {
+        path.relative_to(tmp_path / "staged").as_posix()
+        for path in (tmp_path / "staged").rglob("*")
+        if path.is_file()
+    }
+    relative = "unixnu-out/ipsw/21H461/kernelcache.decompressed"
+    assert relative in excluded, (
+        f"{relative} was not excluded, so the staging step would upload an "
+        f"Apple binary.  excluded={sorted(excluded)}; staged={sorted(staged)}"
+    )
+    assert "pattern" in excluded[relative]["reason"], (
+        f"{relative} was excluded for the wrong reason "
+        f"({excluded[relative]['reason']!r}); the name is what makes it private"
+    )
+    assert relative not in staged, (
+        f"{relative} was staged as well as excluded"
+    )

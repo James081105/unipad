@@ -368,6 +368,25 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **`XNU_OWNER_DATA_VOLUME_UUID` 在容器从 32 MiB 长到 1 GiB 之后是否仍然有效：未经核对。** `prepare-owner-data-fixture.py` 写下的 `seed.json` 记的是 32 MiB 容器的 UUID（本轮实测 `18AF0FFB-77A7-4878-B999-70DD8B4076DC`），而 1 GiB 容器是之后由 `packed_ramdisk.py` 产出的；`build-macos.sh:1959` 从 `seed.json` 读 UUID 并导出。若增长过程换了 UUID，内核会嵌入一个过时的值——下一遍的日志（`build-macos.sh:1873`）会把它打出来，届时核对，现在不下结论。
 - **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8，这一轮没有推进它，因为前置物（能读根的 `qemu_root_defconfig` 内核）还没有造出来。
 
+### 11.11 第五轮：根链拿到 `os_root_status=pass`，第二遍构建退到它自己的第十个 archive（事实 51，2026-10-25）
+
+**(1) refer 路径修好之后，链收口了，而见证 `pass` 的不是链条自己。** run 40206274286：step 14 success，**step 15 `Remove the root chain's disk volumes` 真的跑了**（`7.9G .../target-volumes` → `removed the OS and SystemOS volumes`）。这一步的 `if` 是 `steps.os_root.outputs.os_root_status == 'pass'`，所以它是 `pass` 的第一个独立见证。第二遍随之选中 `qemu_root_defconfig`、导出 `XNU_OWNER_DATA_VOLUME_UUID`、加上 `CONFIG_XNU_BUILD_ARCHIVES=y`，并建出 10 个 archive 里的前 9 个。
+
+**(2) 第十个 archive 退出，而它缺的文件 `unixnu ipsw fetch` 本该留下。** `The original kernelcache is not in the IPSW cache; run "unixnu ipsw fetch"`。直接原因：本 workflow 自己解出并解压 kernelcache，却从不把它放进 `out/ipsw/<build>/`。
+
+**(3) 而这一轮真正的新知识是第二层：这个洞恰好被两遍构建的顺序掩藏着。** `build-platform-power.py` 在没有参考内核时链接一个 no-op `sheng_pmgr_run` 并 `exit 0`，根本走不到那行检查。所以第一遍必然通过，第二遍（已有 `kernel/kernel.macho`）才是第一次需要那个文件。**把构建遍数从一遍改成两遍（事实 45）不只是让链能跑，它还让第十个 archive 第一次被真正执行到。** 一个此前每一遍都"通过"的检查，第一次被执行就失败了——这与本仓库反复出现的"一个声明在任何一个地方的依赖"是同一类：通过不等于被执行。
+
+**(4) 修的时候抓到一个 PRD 12 的真问题，而它今天没有造成后果只靠步骤顺序。** `out/ipsw/` 在 `BUILD_OUTPUT_DIR` 里面，staging 会扫到它；`ROLE_RULES` 把 `kernelcache` 映射到**被允许**的 role `kernel`，`PRIVATE_PATTERNS` 里没有 `*.decompressed`——默认拒绝会凭名字放一个 Apple 私有二进制过关。今天它没被上传，只因为删 `out/ipsw/` 的步骤恰好排在 staging 前面。已补 `*.decompressed`，并用一个真的跑 staging 自己代码的测试钉住：删掉 pattern 再跑，测试打印出 `staged=[... 'unixnu-out/ipsw/21H461/kernelcache.decompressed' ...]`。
+
+**(5) 这个测试的第一版又红在自己的消息里，这是同一类错误第三次。** 它引用了一个已被替换掉的 `manifest` 变量，于是删掉 pattern 之后以 `NameError` 失败——红，但红的理由不对。前两次是 11.7(5) 的 `apply_submodule_divergences()` 匹配到定义、11.9(5) 的 `StopIteration`。**一个测试因为自己的前提不满足而红，和因为它守的契约被破坏而红，是两回事**，而前者比没有测试更危险。三次都已把教训写进各自的注释，但这条值得单独记：写"证明它有牙齿"的那一步时，必须真的去看失败信息指的是不是那个契约。
+
+### 11.12 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核：仍未构建出来。** run 40206274286 的 step 16 以 `stage build-kernel failed` 结束，`root_kernel` 未置位。`--kernelcache-cache` 的修法已推送，但**验证它的 run 尚未触发**，所以"第二遍现在能过"是推断，不是测量。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10，这一轮没有推进它，因为前置物还没有造出来。
+- **`XNU_OWNER_DATA_VOLUME_UUID` 在容器从 32 MiB 长到 1 GiB 之后是否仍然有效：仍未核对。** 见 11.10。`build-macos.sh:1873` 会把它打进日志，下一遍核对。
+- **`build-platform-power.py` 这一次是真的执行了审计，还是仍然走了 no-op 桥：未经核实。** run 40206274286 里它死在第 50 行的检查上，这说明它**越过了** no-op 桥（否则不会到达那里），所以参考内核确实存在；但 `audit-amfi-pmgr-contract.py` 本身是否通过，要等内核cache就位的那一遍才知道。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
