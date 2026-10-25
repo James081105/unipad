@@ -1151,3 +1151,385 @@ def test_a_board_with_no_devicetree_component_refuses_rather_than_writing_nothin
     assert code != 0, payload
     assert payload["error"]["code"] == "artifact_missing", payload
     assert "DeviceTree" in payload["error"]["message"], payload
+
+# ---------------------------------------------------------------------------
+# the owner root chain's inputs
+# ---------------------------------------------------------------------------
+#: The two disk images build-os-root.py consumes.  They are deliberately NOT
+#: part of the board's ``fetch`` -- ``fetch`` is what the kernel and payload
+#: steps want, and the two volumes are 7.88 GiB of it that only the chain needs
+#: -- so the module takes them by name, exactly as it takes every other
+#: component: from the image's own Manifest.
+OS_VOLUME_MEMBER = "044-76040-038.dmg"
+SYSTEMOS_VOLUME_MEMBER = "044-76034-038.dmg"
+
+
+def _chain_image(tmp_path: Path, *, os_bytes: bytes = b"synthetic OS volume") -> Path:
+    """A synthetic image that also carries the two volumes the chain signs."""
+    return _build_image(
+        tmp_path,
+        members={
+            OS_VOLUME_MEMBER: os_bytes,
+            SYSTEMOS_VOLUME_MEMBER: b"synthetic SystemOS volume",
+        },
+        manifest=_manifest(
+            members={
+                "OS": OS_VOLUME_MEMBER,
+                "Cryptex1,SystemOS": SYSTEMOS_VOLUME_MEMBER,
+            }
+        ),
+    )
+
+
+def _chain_declarations(
+    tmp_path: Path, image: Path, *, pin_os: bool = True
+) -> tuple[Path, Path]:
+    """A lock and a board that pin both volumes, as the real ones do.
+
+    ``pin_os=False`` leaves the OS volume unpinned, which is the shape the
+    module has to refuse: the chain signs every 4 KiB block of that image, so an
+    image with no digest to check it against is not a smaller risk.
+    """
+    pins = {
+        "DeviceTree.j120ap.im4p": _sha(b"synthetic devicetree"),
+        "static_tc": _sha(b"synthetic static trust cache"),
+        SYSTEMOS_VOLUME_MEMBER: _sha(b"synthetic SystemOS volume"),
+    }
+    if pin_os:
+        pins[OS_VOLUME_MEMBER] = _sha(b"synthetic OS volume")
+    return _write_declarations(tmp_path, image=image, component_pins=pins)
+
+
+def test_the_chain_members_are_published_from_the_image(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The four members build-os-root.py reads, without the 6.8 GB image.
+
+    This is the whole point of the root-chain flags.  The chain needs the two
+    volumes, the StaticTrustCache IM4P at the path it reads it from, and a
+    manifest plus the System trust cache -- and a GitHub macOS runner has about
+    14 GiB free against ``DEFAULT_MIN_FREE_GB=8``, so the image cannot be kept
+    for the chain.  The members can be, because the chain signs them anyway.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    volumes = tmp_path / "volumes"
+    trustcache = tmp_path / "out" / "ipsw"
+    refer = tmp_path / "refer"
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with workspace:
+        result = ipsw.acquire(
+            lock,
+            device,
+            workspace,
+            image_override=image,
+            root_chain_request=ipsw.RootChainRequest(
+                os_volume_dir=volumes,
+                systemos_volume_dir=volumes,
+                static_trustcache_dir=trustcache,
+                refer_ipsw_dir=refer,
+            ),
+        )
+
+    chain = result.root_chain
+    assert chain.os_volume == volumes / OS_VOLUME_MEMBER, chain
+    assert chain.systemos_volume == volumes / SYSTEMOS_VOLUME_MEMBER, chain
+    # The leaf name is the image's business, not the caller's: a workflow that
+    # spelled it out would be a second place that knows it.
+    assert chain.os_volume.is_file(), chain
+    assert chain.os_volume.read_bytes() == b"synthetic OS volume"
+    # The digest is the one the lock pins, taken from the file the chain will
+    # actually be handed rather than from a directory that was then deleted.
+    assert chain.os_volume_sha256 == _sha(b"synthetic OS volume"), chain
+    assert chain.systemos_volume_sha256 == _sha(b"synthetic SystemOS volume"), chain
+    # <dir>/<build>/<member leaf>, which is where build-os-root.py reads it from
+    # -- the place 'unixnu ipsw fetch' would have left it.
+    assert (
+        chain.static_trustcache == trustcache / BUILD / Path(TRUSTCACHE_MEMBER).name
+    ), chain
+    assert chain.static_trustcache.read_bytes() == b"synthetic static trust cache"
+    assert chain.refer_ipsw == refer / image.name, chain
+    assert chain.refer_members == ("BuildManifest.plist", CRYPTEX_MEMBER), chain
+
+
+def test_the_refer_image_carries_only_what_the_trust_step_opens(
+    tmp_path: Path, stub_decode
+) -> None:
+    """Two members, and the record says so.
+
+    build-original-system-trust.py opens ``<tree>/refer/<ipsw name>`` and reads
+    exactly ``BuildManifest.plist`` (to find the identity) and the
+    ``Cryptex1,SystemTrustCache`` member.  It never touches the volumes -- by
+    then they are on disk, because the chain published them and attached the OS
+    one.  So the reconstruction is honest about what it is, and a reader of the
+    summary cannot mistake it for the pinned 6.37 GiB firmware.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    refer = tmp_path / "refer"
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with workspace:
+        ipsw.acquire(
+            lock,
+            device,
+            workspace,
+            image_override=image,
+            root_chain_request=ipsw.RootChainRequest(refer_ipsw_dir=refer),
+        )
+    with zipfile.ZipFile(refer / image.name) as archive:
+        assert archive.namelist() == ["BuildManifest.plist", CRYPTEX_MEMBER]
+        manifest = plistlib.loads(archive.read("BuildManifest.plist"))
+        identity = next(
+            item
+            for item in manifest["BuildIdentities"]
+            if item["Info"]["DeviceClass"] == DEVICE_CLASS
+        )
+        # The member sits at the path the Manifest names, not at a flattened
+        # name: build-original-system-trust.py resolves it through the Manifest.
+        member = identity["Manifest"]["Cryptex1,SystemTrustCache"]["Info"]["Path"]
+        assert archive.read(member) == b"synthetic cryptex trust cache"
+
+
+def test_a_volume_with_no_pin_is_refused(tmp_path: Path, stub_decode) -> None:
+    """An unpinned volume is a refusal, not a warning.
+
+    The chain signs every 4 KiB block of the OS image and the kernel then
+    verifies every block it reads.  "It came out of the pinned firmware" is not
+    a digest of the member -- zipfile's own CRC is a different claim -- so a
+    volume with no pin is refused rather than published along with the rest.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image, pin_os=False)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(
+                    os_volume_dir=tmp_path / "volumes"
+                ),
+            )
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.CONFIG_INVALID, error
+    assert OS_VOLUME_MEMBER in error.message, error
+
+
+def test_a_volume_whose_digest_disagrees_with_the_pin_is_refused(
+    tmp_path: Path, stub_decode
+) -> None:
+    """A volume that is not the one the board was qualified against."""
+    image = _chain_image(tmp_path, os_bytes=b"a different OS volume")
+    lock, device = _chain_declarations(tmp_path, image)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(
+                    os_volume_dir=tmp_path / "volumes"
+                ),
+            )
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.IMAGE_HASH_MISMATCH, error
+    assert error.details.get("component") == "OS", error.details
+
+
+def test_the_volumes_are_refused_before_extraction_when_they_do_not_fit(
+    tmp_path: Path, pair, stub_decode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk is named, not a digest.
+
+    The peak is the image plus the larger volume, because each volume leaves the
+    workspace before the next one is extracted.  On a ~14 GiB runner that is
+    11.17 GiB, so this is a real refusal and not a nicety: without it the
+    extraction would run until the filesystem filled, and the pin check would
+    then report a digest instead of the disk that was actually wrong.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    volumes = tmp_path / "volumes"
+    monkeypatch.setattr(ipsw, "_free_bytes", lambda _directory: 1024)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(
+                    os_volume_dir=volumes,
+                    systemos_volume_dir=volumes,
+                ),
+            )
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.BLOCKED, error
+    assert "do not fit" in error.message, error
+    assert error.details.get("free_bytes") == 1024, error.details
+    # Nothing was written: the refusal has to come before the extraction, or it
+    # is a cleanup story rather than a guard.
+    assert not volumes.exists() or not any(volumes.iterdir()), list(volumes.glob("*"))
+
+
+def test_a_caller_that_asks_for_no_chain_pays_no_extraction(
+    tmp_path: Path, pair, stub_decode
+) -> None:
+    """The 7.88 GiB is opt-in.
+
+    A caller that only wants the kernelcache must not pay for two disk images it
+    is not going to sign, so the default request is empty and the workspace's
+    parts carry exactly what ``fetch`` named.
+    """
+    image, lock, device = pair
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with workspace:
+        result = ipsw.acquire(lock, device, workspace, image_override=image)
+    assert result.root_chain.published is False, result.root_chain
+    landed = {path.name for path in result.components.values()}
+    assert OS_VOLUME_MEMBER not in landed, landed
+    assert SYSTEMOS_VOLUME_MEMBER not in landed, landed
+
+
+def test_the_cli_publishes_the_chain_and_records_it_as_a_member_set(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The workflow's contract for the chain flags: exit 0, files, honest record.
+
+    ``refer_members`` in the summary is the load-bearing part.  A record that
+    said "an IPSW was published" would let a later reader believe the whole
+    6.37 GiB image had been verified against the lock, when only its members
+    were.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    volumes = tmp_path / "volumes"
+    code, payload = _run_cli(
+        tmp_path,
+        "--lock", str(lock),
+        "--device", str(device),
+        "--work", str(tmp_path / "work"),
+        "--kernelcache", str(tmp_path / "out" / "kernelcache.macho"),
+        "--image", str(image),
+        "--os-volume", str(volumes),
+        "--systemos-volume", str(volumes),
+        "--static-trustcache", str(tmp_path / "out" / "ipsw"),
+        "--refer-ipsw", str(tmp_path / "refer"),
+        "--summary", str(tmp_path / "summary.json"),
+    )
+    assert code == 0, payload
+    assert payload["ok"] is True, payload
+    chain = payload["root_chain"]
+    assert chain["published"] is True, payload
+    assert chain["refer_members"] == ["BuildManifest.plist", CRYPTEX_MEMBER], payload
+    assert chain["os_volume_sha256"] == _sha(b"synthetic OS volume"), payload
+    assert chain["systemos_volume_sha256"] == _sha(b"synthetic SystemOS volume"), payload
+    assert (volumes / OS_VOLUME_MEMBER).is_file(), payload
+    assert (volumes / SYSTEMOS_VOLUME_MEMBER).is_file(), payload
+
+
+def test_a_volume_on_another_filesystem_is_refused_before_extraction(
+    tmp_path: Path, stub_decode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename is what makes the arithmetic true, so it has to be a rename.
+
+    ``shutil.move`` falls back to copy-then-delete across filesystems, which
+    would put the image and *both* volumes on disk at once -- 14.25 GiB, more
+    than the guard measures and more than the runner has.  The destination
+    therefore has to be on the workspace's own filesystem, and that is checked
+    rather than assumed, because the failure it prevents is a silent one: the
+    extraction would simply run out of disk halfway through the second volume.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    # Not the same filesystem, for any pair: the check under test has to see a
+    # destination the move could not reach by renaming.
+    monkeypatch.setattr(ipsw, "_same_filesystem", lambda first, second: False)
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(
+                    os_volume_dir=elsewhere,
+                    systemos_volume_dir=elsewhere,
+                ),
+            )
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.BLOCKED, error
+    assert "another filesystem" in error.message, error
+
+
+def test_a_volume_that_is_already_the_pinned_bytes_is_not_replaced(
+    tmp_path: Path, stub_decode
+) -> None:
+    """A second call into the same directory is idempotent, not a clobber.
+
+    ``shutil.move`` onto an existing path raises on Windows rather than
+    replacing, so without this the re-run would fail with a message about the
+    destination instead of about the digest -- and a caller that reuses the
+    directory would have to delete a good file to get a good file back.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    volumes = tmp_path / "volumes"
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with workspace:
+        first = ipsw.acquire(
+            lock,
+            device,
+            workspace,
+            image_override=image,
+            root_chain_request=ipsw.RootChainRequest(os_volume_dir=volumes),
+        )
+        second = ipsw.acquire(
+            lock,
+            device,
+            workspace,
+            image_override=image,
+            root_chain_request=ipsw.RootChainRequest(os_volume_dir=volumes),
+        )
+    assert first.root_chain.os_volume == second.root_chain.os_volume
+    assert (
+        first.root_chain.os_volume_sha256 == second.root_chain.os_volume_sha256
+    ), (first.root_chain, second.root_chain)
+
+
+def test_a_volume_that_is_already_there_and_wrong_is_refused(
+    tmp_path: Path, stub_decode
+) -> None:
+    """The one file already in the directory is not silently overwritten.
+
+    A caller that points the flag at a directory holding something else has a
+    reason for it, and replacing their file with the pinned one would destroy
+    the only copy of whatever they had put there -- for a build whose whole
+    value is that every input can be traced to a digest.
+    """
+    image = _chain_image(tmp_path)
+    lock, device = _chain_declarations(tmp_path, image)
+    volumes = tmp_path / "volumes"
+    volumes.mkdir()
+    (volumes / OS_VOLUME_MEMBER).write_bytes(b"something else entirely")
+    workspace = ipsw.IpswWorkspace(tmp_path / "ws")
+    with pytest.raises(ipsw.UniPadError) as caught:
+        with workspace:
+            ipsw.acquire(
+                lock,
+                device,
+                workspace,
+                image_override=image,
+                root_chain_request=ipsw.RootChainRequest(os_volume_dir=volumes),
+            )
+    error = caught.value
+    assert error.code is ipsw.ErrorCode.VERIFICATION_FAILED, error
+    assert (volumes / OS_VOLUME_MEMBER).read_bytes() == b"something else entirely"

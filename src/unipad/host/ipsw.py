@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import plistlib
 import shutil
 import struct
@@ -101,6 +102,8 @@ __all__ = [
     "BoardIpsw",
     "IpswPin",
     "IpswWorkspace",
+    "RootChain",
+    "RootChainRequest",
     "acquire",
     "read_board_ipsw",
     "read_pin",
@@ -126,6 +129,21 @@ FETCH_KERNELCACHE = "KernelCache"
 
 #: How the board asks for the device tree.  Also in ``[ipsw] fetch``.
 FETCH_DEVICETREE = "DeviceTree"
+
+#: The two disk images the *owner root chain* consumes.  They are deliberately
+#: NOT part of ``[ipsw] fetch``: ``fetch`` is what the kernel and payload steps
+#: want, and the two DMGs are 7.88 GiB of it that only ``build-os-root.py``
+#: needs -- putting them in ``fetch`` would make every caller of this module pay
+#: for them.  They are named here because the chain needs them and the chain is
+#: the reason this module knows about a root chain at all.
+FETCH_OS = "OS"
+FETCH_SYSTEMOS = "Cryptex1,SystemOS"
+
+#: The two trust-cache IM4Ps.  Both are already in ``[ipsw] fetch``, so this
+#: module extracts them for the kernel and payload steps; the chain reads the
+#: same two members, from a different place, for a different consumer.
+FETCH_STATIC_TRUSTCACHE = "StaticTrustCache"
+FETCH_SYSTEM_TRUSTCACHE = "Cryptex1,SystemTrustCache"
 
 #: Where a chip/board divergence between board.toml and the image is recorded, so
 #: the summary can report it instead of the divergence being swallowed.
@@ -550,6 +568,78 @@ class IpswWorkspace:
 
 
 # ---------------------------------------------------------------------------
+# the owner root chain's inputs
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RootChainRequest:
+    """Where the owner root chain's four inputs go, for a caller that wants them.
+
+    ``vendor/UniXNU-qemu/scripts/build-os-root.py`` takes an ``--ipsw`` path and
+    reads exactly four members out of it:
+
+    * ``BuildManifest.plist`` (to resolve the component paths at all),
+    * the ``OS`` member -- the OS disk image it attaches read-only to sign every
+      4 KiB block of it,
+    * the ``Cryptex1,SystemOS`` member -- the SystemOS image the union mount
+      reads, and
+    * the ``Cryptex1,SystemTrustCache`` member -- the System trust cache that
+      ``build-original-system-trust.py`` bundles.
+
+    ...plus one file that is *not* a zip member: ``<out>/ipsw/<build>/
+    044-76040-038.dmg.trustcache``, the ``StaticTrustCache`` IM4P, which the
+    chain reads from beside the driver's own cache (``build-os-root.py`` line
+    150) because that is where ``unixnu ipsw fetch`` would have left it.
+
+    The two DMGs are 4.80 GiB and 3.08 GiB.  Handing the chain the *image* means
+    keeping 6.37 GiB of firmware on disk for the whole chain, and a GitHub macOS
+    runner has about 14 GiB free against ``DEFAULT_MIN_FREE_GB=8`` -- so the
+    image and the chain cannot coexist there.  What fits is the image's members,
+    which the chain needs anyway: the two DMGs are the volumes it signs.
+
+    So the members are published and the image is not.  Each volume flag names a
+    *directory*; the member's own leaf name is the image's business, not the
+    caller's, and a caller that spelled it would be a second place that knows it.
+    """
+
+    #: Where the OS disk image goes (``<dir>/<member leaf>``).
+    os_volume_dir: Path | None = None
+    #: Where the SystemOS disk image goes.
+    systemos_volume_dir: Path | None = None
+    #: Where the StaticTrustCache IM4P goes, as ``<dir>/<build>/<member leaf>``.
+    static_trustcache_dir: Path | None = None
+    #: Where the reconstructed refer image goes, as ``<dir>/<ipsw.name>``.
+    refer_ipsw_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class RootChain:
+    """What :func:`publish_root_chain` produced, for the caller's record."""
+
+    os_volume: Path | None = None
+    os_volume_sha256: str = ""
+    systemos_volume: Path | None = None
+    systemos_volume_sha256: str = ""
+    static_trustcache: Path | None = None
+    refer_ipsw: Path | None = None
+    #: The members the reconstructed image really carries.  Two, not four: the
+    #: DMGs are published as files rather than duplicated inside a zip, so a
+    #: reader of the record can see that the image is a member set and not the
+    #: pinned firmware.
+    refer_members: tuple[str, ...] = ()
+
+    @property
+    def published(self) -> bool:
+        return any(
+            (
+                self.os_volume,
+                self.systemos_volume,
+                self.static_trustcache,
+                self.refer_ipsw,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 # acquisition
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -568,6 +658,10 @@ class Acquisition:
     #: is keyed by leaf because that is how the pins are spelled, and a caller
     #: asking for the device tree asks for it by component.
     by_component: dict[str, Path] = field(default_factory=dict)
+    #: The owner root chain's inputs, when the caller asked for them.  Empty by
+    #: default: a caller that only wants the kernelcache must not pay 7.88 GiB
+    #: of extraction for a chain it is not running.
+    root_chain: RootChain = field(default_factory=RootChain)
 
 
 def sha256_file(path: Path) -> str:
@@ -874,6 +968,366 @@ def _extract(
     return found
 
 
+def _extract_member(
+    archive: zipfile.ZipFile, workspace: IpswWorkspace, entry: str
+) -> Path:
+    """One zip member, verbatim, into the workspace's ``parts/`` directory."""
+    destination = workspace.part_path(entry)
+    if not destination.is_file():
+        with archive.open(entry) as source, open(destination, "wb") as target:
+            shutil.copyfileobj(source, target, CHUNK)
+    return destination
+
+
+def _free_bytes(directory: Path) -> int | None:
+    """Bytes free on the filesystem holding ``directory``, or None if unknown.
+
+    ``shutil.disk_usage`` rather than shelling out to ``df``: this module
+    already runs on Windows as well as macOS, and the free-space question is the
+    same question on both.
+    """
+    try:
+        return shutil.disk_usage(directory).free
+    except OSError:
+        return None
+
+
+def _same_filesystem(first: Path, second: Path) -> bool:
+    """Whether a rename between two directories is a rename and not a copy.
+
+    ``shutil.move`` falls back to copy-then-delete across filesystems, which
+    would silently double the peak the arithmetic above is built on -- the image
+    plus *both* volumes at once instead of the image plus the larger one.  The
+    fallback is not wrong, it is just not what this module measured, so the two
+    directories have to be on one filesystem and it has to be checked rather than
+    assumed.
+    """
+    try:
+        return os.stat(first).st_dev == os.stat(second).st_dev
+    except OSError:
+        # A directory that does not exist yet is the caller's business: the
+        # caller creates it, and if it never appears the extraction fails on the
+        # open with a message about the path.
+        return True
+
+
+def _require_root_chain_space(
+    image: Path,
+    workspace: IpswWorkspace,
+    identity: dict[str, Any],
+    components: tuple[str, ...],
+    destinations: tuple[Path, ...] = (),
+) -> None:
+    """Refuse before extracting when the volumes would not fit.
+
+    The peak is the image plus the *larger* of the two volumes, because each
+    volume is moved out of the workspace before the next one is extracted (see
+    :func:`_pinned_volume`).  Both figures are the zip entries' ``file_size`` in
+    iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw -- which is what extraction costs
+    and what then occupies the filesystem.  ``BuildIdentities[].Manifest``
+    carries no size for either member (only ``DigestInfo`` hashes), so the zip
+    directory is the only place these numbers come from.  They are deliberately
+    NOT the decoded sizes: ``044-76040-038.dmg`` is a UDIF container that decodes
+    to 6,077,580,800 bytes (5.66 GiB), but ``hdiutil`` reads it in place and
+    nothing ever writes the decoded form out, so the member size is the one the
+    disk sees.
+
+    The image is 6.37 GiB and the OS volume 4.80 GiB, so the peak is 11.17 GiB
+    -- and a GitHub macOS runner has about 14 GiB free *before* the build tree,
+    and far less after it.
+
+    So this is not a nicety.  Without it the extraction would run until the
+    filesystem filled, which on a runner means a half-written multi-GiB DMG that
+    the pin check then refuses -- a failure that names a digest instead of naming
+    the disk.  Reported as ``blocked`` rather than raised, because the caller's
+    other outputs (the kernelcache, the device tree) are still worth having and
+    a caller running the chain later gets to decide with the real number in
+    front of it.
+    """
+    if not components:
+        return
+    with _open_archive(image) as archive:
+        sizes = {
+            component: archive.getinfo(_member_of(identity, component)).file_size
+            for component in components
+        }
+    for destination in destinations:
+        if not _same_filesystem(workspace.parts_dir, destination):
+            raise UniPadError(
+                ErrorCode.BLOCKED,
+                "the owner root chain's volumes cannot be moved to "
+                f"{destination}: it is on another filesystem from the workspace, "
+                "so the move would be a copy and the peak would be the image plus "
+                "both volumes at once -- 14.25 GiB, which does not fit anywhere "
+                "this module is meant to run. Publish them beside the workspace",
+                destination=safe_location(destination),
+            )
+    free = _free_bytes(workspace.parts_dir)
+    if free is None:
+        return
+    needed = image.stat().st_size + max(sizes.values())
+    if free < needed:
+        raise UniPadError(
+            ErrorCode.BLOCKED,
+            "the owner root chain's volumes do not fit on this filesystem: "
+            f"{needed / 2**30:.2f} GiB is needed at the peak (the image plus the "
+            f"larger volume) and {free / 2**30:.2f} GiB is free. The image is "
+            "6.37 GiB and the two volumes are 4.80 GiB and 3.08 GiB, so this "
+            "needs a filesystem emptier than this one: publish the members "
+            "before the build tree exists, or run the chain on its own runner",
+            needed_bytes=needed,
+            free_bytes=free,
+            volume_bytes=sizes,
+        )
+
+
+def _pinned_volume(
+    image: Path,
+    workspace: IpswWorkspace,
+    identity: dict[str, Any],
+    component: str,
+    pins: dict[str, str],
+    directory: Path,
+) -> tuple[Path, str]:
+    """Take one disk image out of the firmware and put it where the chain reads it.
+
+    Moved, not copied, and that is the whole reason this is its own function
+    rather than a call to :func:`_publish`: the two volumes are 4.80 GiB and
+    3.08 GiB, and the image they come out of is 6.37 GiB.  All three on one
+    14 GiB runner is 14.25 GiB and does not fit, so a volume leaves ``parts/``
+    for its destination *before* the next one is extracted -- a rename on the
+    same filesystem, which costs no space and no second copy.  Every figure here
+    is a zip entry's ``file_size``, i.e. what the extraction writes; the OS
+    member is a UDIF container that decodes to 6,077,580,800 bytes and nothing
+    in this module ever writes that form out.
+
+    The digest is checked twice, once from the extracted member and once from
+    the file the caller will actually hand to the chain, because the second one
+    is the one that matters: a pin checked in a directory that is then deleted
+    proves nothing about the file that survives.
+    """
+    entry = _member_of(identity, component)
+    leaf = Path(entry).name
+    wanted = pins.get(leaf)
+    if not wanted:
+        # The chain signs every 4 KiB block of this image.  An image with no
+        # digest to check it against is not a smaller risk, it is an unbounded
+        # one, and "it came out of the pinned firmware" is not a digest of the
+        # member -- the zip's own CRC is checked by zipfile, which is not the
+        # same claim as the lock's.
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"no sha256 is pinned for {leaf}, so the {component} volume could "
+            "not be proven to be the one this board was qualified against: add "
+            "it to sources.lock.json ipsw.component_pins and board.toml "
+            "[ipsw.sha256]",
+            component=component,
+            member=leaf,
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / leaf
+    if destination.is_file():
+        # Already published by an earlier call, or left behind by a caller that
+        # reuses the directory.  Two outcomes, and neither is "overwrite it": a
+        # file that is already the pinned bytes is the answer, and a file that is
+        # not is a refusal -- silently replacing it would destroy the only copy
+        # of whatever the caller had put there.  (It also has to be handled at
+        # all: ``shutil.move`` onto an existing path raises on Windows rather
+        # than replacing, so a re-run would fail with a message about the
+        # destination instead of about the digest.)
+        present = sha256_file(destination)
+        if present == wanted.lower():
+            return destination, present
+        raise UniPadError(
+            ErrorCode.VERIFICATION_FAILED,
+            f"{leaf} is already at {directory} and is not the bytes this board "
+            "was qualified against; refusing to replace it",
+            component=component,
+            actual_sha256=present,
+            pinned_sha256=wanted.lower(),
+        )
+    with _open_archive(image) as archive:
+        extracted = _extract_member(archive, workspace, entry)
+    actual = sha256_file(extracted)
+    if actual != wanted.lower():
+        raise UniPadError(
+            ErrorCode.IMAGE_HASH_MISMATCH,
+            f"{leaf} does not match the digest this board was qualified "
+            "against; refusing to hand it to the root chain",
+            component=component,
+            actual_sha256=actual,
+            pinned_sha256=wanted.lower(),
+        )
+    shutil.move(str(extracted), str(destination))
+    written = sha256_file(destination)
+    if written != actual:
+        raise UniPadError(
+            ErrorCode.VERIFICATION_FAILED,
+            f"{leaf} changed between the image and {directory}",
+            component=component,
+            actual_sha256=written,
+            expected_sha256=actual,
+        )
+    return destination, written
+
+
+def _refer_image(
+    image: Path,
+    workspace: IpswWorkspace,
+    board: BoardIpsw,
+    identity: dict[str, Any],
+    wanted_name: str,
+    directory: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    """Write the two members ``build-original-system-trust.py`` opens the image for.
+
+    ``build-os-root.py`` step 10 symlinks ``<tree>/refer/<ipsw name>`` at the
+    image and runs ``build-original-system-trust.py``, which opens that zip and
+    reads exactly two things: ``BuildManifest.plist`` (to find the identity) and
+    the ``Cryptex1,SystemTrustCache`` member.  It never touches the DMGs -- by
+    then they are already on disk, because step 2 of the chain published them
+    and step 4 attached the OS one.
+
+    So the file the chain is pointed at does not have to be the 6.37 GiB
+    firmware; it has to be a zip carrying those two members at the paths the
+    manifest names.  Writing one is how the chain gets an ``--ipsw`` at all on a
+    runner that cannot hold the image, and it is recorded as what it is: the
+    caller's summary lists the members the reconstruction carries, so a reader
+    of the record cannot mistake it for the pinned image.
+
+    The name is the lock's own ``ipsw.name``, and a caller that asks for another
+    one is refused: ``build-original-system-trust.py`` hard-codes
+    ``refer/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw``, so a differently-named
+    file would make the chain look for a symlink that names something else.
+    """
+    entry = _member_of(identity, FETCH_SYSTEM_TRUSTCACHE)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / wanted_name
+    manifest = MANIFEST_MEMBER
+    with _open_archive(image) as archive:
+        if entry not in set(archive.namelist()):
+            raise UniPadError(
+                ErrorCode.ARTIFACT_MISSING,
+                f"{FETCH_SYSTEM_TRUSTCACHE} is declared as a member this image "
+                "does not carry",
+                component=FETCH_SYSTEM_TRUSTCACHE,
+                member=Path(entry).name,
+            )
+        trust = _extract_member(archive, workspace, entry)
+        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as out:
+            # Deflated for the manifest and stored for the trust cache: the
+            # latter is 1,871 bytes, and compressing it saves nothing while
+            # making the member's bytes different from the image's.
+            out.writestr(manifest, archive.read(manifest), zipfile.ZIP_DEFLATED)
+            out.write(trust, entry)
+    return destination, (manifest, entry)
+
+
+def publish_root_chain(
+    image: Path,
+    workspace: IpswWorkspace,
+    board: BoardIpsw,
+    pins: dict[str, str],
+    wanted_name: str,
+    request: RootChainRequest,
+) -> RootChain:
+    """Publish the owner root chain's inputs, or nothing at all.
+
+    Called while the image is still on disk -- :func:`acquire` deletes it the
+    moment extraction finishes, and every member this function reads comes out
+    of it.  A caller that asked for nothing gets an empty record and pays
+    nothing.
+    """
+    if not any(
+        (
+            request.os_volume_dir,
+            request.systemos_volume_dir,
+            request.static_trustcache_dir,
+            request.refer_ipsw_dir,
+        )
+    ):
+        return RootChain()
+
+    with _open_archive(image) as archive:
+        identity = _load_identity(archive, board)
+
+    # Before anything is extracted, not after: a half-written multi-GiB volume
+    # that the pin then refuses is a failure that names a digest instead of naming
+    # the disk, and the disk is the thing that was actually wrong.
+    wanted: list[str] = []
+    destinations: list[Path] = []
+    for component, directory in (
+        (FETCH_OS, request.os_volume_dir),
+        (FETCH_SYSTEMOS, request.systemos_volume_dir),
+    ):
+        if directory is not None:
+            wanted.append(component)
+            destinations.append(directory)
+    _require_root_chain_space(image, workspace, identity, tuple(wanted), tuple(destinations))
+
+    os_volume: Path | None = None
+    os_digest = ""
+    if request.os_volume_dir is not None:
+        os_volume, os_digest = _pinned_volume(
+            image, workspace, identity, FETCH_OS, pins, request.os_volume_dir
+        )
+    # One at a time, and the order is the space argument rather than a
+    # preference: 6.37 GiB of image plus 4.80 GiB of OS volume is 11.17 GiB,
+    # which is the largest sum that fits on a 14 GiB runner.  Extracting the
+    # smaller SystemOS volume second keeps the peak there.
+    systemos_volume: Path | None = None
+    systemos_digest = ""
+    if request.systemos_volume_dir is not None:
+        systemos_volume, systemos_digest = _pinned_volume(
+            image,
+            workspace,
+            identity,
+            FETCH_SYSTEMOS,
+            pins,
+            request.systemos_volume_dir,
+        )
+
+    static_trustcache = None
+    if request.static_trustcache_dir is not None:
+        # The chain reads this from beside the driver's own cache, at
+        # <out>/ipsw/<build>/, because that is where "unixnu ipsw fetch" leaves
+        # it -- build-os-root.py:150 spells the path out.  There is no pin for
+        # it in either the lock or board.toml; the chain itself checks the IM4P
+        # payload against a digest of its own, so the record here says what was
+        # published and leaves the proof where upstream put it.
+        entry = _member_of(identity, FETCH_STATIC_TRUSTCACHE)
+        directory = request.static_trustcache_dir / board.build
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / Path(entry).name
+        with _open_archive(image) as archive:
+            extracted = _extract_member(archive, workspace, entry)
+        shutil.copyfile(extracted, destination)
+        if sha256_file(destination) != sha256_file(extracted):
+            raise UniPadError(
+                ErrorCode.VERIFICATION_FAILED,
+                f"{destination.name} is not the member the image carried",
+                component=FETCH_STATIC_TRUSTCACHE,
+            )
+        static_trustcache = destination
+
+    refer_ipsw: Path | None = None
+    refer_members: tuple[str, ...] = ()
+    if request.refer_ipsw_dir is not None:
+        refer_ipsw, refer_members = _refer_image(
+            image, workspace, board, identity, wanted_name, request.refer_ipsw_dir
+        )
+
+    return RootChain(
+        os_volume=os_volume,
+        os_volume_sha256=os_digest,
+        systemos_volume=systemos_volume,
+        systemos_volume_sha256=systemos_digest,
+        static_trustcache=static_trustcache,
+        refer_ipsw=refer_ipsw,
+        refer_members=refer_members,
+    )
+
+
 def _verify_components(
     found: dict[str, tuple[str, Path]], pins: dict[str, str]
 ) -> dict[str, str]:
@@ -1102,6 +1556,7 @@ def acquire(
     device_dir: Path,
     workspace: IpswWorkspace,
     image_override: Path | None = None,
+    root_chain_request: RootChainRequest | None = None,
 ) -> Acquisition:
     """Fetch (or accept) the pinned image, verify it, and unpack what the board needs.
 
@@ -1114,10 +1569,17 @@ def acquire(
     ``local-private/`` and re-downloading it to test this module would be
     absurd.  It is verified against exactly the same pin, so an override cannot
     smuggle in an unchecked image.
+
+    ``root_chain_request`` is how a caller running the owner root chain gets the
+    four members ``build-os-root.py`` reads out of the image.  It defaults to
+    None and None means nothing is extracted for it: the two disk images are
+    7.88 GiB and a caller that only wants a kernelcache must not pay for them.
     """
     pin = read_pin(lock_path)
     board = read_board_ipsw(device_dir)
     _check_the_two_declarations_agree(pin, board)
+    if root_chain_request is None:
+        root_chain_request = RootChainRequest()
 
     # open(), not "with": the kernelcache has to outlive this call, so the
     # workspace's teardown belongs to the caller and not to us.
@@ -1155,6 +1617,18 @@ def acquire(
 
     found = _extract(image, workspace, board)
 
+    # The owner root chain's inputs, while the image is still here.  This runs
+    # before the unlink below and not after it, because every member the chain
+    # reads comes out of this file.
+    root_chain = publish_root_chain(
+        image,
+        workspace,
+        board,
+        {**pin.component_pins, **board.component_pins},
+        pin.name,
+        root_chain_request,
+    )
+
     # The image is 6.8 GB and nothing downstream needs it.  Deleting it here
     # rather than at workspace teardown keeps the peak usage to the download
     # plus the handful of components, instead of both plus the parts for the
@@ -1176,6 +1650,7 @@ def acquire(
         components={Path(entry).name: path for _, (entry, path) in found.items()},
         verified_components=verified,
         by_component={component: path for component, (_, path) in found.items()},
+        root_chain=root_chain,
     )
 
 
@@ -1232,6 +1707,7 @@ def _summary(
     nothing path-shaped to print: the build's input location is the caller's own
     ``--kernelcache`` argument, which it already knows.
     """
+    chain = result.root_chain
     return {
         "image_sha256": result.image_sha256,
         "image_bytes": result.image_bytes,
@@ -1243,6 +1719,17 @@ def _summary(
         "devicetree_bytes": devicetree_bytes,
         "components": sorted(result.components),
         "verified_components": dict(result.verified_components),
+        # The root chain, as what it is and not as "an IPSW was published".
+        # ``refer_members`` is the honest part: a reconstructed image carrying
+        # two members is not the pinned 6.37 GiB firmware, and a record that
+        # said otherwise would let a later reader believe the whole image had
+        # been verified against the lock when only its members were.
+        "root_chain": {
+            "os_volume_sha256": chain.os_volume_sha256,
+            "systemos_volume_sha256": chain.systemos_volume_sha256,
+            "refer_members": list(chain.refer_members),
+            "published": chain.published,
+        },
     }
 
 
@@ -1338,6 +1825,38 @@ def main(argv: list[str] | None = None) -> int:
         "fetching it; it is checked against the same pin",
     )
     parser.add_argument(
+        "--os-volume",
+        default=None,
+        metavar="DIR",
+        help="also publish the OS disk image into DIR, under the member name "
+        "the image itself declares (build-os-root.py step 2 attaches it "
+        "read-only to sign every 4 KiB block).  4.80 GiB.",
+    )
+    parser.add_argument(
+        "--systemos-volume",
+        default=None,
+        metavar="DIR",
+        help="also publish the SystemOS disk image into DIR (build-os-root.py "
+        "step 5 signs it under the same key).  3.08 GiB.",
+    )
+    parser.add_argument(
+        "--static-trustcache",
+        default=None,
+        metavar="DIR",
+        help="also publish the StaticTrustCache IM4P as DIR/<build>/<member>, "
+        "which is where build-os-root.py:150 reads it from -- the place "
+        "'unixnu ipsw fetch' would have left it",
+    )
+    parser.add_argument(
+        "--refer-ipsw",
+        default=None,
+        metavar="DIR",
+        help="also write a reconstructed image into DIR carrying only "
+        "BuildManifest.plist and the System trust-cache member, which is all "
+        "build-original-system-trust.py opens the image for.  Named after the "
+        "lock's ipsw.name, because the chain hard-codes that name in refer/",
+    )
+    parser.add_argument(
         "--summary",
         default=None,
         help="also write the JSON summary to this path",
@@ -1347,12 +1866,21 @@ def main(argv: list[str] | None = None) -> int:
     workspace = IpswWorkspace(Path(args.work))
     devicetree: Path | None = None
     devicetree_bytes = 0
+    root_chain = RootChainRequest(
+        os_volume_dir=Path(args.os_volume) if args.os_volume else None,
+        systemos_volume_dir=Path(args.systemos_volume) if args.systemos_volume else None,
+        static_trustcache_dir=Path(args.static_trustcache)
+        if args.static_trustcache
+        else None,
+        refer_ipsw_dir=Path(args.refer_ipsw) if args.refer_ipsw else None,
+    )
     try:
         result = acquire(
             Path(args.lock),
             Path(args.device),
             workspace,
             image_override=Path(args.image) if args.image else None,
+            root_chain_request=root_chain,
         )
         published_bytes = _publish(
             result.kernelcache, Path(args.kernelcache), result.kernelcache_sha256
