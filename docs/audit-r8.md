@@ -307,10 +307,32 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **OS 成员的全图解码：未在本机完成。** 3814 块里 3415 块是 LZFSE，Python 标准库没有解码器。GPT CRC 与卷 UUID 的结论是由一份独立实现得出的；`udif.py` 与之交叉验证的部分是 399 个免库块。
 - **新根目录拓宽了 ONSITE 证据面。** 已实测一个放在 `local-private/boot7/run/guest.log` 的合成 guest log 能满足 M3 全部三个 `_ONSITE` 要求（同一文件放在带 simulation 标记的路径下则正确被判 SIMULATION 且什么都不满足）。这是既有类别的拓宽（`out/real-boot` 早就如此），当前视口内 guest log 数为 0。
 
+### 11.5 第二轮：端到端复测、runner 上的真阻断、CI（事实 44–45，2026-10-25）
+
+这一轮没有换架构，是拿第一轮的结论去跑、然后修跑出来的东西。分四件。
+
+**(1) 端到端回归跑通了，而它先暴露探针自己的一处假声明。** `scripts/windows/probe-root-volume.py` 的 `BootInputs` 把 `devicetree`/`darwinboot`/`unixnu` 写成 `run/"esp"/...`——也就是 `stage_esp` 自己要写的目的地，而它在拷贝任何东西之前先 `shutil.rmtree(esp)`，所以这些输入永远交不到 `boot()` 手里，模块里「The same inputs `unixnu_boot.boot()` takes」这句注释在唯一要紧的地方是假的。回归因此以一个裸 `FileNotFoundError` 失败——一个错的输入在没有任何东西检查它时长什么样。改成指向 payload 构建自己的产物，设备树是唯一没有新鲜来源的输入（会写出它的构建因缺 `FrameBufferSerialPortLib/Font.h` 失败了），于是加了 `verify_adt_matches_board()`：拒绝一份不发布 `board.toml [payload.adt] root_match_volume_uuid` 的树，因为这个属性正是决定内核在等什么的那个。**boot15 实测**：ESP 恰好五个 `stage_esp` 文件，设备树按板级 UUID 校验通过，argv 带根盘，msgbuf 反卷出 **17,112 字节**（sha256 `0cb19122e0bb5557dac35e189ab6a14263e53588e4a30e18a00011d4f8487e4c`），标记 `['Waiting on', 'bsd_autoconf', 'IOMedia']`，`allproc` 只有 `kernel_task` pid 0 状态 `run`，exit 0。同一轮里三个我自己的缺陷各自由我自己的检查抓到，顺序都是反的：暂存文件数检查期望 5 项而 `stage_esp` 返回 5 个 payload 文件加一个 `_esp` 记账键（一次正确的暂存被拒绝）；`guestobserve --run-id` 是字面量 `boot9` 而目录是 `boot15`（样本声称了自己不是的那次运行）；CLI 测试断言 `"root volume attached" not in unattached` 而 `"no root volume attached"` 包含这个子串（断言在它本该排除的分支上通过）。
+
+**(2) 阻断的真正位置在 macOS runner，不在本机内核——这是本轮最重要的发现。** 此前记成「本机内核没有 `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`」，那是症状。链条：M2 的计划里 `build-os-root` 就排在 `build-kernel` 前面，而 `build-kernel` 只在 `root_chain_present` 为真时才换成 `qemu_root_defconfig`；可是 `build-os-root` 要一个**本地** IPSW，workflow 只调用一次 `build-macos.sh`、从不传 `--ipsw`，它自己的 IPSW 步骤取完 kernelcache 就把 6.8 GB 镜像删掉了（`src/unipad/host/ipsw.py:26`）。所以 runner 上 `build-os-root` 恒 `not_run`、无链、内核恒 `qemu_defconfig`。**空间约束让这件事不能靠抬高地板绕过**：`DEFAULT_MIN_FREE_GB=8` 而 macOS runner 只有约 14 GB 空闲，把 IPSW 留整个 job 会直接 `die 'blocked'`。`step_build_os_root` 第 (4) 步自己写明了预期的两遍顺序，所以要查的正是 workflow 有没有做第二遍。**这与事实 43 记的「缺 LZFSE 解码器」是两件不同的事**：后者决定本机能不能自己造出根镜像，前者决定 runner 能不能造出*能读*根镜像的内核——混为一谈正是前者被藏住的原因。
+
+**(3) 内核清点数错了，已更正。** 本文 11.2 此前写「本机四个内核构建」。全盘 `local-private/**/kernel.macho` 共 24 个文件、按 sha256 去重后是 **5 个真构建**（四个 51,859,456 字节、一个 46,415,872 字节；其余 13–73 KB 是占位桩不是内核），五个全部零命中 `NativeVirtioBlock`/`virtio,mmio`/`CONFIG_XNU_NATIVE_VIRTIO_BLOCK`/`VirtioBlock`，对照针 `Libkern`=5、`IOMedia`=28 证明检索有效。少数一个不改变结论，但一个数错的计数会让人以为清点做过了。
+
+**(4) CI 两个红灯都是缺依赖声明，不是代码缺陷。** `tests/integration` **从来没有在 CI 上跑过**：integration job 校验 pin（每次都真过）、证明 HEAD 等于锁里的 commit，然后在裸 runner 解释器上跑 `python -m pytest tests/integration`——没有 pytest，收集阶段就死。`tests/unit` 收集不起来：`test_workflow_contracts.py` 在模块级 import `yaml`，runner 上没有 PyYAML。两处都修了（`[dev]` 加 `pyyaml`；integration job 补上与 preflight 相同的安装步骤）。声明依赖而不是改成「import 失败就 skip」，是因为那个测试存在的全部意义就是让一类**在通常地方看不见**的失败变得可见—— reusable workflow 调用带 `timeout-minutes` 会在 GitHub 建 job 图时就失败，run 零秒完成、`jobs` 为空、没有日志可读——而一个在 CI 上跳过的检查恰恰在那里是不可见的。
+
+### 11.6 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核：仍未构建，因此 launchd PID 1 仍未获取。** 阻断已定位到 runner 的 IPSW/两遍问题（11.5(2)），修法已派 teammate 独立评估。修好之前，任何「根卷可挂载」的说法都是不诚实的。
+- **OS 成员全图解码：解码器已进仓库（`src/unipad/host/lzfse.py`，867 行，纯标准库），但 6 GB 全图未在本机端到端跑完。** 已实测：从 `044-76040-038.dmg` 枚举出 3814 个非终止块（396 raw / 3 零填充 / 3415 LZFSE，与既有记录一致），并用它对**真实块**解码——块 0 是 53 字节压到 512、块 512 是 108 压到 512、块 1024 是 209 压到 16,384，全部成功。这是移植正确的证据，不是全图解码完成的证据。
+- **macOS runner 的 Font.h 修复：代码已改（第三个 pin `uefi_sheng`、`--uefi` 传递、字体 sha256 校验），未在 runner 上验证。** 锁里每一项都已独立核验：仓库 `UniXNU/uefi-sheng` 存在（HTTP 200、默认分支 `sheng`、BSD-2-Clause）、commit `20ac23d5e0937106c2129303dfc931b3390ae660` 是 `sheng` 的尖端、`Font.h` 在锁定路径下 3692 字节、sha256 `d2a3687db67b069f4e34a961e17fd28b0242986e3fa8dd8a7545cab70834fa8e`、git blob sha1 `2ea15a28fe1ad2ddddf1cbbac766aeceb9243183`。`patch-xnu-entry-probe.py:183`、`xnu-panic-screen.c:294`、`board.toml:94` 全部落在所说的行。**该轮曾有一处假声明已被抓出并更正**：它写「导出 `UNIXNU_UEFI` 对 payload 不生效」，而 `cli.py:136` 是 `ctx.uefi = ctx.option('uefi', 'UNIXNU_UEFI')`、`config.py:116` 回落到 `os.environ`——本机跑驱动自己的代码实测：导出后 `ctx.option` 返回该路径，未导出返回 `None`。`payload.py:142` 的覆盖是透传不是清空。选 `--uefi` 仍然对（进 argv.log、`need_uefi()` 读同一个 option），但理由必须是真的。
+- **全量套件在 `tests/acceptance` + `tests/unit` 同进程下有一个跨套件污染失败**：`test_doctor_is_structurally_stable_across_invocations` 在全量下红、在 `tests/unit` 单独跑时全绿（2206 tests / 0 failures / 6 skipped）。`run_cli` 是进程内调用 `cli.main`，pytest 按字母序先跑 acceptance 后跑 unit，所以污染来自 acceptance。**哪个键在动尚未查明**（junit 的失败文本在关键处被截断），已派 teammate 定位；在查明之前不得通过「多 pop 一个键」让它变绿——那个测试的契约就是「doctor 里不是测量的部分不得移动」。
+- **`.tmp-bt/`：38 MB teammate 暂存工作区曾让 `test_the_guard_covers_every_shell_script` 在一次内容完全正常的树上变红**（八份 `build-macos.sh` 副本）。已修：该守卫现在把「本仓库」定义成 git 跟踪的内容，暂存目录叫什么都不会再触发；并实测它仍然能在真正新增一个未被点名的脚本时失败并点名。暂存目录本身仍在本仓库内，已要求移出。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
 
 真机阶段：**BLOCKED**，阻断项见第 6 节，全部指向同一件事——需要一个 macOS runner（或用户自有的 Mac）跑一次 `.github/workflows/build-macos.yml`。跑通之后，M0 的 `clean_build_artifacts` 缺口闭合，M2–M4/WP02–WP04 的 `built_unixnu_kernel_image` 根因才有可能消失，M5 之后的链条才第一次有可观察的对象。
+
+**而"跑一次"具体缺什么，本轮查清了（见 11.5(2)）**：不是缺 runner，是 runner 上 `build-os-root` 永远拿不到本地 IPSW——workflow 只调用一次 `build-macos.sh`、从不传 `--ipsw`，它自己的 IPSW 步骤取完 kernelcache 就把 6.8 GB 镜像删了。于是无链、内核恒 `qemu_defconfig`、第二个块设备永不被枚举。修法候选（保留 IPSW 并在链不再需要时删掉 / 同一 job 内跑两遍 / 只留链需要的成员）已派 teammate 评估，空间约束是 8 GiB 地板对约 14 GiB 空闲，不能靠抬高地板绕过。**在修好并真跑过一次之前，任何"根卷可挂载""launchd 已启动"的说法都是不诚实的。**
 
 在跑那一次之前，任何"P0/P1 验收通过"的说法都是不诚实的。
