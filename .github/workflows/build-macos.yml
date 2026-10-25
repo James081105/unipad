@@ -869,14 +869,16 @@ jobs:
               put material in vendor/ that no pin asked for.
 
               The implementation is unipad.host.source_pins, not this body,
-              because build-macos.sh applies the SAME pins after every driver
-              call -- measured on run 40209085545, where `unixnu build kernel`
-              reset every module submodule to the gitlink and the link script
-              refused with "Rebuild the owned Legacy archive after changing
-              drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp".  Two
-              implementations of "which commit" is the
-              second-place-that-knows-a-sha defect this project keeps hitting,
-              so there is one, and both callers use it.
+              because build-macos.sh applies the SAME pins from its own
+              run_driver, and two implementations of "which commit" is the
+              second-place-that-knows-a-sha defect this project keeps hitting.
+              `pin` is one call with two halves: it moves the checkout AND sets
+              submodule.<path>.update=none so the driver's own
+              `git submodule update --init --recursive` (feeds.py:159-165) stops
+              moving it back.  Measured on run 40217489782: repairing it after
+              the driver call is too late -- the re-pin moved c031d882 ->
+              eb9c949 at 17:50:36.310, one second after the link script had
+              already refused at 17:50:35.288.
 
               The path is put on sys.path HERE rather than inherited from
               PYTHONPATH, because this step's env does not set it and the first
@@ -894,11 +896,11 @@ jobs:
               """
               sys.path.insert(0, str(Path(REPO_ROOT).resolve() / "src"))
               from unipad.errors import UniPadError
-              from unipad.host.source_pins import apply_divergences, read_pins
+              from unipad.host.source_pins import pin, read_pins
 
               try:
                   pins = read_pins(Path(LOCK_PATH))
-                  records = apply_divergences(Path(driver_root), pins)
+                  records = pin(Path(driver_root), pins).moved
               except UniPadError as error:
                   # Re-raised as THIS step's error type, because the step's
                   # contract with its caller is SourcePinError and a caller

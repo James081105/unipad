@@ -10,33 +10,33 @@ where ``NativeLegacyDisplay.cpp:206:59: error: only virtual member functions can
 be marked 'override'`` stopped the owner root chain at its step 9.
 
 The disagreement is only useful if the lock wins *everywhere the sources are
-laid down*, and there are three such places, which is what makes this a module
+laid down*, and there are two halves to that, which is what makes this a module
 rather than a helper in whichever caller needed it first:
 
-1. the workflow's acquisition step, before ``unixnu fetch`` initialises the
-   submodules from the gitlink (``feeds.py:159-165`` reads the DRIVER
-   repository's gitlink table -- a second place that knows a sha);
-2. the chain step, before ``build-os-root.py`` compiles the display driver;
-3. **every** ``unixnu build`` and ``unixnu fetch`` afterwards, because
-   ``cli.py:79-86`` -> ``feeds.py:159-165`` runs ``git submodule update --init
-   --recursive``, which resets every module submodule to the gitlink's commit.
+1. **Move the checkout.**  ``unixnu fetch`` initialises the module submodules
+   from the DRIVER repository's own gitlink table (``feeds.py:159-165``) -- a
+   second place that knows a sha -- and every caller that lays sources down has
+   to apply the lock afterwards.  The workflow's acquisition step and
+   ``build-macos.sh``'s ``run_driver`` both do, through :func:`pin`.
+2. **Stop it being moved back.**  ``cli.py:79-86`` -> ``feeds.py:159-165`` runs
+   ``git submodule update --init --recursive`` at the START of every ``unixnu
+   build`` and ``unixnu fetch``, which resets every module submodule to the
+   gitlink's commit.  Re-applying the pin afterwards is too late: measured on
+   run 40217489782, the re-pin correctly moved ``c031d882 -> eb9c949`` at
+   17:50:36.310, one second AFTER the link script had already refused at
+   17:50:35.288.  :func:`protect` is the half that operates at the right moment,
+   because the command doing the reset is the command that reads the setting.
 
-The third one is the one that was missing, and it is the reason run 40209085545
-died: the chain built the Legacy display archive at the locked ``eb9c949``, the
-second build pass's ``unixnu build kernel`` reset the checkout to the gitlink's
-``c031d882``, and ``build-xnu-4k-baseline.sh:735`` then refused to link with
-``Rebuild the owned Legacy archive after changing
-drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp``.  A caller that has to
-*remember* to re-apply the pin is the same defect one level up, so
-``build-macos.sh`` applies it inside ``run_driver`` -- after every driver call,
-whatever the subcommand, idempotently.
+The first attempt at half 2 put the repair inside ``run_driver`` and believed it
+was sufficient; the runner measured otherwise, in the log, with both timestamps.
 
 What is proven here
 -------------------
 That a checkout whose HEAD differs from the lock is moved to the locked commit
 and reported, that a checkout already there is left alone, that a submodule the
-driver never fetched is not invented, and that a commit that cannot be had is a
-refusal rather than a silence.
+driver never fetched is not invented, that a commit that cannot be had is a
+refusal rather than a silence, and that a protected submodule survives the
+driver's own ``submodule update``.
 """
 
 from __future__ import annotations
@@ -45,16 +45,19 @@ import argparse
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from unipad.errors import ErrorCode, ExitCode, UniPadError
 
 __all__ = [
+    "PinResult",
     "SubmodulePin",
     "SourcePinError",
     "apply_divergences",
+    "pin",
+    "protect",
     "read_pins",
 ]
 
@@ -115,6 +118,43 @@ def read_pins(lock_path: Path) -> list[SubmodulePin]:
     return pins
 
 
+@dataclass(frozen=True)
+class PinResult:
+    """What :func:`pin` did, for the caller's record.
+
+    ``moved`` is the list of submodules that were at the wrong commit and were
+    put right; ``protected`` is the list the driver's own ``submodule update``
+    will now skip.  They are different lists on purpose: a tree that is already
+    correct moves nothing and still needs protecting, and a report that folded
+    the two together could not say so.
+    """
+
+    moved: list[dict[str, str]] = field(default_factory=list)
+    protected: list[str] = field(default_factory=list)
+
+
+def pin(driver_root: Path, pins: list[SubmodulePin]) -> PinResult:
+    """Move every diverging submodule to the locked commit, then keep it there.
+
+    One call, because two calls is the defect this module exists to prevent:
+    the acquisition step used to apply the pins and the chain step used to apply
+    them again, and neither could see a reset that happened afterwards.  The
+    ``protect`` half is what operates at the right moment -- the command doing
+    the reset reads the setting -- and the ``apply_divergences`` half is what
+    puts the checkout there in the first place and repairs it if anything ever
+    does move it.
+
+    The CLI must go through this and not call ``protect`` itself: the first
+    version of it printed the protected count with its own ``protect(...)``
+    call, so removing the call from ``pin`` changed nothing and the test that
+    was supposed to catch that passed anyway.
+    """
+    return PinResult(
+        moved=apply_divergences(driver_root, pins),
+        protected=protect(driver_root, pins),
+    )
+
+
 def _git(directory: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(directory), *arguments],
@@ -146,6 +186,70 @@ def _head_of(directory: Path) -> str:
         text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def protect(driver_root: Path, pins: list[SubmodulePin]) -> list[str]:
+    """Stop the driver from moving the pinned submodules back to the gitlink.
+
+    ``feeds.update_submodules`` runs ``git -C <base> submodule update --init
+    --recursive`` (``feeds.py:159-165``), which resets every module submodule to
+    the commit the DRIVER's gitlink records.  Measured locally against the real
+    ``vendor/UniXNU``::
+
+        $ git -C vendor/UniXNU submodule update --init --recursive
+        Submodule path 'drivers/NativeMobileDisplay': checked out 'c031d882...'
+
+    -- and that is what run 40209085545 and run 40217489782 both died on, in
+    ``build-xnu-4k-baseline.sh:735``:
+
+        Rebuild the owned Legacy archive after changing
+        drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp
+
+    Re-applying the pin *after* the driver call is not enough, and that was
+    measured too: run 40217489782's log shows the re-pin working correctly
+    (``c031d882 -> eb9c949``) at 17:50:36.310, one second *after* the link
+    script had already refused at 17:50:35.288.  The reset happens at the START
+    of the driver call, so everything the call builds -- the archives and the
+    link -- sees the gitlink's commit no matter what runs afterwards.
+
+    ``submodule.<path>.update=none`` is the one lever that operates at the right
+    moment, because it is read by the very command doing the reset.  Measured
+    against the same checkout::
+
+        $ git -C vendor/UniXNU config submodule.drivers/NativeMobileDisplay.update none
+        $ git -C vendor/UniXNU submodule update --init --recursive
+        Skipping submodule 'drivers/NativeMobileDisplay'
+
+    It is set in the driver repository's own ``.git/config``, which is local
+    state and NOT a commit -- so it survives on a runner that clones the pinned
+    repository, and it does not fork a public repository to express a pin.
+
+    ``--init`` is skipped along with the update (measured: a removed submodule
+    stays absent), so this must run only once the submodules are on disk.  In
+    this workflow that is the order: ``unixnu fetch`` initialises them, then the
+    pins are applied and protected.
+    """
+    driver_root = Path(driver_root)
+    protected: list[str] = []
+    for pin in pins:
+        directory = driver_root / pin.path
+        if not directory.is_dir():
+            continue
+        key = f"submodule.{pin.path}.update"
+        result = subprocess.run(
+            ["git", "-C", str(driver_root), "config", key, "none"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SourcePinError(
+                ErrorCode.VERIFICATION_FAILED,
+                f"could not stop the driver from updating {pin.path}",
+                path=pin.path,
+                stderr=result.stderr.strip()[-500:],
+            )
+        protected.append(pin.path)
+    return protected
 
 
 def apply_divergences(
@@ -222,9 +326,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     pins = read_pins(Path(args.lock))
-    moved = apply_divergences(Path(args.driver), pins)
-    if moved or not args.quiet:
-        for record in moved:
+    result = pin(Path(args.driver), pins)
+    if result.moved or not args.quiet:
+        for record in result.moved:
             print(
                 f"{record['path']}: {record['from'] or '<absent>'} -> "
                 f"{record['commit']}"
@@ -235,7 +339,10 @@ def main(argv: list[str] | None = None) -> int:
                     else ""
                 )
             )
-        print(f"source pins: {len(pins)} pinned, {len(moved)} moved")
+        print(
+            f"source pins: {len(pins)} pinned, {len(result.moved)} moved, "
+            f"{len(result.protected)} protected from the driver's own reset"
+        )
     return int(ExitCode.OK)
 
 

@@ -171,12 +171,52 @@ def _workspace(tmp_path: Path) -> tuple[Path, str, str]:
     (upstream / "NativeLegacyDisplay.cpp").write_text("// the locked version\n", encoding="utf-8")
     locked = _commit(upstream, "the locked version")
 
+    # A clone is not a submodule: without .gitmodules and a gitlink entry,
+    # `git submodule update --init --recursive` is a NO-OP, and the first draft
+    # of this workspace passed its "survives the reset" assertion with the
+    # protection removed because there was no reset to survive.  So the
+    # submodule is registered the way the driver repository registers it, with a
+    # .gitmodules file and a gitlink recording `gitlink`.
     submodule = driver / "drivers" / "NativeMobileDisplay"
     subprocess.run(
         ["git", "clone", "-q", str(upstream), str(submodule)],
         capture_output=True,
         text=True,
         check=True,
+    )
+    _git(submodule, "checkout", "-q", "--detach", gitlink)
+    modules = (
+        '[submodule "drivers/NativeMobileDisplay"]\n'
+        "\tpath = drivers/NativeMobileDisplay\n"
+        f"\turl = {upstream.as_posix()}\n"
+    )
+    (driver / ".gitmodules").write_text(modules, encoding="utf-8")
+    _git(driver, "add", ".gitmodules")
+    _commit(driver, "register the module submodule")
+    # The upstream is a local directory, and git refuses `file` transport for
+    # submodules by default (the CVE-2022-39253 mitigation).  Without this the
+    # first `submodule update` that actually has to FETCH dies with
+    # "fatal: transport 'file' not allowed" -- which exits 128 and leaves the
+    # checkout where it was, so the "survives the reset" assertion would pass
+    # with the protection removed.  The real driver's submodules are https; this
+    # is what makes a local fixture behave like one.  It has to be set in BOTH
+    # repositories, because the fetch runs inside the submodule.
+    _git(driver, "config", "protocol.file.allow", "always")
+    _git(submodule, "config", "protocol.file.allow", "always")
+    _git(
+        driver,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{gitlink},drivers/NativeMobileDisplay",
+    )
+    _commit(driver, "the gitlink records the gitlink's version")
+    # Sanity: the reset this test depends on must really be a reset.  Without
+    # this the assertion below would pass for the wrong reason.
+    _git(driver, "submodule", "update", "--init", "--recursive")
+    assert _git(submodule, "rev-parse", "HEAD") == gitlink, (
+        "the fixture's submodule is not registered, so `submodule update` "
+        "cannot move it and the protection under test is never exercised"
     )
     _git(submodule, "checkout", "-q", "--detach", gitlink)
     return driver, gitlink, locked
@@ -269,4 +309,65 @@ def test_the_command_the_shell_builds_repairs_a_reset_submodule(tmp_path: Path) 
         f"an already-pinned tree printed something, so the common path is not "
         f"quiet: {again.stdout!r}"
     )
+    assert _git(submodule, "rev-parse", "HEAD") == locked
+
+
+def test_a_protected_submodule_survives_the_drivers_own_reset(tmp_path: Path) -> None:
+    """The half that actually fixes it, against the command doing the reset.
+
+    Re-applying the pin *after* a driver call is not enough, and that was
+    measured rather than argued: run 40217489782's log shows the re-pin working
+    correctly (``c031d882 -> eb9c949``) at 17:50:36.310, one second AFTER
+    ``build-xnu-4k-baseline.sh:735`` had already refused at 17:50:35.288.  The
+    reset is the driver's FIRST act (``cli.py:79-86`` -> ``prepare()`` ->
+    ``feeds.update_submodules``), so everything the call builds afterwards --
+    the archives and the link -- sees the gitlink's commit no matter what runs
+    once it returns.
+
+    ``submodule.<path>.update=none`` is the one lever that operates at the right
+    moment, because it is read by the very command doing the reset.  This test
+    runs that command -- ``git submodule update --init --recursive``, exactly as
+    ``feeds.py:159-165`` spells it -- and asserts the checkout does not move.
+    """
+    driver, gitlink, locked = _workspace(tmp_path)
+    submodule = driver / "drivers" / "NativeMobileDisplay"
+    lock = _lock(tmp_path, locked, gitlink)
+
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", MODULE, "--lock", str(lock), "--driver", str(driver)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=str(tmp_path),
+        timeout=180,
+    )
+    assert result.returncode == 0, (
+        "the command pin_module_submodules builds did not succeed:\n"
+        + (result.stdout + result.stderr)[-2000:]
+    )
+    assert _git(submodule, "rev-parse", "HEAD") == locked
+
+    # The driver's own reset, spelled the way feeds.py:164 spells it.
+    _git(driver, "submodule", "update", "--init", "--recursive")
+    assert _git(submodule, "rev-parse", "HEAD") == locked, (
+        "the driver's `submodule update` moved the protected submodule back to "
+        f"{gitlink}, so every archive and the link see the gitlink's commit. "
+        "Measured on runs 40209085545 and 40217489782 as "
+        "build-xnu-4k-baseline.sh:735's refusal to link."
+    )
+
+    # ...and it is still protected after a second application, which is what
+    # run_driver does on every driver call.
+    again = subprocess.run(
+        [sys.executable, "-m", MODULE, "--lock", str(lock), "--driver", str(driver)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=str(tmp_path),
+        timeout=180,
+    )
+    assert again.returncode == 0, again.stdout + again.stderr
+    _git(driver, "submodule", "update", "--init", "--recursive")
     assert _git(submodule, "rev-parse", "HEAD") == locked

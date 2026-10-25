@@ -1571,22 +1571,30 @@ run_driver() {
     # `git submodule update --init --recursive` (cli.py:79-86 ->
     # feeds.py:159-165), which resets EVERY module submodule to the commit the
     # DRIVER's gitlink records -- including the ones sources.lock.json
-    # deliberately pins elsewhere.  Measured on run 40209085545: the owner root
-    # chain built the Legacy display archive at the locked eb9c949, the second
-    # build pass's `unixnu build kernel` reset the checkout to the gitlink's
-    # c031d882, and build-xnu-4k-baseline.sh:735 then refused to link with
+    # deliberately pins elsewhere.  Measured on runs 40209085545 and
+    # 40217489782: the owner root chain built the Legacy display archive at the
+    # locked eb9c949, `unixnu build kernel` reset the checkout to the gitlink's
+    # c031d882, and build-xnu-4k-baseline.sh:735 refused to link with
     # "Rebuild the owned Legacy archive after changing
     # drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp" -- nine steps from
     # anything that looked like a submodule problem.
     #
-    # So it is re-applied HERE, after every driver call whatever the
-    # subcommand, rather than remembered by each caller: a caller that forgets
-    # is the same defect one level up, and the chain step's own forcing (which
-    # runs once, before build-os-root.py) cannot see a reset that happens
-    # afterwards.  It is idempotent -- a rev-parse per pinned submodule, and a
-    # fetch only for one that actually moved -- so it costs nothing on the
-    # common path.  A pin that cannot be applied is a refusal, not a warning:
-    # the build would otherwise not be the pinned one.
+    # The half that actually fixes it is inside the module: `pin` also sets
+    # submodule.<path>.update=none, which is read by the very command doing the
+    # reset ("Skipping submodule ..."), so the reset stops happening at all.
+    #
+    # This call is the belt to that braces -- measured on run 40217489782, a
+    # repair here ran at 17:50:36.310, one second AFTER the link script had
+    # refused at 17:50:35.288, because the reset is the driver's FIRST act and
+    # everything it builds afterwards sees the gitlink's commit.  It stays
+    # because it is idempotent (a rev-parse per pinned submodule, a fetch only
+    # for one that really moved) and because it is what would notice a future
+    # driver that ignores the setting.
+    #
+    # It is applied HERE, after every driver call whatever the subcommand,
+    # rather than remembered by each caller: a caller that forgets is the same
+    # defect one level up.  A pin that cannot be applied is a refusal, not a
+    # warning: the build would otherwise not be the pinned one.
     pin_module_submodules "$step"
     return "$status"
 }

@@ -409,6 +409,23 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 - **run 40214067252 暴露的 import 缺陷：修法与测试都已于本轮之前补上，但尚未在 runner 上验证。** 步骤现在自己把 `src` 放进 `sys.path`，而为它写的测试用子进程 + `-S` 复现了 runner 上那条 `ModuleNotFoundError`。**仍未测量**：一次真的 acquisition。
 - **`run_driver` 里的 re-pin 在真 runner 上的开销未测量。** 每个驱动调用多 21 次 `git rev-parse`（锁里的子模块数），只有真发生分歧的才 fetch。设计上是幂等且廉价的，但没有量过。
 
+### 11.15 第七轮：re-pin 放错了位置，而定位它的是同一个 log 里的两个时间戳（事实 53，2026-10-26）
+
+**(1) 上一轮的修法被 runner 判为「工作正常但时机错误」。** run 40217489782：链再次 `os_root_status=pass`，第二遍再次死在 `build-xnu-4k-baseline.sh:735`。而 log 同时打印了 `17:50:35.288 Rebuild the owned Legacy archive after changing ...`（链接脚本拒绝）与 `17:50:36.310 pins: drivers/NativeMobileDisplay: c031d882 -> eb9c949`（re-pin 正确修好了）。**后者比前者晚一秒。**
+
+**(2) 根因是作用时刻，不是作用位置。** `cli.py:79-86` 的 `prepare()` 第一句就是 `feeds.update_submodules`，跑 `git submodule update --init --recursive`——重置是驱动调用的**第一个**动作，所以这次调用里建的 10 个 archive 与链接全部看到 gitlink 的提交。驱动返回之后修什么都已经晚了。**这是被两个时间戳定位的，不是被推理定位的**，而它推翻了上一轮「放这里就行」的判断。
+
+**(3) 修法是让执行重置的那条命令自己跳过。** `submodule.<path>.update=none`。本机对真的 `vendor/UniXNU` 量了三个事实：不设它 → `Submodule path 'drivers/NativeMobileDisplay': checked out 'c031d882...'`（确实重置）；设了它 → `Skipping submodule 'drivers/NativeMobileDisplay'`（检出不动）；`--init` 跟着被跳过（删掉目录再跑不会重新克隆），**所以保护必须在子模块落盘之后才设**——本 workflow 的顺序正是如此。它写在 `.git/config`：本地状态而非提交，在每次重新克隆的 runner 上依然有效。
+
+**(4) 为它写的测试经历了三轮才真的有牙齿，每一轮都是一种新的假绿。** (1) pytest 进程里删 `PYTHONPATH` 无效（`src` 在本机 `sys.path` 上，`sys.modules` 直接给答案）→ 子进程 + `-S` 才复现 runner 的 `ModuleNotFoundError`。(2) 合成工作区只有 clone 没有 `.gitmodules`，`submodule update` 是空操作，删掉保护照样过 → 补 `.gitmodules` 与 gitlink。(3) 补上后撞 `fatal: transport 'file' not allowed`，退出 128 而检出没动，**又是假绿** → 设 `protocol.file.allow=always`（驱动与子模块两处）才拿到契约本身的失败。**至此四种假红加三种假绿，共同点是没有真的去看失败信息指的是不是那个契约，也没有真的确认被抵抗的动作真的发生了。**
+
+### 11.16 本轮新增的未验证项（不得冒充的部分）
+
+- **`qemu_root_defconfig` 内核：仍未构建出来，连续第四轮。** 四次死因各不相同（相对 refer 路径、kernelcache 缓存缺失、子模块重置、re-pin 时机）。`update=none` 的修法已推送，**验证它的 run 尚未触发**。
+- **`update=none` 是否会被 runner 上某些 git 版本或 driver 行为绕过：未测量。** 它依赖 git 对 `submodule.<path>.update` 的既有语义（`git help submodule`），本机 git 已量；runner 的 git 版本不同，未量。
+- **`--init` 被跳过这一语义的后果：未在任何真 runner 上测量。** 本机已量（缺失的子模块不会被重新克隆）。本 workflow 的顺序保证子模块先落盘，但如果将来有人把保护移到 `unixnu fetch` 之前，会得到「子模块永不初始化」——这一点只有注释与测试守着，没有门禁。
+- **本机 QEMU 上的根卷挂载与 launchd PID 1：仍为零。** 见 11.8 / 11.10 / 11.12 / 11.14。
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
