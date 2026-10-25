@@ -273,7 +273,41 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 | M0 AI 接口冒烟记录 | `artifacts/m0/ai-smoke.json` | 存在（gitignored，不入 Git） |
 | 源码分支策略 | `docs/rollback.md` D2 | 运行版本指针与磁盘恢复、源码分支管理三者分离 |
 
-## 10. 结论与下一步
+## 10. 根卷轮实测（2026-10-25，事实 37–43）
+
+这一节记录的是**本机 Windows QEMU TCG 上的一次次真实运行**，不是对进度的转述。所有数字都能在 `local-private/boot7`–`boot11` 里复现。
+
+### 11.1 已经实测到的
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| 真访客启动到 BSD 阶段 | **VERIFIED-ON-HOST** | `boot8`：QMP over TCP 读活访客，`allproc` 走出 `kernel_task` pid 0，`msgbufp` 反卷出 17,084 字节完整 XNU 23.6.0 日志（APFS 已加载、Skywalk 自测全过、`bsd_autoconf: calling kminit`） |
+| 根卷挂载侧 | **CODE COMPLETE + 本机实测 argv 被接受、设备被创建** | `build_argv(root_image=…)` 发出只读 `virtio-blk-device`（MMIO）+ `-global virtio-mmio.force-legacy=false`；`query-block` 报 `device=osroot inserted=True`，`esp` 仍是独立设备 |
+| OS 根卷容器 | **本机解出，字节级校验通过** | `udif.py` 解出 6,077,580,800 字节；GPT 头 CRC32 0xd9e4279c 与分区项 CRC32 0xfa7a560c 双双匹配；399 个免库块与一份独立实现逐字节相同（0 处不符） |
+| 内核等的 UUID 就在解出的镜像里 | **VERIFIED** | 唯一 APFS 卷的卷超级块（block 15900，oid 1026，type 0xd）在 `+0xf0` 处正是 `04769d262ca04825b443e2e5f88300f2`，与内核 `Waiting on … IOMedia … UUID 04769D26-…` 一致 |
+
+### 11.2 阻断是什么，精确地说
+
+**不是镜像，是内核配置。** 实测：把 3.3 GB 裸 APFS 的 SystemOS 镜像作为第二个 virtio-blk 挂上，访客走到与不挂盘时完全相同的位置（17,113 字节日志、`bsd_autoconf` 在、仍在等同一个 UUID），整个内核日志里除 `Waiting on` 那一行本身外**零**块设备枚举。
+
+原因是配置而不是运气：`qemu_defconfig`（本机四个内核构建全部用它）没有 `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`，而 `qemu_root_defconfig` 才加它，并且同时要 owner root chain 的七个开关、两个内核步骤之外产出的归档、Data seed 与 trust cache。全盘四个 `kernel.macho` 逐个查过，`NativeVirtioBlock`/`VerifiedRootProbe`/`NativeRamBlock`/`NativeLegacyDisplay`/`owner-data` 五个串**全部为 0**（`Libkern` 为 5，证明检索有效）。
+
+**传输层也差一点就错。** `NativeVirtioBlock::probe()`（`NativeVirtioBlock.cpp:148-154`）在 provider 的 `compatible` 不是恰好 12 字节 `"virtio,mmio"` 时返回 `nullptr`，所以 `virtio-blk-pci` 永远绑定不上。第一版代码用的正是 PCI，而 QEMU 毫不抱怨地接受了那条 argv——跑得起来、日志正常，只有去读那个永远不会绑定它的驱动的 `probe()` 才发现错。
+
+### 11.3 本轮同时修掉的门禁缺陷（这与根卷无关，但是同一次测量逼出来的）
+
+1. **`_has_sparse_index_symbol` 只读文件最后 8 MiB**，理由「Mach-O 字符串表在 `__LINKEDIT`」——对*已链接*镜像成立，对本机启动的 prelinked 内核不成立（符号在 17,058,661 / 51,859,456，窗口从 43,470,848 开始）。于是对一个**有**该符号的内核报「不存在」，七个里程碑因一个不成立的理由停在 BLOCKED。改成全文件分块扫描；stock kernelcache 全文 0 次命中，是阴性对照，仍须拒绝。
+2. **`_probe_esp_efi_chain` 只认 `MiniEfi: alive`**（旧实验的*测试*载荷），于是在一个 DarwinBoot 早已真实运行的本机上记 `darwinboot: False`。
+3. **对抗审查发现第 2 条的修法本身放宽了门禁**：匹配裸 `DARWINBOOT:` 让一句 `Error: DARWINBOOT: image not found` 或一条注释就能置真并压制 PRD 209 的 veto（实测 M3 从 FAIL 变 UNVERIFIED 且无拒绝）。已改成只匹配 `DARWINBOOT: hand-off to the kernel`。
+
+### 11.4 现场未验证项（本节不得冒充的部分）
+
+- **launchd PID 1 与后续守护进程：未获取。** 根卷未挂载，`vfs_mountroot` 一直阻塞，访客在 `bsd_autoconf` 之后没有新进程。观察通道本身已就绪（30 项合成测试 + 一次真访客实测），缺的是被观察的对象。
+- **macOS 预处理链：代码完成，未在 runner 上执行。** `scripts/macos/build-macos.sh` 的 `build-os-root` stage 与 defconfig 切换是本轮新增；它需要 `hdiutil`、`diskutil`、brew `openssl@3` 与 Xcode，本机全无。`not_run` 理由由脚本自己记录，不由本报告代述。
+- **OS 成员的全图解码：未在本机完成。** 3814 块里 3415 块是 LZFSE，Python 标准库没有解码器。GPT CRC 与卷 UUID 的结论是由一份独立实现得出的；`udif.py` 与之交叉验证的部分是 399 个免库块。
+- **新根目录拓宽了 ONSITE 证据面。** 已实测一个放在 `local-private/boot7/run/guest.log` 的合成 guest log 能满足 M3 全部三个 `_ONSITE` 要求（同一文件放在带 simulation 标记的路径下则正确被判 SIMULATION 且什么都不满足）。这是既有类别的拓宽（`out/real-boot` 早就如此），当前视口内 guest log 数为 0。
+
+## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
 
