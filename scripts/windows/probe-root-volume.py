@@ -13,9 +13,26 @@ The kernel is observed through :mod:`unipad.host.guestobserve` while QEMU is
 still running, which is the only way to read its process list: ``allproc`` is a
 kernel data structure, not something the serial log reports.
 
-This script takes a ``--root-image`` and attaches it exactly as
-:func:`unipad.host.unixnu_boot.build_argv` does, so what is measured here is
-what the launcher would start -- not a hand-rolled argv that could differ.
+This script stages the ESP and seeds ``vars.fd`` exactly as
+:func:`unipad.host.unixnu_boot.boot` does, and attaches ``--root-image`` exactly
+as :func:`unipad.host.unixnu_boot.build_argv` does, so what is measured here is
+what the launcher would start -- not a hand-rolled argv that could differ.  An
+earlier version copytree'd a previous run's ESP and byte-copied the firmware
+into ``vars.fd``, which is a different EDK II variable store and therefore a
+different machine; both are now generated the way ``boot()`` generates them.
+
+**Exit codes.** 0 means a mountpoint marker appeared in the kernel log.  4 means
+the guest never reached the kernel hand-off.  5 means the deadline expired
+first.  2 and 3 are refusals before QEMU starts.  A run that gave up used to
+return 0, which made a failure indistinguishable from a success.
+
+**One unbounded call.** ``guestobserve`` has no deadline of its own and its QMP
+client takes a 10 s default per command, so a single ``go.main()`` can block far
+longer than ``--seconds`` -- the deadline is only evaluated *between* calls.  The
+worst case is a guest whose process list is at ``MAX_PROCESSES`` and whose
+``msgbuf`` claims the full 16 MiB.  That is a ``guestobserve`` limitation this
+probe inherits rather than fixes; it is recorded so nobody reads a long run as a
+hang, or a hang as a long run.
 
 Usage
 -----
@@ -38,13 +55,34 @@ sys.path.insert(0, str(REPO / "src"))
 from unipad.host import guestobserve as go  # noqa: E402
 from unipad.errors import UniPadError  # noqa: E402
 from unipad.host.udif import LzfseDecoder, UdifImage  # noqa: E402
-from unipad.host.unixnu_boot import BootInputs, build_argv, read_board_payload  # noqa: E402
+from unipad.host.adt import read_board_adt  # noqa: E402
+from unipad.host.unixnu_boot import (  # noqa: E402
+    MEMORY_MIB,
+    SCREEN,
+    BootInputs,
+    build_argv,
+    read_board_payload,
+    stage_esp,
+)
 
 QEMU = REPO / "local-private/tools/qemu/qemu-system-aarch64.exe"
 FIRMWARE = REPO / "local-private/tools/qemu/share/edk2-aarch64-code.fd"
 DEVICE_DIR = REPO / "vendor/UniXNU-qemu"
-SOURCE_ESP = REPO / "local-private/boot7/run2/esp"
-KERNEL = REPO / "local-private/boot7/boot-inputs/unixnu-out/qemu/kernel/kernel.macho"
+#: The boot inputs, from the macOS runner's payload build.  The device tree is
+#: the one exception and is explained at its use site.
+INPUTS = REPO / "local-private/boot7/boot-inputs"
+UNIXNU_EFI = INPUTS / "UniXNU.efi"
+KERNEL = INPUTS / "unixnu-out/qemu/kernel/kernel.macho"
+DARWINBOOT_EFI = (INPUTS / "unixnu-out/qemu/tree/build/darwinboot-efi/build"
+                  / "DarwinBoot/DEBUG_CLANGPDB/AARCH64/DarwinBoot.efi")
+#: Where a generated device tree can be found.  The payload build that would
+#: have written one into the bundle failed on a missing font header, so the
+#: bundle carries none -- its own manifest records the role as ``absent`` --
+#: and the trees that exist are inside previously staged ESPs.  That is a
+#: stale copy, and it is *verified against the board* on every run rather than
+#: trusted; see verify_adt_matches_board.
+STAGED_ADT = (REPO / "local-private/boot7/run2/esp/EFI/UniXNU/Payloads"
+              / "kernel.macho.adt")
 KERNEL_SHA = "9d4b1ab14d74fdfa6afeac12871427e26441cab9f3e2efc97e42b103275643e0"
 
 #: Which board member a given image is, by the digest board.toml [ipsw.sha256]
@@ -96,15 +134,63 @@ def is_udif(path: Path) -> bool:
         return False
 
 
+def board_root_uuid() -> str:
+    """The UUID the board tells the kernel to match the root volume by."""
+    import tomllib
+
+    board = tomllib.loads((DEVICE_DIR / "board.toml").read_text(encoding="utf-8"))
+    adt = board.get("payload", {}).get("adt", {})
+    uuid = adt.get("root_match_volume_uuid")
+    if not isinstance(uuid, str) or not uuid.strip():
+        raise SystemExit("board.toml [payload.adt] names no root_match_volume_uuid")
+    return uuid.strip()
+
+
+def verify_adt_matches_board(adt: Path, uuid: str) -> None:
+    """Refuse a device tree that does not publish the board's root UUID.
+
+    The tree this probe uses comes from a previously staged ESP, because the
+    payload build that would have written a fresh one into the bundle failed on
+    a missing font header.  A stale copy is only safe if something checks it,
+    and the property that matters for *this* probe is the one that decides what
+    the kernel waits for: ``/chosen/root-matching``.  It is stored as an XML
+    string inside the Apple-format tree, so a byte search is enough and avoids
+    depending on the shape of unipad.host.adt.parse_adt's return value.
+    """
+    blob = adt.read_bytes()
+    if uuid.encode() not in blob:
+        raise SystemExit(
+            f"{adt.name} does not carry the board's root_match_volume_uuid "
+            f"{uuid}; it is a stale tree and this probe would measure the "
+            "wrong UUID"
+        )
+    print(f"device tree carries the board's root UUID {uuid}", flush=True)
+
+
 def go_decode(source: Path, destination: Path) -> dict:
     """Decode a UDIF container to raw bytes, or raise naming what is missing.
 
     No LZFSE decoder is supplied, which is the honest default on this host:
     Python's standard library has none, and 3415 of the OS member's 3814 chunks
     are LZFSE.  The refusal says so rather than producing a partial image.
+
+    Progress is reported every 256 chunks because the LZFSE path is the
+    bottleneck by two orders of magnitude -- measured ~2 MB/s of output on this
+    host, roughly an hour for a 6 GB image, against ~31 s for the I/O side --
+    and a silent hour-long loop is indistinguishable from a hang.
     """
     image = UdifImage(source)
-    return image.write_raw(destination, LzfseDecoder())
+    begun = time.monotonic()
+
+    def progress(done: int, total: int, elapsed: float) -> None:
+        if done == total or done % 256 == 0:
+            rate = done / elapsed if elapsed > 0 else 0.0
+            print(f"  {done}/{total} chunks, {elapsed:.0f}s, {rate:.0f} chunks/s",
+                  flush=True)
+
+    print(f"decoding {image.raw_size} bytes from {len(list(image.chunks()))} chunks ...",
+          flush=True)
+    return image.write_raw(destination, LzfseDecoder(), progress=progress)
 
 
 def free_port() -> int:
@@ -139,6 +225,15 @@ def main() -> int:
     # volume it contains is exactly the one the kernel waits for.
     if args.decode_udif or is_udif(root):
         decoded = args.run / "os-root.raw"
+        # The probe owns this path, so it clears it.  udif.write_raw refuses to
+        # overwrite an existing image -- correctly, it protects user data -- and
+        # its own cleanup is a `except BaseException`, which a SIGTERM does not
+        # raise: `timeout 60 probe ...` leaves a partial file behind that then
+        # blocks every retry with "refusing to overwrite".  Measured.  Removing
+        # it here is safe precisely because this path is inside the probe's own
+        # run directory, which the probe rmtree's at the start anyway.
+        if decoded.exists():
+            decoded.unlink()
         print(f"{root.name} is a UDIF container; decoding to {decoded.name} ...", flush=True)
         try:
             record = go_decode(root, decoded)
@@ -171,25 +266,80 @@ def main() -> int:
     run = args.run
     if run.exists():
         shutil.rmtree(run, ignore_errors=True)
-    (run / "esp").mkdir(parents=True)
-    print(f"staging the ESP into {run / 'esp'} ...", flush=True)
-    shutil.copytree(SOURCE_ESP, run / "esp", dirs_exist_ok=True)
-    shutil.copyfile(FIRMWARE, run / "vars.fd")
+    run.mkdir(parents=True, exist_ok=True)
 
-    # The same inputs unixnu_boot.boot() takes, so the argv it builds is the argv
-    # the launcher would build -- this probe measures the launcher, not a copy.
+    # The board's declaration, read once and *used*.  An earlier version of this
+    # probe computed ``spec`` and then threw it away, so the board's kernel_args,
+    # its ``loader must be "driver"`` check and its ``dram_size`` never reached
+    # the guest -- the probe booted whatever the copied ESP happened to say, at
+    # 6144 MiB regardless of what the board declares, where ``boot()`` refuses a
+    # mismatch.
     spec = read_board_payload(DEVICE_DIR)
+    board_adt = read_board_adt(DEVICE_DIR)
+    memory_mib = board_adt.dram_size >> 20
+    if memory_mib != MEMORY_MIB:
+        print(f"board declares {memory_mib} MiB but this module gives the machine "
+              f"{MEMORY_MIB} MiB; refusing rather than booting a different board")
+        return 2
+
+    # The same inputs, staged the same way.  An earlier version copytree'd a
+    # *previous run's* ESP out of local-private/boot7/run2 and seeded vars.fd
+    # with a byte copy of the firmware -- where boot() regenerates the ESP from
+    # the current inputs and truncates vars.fd to zeros.  Both are 64 MiB, but
+    # one is the EDK II variable store pre-loaded with the firmware's own bytes
+    # and the other is empty: different machines, invisible in the serial log
+    # this probe reads.  The in-repo precedent for doing it right is
+    # probe-guest-cpu.py, which calls stage_esp.
+    #
+    # Sources, not destinations.  An earlier version named the ESP's own paths
+    # here, which stage_esp rmtree's before it writes them -- so the inputs were
+    # unusable by boot() and the comment claiming they were "the same inputs
+    # boot() takes" was false in exactly the way that matters.  The device tree
+    # is the one input whose fresh source is absent, so it is verified against
+    # the board rather than trusted.
+    verify_adt_matches_board(STAGED_ADT, board_root_uuid())
     inputs = BootInputs(
         firmware=FIRMWARE,
         kernel=KERNEL,
-        devicetree=run / "esp" / "EFI/UniXNU/Payloads/kernel.macho.adt",
-        darwinboot=run / "esp" / "EFI/UniXNU/Payloads/DarwinBoot.efi",
-        unixnu=run / "esp" / "EFI/BOOT/BOOTAA64.EFI",
-        payload_toml=run / "esp" / "EFI/UniXNU/unixnu.toml",
+        devicetree=STAGED_ADT,
+        darwinboot=DARWINBOOT_EFI,
+        unixnu=UNIXNU_EFI,
+        # Deliberately None: stage_esp *generates* unixnu.toml from the board's
+        # own spec, which is what makes the board's kernel_args reach the guest.
+        payload_toml=None,
     )
+    esp = run / "esp"
+    print(f"staging the ESP into {esp} ...", flush=True)
+    staged = stage_esp(inputs, esp, spec)
+    # The five payload files, counted without the ``_esp`` bookkeeping key that
+    # stage_esp also returns -- an earlier version of this check counted every
+    # key and refused a correct staging with "wrote 6 entries, expected 5".
+    # The sizes come from the copy that just happened rather than from a second
+    # stat of a path a later edit could move, and a missing file here is a boot
+    # that never reaches the kernel.
+    expected = 5
+    files = {k: v for k, v in staged.items() if k.startswith("EFI/")}
+    if len(files) != expected:
+        print(f"stage_esp wrote {len(files)} payload files, expected {expected}: "
+              f"{sorted(files)}")
+        return 2
+    for relative, size in sorted(files.items()):
+        print(f"  {relative}  {size} bytes", flush=True)
+
+    # The writable vars flash, truncated to exactly the code flash's size --
+    # zeros, not a copy of the firmware.  Same condition boot() uses.
+    vars_path = run / "vars.fd"
+    code_size = FIRMWARE.stat().st_size
+    if not vars_path.is_file() or vars_path.stat().st_size < code_size:
+        with vars_path.open("wb") as handle:
+            handle.truncate(code_size)
     port = free_port()
+    # Only with the driver that reads it, decided the way boot() decides: a
+    # geometry nothing set is a claim the run cannot support.
+    ramfb_size = SCREEN if (esp / "EFI/UniXNU/Payloads/QemuRamfb.efi").is_file() else None
     argv = [str(QEMU)] + build_argv(
-        QEMU, inputs, run / "esp", run, qmp_port=port, root_image=root
+        QEMU, inputs, esp, run, qmp_port=port, memory_mib=memory_mib,
+        ramfb_size=ramfb_size, root_image=root
     )
     (run / "command.txt").write_text(" ".join(argv), encoding="utf-8")
     print(f"root image {root} ({root.stat().st_size} bytes); qmp port {port}", flush=True)
@@ -200,6 +350,7 @@ def main() -> int:
     #: so the marker is read out of the msgbuf the observer already fetches.
     MARKERS = ("Waiting on", "bsd_autoconf", "mountroot", "IOMedia")
 
+    started = time.monotonic()
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     serial = run / "serial.log"
     kernel_log = run / "kernel.log"
@@ -240,7 +391,7 @@ def main() -> int:
                 "--kernel", str(KERNEL),
                 "--expected-sha256", KERNEL_SHA,
                 "--serial", str(serial),
-                "--run-id", "boot9",
+                "--run-id", run.name,
                 "--log", str(kernel_log),
                 "--scratch", str(run / "pmem.bin"),
             ])
@@ -255,8 +406,17 @@ def main() -> int:
                 print(f"qemu exited with {process.returncode}", flush=True)
                 return 0
             time.sleep(6.0)
-        print(f"gave up after {attempts} observations", flush=True)
-        return 0
+        # Non-zero, and it has to be.  An earlier version returned 0 here, so a
+        # run where the kernel never reached a mountpoint marker was
+        # indistinguishable from a successful one at the process level -- measured
+        # 306 s, 44 observations and exit 0 on a guest that never got there.  The
+        # elapsed time is printed because the deadline is only evaluated *between*
+        # observations, and one ``go.main()`` can block far longer than the whole
+        # budget (see the guestobserve deadline note in the module docstring).
+        print(f"GAVE UP after {attempts} observation(s) and "
+              f"{time.monotonic() - started:.0f}s: no mountpoint marker appeared",
+              flush=True)
+        return 5
     finally:
         if process.poll() is None:
             process.kill()
