@@ -379,11 +379,23 @@ def decode_lzfse_block(src, at, h, out, out_pos):
                                        D_EXTRA_BITS, D_BASE_VALUE)
 
     # ---- literals: 4 interleaved FSE streams (lzfse_decode_base.c:441-484) --
+    #
+    # NOTE there is deliberately no "n_literal_payload_bytes == 0" refusal here.
+    # The reference has none (grep the C: the only guards are the header_size /
+    # payload bounds check at lzfse_decode_base.c:406-410 and
+    # lzfse_check_block_header_v1).  An empty literal payload is LEGAL: the
+    # literal stream's initial accumulator is then the 7 bytes immediately
+    # before the LMD payload (fse_in_checked_init64, lzfse_fse.h:309-316), which
+    # is the tail of the freq table.  Measured on the real image
+    # (local-private/out/components/044-76040-038.dmg): chunk 53 is a bvx2 block
+    # with n_literals=4, n_literal_payload_bytes=0, n_matches=446,
+    # n_lmd_payload_bytes=627, header_size=128, and 128+0+627+4 == its 759
+    # compressed bytes exactly -- so it is one block plus the bvx$ terminator,
+    # and it is the block, not a fragment.  A refusal here reddened
+    # test_root_volume_probe_decoder.py on the first spread sample.
     n_lit = h['n_literals']
     literals = bytearray(n_lit)
     if n_lit:
-        if not h['n_literal_payload_bytes']:
-            raise DecodeError('n_literals > 0 but the literal payload is empty')
         lit_end = at + h['header_size'] + h['n_literal_payload_bytes']
         # buf_start is src_begin, i.e. offset 0 of the whole stream.
         stream = InStream(src, lit_end, h['literal_bits'], 0)
@@ -418,8 +430,10 @@ def decode_lzfse_block(src, at, h, out, out_pos):
     lit_pos = 0
     D = -1
     if h['n_matches']:
-        if not h['n_lmd_payload_bytes']:
-            raise DecodeError('n_matches > 0 but the LMD payload is empty')
+        # No "n_lmd_payload_bytes == 0" refusal either, for the same reason as
+        # the literals': the reference decides in fse_in_init (lzfse_fse.h:300-325),
+        # and fse_bit_count is int32_t (lzfse_fse.h:54) so a negative lmd_bits
+        # reaches the 8-byte path exactly as it does here.
         stream = InStream(src, lmd_start + h['n_lmd_payload_bytes'],
                           h['lmd_bits'], lmd_start)
         buf, pos, accum, nbits = stream.buf, stream.pos, stream.accum, stream.nbits

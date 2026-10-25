@@ -506,6 +506,81 @@ def test_a_v1_block_whose_payload_sizes_are_zero_still_advances() -> None:
     assert decode(_v1_block() + _raw(b"HELLO") + _end(), 5) == b"HELLO"
 
 
+def test_a_v1_block_with_no_literal_payload_still_decodes_its_literals() -> None:
+    """``n_literal_payload_bytes == 0`` with ``n_literals > 0`` is LEGAL.
+
+    This is the block shape that reddened
+    ``tests/acceptance/test_root_volume_probe_decoder.py`` on the real OS image
+    (``local-private/out/components/044-76040-038.dmg``): a ``bvx2`` block with
+    ``n_literals=4``, ``n_literal_payload_bytes=0``, ``n_matches=446``,
+    ``n_lmd_payload_bytes=627``, ``header_size=128`` -- and 128+0+627+4 is its 759
+    compressed bytes exactly, so it is one block plus the ``bvx$`` terminator.
+
+    The reference has no guard for it.  ``fse_in_checked_init64``
+    (lzfse_fse.h:309-316) takes its 7-byte path when the stored bit count is 0,
+    and reads them from immediately before the LMD payload -- which, with no
+    literal payload, is the tail of the freq table.  So the literals are seeded
+    from the header's own last bytes, and that is what the encoder writes.
+
+    An earlier version of this module refused the shape outright
+    ("n_literals > 0 but the literal payload is empty"), inherited from the
+    private kernelcache decoder it was ported from -- which never met it, because
+    all 939 of that file's blocks carry a literal payload.  The guard was not
+    merely redundant: it made 19 of the first 80 real OS chunks undecodable.
+
+    Built here as a ``bvx1`` block rather than a ``bvx2`` one so the freq tables
+    are plain ``uint16_t`` arrays and the whole block is spelled out instead of
+    packed.  What it decodes to is four zero bytes: the literal table puts symbol
+    0 in every state, and the seed bytes are zero.
+    """
+    blob = bytearray(lzfse._V1_SIZEOF)
+
+    def field(offset: int, fmt: str, value: int) -> None:
+        struct.pack_into(fmt, blob, offset, value)
+
+    field(lzfse._V1["magic"], "<I", lzfse.MAGIC_LZFSE_V1)
+    field(lzfse._V1["n_raw_bytes"], "<I", 4)               # 4 literals, no match bytes
+    field(lzfse._V1["n_payload_bytes"], "<I", 7)           # 0 literal + 7 LMD
+    field(lzfse._V1["n_literals"], "<I", 4)
+    field(lzfse._V1["n_matches"], "<I", 1)
+    field(lzfse._V1["n_literal_payload_bytes"], "<I", 0)   # <-- the case under test
+    field(lzfse._V1["n_lmd_payload_bytes"], "<I", 7)
+    field(lzfse._V1["literal_bits"], "<i", 0)
+    field(lzfse._V1["lmd_bits"], "<i", 0)
+    field(lzfse._V1["l_state"], "<H", 0)
+    field(lzfse._V1["m_state"], "<H", 0)
+    field(lzfse._V1["d_state"], "<H", 0)
+    # l_freq[4] owns every L state, so the L decode returns L_BASE_VALUE[4] == 4
+    # with no extra bits -- the one triple that flushes exactly four literals.
+    field(lzfse._V1["l_freq"] + 2 * 4, "<H", lzfse.L_STATES)
+    field(lzfse._V1["m_freq"], "<H", lzfse.M_STATES)       # M == 0
+    field(lzfse._V1["d_freq"] + 2 * 1, "<H", lzfse.D_STATES)  # D == 1, the first
+    #                                                          match's only legal D
+    field(lzfse._V1["literal_freq"], "<H", 512)            # symbols 0 and 1 share
+    field(lzfse._V1["literal_freq"] + 2, "<H", 512)        # the 1024 literal states
+
+    block = bytes(blob) + b"\x00" * 7                      # the LMD payload, all zero
+    assert len(block) == lzfse._V1_SIZEOF + 7
+    assert decode(block + _end(), 4) == b"\x00\x00\x00\x00"
+
+
+def test_a_v1_block_with_matches_but_no_lmd_payload_is_still_refused() -> None:
+    """The mirror of the test above, and the reason the guard was not simply deleted.
+
+    An empty literal payload is legal; an empty LMD payload is not.  The
+    reference decides both in ``fse_in_init``, and for the LMD stream it passes
+    ``s->src`` as ``buf_start`` (lzfse_decode_base.c:500) -- the start of the LMD
+    payload, not of the block.  So with no payload the 7 bytes it needs would
+    come from before the payload begins, which is a range it refuses.
+    """
+    block = bytearray(_v1_block())
+    struct.pack_into("<I", block, lzfse._V1["n_matches"], 1)
+    struct.pack_into("<I", block, lzfse._V1["n_lmd_payload_bytes"], 0)
+    with pytest.raises(DecodeError) as caught:
+        decode(bytes(block) + _end(), 0)
+    assert "underflow" in str(caught.value), caught.value
+
+
 # ---------------------------------------------------------------------------
 # (b) uncompressed and end-of-stream blocks
 # ---------------------------------------------------------------------------

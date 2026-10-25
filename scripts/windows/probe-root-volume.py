@@ -54,7 +54,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from unipad.host import guestobserve as go  # noqa: E402
 from unipad.errors import UniPadError  # noqa: E402
-from unipad.host.udif import LzfseDecoder, UdifImage  # noqa: E402
+from unipad.host.udif import UdifImage, default_lzfse  # noqa: E402
 from unipad.host.adt import read_board_adt  # noqa: E402
 from unipad.host.unixnu_boot import (  # noqa: E402
     MEMORY_MIB,
@@ -170,14 +170,21 @@ def verify_adt_matches_board(adt: Path, uuid: str) -> None:
 def go_decode(source: Path, destination: Path) -> dict:
     """Decode a UDIF container to raw bytes, or raise naming what is missing.
 
-    No LZFSE decoder is supplied, which is the honest default on this host:
-    Python's standard library has none, and 3415 of the OS member's 3814 chunks
-    are LZFSE.  The refusal says so rather than producing a partial image.
+    The decoder is the repo's own pure-stdlib port (``unipad.host.lzfse``,
+    reached through ``udif.default_lzfse``).  It used to be omitted, which was
+    the honest default while the standard library had no LZFSE decoder and 3415
+    of the OS member's 3814 chunks are LZFSE -- the refusal said so rather than
+    producing a partial image.  The refusal is still there for a caller that
+    builds ``LzfseDecoder()`` with no argument; this one does not, because there
+    is now something correct to hand it.
 
     Progress is reported every 256 chunks because the LZFSE path is the
     bottleneck by two orders of magnitude -- measured ~2 MB/s of output on this
     host, roughly an hour for a 6 GB image, against ~31 s for the I/O side --
-    and a silent hour-long loop is indistinguishable from a hang.
+    and a silent hour-long loop is indistinguishable from a hang.  That rate was
+    measured against ``/usr/bin/compression_tool`` on a macOS host; the pure
+    Python port's rate on this host is what ``probe-root-volume.py --decode-udif``
+    now measures, and it has not been measured end to end yet.
     """
     image = UdifImage(source)
     begun = time.monotonic()
@@ -190,7 +197,7 @@ def go_decode(source: Path, destination: Path) -> dict:
 
     print(f"decoding {image.raw_size} bytes from {len(list(image.chunks()))} chunks ...",
           flush=True)
-    return image.write_raw(destination, LzfseDecoder(), progress=progress)
+    return image.write_raw(destination, default_lzfse(), progress=progress)
 
 
 def free_port() -> int:
