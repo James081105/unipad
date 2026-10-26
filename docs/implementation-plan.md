@@ -282,3 +282,21 @@ native_owner_cache_stage = 1;
 | `_native_virtio_verified_devices` | 1 | 1 |
 
 **同时 root 一侧全绿**：`_native_owner_root_accepted = 1`、`_native_owner_root_readonly = 1`、`_native_owner_root_trust_enabled = 1`、`_native_owner_root_mount_device = _native_owner_root_selected_device = _native_verified_block_root_device = 0x01000003`（disk1s1）、`_native_verified_block_root_uuid_match = 1`、`_native_verified_block_root_media_matches = 1`、`_native_verified_block_root_provider_depth = 9`、`_native_verified_block_wrong_uuid_refused = 1`、`_native_owner_root_apple_autherr = 80`。**所以 `root_authorized` 三个合取项全部为真，内核确实越过了 root 检查、死在紧接着的 `native_verified_block_volume_device()`**（补丁源码里 `native_owner_cache_stage = 1;` 之后那一行），与 checker 记录的拒绝态是**同一处**。那个函数找的是 `XNU_OWNER_CACHE_VOLUME_UUID`，补丁里的缺省值是 **`8846FE78-2910-4297-AF97-D59BB6F8FC16`**。**而本机 QEMU 只给了两个块设备：ESP（fat:）与 `os-root.raw`（6,077,580,800 字节，卷 UUID `04769D26-…`，即 disk1s1）——没有任何设备携带 `8846FE78-…` 这个卷**，`_native_virtio_verified_devices == 1`（只验证了根）也正好对上；成功态要求 2。**被钉死的仓库自己写的接法就是两个 VirtIO 块设备**：`vendor/UniXNU-qemu/README.md:108`「把裸设备和 SystemOS 镜像作为两个 VirtIO 块设备交给 QEMU」。**IPSW 里两个候选都在**：`044-76034-038.dmg`（3,303,014,400 字节，事实 8 已证是**裸 APFS**、偏移 32 处 `NXSB`、无 koly 无 GPT，因此可直接当 raw 块设备）与 `044-76040-038.dmg`（5,157,406,069 字节，UDIF，已转成 `os-root.raw`）。本机 `local-private/ipsw/21H461/` 目前只有前者的 `.trustcache`，**镜像本体没有被抽取出来**。**所以下一步是一个具体的、有依据的动作：把 `044-76034-038.dmg` 从 IPSW 抽出来作为第二个 VirtIO 只读块设备接上，再测同一组全局量**——成功态的判据（stage 6、status/mount_status 0、readonly 1、authorized 1、selected == mounted == `0x01000004`、`verified_devices == 2`、read_requests 304、verified_blocks 478）已经由设备仓库写好，不需要我自己发明。
+
+77. **把 SystemOS cryptex 作为第三个 VirtIO 只读块设备接上，`native_owner_cache_prepare()` 就从拒绝变成成功——设备仓库成功态判据 11 条中 9 条逐字段相同，阻断点前移到 Data 挂载**（2026-10-26，本机证据 `local-private/boot23/run/`）：做法是把 `044-76034-038.dmg`（3,303,014,400 字节）从 IPSW 抽出来，追加 `-drive if=none,id=systemos,format=raw,readonly=on,file=…` + `-device virtio-blk-device,drive=systemos`。**先验证它确实能当裸块设备**：偏移 32 处是 `NXSB`、512 字节尾部没有 `koly`，即事实 8 已判定的裸 APFS，无需转换。**同一组全局量复测结果**：
+
+| 全局量 | 设备仓库期望（成功） | 实测 |
+| --- | --- | --- |
+| `_native_owner_cache_stage` | 6 | 6 |
+| `_native_owner_cache_status` | 0 | 0 |
+| `_native_owner_cache_mount_status` | 0 | 0 |
+| `_native_owner_cache_readonly` | 1 | 1 |
+| `_native_owner_cache_authorized` | 1 | 1 |
+| `_native_owner_cache_root_recheck` | 1 | 1 |
+| `_native_owner_cache_selected_device` | 0x01000004 | 0x01000004 |
+| `_native_owner_cache_mounted_device` | 0x01000004 | 0x01000004 |
+| `_native_virtio_verified_devices` | 2 | 2 |
+| `_native_virtio_read_requests` | 304 | **306** |
+| `_native_virtio_verified_blocks` | 478 | **482** |
+
+**9 条逐字段相同；差的两条是 I/O 计数，各多 2 次读、4 个块**，方向与「本机配置比仓库的受控候选多做一点事」一致，不是失败。`_native_owner_cache_original_root` 与 `_native_owner_cache_current_root` 现在**不同**（前者 `…92512`、后者 `…91312` 的低 32 位），说明根 vnode 确实被换成挂载点的根了。**而 PC 仍是 `0xfffffff00b8653fc`（同一个 panic 终态），且 `_native_owner_cache_status == 0`**——所以 `if (cache_error) panic(...)` 不会再触发，**阻断点已经前移到紧随其后的 `native_owner_data_prepare()`**：实测 `_native_owner_data_stage == 0`、`_native_owner_data_status == 2`（`ENOENT`），即 Data 卷也没找到。**另有一条操作性事实**：加第三个块设备之后 UEFI 的自动枚举顺序变了，启动直接掉进 UEFI Shell（串口停在 `Shell>`，DarwinBoot 根本没跑），给 ESP 的 `virtio-blk-pci` 显式加 `bootindex=0` 才恢复——两个块设备时靠枚举刚好对，三个就不成立了。
