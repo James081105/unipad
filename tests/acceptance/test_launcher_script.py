@@ -667,6 +667,17 @@ def test_interpreter_that_cannot_import_unipad_is_skipped(ascii_scratch):
     # Windows-style separators: a native child cannot search a POSIX-style PATH.
     env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
     env.pop("UNIPAD_PYTHON", None)
+    # PYTHONPATH goes too, and it is not tidying up.  The premise of this test is
+    # that the stub CANNOT `import unipad`, and PATH is not the only thing that
+    # decides that: the child inherits this process's environment, so a
+    # `PYTHONPATH=src` in it -- which is exactly how this suite gets run here --
+    # puts the package on the stub's path as surely as the installed shim puts it
+    # on the real interpreter's.  Measured 2026-10-26: with it set, the stub
+    # imports fine, the launcher finds an "interpreter", and the run is blocked
+    # by the controller's "no experiment run found" instead -- exit code still
+    # 3, so the first assertion passes and the second one is looking at a
+    # different failure entirely.  Scrubbing it is what makes the stub a stub.
+    env.pop("PYTHONPATH", None)
     cmd = [
         _powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
         "-Action", "stop", "-RunsRoot", str(empty_runs),
