@@ -516,6 +516,17 @@ Notes:
     toolchain the kernel and the bootloader need exists on macOS only, so on any
     other host they record not_run with that reason; see STATUS at the top of
     this file.
+  * material-manifest runs last, after every build stage, and binds the run's
+    material to one build id: it hashes every artifact, checks each against the
+    pins in board.toml, and re-derives the Data volume UUID from the seed's own
+    volume superblock so it can be compared to the one the kernel was built
+    with.  It verifies the staged delivery, not the tree, and a verification
+    failure is a failed stage.  The seed is Apple-derived (PRD 12): with
+    MATERIAL_DELIVERY_KEY set it is encrypted with
+    `openssl enc -aes-256-gcm -pbkdf2 -salt` into out/private and the plaintext
+    never leaves the runner; without it the step records that the seed was NOT
+    encrypted and must be collected from the runner directly.  Either way the
+    staging step's default-deny keeps it off the public artifact path.
 EOF
 }
 
@@ -1162,6 +1173,226 @@ not_run_reasons_json() {
 }
 
 # ---------------------------------------------------------------------------
+# the material manifest
+# ---------------------------------------------------------------------------
+# material_manifest_path -- where this run's manifest is written.
+#
+# Under OUT_DIR and not under the tree, for the same reason the other evidence
+# files are: the staging step scans BUILD_OUTPUT_DIR, and a manifest inside the
+# build tree would be found twice or not at all depending on where the tree is
+# assembled this run.
+#
+# Inside the delivery directory and not beside the other run evidence on
+# purpose.  The manifest names the Data seed -- its digest, its measured size
+# and the volume UUID the kernel was built with -- so it is the index of
+# Apple-derived material even though it is not itself Apple material, and it has
+# to travel the channel the material travels.  Keeping every file this stage
+# writes in ONE directory is what makes that enforceable with one staging
+# pattern ("private/*") instead of a list of names that can drift; the verdict
+# is still public, because build-report.json's ledger records whether the stage
+# ran, failed or did not run and why, without the material's identity.
+material_manifest_path() { printf '%s' "$(material_delivery_dir)/material-manifest.json"; }
+
+# material_delivery_dir -- the flat directory a delivery is staged into.
+#
+# The manifest records LEAF names, because the same manifest has to be readable
+# on a macOS runner and on a Windows host that downloaded the material into one
+# place.  A flat directory is what that means, and it is the layout the
+# workflow's boot-inputs bundle already uses.
+material_delivery_dir() { printf '%s' "$OUT_DIR/private"; }
+
+# material_kernelcache -- the donor kernelcache the prelink step used.
+#
+# unipad.host.ipsw publishes it as <cache>/<board.build>/kernelcache.decompressed,
+# and the workflow passes --kernelcache-cache build-output/unixnu-out/ipsw
+# (build-macos.yml), which is also the driver's own IPSW cache because the
+# driver's --out is $UNIXNU_OUT.  The plain $OUT_DIR/ipsw spelling is searched
+# too, because --kernelcache-cache is a flag and a caller may point it
+# elsewhere; globbing the build directory rather than naming the build is the
+# driver's own habit (ipsw.py:1355) and avoids reading board.toml [ipsw] build a
+# second time just to build a path.
+material_kernelcache() {
+    local candidate
+    for candidate in "$UNIXNU_OUT"/ipsw/*/kernelcache.decompressed \
+                     "$OUT_DIR"/ipsw/*/kernelcache.decompressed; do
+        [[ -f "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 0
+}
+
+# material-manifest -- record which build produced what, and refuse if it does
+#   not hold together.
+#
+# WHY THIS STEP EXISTS.  Until now nothing recorded which build produced which
+# piece of a boot's material, and nothing checked that the pieces still belong
+# together.  The consequence was measured on 2026-10-26 (implementation-plan
+# fact 81): the owner-data-1g.dbr on this host's ESP is a 36,960-byte
+# hand-written stub whose container superblock is correct in every field a
+# structural check reads -- NXSB, 4096, 262144 blocks -- and whose nx_uuid is
+# 00 01 02 ... 0f.  It was wired up and booted, and only the guest's own
+# console said it was not an APFS container.  The real runner-built seed is
+# 1,245,328 bytes.
+#
+# So the manifest binds five things a plausible-looking file cannot satisfy by
+# accident: one build id for every artifact; a known producer for every
+# artifact; the hash and the size, recomputed from the bytes; the Data volume
+# UUID equal in the seed and in the kernel; and the pinned identity of the
+# donor kernelcache and the ADT's root-match UUID, both read out of board.toml
+# rather than restated here.
+#
+# The step verifies before it publishes, and a verification failure is a failed
+# stage rather than a warning: a manifest that does not verify is exactly the
+# artifact that must not be delivered.
+step_material_manifest() {
+    local name='material-manifest'
+
+    # (1) the inputs.  Each one is named with the stage that produces it, so a
+    #     not_run says which earlier stage did not run rather than only that
+    #     something is missing.
+    local header seed kernelcache
+    header="$(work_dir)/build/xnu/owner-data-volume.h"
+    seed="$(os_root_seed_json)"; seed="${seed%/*}/owner-data-1g.dbr"
+    kernelcache="$(material_kernelcache)"
+    if [[ ! -f "$header" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the kernel's owner-data-volume.h is not on disk ($(shown_path "$header")): build-kernel did not run, and without it no Data volume UUID can be bound to the kernel that was built"
+        return 0
+    fi
+    if [[ ! -f "$seed" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the owner root chain's packed Data seed is not on disk ($(shown_path "$seed")): build-os-root did not produce it, and a manifest without the seed cannot be verified against anything"
+        return 0
+    fi
+    if [[ ! -f "$kernelcache" ]]; then
+        ledger_add "$name" 'not_run' \
+            "the donor kernelcache is in neither $(shown_path "$UNIXNU_OUT/ipsw") nor $(shown_path "$OUT_DIR/ipsw"): the acquisition step publishes it with --kernelcache-cache, and without it board.toml [kernel.prelink] kernelcache_sha256 cannot be checked"
+        return 0
+    fi
+    local board="$DEVICE_DIR/board.toml"
+    if [[ ! -f "$board" ]]; then
+        ledger_add "$name" 'not_run' "board.toml is not at $(shown_path "$board")"
+        return 0
+    fi
+
+    # Every input is present, so the delivery directory exists from here on.  It
+    # is made before anything is written into it rather than at the point of
+    # use, so a stage that fails halfway leaves a directory whose contents are
+    # exactly the files that were produced -- and so the collect log below has
+    # somewhere to be.
+    local delivery manifest
+    delivery="$(material_delivery_dir)"
+    manifest="$(material_manifest_path)"
+    mkdir -p "$delivery"
+
+    # (2) collect.  The module hashes every file itself, so the digests in the
+    #     manifest come from the same bytes the verification below will read.
+    #     Both logs land in the delivery directory, beside the manifest they
+    #     describe, because both print it: the collect log carries the digests
+    #     and the volume UUID, which is the material's identity and not the
+    #     build's.
+    log "+ $PY -m unipad.host.material_manifest --collect (manifest $(shown_path "$manifest"))"
+    if ! run_unipad -m unipad.host.material_manifest --collect \
+            --tree "$(work_dir)" \
+            --device "$DEVICE_DIR" \
+            --esp "$OUT_DIR/payload-esp" \
+            --kernelcache "$kernelcache" \
+            --volumes "$DEVICE_DIR/.cache/firmware/target-volumes" \
+            --board "$board" \
+            --build-id "$RUN_ID" \
+            --board-name "$BOARD_NAME" \
+            --manifest "$manifest" \
+            --device-commit "${LOCK_DEVICE_COMMIT:-}" \
+            --unixnu-commit "${LOCK_UNIXNU_COMMIT:-}" \
+            2>&1 | tee "$delivery/${name}.collect.log"; then
+        ledger_add "$name" 'failed' \
+            "the material could not be manifested; see $(shown_path "$delivery/${name}.collect.log")"
+        return 1
+    fi
+
+    # (3) stage the flat delivery, then verify against the staged copy.
+    #
+    #     Verified against the delivery and not against the build tree on
+    #     purpose: a manifest that is only true of the tree it was collected
+    #     from is not a manifest of what was delivered, and the two differ by
+    #     exactly the files that get left behind.
+    local role path leaf
+    while IFS="$(printf '\t')" read -r role leaf; do
+        [[ -n "$leaf" ]] || continue
+        for path in "$(work_dir)/$leaf" "$DEVICE_DIR/.cache/firmware/owner-data/$leaf" \
+                    "$DEVICE_DIR/.cache/firmware/target-volumes/$leaf" \
+                    "$OUT_DIR/payload-esp/EFI/UniXNU/$leaf" "$kernelcache"; do
+            [[ -f "$path" ]] || continue
+            cp "$path" "$delivery/$leaf"
+            break
+        done
+    done < <(run_unipad - "$manifest" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+for role, entry in sorted(manifest["artifacts"].items()):
+    # A role recorded without bytes (the two multi-GB members PRD 12 deletes) has
+    # nothing to copy; its identity is the board's pin, checked in step (4).
+    if entry.get("bytes"):
+        print(role + "\t" + entry["path"])
+PY
+)
+    if ! run_unipad -m unipad.host.material_manifest --verify \
+            --manifest "$manifest" \
+            --root "$delivery" \
+            --board "$board" \
+            --expect-build "$RUN_ID" \
+            2>&1 | tee "$delivery/${name}.verify.log"; then
+        ledger_add "$name" 'failed' \
+            "the material manifest does not verify; see $(shown_path "$delivery/${name}.verify.log"). Nothing in this delivery may be read as a matched build"
+        return 1
+    fi
+
+    # (4) the measured sizes, in the log, because "is the seed small enough to
+    #     travel" is a question about a number and not about a judgement.  The
+    #     logical size is 1 GiB (that is what resizeContainer grew the container
+    #     to) and the packed size is what actually moves; quoting only one of
+    #     the two is how a 1 GiB volume gets mistaken for a 1 GiB download.
+    local seed_bytes packed_bytes
+    seed_bytes="$(wc -c <"$seed" | tr -d ' ')"
+    packed_bytes="$(wc -c <"$delivery/owner-data-1g.dbr" 2>/dev/null | tr -d ' ' || printf '0')"
+    log "material: Data seed $seed_bytes bytes packed (logical 1 GiB); the manifest is $(shown_path "$manifest")"
+
+    # (5) the private channel.  The seed is the OS volume's own private/var, so
+    #     it is Apple-derived material (PRD 12) and must not travel the public
+    #     artifact path however small it is.  Two things keep it out, and the
+    #     second is the one that is meant to matter: the staging step excludes
+    #     everything under private/ by pattern, and the plaintext is deleted
+    #     here the moment it has a ciphertext, so the plaintext never coexists
+    #     with the staging step at all.  The delivery stays flat -- the
+    #     ciphertext sits beside the manifest that describes it, which is the
+    #     same layout the manifest's leaf names assume.
+    if [[ -n "${MATERIAL_DELIVERY_KEY:-}" ]]; then
+        if openssl enc -aes-256-gcm -pbkdf2 -salt \
+                -in "$delivery/owner-data-1g.dbr" \
+                -out "$delivery/owner-data-1g.dbr.enc" \
+                -pass env:MATERIAL_DELIVERY_KEY 2>>"$delivery/${name}.verify.log"; then
+            # Deleted the moment it has a ciphertext, for the reason the
+            # workflow's own removal step gives: an exclusion is a record that a
+            # file existed, and the file should not exist at all.  Verification
+            # already ran against these exact bytes (step 3), so deleting them
+            # costs nothing the manifest has not recorded.
+            rm -f "$delivery/owner-data-1g.dbr"
+            log "material: the Data seed is encrypted into $(shown_path "$delivery/owner-data-1g.dbr.enc") ($(wc -c <"$delivery/owner-data-1g.dbr.enc" | tr -d ' ') bytes of ciphertext); the plaintext is gone from this runner"
+        else
+            ledger_add "$name" 'failed' \
+                "MATERIAL_DELIVERY_KEY was given but the Data seed could not be encrypted; see $(shown_path "$delivery/${name}.verify.log")"
+            return 1
+        fi
+        ledger_add "$name" 'ran' \
+            "the material manifest verifies and the Data seed is encrypted into $(shown_path "$delivery") ($(wc -c <"$delivery/owner-data-1g.dbr.enc" | tr -d ' ') bytes of ciphertext); decrypt with MATERIAL_DELIVERY_KEY"
+    else
+        ledger_add "$name" 'ran' \
+            "the material manifest verifies ($packed_bytes bytes packed); the Data seed is Apple-derived (PRD 12) and was NOT encrypted because MATERIAL_DELIVERY_KEY is unset, so it must be collected from this runner directly and never from the public artifact path"
+        log 'material: MATERIAL_DELIVERY_KEY is unset, so the Data seed stays on this runner unencrypted.'
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # stage plan
 # ---------------------------------------------------------------------------
 # Prints the planned step names for a milestone, one per line.
@@ -1188,6 +1419,11 @@ plan_steps() {
     if (( n >= 9 )); then printf 'assemble-image\n'; fi
     printf 'verify-artifacts\n'
     printf 'write-manifest\n'
+    # material-manifest is last because it binds the build's material together
+    # and verifies the binding: everything it names must already exist.  It is
+    # not milestone-gated for the same reason the plan above is -- adding it to
+    # milestone 9 only would mean a --milestone 4 caller silently loses it.
+    printf 'material-manifest\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -3553,6 +3789,19 @@ main() {
             write-manifest)
                 step 'write-manifest'
                 ledger_add "$s" 'ran' 'artifact-manifest.json written'
+                ;;
+            material-manifest)
+                step 'material-manifest'
+                # Not gated on SOURCES_INCOMPLETE the way the build stages are:
+                # this stage reads the board and the tree, never a pinned source
+                # that would have to be fetched.  A stage that could not run
+                # records that itself, with the stage that should have produced
+                # each missing input named.
+                if step_material_manifest; then
+                    :
+                else
+                    stage_failed=1
+                fi
                 ;;
         esac
         # A stage that failed stops the plan: the next stage's inputs come out

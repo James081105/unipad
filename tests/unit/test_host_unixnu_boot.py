@@ -236,6 +236,23 @@ def _values(argv: list[str], name: str) -> list[str]:
     return [argv[index + 1] for index, item in enumerate(argv) if item == name]
 
 
+def _scrubbed(argv: list[str], scratch: Path) -> list[str]:
+    """``argv`` with the scratch directory removed from every token.
+
+    ``build_argv`` embeds absolute paths, and pytest names each test's scratch
+    directory after the test, so a run whose *name* mentions the SystemOS cryptex
+    would otherwise match its own tmpdir and fail a "nothing mentions systemos"
+    assertion for the wrong reason.  Both spellings go: ``build_argv`` renders
+    drive files forward-slashed, while the QEMU executable path is handed over as
+    ``str(path)`` and keeps its Windows separators.
+    """
+    forward, native = scratch.as_posix(), str(scratch)
+    scrubbed = []
+    for token in argv:
+        scrubbed.append(token.replace(forward, "").replace(native, ""))
+    return scrubbed
+
+
 def _absent(name: str) -> Path:
     """A path that names a file which does not exist, wherever it is rooted.
 
@@ -660,7 +677,7 @@ def test_the_argv_is_the_boards_machine(
     assert _flag(argv, "-name") == "unipad-unixnu", argv
     assert _flag(argv, "-qmp") == "tcp:127.0.0.1:14444,server=on,wait=off", argv
     assert _values(argv, "-device") == [
-        "virtio-blk-pci,drive=esp",
+        "virtio-blk-pci,drive=esp,bootindex=0",
         "ramfb",
         "qemu-xhci",
         "usb-kbd",
@@ -845,7 +862,7 @@ def test_the_root_volume_is_a_second_read_only_mmio_disk(
         f"if=none,id=osroot,format=raw,readonly=on,file={root.resolve().as_posix()}"
     ), argv
     assert _values(argv, "-device") == [
-        "virtio-blk-pci,drive=esp",
+        "virtio-blk-pci,drive=esp,bootindex=0",
         "virtio-blk-device,drive=osroot",
         "ramfb",
         "qemu-xhci",
@@ -859,7 +876,9 @@ def test_the_root_volume_is_a_second_read_only_mmio_disk(
     # mode and the driver's register offsets do not hold (run-qemu.py:203-208).
     assert _flag(argv, "-global") == "virtio-mmio.force-legacy=false", argv
     # After the ESP, so the ESP keeps the device number every earlier run recorded.
-    assert argv.index("virtio-blk-pci,drive=esp") < argv.index("virtio-blk-device,drive=osroot"), argv
+    assert argv.index("virtio-blk-pci,drive=esp,bootindex=0") < argv.index(
+        "virtio-blk-device,drive=osroot"
+    ), argv
 
 
 def test_without_a_root_image_the_argv_is_exactly_what_it_was(
@@ -1001,6 +1020,342 @@ def test_the_report_says_which_kind_of_run_it_was() -> None:
     assert default.to_dict()["root_image"] is None, default.to_dict()
     attached = ub.BootReport(ok=True, root_image="F:/somewhere/os-root.raw")
     assert attached.to_dict()["root_image"] == "F:/somewhere/os-root.raw", attached.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# the SystemOS cryptex
+# ---------------------------------------------------------------------------
+def _verified_command() -> list[str]:
+    """The argv of the boot that measured the SystemOS attachment.
+
+    ``local-private/boot24/command.txt`` is the command line of the run that took
+    ``_native_owner_cache_stage`` from 1 to 6, so it is the only authority there
+    is on where the pair belongs and how it is spelled.  It is absent from every
+    checkout by design (PRD 12) -- the same reason ``DarwinBoot.efi`` is -- so a
+    test that pins against it skips rather than inventing a shape to pin.
+    """
+    path = REAL_PRIVATE / "boot24" / "command.txt"
+    if not path.is_file():
+        pytest.skip("local-private/boot24/command.txt is not present on this host")
+    return path.read_text(encoding="utf-8").split()
+
+
+def _without_file(drive: str) -> str:
+    """One ``-drive`` value with its ``file=`` taken out.
+
+    What is left is the part of the spelling that is *not* about this host's
+    paths, which is the part worth pinning: ``if=none,id=systemos,format=raw,
+    readonly=on``.  Two runs of the same configuration spell that identically
+    and differ in the path.
+    """
+    head, _, _ = drive.partition(",file=")
+    return head
+
+
+def test_the_systemos_cryptex_is_a_third_read_only_mmio_disk(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The attachment the official path was missing, and the three ways it is spelled.
+
+    * ``readonly=on``.  This is a signed, shipped cryptex; a boot that writes to
+      it is a different experiment with different consequences (PRD 4.2).
+    * Its own ``id``.  Two block devices sharing one drive id is one device, and
+      the ESP would stop being the disk the firmware booted from.
+    * **MMIO, not PCI.**  ``NativeVirtioBlock::probe``
+      (``vendor/UniXNU/drivers/NativeVirtioBlock/NativeVirtioBlock.cpp:148-154``)
+      returns ``nullptr`` unless the provider's ``compatible`` is exactly the
+      twelve bytes ``"virtio,mmio"`` -- the same reason the OS root volume is
+      MMIO, and the reason a PCI spelling would be accepted by QEMU and bound by
+      nothing.
+    * **Last, after ``-name``.**  A position, not a formatting preference: it is
+      where the verified run puts it, and the verified run is the only evidence
+      there is about it.
+    """
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root, systemos_image=cryptex,
+    )
+
+    systemos_drive = (
+        f"if=none,id=systemos,format=raw,readonly=on,file={cryptex.resolve().as_posix()}"
+    )
+    # The last four tokens are the pair, in this order, with the drive spelled
+    # exactly as the verified command spells it.
+    assert argv[-4:] == [
+        "-drive", systemos_drive, "-device", "virtio-blk-device,drive=systemos",
+    ], argv[-4:]
+    assert _values(argv, "-drive")[-1] == systemos_drive, argv
+    assert _values(argv, "-device") == [
+        "virtio-blk-pci,drive=esp,bootindex=0",
+        "virtio-blk-device,drive=osroot",
+        "ramfb",
+        "qemu-xhci",
+        "usb-kbd",
+        "virtio-blk-device,drive=systemos",
+    ], argv
+    assert "virtio-blk-pci,drive=systemos" not in argv, argv
+    assert "readonly=on" in systemos_drive, systemos_drive
+    # After ``-name``, which is what "last" means in a command line whose last
+    # option is the one that was appended.
+    assert argv.index("-name") < argv.index("virtio-blk-device,drive=systemos"), argv
+    # The ESP keeps its place and its transport: it is the disk the firmware
+    # boots from, and it is found on the virtual PCI bus.
+    assert argv.index("virtio-blk-pci,drive=esp,bootindex=0") < argv.index(
+        "virtio-blk-device,drive=systemos"
+    ), argv
+    # Every path in it is absolute and forward-slashed, like every other one.
+    for path in _paths_in(systemos_drive):
+        assert Path(path).is_absolute(), path
+        assert "\\" not in path, path
+
+
+def test_the_systemos_pair_is_the_verified_commands_spelling(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """Order and spelling, pinned against the run that measured the attachment.
+
+    The whole point of wiring this in is to reproduce a configuration that was
+    *measured*, so the test reads the measured command line and compares the two
+    token for token -- with ``file=`` removed, because that is the one part that
+    is about this host's paths rather than about the machine.  A change that
+    reordered the pair, dropped ``readonly=on``, renamed the drive id, or moved
+    the pair somewhere other than last fails here.
+    """
+    verified = _verified_command()
+    at = verified.index("virtio-blk-device,drive=systemos")
+    # The verified command's own tail: ``-drive`` then ``-device``, and nothing
+    # after them.  ``at`` is the device spec, so the drive spec is two back.
+    assert verified[at - 3 : at + 1] == [
+        "-drive", verified[at - 2], "-device", verified[at],
+    ], verified[at - 3 : at + 1]
+    assert at + 1 == len(verified), verified[at:]
+    assert verified[at - 5] == "-name" and verified[at - 4] == "unipad-unixnu", verified[at - 5:at]
+
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root, systemos_image=cryptex,
+    )
+    # ``-drive <spec> -device <spec>``, so the drive spec is two before the
+    # device spec -- the token immediately before it is the ``-device`` flag.
+    built = argv[argv.index("virtio-blk-device,drive=systemos") - 2]
+    assert _without_file(built) == _without_file(verified[at - 2]), (built, verified[at - 2])
+    # ...and the pair is this module's last four tokens too, in the same order.
+    assert argv[-4:-2] == ["-drive", built], argv[-4:]
+    assert argv[-1] == "virtio-blk-device,drive=systemos", argv[-1]
+    # The verified run's OS root volume and this one differ only in path, so the
+    # shape being pinned is the machine's and not one run's.
+    assert _without_file(_values(argv, "-drive")[-2]) == _without_file(
+        _values(verified, "-drive")[-2]
+    ), argv
+
+
+def test_the_esp_device_is_the_one_the_verified_run_used(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The ESP's device, byte for byte, and the reason it carries a bootindex.
+
+    ``bootindex=0`` is what keeps the firmware off the UEFI Shell once a third
+    block device exists.  That is measured, not inferred: adding the SystemOS
+    cryptex flipped UEFI's automatic enumeration order and the serial log stopped
+    at ``Shell>`` with DarwinBoot never running, and the run that produced the
+    stage-6/status-0 numbers is the one carrying this token.  It is emitted
+    unconditionally rather than only when a third disk is attached, because the
+    ESP is the disk to boot from in every machine this module builds -- and the
+    combination a "third disk" condition would get wrong is reachable from here:
+    a cryptex with no OS root volume.
+
+    The spelling is read out of the verified command rather than restated here,
+    so the file is the authority and this test fails when the two drift apart.
+    The two assertions after it are the ones that hold on a checkout without
+    ``local-private/``.
+    """
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root, systemos_image=cryptex,
+    )
+    built = _values(argv, "-device")[0]
+    # First, and immediately behind its own ``-drive``: the ESP is the disk the
+    # firmware starts, and everything else on the command line is behind it.
+    assert built.startswith("virtio-blk-pci,drive=esp,"), built
+    assert argv[argv.index(built) - 1] == "-device", argv
+    assert "id=esp" in argv[argv.index(built) - 2], argv
+    assert "bootindex=0" in built, built
+    # One bootindex, on the ESP, on no other device.
+    assert sum("bootindex" in item for item in argv) == 1, argv
+    assert built.index("bootindex") > built.index("drive=esp"), built
+
+    verified = _verified_command()
+    theirs = next(item for item in verified if item.startswith("virtio-blk-pci,drive=esp"))
+    assert built == theirs, (built, theirs)
+
+
+def test_without_a_systemos_image_the_argv_has_no_third_disk(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The parameter is additive: no cryptex, no drive, no extra global.
+
+    Every run without one is the state this module has produced since it was
+    written, and an unattached run has to stay byte-identical to it -- a
+    ``-device`` that appeared unconditionally would change the machine every
+    earlier run described.
+    """
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run"
+    )
+    # Scrub the scratch directory first: it is named after this test, and a
+    # "systemos" inside a path is the tmpdir, not a drive.
+    assert not any("systemos" in token for token in _scrubbed(argv, tmp_path)), argv
+    assert "virtio-blk-device,drive=systemos" not in argv, argv
+    assert not any(item.startswith("if=none,id=systemos") for item in argv), argv
+    assert _values(argv, "-device") == [
+        "virtio-blk-pci,drive=esp,bootindex=0", "ramfb", "qemu-xhci", "usb-kbd",
+    ], argv
+    assert len(_values(argv, "-drive")) == 3, argv
+    assert _values(argv, "-global") == [], argv
+
+
+def test_a_cryptex_without_an_os_root_volume_still_gets_the_modern_mmio_transport(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The global is about the transport, not about the root volume.
+
+    ``-device virtio-blk-device`` is MMIO whichever disk it fronts, and legacy
+    mode would hand the cryptex the wrong register layout -- the driver's
+    ``mapDeviceMemoryWithIndex(0)`` has to be at least 0x108, which is the modern
+    layout's offset.  The global normally rides with the OS root volume because
+    that is where upstream puts it; with no root volume it goes in front of the
+    cryptex instead.
+    """
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        systemos_image=cryptex,
+    )
+    assert argv[-6:] == [
+        "-global", "virtio-mmio.force-legacy=false",
+        "-drive",
+        f"if=none,id=systemos,format=raw,readonly=on,file={cryptex.resolve().as_posix()}",
+        "-device", "virtio-blk-device,drive=systemos",
+    ], argv[-6:]
+    # ...and with a root volume it is emitted once, before that drive, not twice.
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    both = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        root_image=root, systemos_image=cryptex,
+    )
+    assert _values(both, "-global") == ["virtio-mmio.force-legacy=false"], both
+
+
+def test_a_missing_systemos_image_is_refused_before_qemu_starts(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """Refused here, not by QEMU's exit 1 -- and the message says what is lost.
+
+    The failure this prevents is *not* the same as a missing root volume: without
+    a cryptex the guest gets past ``vfs_mountroot``, passes the root checks, and
+    panics.  So the message has to name the panic rather than the mountroot
+    block, or an operator who has seen one will go looking for the other.
+    """
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        systemos_image=tmp_path / "not-there.dmg",
+    )
+    assert error.code is ErrorCode.IMAGE_NOT_FOUND, error
+    assert "SystemOS cryptex" in error.message, error
+    assert "native_owner_cache_prepare" in error.message, error
+
+
+def test_an_empty_systemos_image_is_refused(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """A zero-length file is a valid raw disk to QEMU and a useless cryptex.
+
+    ``CONFIG_INVALID``, not ``IMAGE_NOT_FOUND``, for the reason the root volume
+    gives: retrying can never change a file's length from zero, so a caller that
+    branched on the code and retried would retry forever.
+    """
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"")
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        systemos_image=cryptex,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "empty" in error.message, error
+    assert "SystemOS cryptex" in error.message, error
+
+
+def test_a_udif_container_is_refused_as_a_systemos_image(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The two ``.dmg`` candidates in an IPSW are told apart by their last 512 bytes.
+
+    ``044-76034-038.dmg`` is 3,303,014,400 bytes of raw APFS with no trailer and
+    needs no decoding; ``044-76040-038.dmg`` is a UDIF container that passes every
+    size check and would be handed to the guest compressed.  Both carry the same
+    suffix, so the suffix decides nothing -- and a run given the container would
+    attach a device that publishes no volume, which is indistinguishable from
+    attaching nothing at all.
+    """
+    container = tmp_path / "044-76040-038.dmg"
+    container.write_bytes(b"\0" * 1024 + b"koly" + b"\0" * 508)
+    error = _refused(
+        ub.build_argv,
+        tmp_path / "qemu-system-aarch64.exe",
+        inputs,
+        tmp_path / "esp",
+        tmp_path / "run",
+        systemos_image=container,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "UDIF container" in error.message, error
+    assert "udif" in error.message, error
+
+    # ...and a raw APFS image carrying the same suffix is accepted.
+    raw = tmp_path / "044-76034-038.dmg"
+    raw.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run",
+        systemos_image=raw,
+    )
+    assert any("id=systemos" in token for token in argv), argv
+
+
+def test_the_report_names_the_systemos_attachment() -> None:
+    """``systemos_image`` is recorded, and is ``None`` when none was attached.
+
+    A run with a cryptex and a run without one both reach the kernel, and both
+    print ``XNU:`` lines -- so the serial log cannot separate them and the report
+    has to.  ``None`` has to mean "no cryptex" rather than "not recorded", which
+    is why the default is asserted through a round trip.
+    """
+    default = ub.BootReport(ok=True)
+    assert default.systemos_image is None, default
+    assert default.to_dict()["systemos_image"] is None, default.to_dict()
+    attached = ub.BootReport(ok=True, systemos_image="044-76034-038.dmg")
+    assert attached.to_dict()["systemos_image"] == "044-76034-038.dmg", attached.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -1439,6 +1794,272 @@ def test_the_cli_prints_which_kind_of_run_it_was(
     # meant to exclude.  An earlier version of this test had that bug and the
     # suite went green anyway.
     assert "root volume attached: os-root.raw" not in unattached, unattached
+
+
+# ---------------------------------------------------------------------------
+# the optional inputs, through boot() rather than through stage_esp
+# ---------------------------------------------------------------------------
+def _both_halves(inputs: BootInputs, tmp_path: Path) -> BootInputs:
+    """The input set a boot with a trust cache *and* a Data seed needs.
+
+    Both halves of the ramdisk pair, because a boot that carries one without the
+    other is refused by :func:`stage_esp` -- so a test about the *other* two
+    optional fields has to supply this pair correctly or it fails on the ramdisk
+    and proves nothing about what it is about.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    bundle = tmp_path / "original-static-system.bundle"
+    bundle.write_bytes(b"synthetic trust bundle")
+    return replace(
+        inputs, devicetree=tree, data_ramdisk=seed, trust_cache=bundle
+    )
+
+
+def test_a_boot_that_asks_for_a_trust_cache_and_a_data_ramdisk_carries_both(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both optional inputs survive ``boot()`` and land on the ESP the guest gets.
+
+    This is the test the defect was found by.  ``boot()`` rebuilt ``BootInputs``
+    by listing the five required paths by hand, so ``trust_cache`` and
+    ``data_ramdisk`` were checked by ``missing()``, resolved, and then dropped:
+    the ESP carried five files, ``report.inputs`` recorded five, and the guest
+    booted without either.  Neither loss is visible in the serial log -- AMFI
+    refusing to exec launchd (namespace 9, EXEC, code 8, SECURITY_POLICY,
+    ``build-os-root.py:26-27``) and DarwinBoot refusing the ramdisk half with
+    ``EFI_COMPROMISED_DATA`` before the kernel starts (``DarwinBoot.c:563-569``)
+    -- so the run report was the only place either could have been caught, and it
+    was the place that agreed with the lie.
+
+    Reintroducing the defect makes this test fail with the guard's own message,
+    which names the field: "resolving the input paths does not carry the
+    trust_cache this run asked for".  The per-role assertions below are what keep
+    it that way -- a fix that staged the files but recorded something else fails on
+    "boot() dropped <role>" rather than on a size mismatch somewhere unrelated.
+    """
+    import json
+
+    assert ub.TRUSTCACHE_NAME == TRUSTCACHE_NAME, ub.TRUSTCACHE_NAME
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+
+    report = ub.boot(
+        _both_halves(inputs, tmp_path), work, qemu=qemu, device_dir=_synthetic_device(tmp_path)
+    )
+
+    # The run itself is the fake's failure, not the inputs': QEMU "exited" before
+    # QMP answered, which is what this stand-in is for.
+    assert report.error_code is ErrorCode.QEMU_LAUNCH_FAILED, report
+    assert launched, "boot never reached Popen"
+
+    # The ESP carries seven files, not five: the trust cache at the name the
+    # loader looks for, and the seed at the one name the config can spell.
+    staged_files = sorted(
+        path.relative_to(work / "esp").as_posix() for path in (work / "esp").rglob("*")
+        if path.is_file()
+    )
+    assert staged_files == sorted(
+        ESP_FILES + (TRUSTCACHE_NAME, f"EFI/UniXNU/Payloads/{ub.DATA_RAMDISK_NAME}")
+    ), staged_files
+    assert (work / "esp" / TRUSTCACHE_NAME).read_bytes() == b"synthetic trust bundle"
+    assert f'initrd = "Payloads/{ub.DATA_RAMDISK_NAME}"' in (
+        work / "esp" / "EFI/UniXNU/unixnu.toml"
+    ).read_text(encoding="utf-8")
+
+    # ...and the report says so, in both the object and the file on disk.  These
+    # are the two lines that used to name five files.
+    for role, expected in (
+        ("trust_cache", "original-static-system.bundle"),
+        ("data_ramdisk", ub.DATA_RAMDISK_NAME),
+    ):
+        assert report.inputs.get(role) == expected, (
+            f"boot() dropped {role}: the report records {sorted(report.inputs)}"
+        )
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["inputs"].get("trust_cache") == "original-static-system.bundle", written
+    assert written["inputs"].get("data_ramdisk") == ub.DATA_RAMDISK_NAME, written
+
+    # ...and the ESP manifest, which is the record of what was actually written.
+    manifest = json.loads((work / "esp-manifest.json").read_text(encoding="utf-8"))
+    assert manifest.get(TRUSTCACHE_NAME) == len(b"synthetic trust bundle"), manifest
+    assert (
+        manifest.get(f"EFI/UniXNU/Payloads/{ub.DATA_RAMDISK_NAME}")
+        == (work / "esp" / "EFI/UniXNU/Payloads" / ub.DATA_RAMDISK_NAME).stat().st_size
+    ), manifest
+
+
+def test_a_boot_without_either_optional_input_records_neither(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default is unchanged, so the guard above is not a guard against everything.
+
+    A run that asks for neither must still record neither -- a fix that made the
+    report name a trust cache unconditionally would make the record useless as an
+    answer to "did this boot carry one".
+    """
+    import json
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+
+    report = ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path))
+
+    assert TRUSTCACHE_NAME not in report.inputs, report.inputs
+    assert "data_ramdisk" not in report.inputs, report.inputs
+    assert sorted(
+        path.relative_to(work / "esp").as_posix() for path in (work / "esp").rglob("*")
+        if path.is_file()
+    ) == sorted(ESP_FILES)
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert "trust_cache" not in written["inputs"], written
+
+
+def test_a_staged_esp_that_is_missing_an_asked_for_input_is_refused(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load-bearing test for the guard: a stage that drops a field is refused.
+
+    ``missing()`` says the file was on disk when the run began; the guard says the
+    file is on the ESP the guest is handed.  Those are different claims, and the
+    second is the one that failed -- so this test takes a *correct* staging away
+    one key at a time and requires the run to refuse, naming the role.
+
+    The ``where`` detail is what keeps it honest.  Without it, a run whose
+    *resolution* dropped the field would satisfy every assertion below by raising
+    at the other call site, and this test would pass without ever exercising the
+    staging half of the guard.
+    """
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited([]))
+    real_stage = ub.stage_esp
+
+    def dropping(the_inputs: BootInputs, esp: Path, spec: Any) -> dict:
+        written = real_stage(the_inputs, esp, spec)
+        written.pop(TRUSTCACHE_NAME)
+        return written
+
+    monkeypatch.setattr(ub, "stage_esp", dropping)
+    error = _refused(
+        ub.boot,
+        _both_halves(inputs, tmp_path),
+        tmp_path / "run",
+        qemu=qemu,
+        device_dir=_synthetic_device(tmp_path),
+    )
+    assert error.code is ErrorCode.INVALID_PACKAGE, error
+    assert "trust_cache" in error.message, error
+    assert error.details.get("role") == "trust_cache", error.details
+    assert error.details.get("where") == "the staged ESP", error.details
+
+
+def test_a_boot_with_a_systemos_cryptex_attaches_it_and_records_it(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attachment is in the argv the guest was offered, and in the report.
+
+    ``boot()`` is where the parameter has to arrive for the official path to
+    produce the measured machine, so this asserts all three places it has to show
+    up: the argv, ``report.systemos_image`` and ``boot-report.json``.  The
+    run-directory half is the same evidence ``root_image``'s test collects, which
+    is why the two tests are shaped alike.
+    """
+    import json
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"raw os volume, not a UDIF container")
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+
+    report = ub.boot(
+        inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path),
+        root_image=root, systemos_image=cryptex,
+    )
+
+    assert report.error_code is ErrorCode.QEMU_LAUNCH_FAILED, report
+    assert report.systemos_image == "044-76034-038.dmg", report.systemos_image
+    assert str(tmp_path) not in report.systemos_image, report.systemos_image
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["systemos_image"] == "044-76034-038.dmg", written
+
+    command = launched[0]
+    assert command[-4:] == [
+        "-drive",
+        f"if=none,id=systemos,format=raw,readonly=on,file={cryptex.resolve().as_posix()}",
+        "-device",
+        "virtio-blk-device,drive=systemos",
+    ], command[-4:]
+    assert "virtio-blk-pci,drive=systemos" not in command, command
+    # ...and ``command.txt`` in the run directory is the same command line.
+    assert (work / "command.txt").read_text(encoding="utf-8").split()[-1] == (
+        "virtio-blk-device,drive=systemos"
+    )
+
+
+def test_a_boot_without_a_systemos_cryptex_says_so(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unattached run is labelled too, and its argv has no third disk.
+
+    An attached run and an unattached one both reach the kernel and both print
+    ``XNU:`` lines, so the serial log cannot separate them; the report has to, and
+    ``None`` has to be what an unattached run carries rather than an absent key.
+    """
+    import json
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    work = tmp_path / "run"
+
+    report = ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path))
+
+    assert report.systemos_image is None, report.systemos_image
+    written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["systemos_image"] is None, written
+    assert not any("systemos" in item for item in _scrubbed(launched[0], tmp_path)), launched[0]
+    assert "virtio-blk-device,drive=systemos" not in launched[0], launched[0]
+
+
+def test_the_cli_prints_whether_a_cryptex_went_with_the_run(
+    inputs: BootInputs, qemu: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """``main`` says out loud which of the two machines the operator just booted.
+
+    Both branches, and the exact line rather than the phrase for the same reason
+    the root volume's test uses it: "no SystemOS cryptex attached" does not
+    contain "SystemOS cryptex attached" as a substring, but asserting the phrase
+    would pass on either branch and the whole point is that they are different.
+    """
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited([]))
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    base = [
+        "--device", str(_synthetic_device(tmp_path)),
+        "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware),
+        "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree),
+        "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu),
+        "--workdir", str(tmp_path / "run"),
+    ]
+
+    assert ub.main([*base, "--systemos-image", str(cryptex)]) == 1
+    attached = capsys.readouterr().out
+    assert "SystemOS cryptex attached: 044-76034-038.dmg" in attached, attached
+    assert str(tmp_path) not in attached, attached
+
+    assert ub.main(base) == 1
+    unattached = capsys.readouterr().out
+    assert "no SystemOS cryptex attached" in unattached, unattached
+    assert "SystemOS cryptex attached: 044-76034-038.dmg" not in unattached, unattached
 
 
 # ---------------------------------------------------------------------------

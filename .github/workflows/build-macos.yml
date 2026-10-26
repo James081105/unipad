@@ -1824,6 +1824,17 @@ jobs:
           DEVICETREE_PATH: ipsw-work/devicetree
           KERNELCACHE_PATH: ipsw-work/kernelcache.macho
           BUILD_PAYLOAD: '1'
+          # The passphrase the material-manifest stage encrypts the Data seed
+          # with (`openssl enc -aes-256-gcm -pbkdf2 -salt -pass env:`).  It is a
+          # secret, so it is never echoed and never written to disk by this
+          # script: openssl reads it from the environment and the ciphertext is
+          # the only thing that leaves the runner.  Unset (a fork, a PR from a
+          # branch with no access to the secret) means the stage records that
+          # the seed was NOT encrypted, and the seed has to be collected from
+          # the runner directly -- the manifest still verifies, because the
+          # binding it checks is between the seed and the kernel, not between
+          # the seed and a key.
+          MATERIAL_DELIVERY_KEY: ${{ secrets.MATERIAL_DELIVERY_KEY }}
         run: |
           set -euo pipefail
           started=$(date -u +%s)
@@ -2104,6 +2115,19 @@ jobs:
               # step that removes out/ipsw/.  PRD 12 does not get to rest on a
               # step order.
               "*.decompressed",
+              # build-output/private/ is the material delivery directory that
+              # build-macos.sh's material-manifest stage stages into: the packed
+              # Data seed, which is the OS volume's own /private/var (PRD 12),
+              # and material-manifest.json, which binds that seed to the kernel
+              # built with its volume UUID.  The manifest is not itself Apple
+              # material, but it is the index of Apple material -- it names the
+              # seed, its measured size and its digest -- so it travels the same
+              # channel as the seed rather than the public artifact path, and a
+              # reader must never be able to fetch the index and assume the
+              # material it points at was fetched too.  *.enc is the encrypted
+              # form of the same delivery, uploaded separately by the
+              # "Deliver the encrypted material" step below.
+              "private/*", "*.enc",
           )
           METADATA_SUFFIXES = {".json", ".txt", ".log", ".md", ".cfg", ".toml", ".csv", ".plist"}
           ROLE_RULES = (
@@ -2556,6 +2580,85 @@ jobs:
           path: boot-inputs/
           retention-days: 30
           if-no-files-found: error
+
+      # The Data seed is the one piece of a boot that cannot be produced on the
+      # Windows host: it is the OS volume's own /private/var, and making one
+      # means running the upstream chain on macOS.  So it has to leave this
+      # runner, and it may not leave by the public artifact path (PRD 12).
+      #
+      # It leaves ENCRYPTED, and the two halves travel by different routes on
+      # purpose: the passphrase is the MATERIAL_DELIVERY_KEY secret and never
+      # touches the runner's disk in a file, and the ciphertext is this
+      # artifact.  The material-manifest stage deleted the plaintext as soon as
+      # it had a ciphertext, so there is no window in which the plaintext is
+      # both on disk and staged.
+      #
+      # Size, measured rather than assumed: the packed seed is 1,245,328 bytes
+      # (~1.2 MiB), four orders of magnitude below this workflow's own 2 GiB
+      # MAX_FILE_BYTES and below GitHub's artifact limits, so the encrypted form
+      # travels as an artifact and needs no external store.  What must never go
+      # into a secret is the multi-GB IPSW material -- and this is not that; a
+      # secret carries a passphrase, not a payload.
+      #
+      # `if: always()` with an existence check rather than a bare upload: a run
+      # whose owner root chain did not build has no material to deliver, and
+      # that is a recorded outcome, not a failed job.  The step also decides
+      # whether anything is uploaded at all: with MATERIAL_DELIVERY_KEY unset
+      # the delivery is a PLAINTEXT Apple-derived seed, and an unencrypted seed
+      # is not deliverable by any channel this workflow controls -- so it is
+      # reported, never uploaded, and removed from the runner below.
+      - name: Report the material delivery
+        id: material
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -d build-output/private ]; then
+            echo "the material delivery directory:"
+            for f in build-output/private/*; do
+              [ -f "$f" ] || continue
+              echo "  ${f#build-output/} $(wc -c <"$f" | tr -d ' ') bytes"
+            done
+            if [ -f build-output/private/owner-data-1g.dbr.enc ]; then
+              echo "encrypted=yes" >> "$GITHUB_OUTPUT"
+              echo "the Data seed is encrypted; decrypt with MATERIAL_DELIVERY_KEY"
+            else
+              echo "encrypted=no" >> "$GITHUB_OUTPUT"
+              echo "::warning::the Data seed is NOT encrypted (MATERIAL_DELIVERY_KEY is unset); collect it from this runner directly and never from any artifact"
+            fi
+          else
+            echo "encrypted=no" >> "$GITHUB_OUTPUT"
+            echo "no material delivery this run: the owner root chain did not build, so there is no Data seed"
+          fi
+
+      - name: Deliver the encrypted material (private channel)
+        if: always() && steps.material.outputs.encrypted == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-data-material-${{ github.run_id }}
+          path: |
+            build-output/private/owner-data-1g.dbr.enc
+            build-output/private/material-manifest.json
+          retention-days: 30
+          if-no-files-found: error
+
+      # The counterpart of the encrypted path.  The material-manifest stage
+      # deletes the plaintext itself as soon as it has a ciphertext, so this
+      # only ever fires on a run that had no key -- and on such a run the
+      # plaintext has been verified, logged and left for collection from the
+      # runner, and must not then sit on a persistent runner's disk forever.
+      # PRD 12 is about where the material ends up, not about how long it took
+      # to get there.
+      - name: Remove the unencrypted material from the runner
+        if: always()
+        run: |
+          set -euo pipefail
+          seed=build-output/private/owner-data-1g.dbr
+          if [ -f "$seed" ]; then
+            rm -f "$seed"
+            echo "removed $seed: MATERIAL_DELIVERY_KEY was unset, so an unencrypted Apple-derived seed must not survive the job (PRD 12)"
+          else
+            echo "no unencrypted Data seed on this runner"
+          fi
 
       - name: Step summary
         if: always()

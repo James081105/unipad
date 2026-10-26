@@ -282,6 +282,27 @@ def main() -> int:
                         help="the owner root chain's trust bundle, staged as "
                              "kernel.macho.trustcache; without it AMFI refuses "
                              "launchd (build-os-root.py:26-27)")
+    parser.add_argument("--data-ramdisk", type=Path, default=None,
+                        help="the packed Data ramdisk (.dbr) from a matched "
+                             "build, staged beside the kernel and named by "
+                             "unixnu.toml's initrd.  It is one half of a pair "
+                             "with the device tree: DarwinBoot refuses a boot "
+                             "that supplies one without the other "
+                             "(DarwinBoot.c:558-567), so giving this while "
+                             "--devicetree carries no PackedRAMDisk placeholder "
+                             "is refused before the kernel starts.  There is no "
+                             "default because no real seed exists on this host "
+                             "(verified 2026-10-26); a placeholder image must "
+                             "never be substituted for one.")
+    parser.add_argument("--systemos", type=Path, default=None,
+                        help="the SystemOS cryptex (044-76034-038.dmg, raw, not "
+                             "a UDIF container) attached as a third read-only "
+                             "virtio-blk disk.  Without it "
+                             "native_owner_cache_prepare() has no volume to "
+                             "mount and the guest panics with 'offline owner "
+                             "SystemOS mount failed: 80 (EAUTH)'.  Defaults to "
+                             "the board member beside --root-image when that is "
+                             "the OS root volume.")
     parser.add_argument("--devicetree", type=Path, default=STAGED_ADT,
                         help="the Apple-format device tree to boot (default: "
                              "%(default)s).  It MUST carry the board's "
@@ -321,11 +342,26 @@ def main() -> int:
         print(f"root image unusable: {root}")
         return 2
 
+    # Which board member this is, and where it came from.  ``source`` stays the
+    # file the operator named even after ``root`` is replaced by a decoded image,
+    # because the SystemOS default below looks *beside the source* -- the two
+    # members ship in the same directory and a decoded image is written into the
+    # run directory, far from its sibling.
+    member = None
+    source = root
+
     # A UDIF container is decoded here rather than by the operator, so the probe
     # can be handed the image the IPSW actually ships.  QEMU's format=raw cannot
     # read one, and without this the pinned OS member is unusable even though the
     # volume it contains is exactly the one the kernel waits for.
     if args.decode_udif or is_udif(root):
+        # Resolved BEFORE the decode, because the board pins the *member's*
+        # digest and decoding changes every byte: hashing the decoded image
+        # against ``[ipsw.sha256]`` can never match, so the member would come
+        # back None and the SystemOS default below would silently not fire on
+        # exactly the run that needs it.
+        member = board_members().get(sha256_of(root))
+        source = root
         decoded = args.run / "os-root.raw"
         # The probe owns this path, so it clears it.  udif.write_raw refuses to
         # overwrite an existing image -- correctly, it protects user data -- and
@@ -353,7 +389,10 @@ def main() -> int:
     # Name the image against the board's own pins.  A run that attached the wrong
     # member is a run whose negative result means nothing, so the probe says which
     # member it has rather than leaving the operator to work it out afterwards.
-    member = board_members().get(sha256_of(root))
+    # ``member`` is already resolved when the image was decoded (above); hashing
+    # the decoded bytes against a pin taken from the container would never match.
+    if member is None:
+        member = board_members().get(sha256_of(root))
     if member is None:
         print(f"NOTE: {root.name} matches no digest in board.toml [ipsw.sha256]; "
               f"it is not a pinned IPSW member")
@@ -410,6 +449,7 @@ def main() -> int:
         # own spec, which is what makes the board's kernel_args reach the guest.
         payload_toml=None,
         trust_cache=args.trust_cache,
+        data_ramdisk=args.data_ramdisk,
     )
     # The TrustCache memory-map binding, and what it MEASURABLY does.
     #
@@ -436,30 +476,57 @@ def main() -> int:
     # being an instrument.  What it must not do is stay silent, because the two
     # cases below are indistinguishable in the boot's own output.
     tree = args.devicetree.read_bytes()
-    if b"PackedRAMDisk" in tree:
-        # THE one that stops the boot, isolated on 2026-10-26.  payload.py:157
-        # turns --data-ramdisk into make-qemu-adt.py --packed-data-ramdisk (when
-        # board.toml [payload.adt] packed_data_ramdisk is true), and make-dt.py
-        # then emits a 16-zero-byte PackedRAMDisk region.  DarwinBoot.c:558 reads
-        # ``if (KeepPacked && (!RamdiskPacked || RamdiskOffset == MAX_UINTN))``
-        # -> EFI_COMPROMISED_DATA, and RamdiskPacked comes from the boot REQUEST
-        # (DarwinBoot.c:512, RamdiskLayout over Request->Ramdisk), not from the
-        # tree.  Nothing on the QEMU path supplies a packed ramdisk, so the boot
-        # stops before the kernel hand-off.
-        #
-        # Measured, kernel held constant:
-        #   no binding, no file                 -> boots, kernel runs
-        #   TrustCache binding + file           -> boots, kernel runs, 2 modules load
-        #   PackedRAMDisk binding, no file      -> Compromised Data
-        #   PackedRAMDisk + TrustCache + file   -> Compromised Data
-        # So the TRUST CACHE is not what breaks it, and this probe's first
-        # warning said the opposite.  A guard that names the wrong cause is worse
-        # than no guard: it sends the next reader to fix the wrong thing.
-        print("WARNING: this device tree carries a PackedRAMDisk region "
-              "(make-dt.py under --packed-data-ramdisk). Measured on 2026-10-26: "
-              "with it DarwinBoot refuses the boot with 'Compromised Data' "
-              "(DarwinBoot.c:558 wants RamdiskPacked from the request, which the "
-              "QEMU path does not supply). The guest will not reach the kernel.")
+    # The ramdisk pair, and a correction to this probe's own earlier reading.
+    #
+    # The block that used to sit here said a tree carrying a PackedRAMDisk region
+    # can never boot on QEMU, "because RamdiskPacked comes from the request and
+    # the QEMU path does not supply it".  That is a misreading of where
+    # RamdiskPacked comes from, and the measurement that supposedly proved it
+    # never ran the row that settles it.
+    #
+    # DarwinBoot.c:512 is ``RamdiskLayout (Request->Ramdisk, Request->RamdiskSize,
+    # &RamdiskExpandedSize, &RamdiskPacked)`` -- RamdiskPacked is an *output* of
+    # inspecting the seed's bytes, not a field the request carries.  A DBRDISK1
+    # seed sets it; no seed at all leaves it false.  So :558
+    # ``if (KeepPacked && (!RamdiskPacked || RamdiskOffset == MAX_UINTN))``
+    # refuses a tree whose placeholder says "packed" while the ESP carries no
+    # packed seed -- which is the exclusive-or's other half, not a QEMU
+    # limitation.  The four rows measured here all had no initrd, so all four
+    # were that one case.
+    #
+    # The row that settles it was run by stage-packed-data.py rather than by this
+    # probe: placeholder + initrd + a DBRDISK1 seed boots, the guest publishes
+    # the RAM block (`_native_ram_block_ready` 1, `bytes` 1073741824) and reaches
+    # native_owner_data_prepare() -- implementation-plan fact 80, 2026-10-26.
+    # So the placeholder is the *required* configuration, and this probe's old
+    # warning would have told an operator to remove the one thing that makes the
+    # Data mount possible at all.
+    has_placeholder = b"PackedRAMDisk" in tree or b"RAMDisk" in tree
+    if has_placeholder and args.data_ramdisk is None:
+        # Request->Ramdisk == NULL with a placeholder present: refused at :558
+        # (KeepPacked && !RamdiskPacked) before the :565 else-arm is reached.
+        print("REFUSED: this device tree carries a ramdisk placeholder but no "
+              "--data-ramdisk was given. DarwinBoot.c:558 refuses that "
+              "combination with EFI_COMPROMISED_DATA before the kernel hand-off; "
+              "measured 2026-10-26, 'DARWINBOOT: boot refused: Compromised Data'. "
+              "Either pass --data-ramdisk or use a tree built without "
+              "--packed-data-ramdisk.")
+        return 2
+    if args.data_ramdisk is not None and not has_placeholder:
+        # Request->Ramdisk != NULL with no placeholder: refused at :563-565.
+        print("REFUSED: --data-ramdisk was given but this tree carries no ramdisk "
+              "placeholder, so AdtNode reports RamdiskOffset == MAX_UINTN and "
+              "DarwinBoot.c:563-565 refuses with EFI_COMPROMISED_DATA. The two "
+              "are halves of one hand-off: make the tree with "
+              "make-qemu-adt.py --packed-data-ramdisk (a 16-zero-byte "
+              "PackedRAMDisk in /chosen/memory-map) or drop --data-ramdisk.")
+        return 2
+    if has_placeholder:
+        print("NOTE: the ramdisk pair is complete -- the tree carries the "
+              "placeholder and --data-ramdisk supplies the packed seed, which is "
+              "the configuration DarwinBoot.c:558-567 requires (measured "
+              "2026-10-26: the guest publishes the RAM block and reaches "
+              "native_owner_data_prepare).")
     if b"TrustCache" in tree and args.trust_cache is None:
         print("WARNING: this device tree carries the TrustCache sidecar binding "
               "but no --trust-cache file was given; DarwinBoot.c:578 refuses that "
@@ -475,15 +542,21 @@ def main() -> int:
     esp = run / "esp"
     print(f"staging the ESP into {esp} ...", flush=True)
     staged = stage_esp(inputs, esp, spec)
-    # The five payload files, counted without the ``_esp`` bookkeeping key that
+    # The payload files, counted without the ``_esp`` bookkeeping key that
     # stage_esp also returns -- an earlier version of this check counted every
     # key and refused a correct staging with "wrote 6 entries, expected 5".
     # The sizes come from the copy that just happened rather than from a second
     # stat of a path a later edit could move, and a missing file here is a boot
     # that never reaches the kernel.
-    # Five without a trust cache, six with one.  A constant that says five is a
-    # probe that refuses the run it was given.
-    expected = 6 if args.trust_cache is not None else 5
+    # Five is the floor -- the four payload copies plus the generated
+    # unixnu.toml -- and each optional input adds exactly one.  A constant is
+    # what this check must not be: it was five, then six when the trust cache
+    # arrived, and a run carrying both a trust cache and a Data ramdisk would be
+    # refused by either of them.
+    expected = 5
+    for given in (args.trust_cache, args.data_ramdisk):
+        if given is not None:
+            expected += 1
     files = {k: v for k, v in staged.items() if k.startswith("EFI/")}
     if len(files) != expected:
         print(f"stage_esp wrote {len(files)} payload files, expected {expected}: "
@@ -503,9 +576,31 @@ def main() -> int:
     # Only with the driver that reads it, decided the way boot() decides: a
     # geometry nothing set is a claim the run cannot support.
     ramfb_size = SCREEN if (esp / "EFI/UniXNU/Payloads/QemuRamfb.efi").is_file() else None
+    # The SystemOS cryptex, and where it comes from when the operator did not
+    # name one.  This probe already knew the member's *role* (ROLES above maps
+    # ``044-76034-038.dmg`` to "systemos") and used it only to warn that an image
+    # was the wrong one.  It was never attached.  That is the gap: without it the
+    # guest panics with ``offline owner SystemOS mount failed: 80 (EAUTH)`` at
+    # ``kern_exec.c:8032``, measured on this host on the machine that had an ESP
+    # and an OS root volume and nothing else (implementation-plan facts 77-78).
+    # build_argv() validates the path -- absent, empty and UDIF-container are
+    # three different refusals with three different consequences -- so handing
+    # it the default rather than checking it here keeps one implementation of
+    # "is this a usable raw disk".
+    systemos = args.systemos
+    if systemos is None and member == "044-76040-038.dmg":
+        beside = source.parent / "044-76034-038.dmg"
+        if beside.is_file():
+            systemos = beside
+            print(f"systemos {beside} (the board member beside the OS root volume)")
+        else:
+            print("NOTE: no --systemos and none beside the OS root volume; this "
+                  "guest cannot mount the SystemOS cryptex, so "
+                  "native_owner_cache_prepare() will panic with EAUTH however "
+                  "far the boot gets")
     argv = [str(QEMU)] + build_argv(
         QEMU, inputs, esp, run, qmp_port=port, memory_mib=memory_mib,
-        ramfb_size=ramfb_size, root_image=root
+        ramfb_size=ramfb_size, root_image=root, systemos_image=systemos
     )
     (run / "command.txt").write_text(" ".join(argv), encoding="utf-8")
     print(f"root image {root} ({root.stat().st_size} bytes); qmp port {port}", flush=True)

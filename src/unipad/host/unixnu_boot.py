@@ -44,7 +44,7 @@ import struct
 import subprocess
 import time
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -307,6 +307,13 @@ class BootReport:
     #: without one *looks* identical in the serial log until the kernel blocks
     #: in ``vfs_mountroot``; the report has to say which kind of run it was.
     root_image: Optional[str] = None
+    #: The SystemOS cryptex this run attached, or ``None``.  The same argument as
+    #: :attr:`root_image`, for a failure that is *further* along the boot and
+    #: therefore easier to misread: a run with a root volume and no cryptex gets
+    #: past ``vfs_mountroot``, passes the root checks, and panics with
+    #: ``offline owner SystemOS mount failed: 80`` -- so "the kernel started" is
+    #: true of both machines and only this field separates them.
+    systemos_image: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -323,6 +330,7 @@ class BootReport:
             "screenshots": list(self.screenshots),
             "inputs": dict(self.inputs),
             "root_image": self.root_image,
+            "systemos_image": self.systemos_image,
             "error_code": self.error_code,
             "error_message": self.error_message,
         }
@@ -531,6 +539,12 @@ def unixnu_toml(
 #: ``owner-data/owner-data-1g.dbr`` and stages it as this).
 DATA_RAMDISK_NAME = "owner-data-1g.dbr"
 
+#: The name the trust cache is staged under, beside the kernel.  One spelling,
+#: because it is a *lookup* rather than a label: ``unixnu/payload.py:143-144``
+#: writes exactly this and UniXNU reads exactly this, so a second spelling would
+#: stage a file nothing opens.
+TRUSTCACHE_NAME = "EFI/UniXNU/Payloads/kernel.macho.trustcache"
+
 #: The ``initrd =`` line, as a compiled pattern.  Config.c reads the key with
 #: ``TomlGetString`` so whitespace is not significant, but this is only used to
 #: detect presence in a config this module did not write, so the simple form is
@@ -591,6 +605,64 @@ def _check_ramdisk_pair(
         )
 
 
+#: Where each optional input lands on the ESP, keyed by the role
+#: :class:`BootInputs` names it.  ``stage_esp`` writes exactly these keys, so
+#: this is the whole contract between "the caller asked for it" and "the guest
+#: has it" -- which is what :func:`_check_carried` compares.
+_OPTIONAL_STAGED = {
+    "trust_cache": TRUSTCACHE_NAME,
+    "data_ramdisk": f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}",
+}
+
+
+def _check_carried(
+    requested: "BootInputs", carried: Mapping[str, bool], where: str
+) -> None:
+    """Refuse a run that has lost one of the optional inputs it was given.
+
+    ``requested`` is what the caller handed :func:`boot`.  ``carried`` says, role
+    by role, whether that input is still in hand at the point ``where`` names, and
+    the two call sites are the whole point of the ``where``: resolving the paths
+    and staging the ESP fail in different places and would otherwise be told apart
+    only by which one raised.
+
+    ``BootInputs`` gained ``trust_cache`` and ``data_ramdisk`` after ``boot()``'s
+    path-resolution block was written, and that block listed the five paths by
+    hand.  A caller that passed both therefore had them checked by ``missing()``,
+    resolved, and then dropped on the floor: the ESP carried five files,
+    ``report.inputs`` recorded five, and the guest booted without either.  Both
+    consequences are invisible in the serial log -- AMFI refusing to exec launchd
+    (namespace 9, EXEC, code 8, SECURITY_POLICY, ``build-os-root.py:26-27``) and
+    DarwinBoot refusing the ramdisk half of the pair with ``EFI_COMPROMISED_DATA``
+    before the kernel starts (``DarwinBoot.c:563-569``) -- so the run reads as a
+    guest bug, and the run report agrees with the lie.
+
+    Comparing two *records* is what makes this a guard rather than a second copy
+    of ``missing()``: ``missing()`` says the file was on disk when the run began,
+    and this says the file is still in hand afterwards.  The inputs compared are
+    the caller's, taken before anything is resolved, so a future edit that drops a
+    field again fails here -- naming the role -- instead of producing a boot
+    report that describes a payload that was never staged.
+
+    ``where`` is carried in the details as well as in the message, so a caller (or
+    a test) can tell the two call sites apart without matching prose.
+    """
+    for role, esp_name in _OPTIONAL_STAGED.items():
+        asked = getattr(requested, role) is not None
+        present = carried[role]
+        if asked != present:
+            raise UniPadError(
+                ErrorCode.INVALID_PACKAGE,
+                f"{where} does not carry the {role} this run asked for; the guest "
+                "would boot without it and the run report would not say so",
+                role=role,
+                asked=asked,
+                carried=present,
+                where=where,
+                esp_name=esp_name,
+            )
+
+
 # ---------------------------------------------------------------------------
 # staging
 # ---------------------------------------------------------------------------
@@ -645,9 +717,9 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
     # trust cache", which is the question that decides whether AMFI will let the
     # kernel exec launchd (``build-os-root.py:26-27``).
     if inputs.trust_cache is not None:
-        target = esp / "EFI/UniXNU/Payloads/kernel.macho.trustcache"
+        target = esp / TRUSTCACHE_NAME
         shutil.copyfile(inputs.trust_cache, target)
-        written["EFI/UniXNU/Payloads/kernel.macho.trustcache"] = target.stat().st_size
+        written[TRUSTCACHE_NAME] = target.stat().st_size
 
     # The packed Data ramdisk.  Validated before it is copied, against the
     # format both the bootloader and the kernel driver parse, so a seed one of
@@ -681,6 +753,65 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
 # ---------------------------------------------------------------------------
 # the command line
 # ---------------------------------------------------------------------------
+def _raw_volume(path: Path, role: str, consequence: str) -> Path:
+    """A raw block-device image, resolved, and refused if it cannot be one.
+
+    The three refusals are the three ways a path can look right and be useless,
+    and each of them is measured rather than imagined:
+
+    * **absent.**  QEMU would refuse the path too, but *after* it started -- and
+      a run that started is a run that produced a serial log to read, one that
+      stops at ``Waiting on IOMedia`` and looks exactly like a run that had no
+      volume at all.
+    * **empty.**  A zero-length file is a valid raw disk to QEMU and a useless
+      volume; the run would spend its whole window waiting for a UUID nothing
+      can publish.  ``CONFIG_INVALID`` rather than ``IMAGE_NOT_FOUND`` because
+      retrying can never change a file's length from zero, and a caller that
+      branches on the code and retries would retry forever.
+    * **a UDIF container.**  ``044-76040-038.dmg`` is 5,157,406,069 bytes, so it
+      passes both checks above and QEMU opens it happily -- ``format=raw``
+      accepts any bytes -- and hands the guest a compressed container as a raw
+      disk.  There is then no GPT, no APFS and no volume UUID, so the boot
+      blocks on the same ``Waiting on IOMedia`` line as a run with no volume at
+      all, while the caller reads the report field set and ``main()`` prints
+      that the volume was attached.  ``unipad.host.udif`` is what turns one of
+      these into a raw image -- and for the OS member that is 3415 of its 3814
+      chunks, which is why the decoder exists.
+
+    ``role`` names the attachment ("root volume", "SystemOS cryptex") and
+    ``consequence`` is the clause that says what the guest loses without it,
+    because that is the part of the message an operator acts on.  Both volumes
+    go through here so they cannot drift into different answers about the same
+    bytes.
+    """
+    volume = Path(path).resolve()
+    if not volume.is_file():
+        raise UniPadError(
+            ErrorCode.IMAGE_NOT_FOUND,
+            f"the {role} image does not exist; {consequence}",
+            path=safe_location(volume),
+        )
+    if volume.stat().st_size <= 0:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the {role} image is empty; no IOMedia can be published from it, so "
+            "the volume the guest looks for cannot be found.  This is "
+            "CONFIG_INVALID rather than IMAGE_NOT_FOUND because retrying can "
+            "never change a file's length from zero, and a caller that branches "
+            "on the code and retries would retry forever",
+            path=safe_location(volume),
+        )
+    if _ends_in_udif_trailer(volume):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the {role} image is a UDIF container, not a raw disk; QEMU's "
+            "format=raw would hand the guest the compressed container, which "
+            "publishes no IOMedia. Decode it first with unipad.host.udif",
+            path=safe_location(volume),
+        )
+    return volume
+
+
 def build_argv(
     qemu: Path,
     inputs: BootInputs,
@@ -692,6 +823,7 @@ def build_argv(
     display: str = "none",
     ramfb_size: Optional[str] = None,
     root_image: Optional[Path] = None,
+    systemos_image: Optional[Path] = None,
 ) -> list[str]:
     """The QEMU argv (without the executable).
 
@@ -755,6 +887,54 @@ def build_argv(
     A first version of this parameter emitted the root volume on PCI as well.
     It was wrong for the reason above and the mistake was only visible by
     reading the driver's ``probe`` -- the argv was accepted by QEMU either way.
+
+    ``systemos_image`` is the SystemOS cryptex as a *third*, read-only block
+    device, and it is the attachment the official path was missing: the OS root
+    volume and the SystemOS image are the two VirtIO block devices the device
+    repository's README says to hand QEMU, and the guest's own checker names
+    what each one is for.  ``native_owner_cache_prepare()``
+    (``vendor/UniXNU/patches/xnu/offline-owner-systemos-mount.patch``) looks for
+    the volume ``XNU_OWNER_CACHE_VOLUME_UUID``
+    (``8846FE78-2910-4297-AF97-D59BB6F8FC16``) and sets ``error = EAUTH`` when
+    no device carries it.
+
+    Measured on this host, 2026-10-26, on the machine that had an ESP and an OS
+    root volume and nothing else: ``_native_owner_cache_stage`` stayed 1,
+    ``_native_owner_cache_status`` 80 (``EAUTH``),
+    ``_native_virtio_verified_devices`` 1, and the kernel panicked with
+    ``offline owner SystemOS mount failed: 80 @kern_exec.c:8032``.  Attaching
+    the cryptex as a third read-only ``virtio-blk-device`` took the same globals
+    to stage 6, status 0, mount_status 0, readonly 1, authorized 1, selected ==
+    mounted == ``0x01000004`` and ``_native_virtio_verified_devices`` 2 -- nine
+    of the device repository's eleven success criteria field for field, the two
+    that differ being I/O counters four blocks ahead.  The console line that
+    separates the two machines is ``disk1s1 mounting volume ...SystemCryptex,
+    requested by: init (pid 1)`` followed by ``mount-complete``.
+
+    So it is not decoration, and its absence is *not* the same failure as a
+    missing root volume: without a cryptex the guest gets past
+    ``vfs_mountroot``, passes the root checks, and panics.  A run that "reached
+    the kernel" is therefore true of both, and only
+    :attr:`BootReport.systemos_image` says which one it was.
+
+    **Position: last, after ``-name``.**  That is where the verified run puts it
+    -- ``local-private/boot24/command.txt`` is the argv of the boot that
+    measured the numbers above, and its last two tokens are exactly this pair.
+    The order is ``-drive`` then ``-device`` and the drive id is ``systemos``;
+    both are pinned by test against that file rather than by taste.
+
+    MMIO, not PCI, for the reason the OS root volume is: the driver that reads
+    it matches on ``compatible == "virtio,mmio"``.  ``readonly=on`` because this
+    is a signed, shipped image and a boot that writes to it is a different
+    experiment with different consequences (PRD 4.2).
+
+    One operational consequence the verified run had to pay for: a third block
+    device changes UEFI's automatic enumeration order, and the boot fell through
+    to the UEFI Shell with the serial log stopped at ``Shell>`` -- DarwinBoot
+    never ran.  The verified command carries ``bootindex=0`` on the ESP's
+    ``virtio-blk-pci``, and that is what restored it, so :func:`build_argv` emits
+    it too -- unconditionally, for the reason spelled out at the device below.
+    The probe scripts call this function, so they get it without being edited.
     """
     if not 1 <= int(qmp_port) <= 65535:
         raise UniPadError(
@@ -771,51 +951,32 @@ def build_argv(
             "from it and the machine cannot start without both",
             path=safe_location(firmware),
         )
-    # The root image is checked here, before the argv exists, for the same
-    # reason the firmware is: QEMU would reject the whole command line at exit 1
-    # with a path that looks right, and the failure would be indistinguishable
-    # from a boot that never started.  A zero-length image is refused too -- an
-    # empty file is a valid raw disk to QEMU but a useless root volume, and the
-    # run would spend its whole window waiting for a UUID nothing can publish.
-    #
-    # A UDIF *container* is refused as well, and that is not a theoretical case:
-    # ``044-76040-038.dmg`` is 5,157,406,069 bytes, so it passes both checks above
-    # and QEMU opens it happily -- ``format=raw`` accepts any bytes -- and hands
-    # the guest a compressed container as a raw disk.  There is then no GPT, no
-    # APFS and no volume UUID, so the boot blocks on the same ``Waiting on
-    # IOMedia`` line as a run with no root volume at all, while the caller reads
-    # ``report.root_image`` set and ``main()`` prints "root volume attached".
-    # ``unipad.host.udif`` is what turns one of these into a raw image.
+    # Both block-device images are checked here, before the argv exists, for the
+    # same reason the firmware is: QEMU would reject the whole command line at
+    # exit 1 with a path that looks right, and the failure would be
+    # indistinguishable from a boot that never started.  The three ways each can
+    # be unusable, and why each is a refusal rather than a QEMU error, are in
+    # :func:`_raw_volume`.
     root: Optional[Path] = None
     if root_image is not None:
-        root = Path(root_image).resolve()
-        if not root.is_file():
-            raise UniPadError(
-                ErrorCode.IMAGE_NOT_FOUND,
-                "the root volume image does not exist; the guest would boot "
-                "with the ESP alone and block in vfs_mountroot",
-                path=safe_location(root),
-            )
-        if root.stat().st_size <= 0:
-            raise UniPadError(
-                ErrorCode.CONFIG_INVALID,
-                "the root volume image is empty; no IOMedia can be published "
-                "from it, so the kernel's root match cannot be satisfied.  This "
-                "is CONFIG_INVALID rather than IMAGE_NOT_FOUND because retrying "
-                "can never change a file's length from zero, and a caller that "
-                "branches on the code and retries would retry forever",
-                path=safe_location(root),
-            )
-        if _ends_in_udif_trailer(root):
-            raise UniPadError(
-                ErrorCode.CONFIG_INVALID,
-                "the root volume image is a UDIF container, not a raw disk; "
-                "QEMU's format=raw would hand the guest the compressed "
-                "container, which publishes no IOMedia. Decode it first with "
-                "unipad.host.udif (which needs an LZFSE decoder for the OS "
-                "member, 3415 of its 3814 chunks)",
-                path=safe_location(root),
-            )
+        root = _raw_volume(
+            root_image,
+            "root volume",
+            "the guest would boot with the ESP alone and block in vfs_mountroot",
+        )
+    # The cryptex goes through the same three checks, and the trap is the same
+    # one wearing a different suffix: ``044-76034-038.dmg`` is 3,303,014,400
+    # bytes of *raw* APFS with no trailer at all, while ``044-76040-038.dmg`` is
+    # a container -- so the image that needs no decoding and the one that does
+    # are told apart by their last 512 bytes, never by their names.
+    systemos: Optional[Path] = None
+    if systemos_image is not None:
+        systemos = _raw_volume(
+            systemos_image,
+            "SystemOS cryptex",
+            "native_owner_cache_prepare() would find no volume to mount and the "
+            "kernel would panic with 'offline owner SystemOS mount failed'",
+        )
 
     def qpath(path: Path | str) -> str:
         # Absolute, and forward slashes.  QEMU is started with this run directory
@@ -824,6 +985,20 @@ def build_argv(
         # exists becomes "Could not open" with a path that looks right.  A
         # backslash is an escape in a QEMU option value, so it is never used.
         return Path(path).resolve().as_posix()
+
+    # The SystemOS cryptex, built last because that is where the verified run
+    # puts it.  It carries the MMIO global with it when there is no OS root
+    # volume to carry it: the cryptex is ``-device virtio-blk-device`` too, and
+    # legacy mode would hand it the wrong register layout.
+    systemos_argv: list[str] = []
+    if systemos is not None:
+        if root is None:
+            systemos_argv += ["-global", "virtio-mmio.force-legacy=false"]
+        systemos_argv += [
+            "-drive",
+            f"if=none,id=systemos,format=raw,readonly=on,file={qpath(systemos)}",
+            "-device", "virtio-blk-device,drive=systemos",
+        ]
 
     return [
         "-drive", f"if=pflash,format=raw,readonly=on,file={qpath(firmware)}",
@@ -838,8 +1013,28 @@ def build_argv(
         # The ESP as a read-only FAT volume behind virtio-blk: the only disk
         # form UniXNU boots.  PCI, because EDK II enumerates the virtual PCI bus
         # to find it (BdsDxe loads Boot0001 from PciRoot(0x0)/Pci(0x1,0x0)).
+        #
+        # ``bootindex=0`` is not decoration and it is not conditional on how many
+        # other disks happen to be attached.  It says the ESP is the disk to boot
+        # from, which is true of every machine this function builds: it is the
+        # only disk carrying EFI/BOOT/BOOTAA64.EFI.  The measured reason it has to
+        # be *said* rather than left to the firmware's guess is the third block
+        # device -- with the ESP, an OS root volume and a SystemOS cryptex, UEFI's
+        # automatic enumeration order flipped and the boot fell through to the
+        # UEFI Shell with the serial log stopped at ``Shell>``, so DarwinBoot
+        # never ran.  Every recorded run of that three-disk machine carries it
+        # (``local-private/boot23`` through ``boot25``), and the earlier runs
+        # without it are the ones from before the problem was hit, not evidence
+        # that omitting it is ever better.
+        #
+        # It is unconditional rather than "only when a third disk is attached"
+        # because that threshold is not a property of the machine, it is a
+        # property of one afternoon's discoveries -- and the combination it would
+        # get wrong is reachable from this very module: a SystemOS cryptex with no
+        # OS root volume is a two-disk machine that has never been booted, and it
+        # would silently lose the one hint that keeps the firmware off the Shell.
         "-drive", f"if=none,id=esp,format=raw,readonly=on,file=fat:{qpath(Path(esp))}",
-        "-device", "virtio-blk-pci,drive=esp",
+        "-device", "virtio-blk-pci,drive=esp,bootindex=0",
         # The OS root volume, when one is supplied.  Its own drive id, because
         # two block devices sharing one would be one device; and it is emitted
         # *after* the ESP so the ESP keeps the device number the boot log and
@@ -865,7 +1060,7 @@ def build_argv(
         "-name", "unipad-unixnu",
     ] + (
         ["-fw_cfg", f"name=opt/org.unixnu/ramfb-size,string={ramfb_size}"] if ramfb_size else []
-    )
+    ) + systemos_argv
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1171,7 @@ def boot(
     qmp_port: int = DEFAULT_QMP_PORT,
     display: str = "none",
     root_image: Optional[Path] = None,
+    systemos_image: Optional[Path] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
 
@@ -987,16 +1183,19 @@ def boot(
     Raises:
         UniPadError: ``image_not_found`` for a missing *boot input* -- the five
             :class:`BootInputs` paths and the QEMU binary, all checked before
-            anything is written.  The root volume is **not** in that set: it is
-            checked inside :func:`build_argv`, which runs after the work
-            directory, the ESP and ``vars.fd`` have been written, so a bad
-            ``root_image`` leaves a staged ESP behind.  The asymmetry is
-            deliberate -- the root volume is an attachment, not an input the
+            anything is written.  The two block-device images are **not** in that
+            set: they are checked inside :func:`build_argv`, which runs after the
+            work directory, the ESP and ``vars.fd`` have been written, so a bad
+            ``root_image`` or ``systemos_image`` leaves a staged ESP behind.  The
+            asymmetry is deliberate -- each is an attachment, not an input the
             boot cannot proceed without -- and it is stated here because the
             earlier wording claimed both happened "before anything is written",
             which was not true of the root image and was not tested for it.
             ``config_invalid`` for an unusable port, a machine the board does
-            not declare, or a root volume that is empty or a UDIF container;
+            not declare, or an attachment that is empty or a UDIF container;
+            ``invalid_package`` when an optional input the caller asked for is
+            lost -- either resolving the paths or staging the ESP
+            (:func:`_check_carried`);
             ``qemu_launch_failed`` when QEMU exits before QMP answers.
     """
     qemu = Path(qemu)
@@ -1017,16 +1216,42 @@ def boot(
     # driver it refuses produces an error that names the device and not the
     # cause (measured 2026-10-24, see :func:`pe_subsystem`).
     _refuse_non_application(Path(inputs.unixnu).resolve())
+    # What the caller asked for, kept aside before the paths are resolved.
+    # :func:`_check_carried` compares *this* against the resolved inputs and then
+    # against the ESP that was written, so it can tell "the caller never asked"
+    # from "the caller asked and the file is not on the disk the guest gets".
+    requested = inputs
     # Resolved once, here, so every later use -- the ESP staging, the argv, the
     # record -- names the same file.  A relative input path is the caller's
     # spelling, not QEMU's: the child runs with the run directory as its cwd.
-    inputs = BootInputs(
+    #
+    # :func:`dataclasses.replace`, not a hand-written ``BootInputs(...)``: this
+    # block used to list the five paths by name, and when ``trust_cache`` and
+    # ``data_ramdisk`` were added to the dataclass the list was not extended.
+    # A caller that passed both had them checked by ``missing()``, resolved, and
+    # then dropped -- the ESP carried five files, the report recorded five, and
+    # the guest booted without a trust cache AMFI needs to exec launchd
+    # (``build-os-root.py:26-27``) and without the ramdisk DarwinBoot's
+    # exclusive-or gate refuses (``DarwinBoot.c:563-569``).  Deriving the new
+    # record from the old one means a field added later survives by
+    # construction rather than by somebody remembering this block.
+    inputs = replace(
+        inputs,
         firmware=Path(inputs.firmware).resolve(),
         kernel=Path(inputs.kernel).resolve(),
         devicetree=Path(inputs.devicetree).resolve(),
         darwinboot=Path(inputs.darwinboot).resolve(),
         unixnu=Path(inputs.unixnu).resolve(),
         payload_toml=None if inputs.payload_toml is None else Path(inputs.payload_toml).resolve(),
+    )
+    # ...and the resolution kept every optional input.  Checked here rather than
+    # only against the staged ESP because this is where a hand-written list would
+    # drop one, and the pair check inside ``stage_esp`` would otherwise fire
+    # first and blame the device tree for a field the resolution lost.
+    _check_carried(
+        requested,
+        {role: getattr(inputs, role) is not None for role in _OPTIONAL_STAGED},
+        "resolving the input paths",
     )
 
     spec = read_board_payload(device_dir)
@@ -1054,6 +1279,16 @@ def boot(
     work.mkdir(parents=True, exist_ok=True)
     esp = work / "esp"
     staged = stage_esp(inputs, esp, spec)
+    # ...and what was asked for is what the guest is handed.  After staging
+    # rather than before, because this is the first moment both halves of the
+    # comparison exist; it costs a dict lookup and it is the only thing standing
+    # between a dropped field and a boot report that describes a payload which
+    # was never written to disk.
+    _check_carried(
+        requested,
+        {role: esp_name in staged for role, esp_name in _OPTIONAL_STAGED.items()},
+        "the staged ESP",
+    )
 
     # The writable vars flash, sized to the code flash exactly.  A file that is
     # already the right size is left alone: it holds the variables from a
@@ -1078,6 +1313,7 @@ def boot(
         # the run cannot support (run-qemu.py:105-116).
         ramfb_size=SCREEN if (esp / "EFI/UniXNU/Payloads/QemuRamfb.efi").is_file() else None,
         root_image=root_image,
+        systemos_image=systemos_image,
     )
     (work / "command.txt").write_text(" ".join([str(qemu), *command]) + "\n", encoding="utf-8")
 
@@ -1087,6 +1323,11 @@ def boot(
         # Named here rather than in every later assignment, so a run that fails
         # before the report is built still says whether it had a root volume.
         root_image=safe_location(root_image.resolve()) if root_image is not None else None,
+        # ...and the same for the cryptex, for the same reason and with a
+        # further-out failure to distinguish (see :attr:`BootReport.systemos_image`).
+        systemos_image=(
+            safe_location(systemos_image.resolve()) if systemos_image is not None else None
+        ),
     )
 
     stdout_path = work / "qemu-stdout.log"
@@ -1259,6 +1500,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--root-image", type=Path, default=None,
                         help="raw OS volume to attach as a second, read-only virtio-blk disk; "
                              "without it the guest has the ESP alone and blocks in vfs_mountroot")
+    parser.add_argument("--systemos-image", type=Path, default=None,
+                        help="raw SystemOS cryptex to attach as a third, read-only virtio-blk "
+                             "disk; without it native_owner_cache_prepare() finds no volume to "
+                             "mount and the kernel panics, which is a different failure from "
+                             "the one --root-image prevents")
     parser.add_argument("--kernel-arg", action="append", default=[], metavar="NAME=VALUE",
                         help="replace the board's argument of the same name; repeatable")
     args = parser.parse_args(argv)
@@ -1287,12 +1533,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         qmp_port=args.qmp_port,
         display=args.display,
         root_image=args.root_image,
+        systemos_image=args.systemos_image,
     )
     print(f"qemu exit {report.exit_code}; qmp ready: {report.reached_qmp}; serial {report.serial_bytes} bytes")
     if report.root_image:
         print(f"root volume attached: {report.root_image}")
     else:
         print("no root volume attached: the guest has the ESP alone")
+    if report.systemos_image:
+        print(f"SystemOS cryptex attached: {report.systemos_image}")
+    else:
+        print("no SystemOS cryptex attached: native_owner_cache_prepare() will refuse")
     for line in report.serial_markers[-8:]:
         print(f"  {line}")
     if report.screenshots:

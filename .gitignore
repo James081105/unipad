@@ -80,3 +80,8 @@ scripts/macos/build-out/
 # 防止有人用默认 --out 在仓库里跑一次之后顺手 git add -A 的兜底。
 platform-seed
 platform-seed.json
+
+# 原子写留下的临时文件（Write/Edit 与若干 host 模块的 tempfile 用法）。一个
+# agent 中途被杀就会在 src/ 下留下一个，而 `git add -A` 分不清它和真源码——
+# 已实测发生过一次（src/unipad/host/unixnu_boot.py.tmp.<pid>.<hex>）。
+*.tmp.*

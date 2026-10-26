@@ -3,7 +3,9 @@
 Five tools that answer questions the serial log cannot.  They were
 written during the 2026-10-24 boot of the runner's kernel on this Windows host,
 and each one exists because a specific question came up and nothing else could
-answer it.
+answer it.  A sixth, `local-private/firmware/verify-data-mount.py`, answers
+whether the answers add up to success; it is described at the end and is not
+committed, because the UUID it compares against is Apple-derived.
 
 None of them modifies the guest, the kernel, or the device tree.
 `probe-adt-uart.py` writes a *variant* device tree beside the original and boots
@@ -68,6 +70,40 @@ hand-off, 5 = the deadline expired with no marker.  An earlier version returned
 
 The first two are recorded in `docs/boot-windows.md` §1.4 and §3.4; the
 root-volume measurement is in §6.
+
+## The one that only reads: `verify-data-mount.py`
+
+None of the five above answers the question the whole boot path is now waiting
+on.  They report what the guest printed; `local-private/firmware/
+verify-data-mount.py` reports whether that adds up to *success*.  It takes a run
+directory and answers one question -- did the Data volume mount, and is the
+original launchd running as PID 1 -- against an explicit rule, with a non-zero
+exit when the answer is no:
+
+```
+python local-private/firmware/verify-data-mount.py --run DIR [--dry-run | --live]
+```
+
+It boots nothing.  `--dry-run` (the default) opens no socket and reads only what
+the run directory already holds: `summary.json` for the guest globals and
+`kernel.log` for the console ring, or `verify-data-mount.json` if a `--live` run
+wrote one.  `--live` connects to the QMP port the run's own `command.txt` names
+and reads the guest through `unipad.host.guestobserve` -- the same reader
+`read-owner-state.py` uses, so there is no second memory reader -- waiting on
+that script's exit condition (`_native_owner_data_stage != 0`, or a 90-second
+quiet ring) rather than on the `No POST boot-arg set.` marker, which is printed
+twice and breaks on the first one a guest still loading kexts.
+
+Proved on `local-private/boot25/run-real`, the boot that carried everything
+except a real Data seed: `--dry-run` reports it **not verified** with
+`_native_owner_data_stage 0` and `_native_owner_data_status 2` (ENOENT), and
+exits 1.  A harness that reported that boot as anything else would be broken.
+
+The rule itself is tested in `tests/unit/test_verify_data_mount_rule.py`, which
+loads the script across the `local-private/` boundary and exercises it in both
+directions: a synthetic fixture that mounted the volume verifies, and eighteen
+mutations each break exactly the criterion that names them.  That test is why
+the script can live in a gitignored directory and still be checked.
 
 ## Why they are committed
 
