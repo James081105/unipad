@@ -182,33 +182,50 @@ def write_tree(
     """
     if adt_uuid is None:
         adt_uuid = root_uuid
-    tree = where / "tree"
-    (tree / "kernel").mkdir(parents=True)
+    # The driver's TWO output roots, spelled the way unixnu/config.py:80-82 and
+    # build-macos.sh's work_dir()/tree_dir() spell them.  The board's [board]
+    # name is 'qemu' and its defconfig is 'qemu_root_defconfig', so the work dir
+    # is NOT named after the config -- and this fixture must not name it after
+    # the config either, because that is precisely the confusion that made the
+    # stage look for the kernel's header under the wrong root on run 40339678974
+    # and cost that run its whole encrypted Data delivery.  ``<work>`` is
+    # ctx.work (kernel/, payload/, .config); ``<work>/tree`` is ctx.tree
+    # (build/, scripts/), which is where every script-derived file lands.
+    work = where / "qemu"
+    tree = work / "tree"
+    (work / "kernel").mkdir(parents=True)
     (tree / "build/original-static-system-trust").mkdir(parents=True)
     (tree / "build/xnu").mkdir(parents=True)
-    (tree / "payload-esp/EFI/UniXNU").mkdir(parents=True)
+    (work / "payload-esp/EFI/UniXNU").mkdir(parents=True)
     device = where / "device"
     (device / ".cache/firmware/owner-data").mkdir(parents=True)
     (device / ".cache/firmware/target-volumes").mkdir(parents=True)
     (where / "out/ipsw/21H461").mkdir(parents=True)
 
     # The kernel: a Mach-O-ish image that carries the UUID it was built with, the
-    # way the real one carries it as a C string literal.
-    (tree / "kernel/kernel.macho").write_bytes(
+    # way the real one carries it as a C string literal.  ctx.work, so ``work``.
+    (work / "kernel/kernel.macho").write_bytes(
         b"\xcf\xfa\xed\xfe" + b"\0" * 64 + kernel_uuid.encode() + b"\0" * 32
     )
     # The device tree publishes the root-match UUID as an XML string under
-    # /chosen/root-matching, so the bytes are the check.
-    (tree / "kernel/kernel.macho.adt").write_bytes(
+    # /chosen/root-matching, so the bytes are the check.  Also ctx.work: the
+    # prelink step writes it beside the kernel (kernel.prelink() of kernel.py).
+    (work / "kernel/kernel.macho.adt").write_bytes(
         b"<dict><key>root-matching</key><string>" + adt_uuid.encode() + b"</string>"
     )
+    # The two script-derived files, which are ctx.tree: the chain's trust bundle
+    # (build-original-system-trust.py:54-56) and the kernel's header
+    # (build-xnu-4k-baseline.sh:394, run with cwd=ctx.tree by kernel.py:100).
     (tree / "build/original-static-system-trust/original-static-system.bundle").write_bytes(
         b"trust cache bundle\n"
     )
     (tree / "build/xnu/owner-data-volume.h").write_text(
         '#define XNU_OWNER_DATA_VOLUME_UUID "' + kernel_uuid + '"\n', encoding="utf-8"
     )
-    (tree / "payload-esp/EFI/UniXNU/unixnu.toml").write_text(
+    # The ESP is passed explicitly by the runner ($OUT_DIR/payload-esp), so it
+    # hangs off the work dir here only because the fixture has nowhere else to
+    # put it -- it is not a claim about where the runner stages it.
+    (work / "payload-esp/EFI/UniXNU/unixnu.toml").write_text(
         '[boot]\nentries = ["kernel"]\n', encoding="utf-8"
     )
     # The seed: a packed disk whose container superblock is page 0 and whose
@@ -242,9 +259,9 @@ def write_tree(
 def collect_manifest(where: Path, board: Path, **overrides: object) -> mm.MaterialManifest:
     return mm.collect(
         mm.BuildTree(
-            root=where / "tree",
+            root=where / "qemu",
             device_root=where / "device",
-            esp=where / "tree/payload-esp",
+            esp=where / "qemu/payload-esp",
             volumes=where / "device/.cache/firmware/target-volumes",
             kernelcache=where / "out/ipsw/21H461/kernelcache.decompressed",
         ),
@@ -471,7 +488,7 @@ def test_an_artifact_whose_hash_does_not_match_is_refused(tmp_path: Path) -> Non
     """
     where, board = write_tree(tmp_path)
     manifest = collect_manifest(where, board)
-    kernel = where / "tree/kernel/kernel.macho"
+    kernel = where / "qemu/kernel/kernel.macho"
     kernel.write_bytes(kernel.read_bytes() + b"one more byte\n")
     with pytest.raises(mm.MaterialManifestError) as caught:
         verify(manifest, where, board)
@@ -660,7 +677,7 @@ def test_the_kernel_must_actually_carry_the_uuid_it_claims(tmp_path: Path) -> No
     manifest = collect_manifest(where, board)
     # A kernel image that does not carry the UUID, with everything else intact.
     replacement = b"\xcf\xfa\xed\xfe" + b"\0" * 256
-    (where / "tree/kernel/kernel.macho").write_bytes(replacement)
+    (where / "qemu/kernel/kernel.macho").write_bytes(replacement)
     honest = mm.MaterialManifest(
         schema=manifest.schema,
         build_id=manifest.build_id,
@@ -704,12 +721,80 @@ def test_a_kernel_with_no_data_mount_cannot_be_manifested(tmp_path: Path) -> Non
     the Data volume depends on.
     """
     where, board = write_tree(tmp_path)
-    (where / "tree/build/xnu/owner-data-volume.h").write_text(
+    (where / "qemu/tree/build/xnu/owner-data-volume.h").write_text(
         "/* Scratch Data IOKit selection disabled. */\n", encoding="utf-8"
     )
     with pytest.raises(mm.MaterialManifestError) as caught:
         collect_manifest(where, board)
     assert caught.value.rule == mm.RULE_DATA_UUID, caught.value
+
+
+def test_the_header_lives_in_the_drivers_tree_and_not_the_work_dir(tmp_path: Path) -> None:
+    """``unixnu`` has TWO output roots and the header is in the inner one.
+
+    Measured on run 40339678974, the run that built a real 1 GiB Data seed and a
+    kernel compiled with its UUID: the material-manifest stage looked for the
+    header under ``unixnu-out/qemu/build/xnu/`` and recorded ``not_run`` on BOTH
+    of that run's build passes, so the encrypted delivery never happened.  The
+    kernel log from the same seconds shows why -- ``kernel.py:100`` runs
+    ``build-xnu-4k-baseline.sh`` with ``cwd=ctx.tree``, and ``ctx.tree`` is
+    ``ctx.work/'tree'`` (config.py:80-82), so ``OWNER_DATA_HEADER`` (that
+    script's line 394) lands under ``unixnu-out/qemu/tree/build/``.
+
+    The board is what makes the two roots easy to confuse: its ``[board] name``
+    is ``qemu`` while its defconfig is ``qemu_root_defconfig``, so neither root
+    is named after the config.
+
+    This test is two-sided on purpose.  A header at the path the bug looked at
+    must be REFUSED (so the module demonstrably does not read there), and the
+    header at the path the driver writes must be READ (so the refusal above is
+    the path being wrong and not the header being ignored).  One-sided, either
+    assertion would also pass against a module that read nowhere.
+    """
+    where, board = write_tree(tmp_path)
+    header = where / "qemu/tree/build/xnu/owner-data-volume.h"
+    assert header.is_file(), "the fixture must put the header where the driver writes it"
+
+    # (1) the inner root is a child of the work dir, and both script-derived
+    #     files resolve into it.
+    tree = mm.BuildTree(root=where / "qemu", device_root=where / "device")
+    assert tree.source_tree == where / "qemu/tree"
+    assert tree.owner_data_header == header
+    assert tree.trust_cache == (
+        where / "qemu/tree/build/original-static-system-trust/original-static-system.bundle"
+    )
+    # ...and the driver's own outputs stay in the work dir: if these moved into
+    # the tree, the split would be drawn in the wrong place the other way.
+    assert tree.kernel == where / "qemu/kernel/kernel.macho"
+    assert tree.devicetree_path == where / "qemu/kernel/kernel.macho.adt"
+
+    # (2) the same header one level up -- exactly where run 40339678974 looked --
+    #     is not read, so a build that wrote it there cannot be manifested.  The
+    #     rule is ``kernelconfig-absent`` and not ``data-uuid-mismatch``, and the
+    #     message names the tree path: the reader went to the tree, found
+    #     nothing, and said where it looked.  A module reading at the work dir
+    #     would have found the moved file and manifested it.
+    moved = where / "qemu/build/xnu/owner-data-volume.h"
+    moved.parent.mkdir(parents=True)
+    header.rename(moved)
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        collect_manifest(where, board)
+    assert caught.value.rule == mm.RULE_KERNELCONFIG_ABSENT, caught.value
+    # The ``header`` detail is the sanitised leaf (PRD 9.2: no absolute paths in
+    # an error), so the path it looked at is in the message -- normalised to
+    # forward slashes because this host spells paths with backslashes.
+    said = str(caught.value).replace("\\", "/").replace("//", "/")
+    assert (where / "qemu/tree/build/xnu/owner-data-volume.h").as_posix() in said, said
+
+    # (3) and put back where the driver writes it, it is read again -- which is
+    #     what makes (2) a statement about the path rather than about the reader.
+    moved.rename(header)
+    manifest = collect_manifest(where, board)
+    # The volume_uuid role is a manifest entry whose value is the header's own
+    # #define, so "read again" means the value came back, not just that collect
+    # stopped refusing.
+    assert manifest.artifacts["volume_uuid"].value == DATA_UUID
+    assert manifest.artifacts["trust_cache"].sha256 == hashlib.sha256(b"trust cache bundle\n").hexdigest()
 
 
 def test_a_manifest_needs_a_build_id(tmp_path: Path) -> None:
@@ -843,16 +928,16 @@ def test_two_roles_with_one_leaf_name_are_refused(tmp_path: Path) -> None:
     nobody knows works.
     """
     where, board = write_tree(tmp_path)
-    esp = where / "tree/payload-esp/EFI/UniXNU"
+    esp = where / "qemu/payload-esp/EFI/UniXNU"
     # The boot config is already there as unixnu.toml; point the device tree at
     # the same leaf and the two collide.
     colliding = esp / "unixnu.toml"
     with pytest.raises(mm.MaterialManifestError) as caught:
         mm.collect(
             mm.BuildTree(
-                root=where / "tree",
+                root=where / "qemu",
                 device_root=where / "device",
-                esp=where / "tree/payload-esp",
+                esp=where / "qemu/payload-esp",
                 devicetree=colliding,
                 volumes=where / "device/.cache/firmware/target-volumes",
                 kernelcache=where / "out/ipsw/21H461/kernelcache.decompressed",

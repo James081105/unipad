@@ -485,7 +485,10 @@ class BuildTree:
     between the chain and the second build pass.
     """
 
-    #: The build tree -- ``work_dir`` of build-macos.sh, which holds ``kernel/``.
+    #: The build tree -- ``work_dir`` of build-macos.sh, which holds ``kernel/``,
+    #: ``payload/`` and ``.config``.  It is the driver's ``ctx.work``
+    #: (``<out>/<board name>``) and it CONTAINS ``ctx.tree``; see
+    #: :attr:`source_tree` before assuming anything built by a script lives here.
     root: Path
     #: The device repository -- ``DEVICE_DIR``, which holds ``.cache/firmware/``.
     device_root: Path
@@ -510,8 +513,44 @@ class BuildTree:
         return self.devicetree or self.root / "kernel/kernel.macho.adt"
 
     @property
+    def source_tree(self) -> Path:
+        """``unixnu``'s own build tree, which is a *child* of :attr:`root`.
+
+        ``unixnu/config.py:80-82`` derives them separately:
+
+            self.work = self.out_root / self.name     # <out>/<board name>
+            self.tree = self.work / 'tree'            # <out>/<board name>/tree
+
+        ``<board name>`` is board.toml's ``[board] name`` -- ``qemu`` -- and NOT
+        the defconfig, so on the board this repository builds the two are
+        ``build-output/unixnu-out/qemu`` and
+        ``build-output/unixnu-out/qemu/tree``.  Everything ``unixnu`` writes
+        through ``ctx.tree`` (the kernel build, the chain, every archive
+        builder) lands under ``tree/``; everything the driver writes through
+        ``ctx.work`` (the prelinked kernel, the payload, the boot image, the
+        generated ``.config``) lands directly under it.  Measured on run
+        40339678974, whose kernel log names both paths in one line:
+
+            bash .../build-output/unixnu-out/qemu/tree/scripts/build-xnu-4k-baseline.sh
+            ... --output .../build-output/unixnu-out/qemu/kernel/kernel.macho
+
+        The workflow's own chain step spells the split the same way
+        (``tree="$(ls -d "$OUT_ROOT"/*/tree)"; work="$(dirname "$tree")"``,
+        build-macos.yml:1636-1638), so this is not a private convention.
+        """
+        return self.root / "tree"
+
+    @property
     def trust_cache(self) -> Path:
-        return self.root / "build/original-static-system-trust/original-static-system.bundle"
+        """The chain's trust bundle, which lives in the tree's ``build/``.
+
+        ``build-original-system-trust.py:10,54-56`` derives ``ROOT`` from
+        ``__file__`` (``<tree>/scripts/build-original-system-trust.py``) and
+        writes ``ROOT/build/original-static-system-trust/``.  It is in the
+        tree's ``build/`` and not in :attr:`root`'s because ``tree.py:48-49``
+        makes ``build/`` a fresh directory per tree while ``.cache`` is shared.
+        """
+        return self.source_tree / "build/original-static-system-trust/original-static-system.bundle"
 
     @property
     def data_seed(self) -> Path:
@@ -524,9 +563,19 @@ class BuildTree:
         ``build-xnu-4k-baseline.sh:394-411`` writes it from
         ``$XNU_OWNER_DATA_VOLUME_UUID`` at every kernel build and refuses a value
         that is not a UUID, so it is the authoritative record of what the kernel
-        was built with -- not this module's opinion.
+        was built with -- not this module's opinion.  ``kernel.py:100`` runs that
+        script with ``cwd=ctx.tree``, and the script derives ``ROOT`` from
+        ``BASH_SOURCE`` (line 5), so the header lands in the tree's ``build/``
+        -- which is why this is :attr:`source_tree` and not :attr:`root`.
+
+        Measured on run 40339678974: the stage that looked for it under
+        ``unixnu-out/qemu/build/xnu/owner-data-volume.h`` recorded ``not_run``
+        on both of that run's build passes, and the kernel log from the same
+        seconds shows the script that writes it running from
+        ``unixnu-out/qemu/tree/``.  One missing path segment, and it cost the
+        run its entire encrypted Data delivery.
         """
-        return self.root / "build/xnu/owner-data-volume.h"
+        return self.source_tree / "build/xnu/owner-data-volume.h"
 
     @property
     def boot_config(self) -> Path:

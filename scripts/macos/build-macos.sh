@@ -1249,8 +1249,25 @@ step_material_manifest() {
     # (1) the inputs.  Each one is named with the stage that produces it, so a
     #     not_run says which earlier stage did not run rather than only that
     #     something is missing.
+    #
+    #     $(tree_dir) and NOT $(work_dir) for the header: unixnu/config.py:80-82
+    #     gives the driver TWO output roots, and the board's [board] name is
+    #     'qemu' while its defconfig is 'qemu_root_defconfig', so on this board
+    #     the pair is build-output/unixnu-out/qemu (kernel/, payload/, .config)
+    #     and build-output/unixnu-out/qemu/tree (build/, scripts/).  kernel.py:100
+    #     runs build-xnu-4k-baseline.sh with cwd=ctx.tree and that script derives
+    #     ROOT from BASH_SOURCE (line 5), so OWNER_DATA_HEADER (line 394) lands in
+    #     the tree's build/.  Measured on run 40339678974: the stage looked under
+    #     unixnu-out/qemu/build/ and recorded not_run on BOTH of that run's build
+    #     passes -- the second of which had just built a real 1 GiB Data seed and
+    #     a kernel compiled with its UUID -- while the kernel log from the same
+    #     seconds shows the script that writes it running out of
+    #     unixnu-out/qemu/tree/.  One missing segment, and it cost the run its
+    #     whole encrypted delivery.  The workflow's own chain step draws the same
+    #     split (build-macos.yml:1636-1638: tree="$(ls -d "$OUT_ROOT"/*/tree)";
+    #     work="$(dirname "$tree")").
     local header seed kernelcache
-    header="$(work_dir)/build/xnu/owner-data-volume.h"
+    header="$(tree_dir)/build/xnu/owner-data-volume.h"
     seed="$(os_root_seed_json)"; seed="${seed%/*}/owner-data-1g.dbr"
     kernelcache="$(material_kernelcache)"
     if [[ ! -f "$header" ]]; then
@@ -1318,7 +1335,16 @@ step_material_manifest() {
     local role path leaf
     while IFS="$(printf '\t')" read -r role leaf; do
         [[ -n "$leaf" ]] || continue
-        for path in "$(work_dir)/$leaf" "$DEVICE_DIR/.cache/firmware/owner-data/$leaf" \
+        # $(tree_dir) before $(work_dir), and both before everything else: the
+        # trust bundle is a script output and lives in the tree's build/
+        # (build-original-system-trust.py:54-56, ROOT from __file__), while the
+        # kernel and the device tree are the driver's own and live in work_dir.
+        # Same two-root split as the header check in (1); see the note there.
+        # Without the tree in this list the bundle is simply not copied, and the
+        # verify in (3) then refuses a delivery that is missing a file the build
+        # really did produce.
+        for path in "$(tree_dir)/$leaf" "$(work_dir)/$leaf" \
+                    "$DEVICE_DIR/.cache/firmware/owner-data/$leaf" \
                     "$DEVICE_DIR/.cache/firmware/target-volumes/$leaf" \
                     "$OUT_DIR/payload-esp/EFI/UniXNU/$leaf" "$kernelcache"; do
             [[ -f "$path" ]] || continue

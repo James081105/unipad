@@ -2358,11 +2358,12 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
 ) -> None:
     """PRD 7.4: missing evidence is unverified, never success.
 
-    Three independent reasons a stage cannot run are in play at once -- the
+    Four independent reasons a stage cannot run are in play at once -- the
     Apple-format device tree needs qemu-system-aarch64 to dump the machine's own
-    device tree, this board declares no [firmware], and the owner root chain's
-    first sub-step needs a kernel that has not been built yet -- and none may be
-    folded into "ran".  The run itself succeeds (exit 0) and still reports ok=false.
+    device tree, this board declares no [firmware], the owner root chain's first
+    sub-step needs a kernel that has not been built yet, and the material
+    manifest needs the header that kernel build writes -- and none may be folded
+    into "ran".  The run itself succeeds (exit 0) and still reports ok=false.
 
     The seed is NOT one of the three reasons here, and that is the point of this
     test's history: the scratch repository used to stub ``src/unipad`` out, so
@@ -2418,6 +2419,30 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert "tree.py:70-76" in os_root["reason"], os_root
     assert "unixnu defconfig" in os_root["reason"], os_root
 
+    # (2c) material-manifest: the same ordering fact as (2b), one stage later,
+    #      and the one this test is really here to pin.  The manifest binds the
+    #      Data volume UUID to the kernel that was compiled with it, and the
+    #      header carrying that UUID is written by the kernel build itself --
+    #      so on a fresh workspace it cannot exist and the stage says so.
+    #
+    #      The path is asserted in BOTH directions, and that is the point.
+    #      ``unixnu`` has two output roots (config.py:80-82: ctx.work and
+    #      ctx.work/tree) and the header is in the inner one, because
+    #      kernel.py:100 runs the baseline script with cwd=ctx.tree and that
+    #      script derives ROOT from BASH_SOURCE.  A version of the stage looked
+    #      under ctx.work/build/ instead, and on run 40339678974 it recorded
+    #      not_run on both build passes -- the second of which had just built a
+    #      real 1 GiB Data seed and a kernel compiled with its UUID -- so the
+    #      run produced no delivery at all.  One missing path segment.  The
+    #      assertion below is what stops that coming back: the work-dir spelling
+    #      must not appear in the reason, because a stage that names the wrong
+    #      path tells the operator the kernel stage failed when it did not.
+    material = report_steps["material-manifest"]
+    assert material["status"] == "not_run", material
+    assert "owner-data-volume.h" in material["reason"], material
+    assert "unixnu-out/qemu/tree/build/xnu/owner-data-volume.h" in material["reason"], material
+    assert "unixnu-out/qemu/build/" not in material["reason"], material
+
     # (3) the stages that DID run are recorded ran, with what they ran.
     for name in ("build-kernel", "build-bootloader", "build-devicetree"):
         assert report_steps[name]["status"] == "ran", report_steps[name]
@@ -2427,11 +2452,12 @@ def test_a_stage_that_cannot_run_says_so_and_the_run_is_not_a_success(
     assert stage["ok"] is False, stage
     assert stage["status"] == "incomplete", stage
     assert stage["step_summary"].startswith("ran="), stage
-    assert "not_run=3" in stage["step_summary"], stage
-    assert len(stage["not_run_reasons"]) == 3, stage
+    assert "not_run=4" in stage["step_summary"], stage
+    assert len(stage["not_run_reasons"]) == 4, stage
     assert any("qemu-system-aarch64" in reason for reason in stage["not_run_reasons"])
     assert any("no [firmware]" in reason for reason in stage["not_run_reasons"])
     assert any("build-os-root" in reason for reason in stage["not_run_reasons"])
+    assert any("material-manifest" in reason for reason in stage["not_run_reasons"])
     # (5) and the same ledger is what build-report.json carries, so the two files
     #     cannot disagree about what ran.
     assert scratch.stage_steps() == report_steps
