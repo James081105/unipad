@@ -861,12 +861,31 @@ def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
         )
     # (3) the list is iterated, not one file hardcoded: a member added later is
     #     encrypted because it is in the list, and the loop proves there is a
-    #     loop rather than a second copy of the openssl invocation.
+    #     loop rather than a second copy of the cipher invocation.
     assert 'for member in "${apple_derived[@]}"' in block, block
-    assert block.count("openssl enc -aes-256-gcm") == 1, (
+    assert block.count("-aes-256-gcm") == 1, (
         "the ciphertext is produced by more than one invocation, so the list is "
         "not what decides what gets encrypted"
     )
+    # (3b) ...and it is invoked through the resolved OpenSSL 3 keg, not through
+    #      bare `openssl`.  macOS's /usr/bin/openssl is LibreSSL, whose `enc` has
+    #      no GCM, so `openssl enc -aes-256-gcm` fails there -- measured on run
+    #      40392771419, whose delivery encryption failed for exactly that reason
+    #      and left no line in the step log.  Asserting the variable rather than
+    #      the word is what keeps a future edit from putting the bare command
+    #      back: `bash -n` cannot tell the two apart and neither can a reviewer
+    #      skimming for "openssl".
+    assert '"$ossl" enc -aes-256-gcm' in block, block
+    assert not re.search(r"(?<![$\w])openssl\s+enc\s", block), (
+        "the encryption calls bare `openssl`, which on macOS is LibreSSL and has "
+        "no GCM; use the keg openssl_bin() resolves"
+    )
+    # The failure is logged, not only recorded: ledger_add appends to an array
+    # and prints nothing, so a refusal that lands only in the build report is one
+    # the operator reading the step log cannot see.
+    assert "could NOT be encrypted by" in block, block
+    assert "${encrypt_error:-<no output>}" in block, block
+    assert 'ossl="$(openssl_bin)"' in block, block
     # (4) the plaintext is deleted as it is encrypted, per member.
     assert 'rm -f "$delivery/$member"' in block, block
     # (5) no key is not a silent pass: the stage says so and uploads nothing.

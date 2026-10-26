@@ -1201,6 +1201,39 @@ material_manifest_path() { printf '%s' "$(material_delivery_dir)/material-manife
 # workflow's boot-inputs bundle already uses.
 material_delivery_dir() { printf '%s' "$OUT_DIR/private"; }
 
+# openssl_keg -- the OpenSSL 3 keg this host has, or nothing.
+#
+# macOS ships /usr/bin/openssl, and that one is LibreSSL, whose `enc` has no GCM:
+# `openssl enc -aes-256-gcm` fails on it.  The material delivery encrypts with
+# exactly that cipher, so it must use the keg the workflow installs (its "Install
+# OpenSSL 3" step, which also exports OPENSSL_PREFIX) rather than whatever bare
+# `openssl` resolves to.  Measured on run 40392771419: the delivery's encryption
+# failed with no line in the step log at all, because the script called the
+# system LibreSSL and sent its stderr into a file under private/, which is never
+# uploaded.  The owner root chain resolves the same keg for its host verifier;
+# this is that resolution, named once instead of spelled twice.
+openssl_keg() {
+    local candidate
+    for candidate in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
+        if [[ -d "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+    done
+    return 0
+}
+
+# openssl_bin -- the openssl to encrypt with: the keg's, or PATH's as a fallback.
+#
+# The fallback is deliberate rather than lazy: on a host with no keg the delivery
+# cannot be encrypted at all, and the caller's error message has to say which
+# binary was tried so the operator can see it was the system one.
+openssl_bin() {
+    local keg; keg="$(openssl_keg)"
+    if [[ -n "$keg" && -x "$keg/bin/openssl" ]]; then
+        printf '%s' "$keg/bin/openssl"
+    else
+        printf 'openssl'
+    fi
+}
+
 # material_kernelcache -- the donor kernelcache the prelink step used.
 #
 # unipad.host.ipsw publishes it as <cache>/<board.build>/kernelcache.decompressed,
@@ -1466,7 +1499,10 @@ PY
     #     the key -- which is the opposite of what a verifiable delivery is for.
     local -a apple_derived=('owner-data-1g.dbr' 'kernelcache.decompressed'
                             'original-static-system.bundle')
-    local encrypted_count=0 member
+    local encrypted_count=0 member ossl encrypt_error keg
+    keg="$(openssl_keg)"
+    ossl="$(openssl_bin)"
+    log "material: encrypting the Apple-derived members with $(shown_path "$ossl")${keg:+ (the OpenSSL 3 keg)}${keg:- (no keg on this host, so whatever 'openssl' resolves to)}"
     if [[ -n "${MATERIAL_DELIVERY_KEY:-}" ]]; then
         for member in "${apple_derived[@]}"; do
             # Not a skip.  Reaching (5) means (3) staged every role the manifest
@@ -1480,12 +1516,19 @@ PY
                     "'$member' is an Apple-derived member the manifest records, but $(shown_path "$delivery/$member") is not in the delivery, so it can neither be encrypted nor verified"
                 return 1
             fi
-            if ! openssl enc -aes-256-gcm -pbkdf2 -salt \
+            if ! encrypt_error="$("$ossl" enc -aes-256-gcm -pbkdf2 -salt \
                     -in "$delivery/$member" \
                     -out "$delivery/$member.enc" \
-                    -pass env:MATERIAL_DELIVERY_KEY 2>>"$delivery/${name}.verify.log"; then
+                    -pass env:MATERIAL_DELIVERY_KEY 2>&1)"; then
+                # Logged, not only recorded.  ``ledger_add`` appends to an array
+                # and prints nothing, and the openssl stderr used to go to a file
+                # under private/ -- which is never uploaded.  Measured on run
+                # 40392771419: the encryption failed and the step log carried no
+                # line about it at all, so the only way to find out why was to
+                # guess.  A refusal the operator cannot read is not a refusal.
+                log "material: $member could NOT be encrypted by $(shown_path "$ossl"): ${encrypt_error:-<no output>}"
                 ledger_add "$name" 'failed' \
-                    "MATERIAL_DELIVERY_KEY was given but $member could not be encrypted; see $(shown_path "$delivery/${name}.verify.log")"
+                    "MATERIAL_DELIVERY_KEY was given but $member could not be encrypted by $ossl: ${encrypt_error:-<no output>}"
                 return 1
             fi
             # Deleted the moment it has a ciphertext, for the reason the
@@ -2212,12 +2255,12 @@ step_build_os_root() {
     #     grow the Data container and mount it to write SpringBoard's
     #     preferences (build-os-root.py:70,104-131); the host verifier links
     #     against OpenSSL 3, whose keg the script takes as --openssl-prefix
-    #     (build-os-root.py:44-45,63-65).  Neither exists off macOS.
+    #     (build-os-root.py:44-45,63-65).  Neither exists off macOS.  The keg is
+    #     resolved by openssl_keg(), which is the same resolution the material
+    #     delivery's encryption uses -- two spellings of it would be the
+    #     divergence class this script keeps paying for.
     local openssl_prefix=''
-    local candidate
-    for candidate in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
-        if [[ -d "$candidate" ]]; then openssl_prefix="$candidate"; break; fi
-    done
+    openssl_prefix="$(openssl_keg)"
     local -a need=('hdiutil' 'diskutil' 'python3')
     if [[ -n "$openssl_prefix" ]]; then
         apple_step_gate "$name" "${need[@]}" "$openssl_prefix" || return 0
