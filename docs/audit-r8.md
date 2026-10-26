@@ -484,6 +484,15 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 **转公开的直接后果：Actions 恢复。** 公开仓库的 Actions 计算是免费的，11.20 记的计费失败随之消失——随后手动触发的 `build-macos`（run 40250055465）正常启动并进入 in_progress。**所以 11.20 的「runner 验证暂停」已解除**，`34fe029` 的 trust cache 转发终于可以复验。
 
 
+### 11.22 本机环境事实：git push 走全局代理会失败，绕过代理才通
+
+2026-10-26。本机 `git config --global http.proxy` 是 `http://127.0.0.1:7897`（本地代理）。**走它 push 会失败**，报 `TLS connect error: error:0A000126:SSL routines::unexpected eof while reading`；`git -c http.proxy= push` 立刻成功。
+
+**代价记下来**：有四个提交一度只在本机、没上去（`3d3092a` `3b20e9e` `2e2789c` `ce8f0d7`），而我在几条命令里用了 `... | head -2; echo pushed` 这种写法，`echo pushed` 是无条件执行的，于是我自己打印了四次「pushed」——**四次都是假的**。真正发现是通过 `gh api .../commits/main` 对远端 HEAD，才发现远端停在 `214f358`。**教训与事实 54c 同形**：一条会把失败说成成功的命令行，和没有检查是等价的；`&&` 与管道位置比一句 `echo` 更值得想一秒钟。
+
+顺带排掉了两个错误方向：`http.schannelCheckRevoke=false`（针对 `CRYPT_E_REVOCATION_OFFLINE`，本机确实有这个错，但不是 push 失败的原因）试过无效，**已改回原状**，没有留在全局配置里；`http.sslBackend=openssl` 同样无效，且那是本机原有设置。
+
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
