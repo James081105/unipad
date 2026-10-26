@@ -411,20 +411,67 @@ def main() -> int:
         payload_toml=None,
         trust_cache=args.trust_cache,
     )
-    if args.trust_cache is None:
+    # The TrustCache memory-map binding, and what it MEASURABLY does.
+    #
+    # make-dt.py:162 emits ('TrustCache', bytes(16)) -- a 16-zero-byte entry in
+    # the ADT's memory-map node -- only under its own --trust-cache, describing
+    # itself as "a zeroed owned TrustCache sidecar binding".  This probe used to
+    # REFUSE a --trust-cache whose tree lacked the binding, on the reasoning that
+    # a file staged but never bound is the most misleading shape the measurement
+    # could take.
+    #
+    # The measurement refuted that reasoning, in both directions, on 2026-10-26:
+    #
+    #   binding + trust cache file -> DARWINBOOT: boot refused: Compromised Data
+    #   binding, no file          -> DARWINBOOT: boot refused: Compromised Data
+    #
+    # So the binding is not what makes the trust cache effective -- on this
+    # DarwinBoot it is what stops the boot at all.  A zeroed sidecar binding is a
+    # placeholder something else (iBoot on a real device) is expected to fill in,
+    # and nothing on QEMU fills it in, so DarwinBoot sees a TrustCache region of
+    # address 0 length 0 and refuses.
+    #
+    # The guard is therefore a WARNING in both directions rather than a refusal
+    # in one: a probe that refuses the combination worth measuring has stopped
+    # being an instrument.  What it must not do is stay silent, because the two
+    # cases below are indistinguishable in the boot's own output.
+    tree = args.devicetree.read_bytes()
+    if b"PackedRAMDisk" in tree:
+        # THE one that stops the boot, isolated on 2026-10-26.  payload.py:157
+        # turns --data-ramdisk into make-qemu-adt.py --packed-data-ramdisk (when
+        # board.toml [payload.adt] packed_data_ramdisk is true), and make-dt.py
+        # then emits a 16-zero-byte PackedRAMDisk region.  DarwinBoot.c:558 reads
+        # ``if (KeepPacked && (!RamdiskPacked || RamdiskOffset == MAX_UINTN))``
+        # -> EFI_COMPROMISED_DATA, and RamdiskPacked comes from the boot REQUEST
+        # (DarwinBoot.c:512, RamdiskLayout over Request->Ramdisk), not from the
+        # tree.  Nothing on the QEMU path supplies a packed ramdisk, so the boot
+        # stops before the kernel hand-off.
+        #
+        # Measured, kernel held constant:
+        #   no binding, no file                 -> boots, kernel runs
+        #   TrustCache binding + file           -> boots, kernel runs, 2 modules load
+        #   PackedRAMDisk binding, no file      -> Compromised Data
+        #   PackedRAMDisk + TrustCache + file   -> Compromised Data
+        # So the TRUST CACHE is not what breaks it, and this probe's first
+        # warning said the opposite.  A guard that names the wrong cause is worse
+        # than no guard: it sends the next reader to fix the wrong thing.
+        print("WARNING: this device tree carries a PackedRAMDisk region "
+              "(make-dt.py under --packed-data-ramdisk). Measured on 2026-10-26: "
+              "with it DarwinBoot refuses the boot with 'Compromised Data' "
+              "(DarwinBoot.c:558 wants RamdiskPacked from the request, which the "
+              "QEMU path does not supply). The guest will not reach the kernel.")
+    if b"TrustCache" in tree and args.trust_cache is None:
+        print("WARNING: this device tree carries the TrustCache sidecar binding "
+              "but no --trust-cache file was given; DarwinBoot.c:578 refuses that "
+              "combination (file absent, binding present).")
+    elif b"TrustCache" not in tree and args.trust_cache is not None:
+        print("WARNING: --trust-cache was given but this tree has no TrustCache "
+              "binding; DarwinBoot.c:575 refuses that combination (file present, "
+              "binding absent). The two are a matched pair (DarwinBoot.c:569-582).")
+    elif args.trust_cache is None:
         print("NOTE: no --trust-cache; this guest's kernel cannot exec launchd "
               "(AMFI, build-os-root.py:26-27), so a userland marker will not "
               "appear however far the boot gets")
-    elif b"TrustCache" not in args.devicetree.read_bytes():
-        # The binding is 16 zero bytes under the name TrustCache in the ADT's
-        # memory-map node (make-dt.py:162, emitted only under make-dt.py's own
-        # --trust-cache).  A tree without it is a boot where the trust cache file
-        # is staged and never bound, which is the most misleading shape this
-        # measurement could take: everything looks supplied and nothing is.
-        print("REFUSING: --trust-cache was given but this device tree carries no "
-              "TrustCache binding (make-dt.py:162), so the file would be staged "
-              "and never bound.  Build the tree with --trust-cache.")
-        return 2
     esp = run / "esp"
     print(f"staging the ESP into {esp} ...", flush=True)
     staged = stage_esp(inputs, esp, spec)
