@@ -455,6 +455,21 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 
 **(3) 已做但未在 runner 复验。** `build-macos.sh` 新增两个 flag 并由 `step_build_payload` 转发，workflow 第二遍从 chain 的产出路径取文件传入。测试 `tests/acceptance/test_payload_trust_cache.py` **执行** payload 阶段的 argv 构造区段（stub 掉 `run_driver` 后断言它收到的参数），并执行 workflow 第二遍的 shell（stub 掉 `build-macos.sh` 后断言它收到的参数）。八项反向删除全部验证为红，其中一项的边界如实记录在该测试自己的 docstring 里。**「传进去之后 AMFI 放行 launchd」是设计意图，不是实测。**
 
+### 11.20 外部阻断：GitHub Actions 计费失败，runner 验证暂停
+
+2026-10-26，提交 `34fe029` 之后，`preflight` 与随后手动触发的 `build-macos` **都没有启动任何 job**，两者的 annotation 是同一句：
+
+> The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings
+
+**这不是代码问题，也无法在本仓库内修复。** 它挡住的是「runner 验证」这一栏，不是「代码完成」这一栏：
+
+- 已代码完成并有本机测试的：trust cache / Data ramdisk 转发（提交 `34fe029`，8 项反向删除全红）、probe 的 `--inputs` / `--trust-cache` / `--devicetree`。
+- **未在 runner 上复验的**：`34fe029` 之后没有任何 run 启动过，所以「传进去之后 AMFI 放行 launchd」仍是设计意图。上一个成功的 runner 证据仍是 `40241617618`（`qemu_root_defconfig` 第一次构建出来）。
+- 本机侧未受影响：`qemu_root_defconfig` 内核、OS 卷挂载、PID 1 的实测证据全部来自本机 QEMU TCG，不依赖 runner。
+
+**处置**：不因此停下本机工作。恢复条件是用户结清 GitHub 计费或提高 spending limit；恢复后第一件事是重跑 `build-macos`（stage=M3）验 `34fe029`。
+
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
