@@ -522,11 +522,13 @@ Notes:
     volume superblock so it can be compared to the one the kernel was built
     with.  It verifies the staged delivery, not the tree, and a verification
     failure is a failed stage.  The seed is Apple-derived (PRD 12): with
-    MATERIAL_DELIVERY_KEY set it is encrypted with
-    `openssl enc -aes-256-gcm -pbkdf2 -salt` into out/private and the plaintext
-    never leaves the runner; without it the step records that the seed was NOT
-    encrypted and must be collected from the runner directly.  Either way the
-    staging step's default-deny keeps it off the public artifact path.
+    MATERIAL_DELIVERY_KEY set every Apple-derived member is encrypted with
+    `openssl enc -aes-256-cbc -pbkdf2 -salt` into out/private and the plaintext
+    never leaves the runner; without it the step records that the members were
+    NOT encrypted and must be collected from the runner directly.  Either way the
+    staging step's default-deny keeps them off the public artifact path.  CBC and
+    not GCM: `enc` refuses AEAD ciphers on OpenSSL 3 as well as LibreSSL
+    (measured, run 40397080085).
 EOF
 }
 
@@ -1502,7 +1504,11 @@ PY
     local encrypted_count=0 member ossl encrypt_error keg
     keg="$(openssl_keg)"
     ossl="$(openssl_bin)"
-    log "material: encrypting the Apple-derived members with $(shown_path "$ossl")${keg:+ (the OpenSSL 3 keg)}${keg:- (no keg on this host, so whatever 'openssl' resolves to)}"
+    if [[ -n "$keg" ]]; then
+        log "material: encrypting the Apple-derived members with $(shown_path "$ossl") (the OpenSSL 3 keg)"
+    else
+        log "material: no OpenSSL 3 keg on this host, so encrypting with $(shown_path "$ossl") -- whatever 'openssl' resolves to"
+    fi
     if [[ -n "${MATERIAL_DELIVERY_KEY:-}" ]]; then
         for member in "${apple_derived[@]}"; do
             # Not a skip.  Reaching (5) means (3) staged every role the manifest
@@ -1516,7 +1522,19 @@ PY
                     "'$member' is an Apple-derived member the manifest records, but $(shown_path "$delivery/$member") is not in the delivery, so it can neither be encrypted nor verified"
                 return 1
             fi
-            if ! encrypt_error="$("$ossl" enc -aes-256-gcm -pbkdf2 -salt \
+            # The cipher is CBC and not GCM, and that is measured rather than
+            # preferred.  OpenSSL's ``enc`` command refuses AEAD ciphers
+            # outright -- GCM among them -- with ``enc: AEAD ciphers not
+            # supported``, on OpenSSL 3 as well as on LibreSSL.  Measured on run
+            # 40397080085, which resolved the keg correctly and still failed, and
+            # whose message is the only reason this is known: the previous
+            # revision's stderr went to a file under private/ that is never
+            # uploaded, so the same failure on run 40392771419 left no line at
+            # all.  ``-aes-256-gcm`` is what the first revision of this step
+            # specified, and it had never been executed even once -- the same
+            # shape as the here-document in fact 94 and the leaf search in fact
+            # 93.
+            if ! encrypt_error="$("$ossl" enc -aes-256-cbc -pbkdf2 -salt \
                     -in "$delivery/$member" \
                     -out "$delivery/$member.enc" \
                     -pass env:MATERIAL_DELIVERY_KEY 2>&1)"; then

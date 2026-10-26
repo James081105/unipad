@@ -847,7 +847,15 @@ def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
         "this file has to be rewritten with it rather than left asserting the "
         "shape of code that is gone"
     )
-    block = script[start:script.index("return 0", start)]
+    # Full-line comments stripped.  The stage documents the cipher it does NOT
+    # use and the binary it does not call, so a scanner that reads comments
+    # reports the documentation as the defect -- the third time this session a
+    # guard has reddened on its own prose, which is why the stripping lives in
+    # the extraction rather than in each assertion.
+    block = "\n".join(
+        line for line in script[start:script.index("return 0", start)].splitlines()
+        if not line.lstrip().startswith("#")
+    )
 
     # (1) every Apple-derived member is in the list.
     for member in ("owner-data-1g.dbr", "kernelcache.decompressed",
@@ -863,22 +871,33 @@ def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
     #     encrypted because it is in the list, and the loop proves there is a
     #     loop rather than a second copy of the cipher invocation.
     assert 'for member in "${apple_derived[@]}"' in block, block
-    assert block.count("-aes-256-gcm") == 1, (
-        "the ciphertext is produced by more than one invocation, so the list is "
-        "not what decides what gets encrypted"
+    assert block.count("-aes-256-cbc") == 1, (
+        f"the ciphertext is produced by {block.count('-aes-256-cbc')} CBC "
+        "invocations, not exactly one: either the list is not what decides what "
+        "gets encrypted, or the cipher is not the one `enc` supports"
+    )
+    # (3a) ...and the cipher is one `enc` actually supports.  OpenSSL's `enc`
+    #      refuses AEAD ciphers outright -- GCM among them -- with
+    #      `enc: AEAD ciphers not supported`, on OpenSSL 3 as well as on
+    #      LibreSSL.  Measured on run 40397080085, which resolved the keg
+    #      correctly and still failed for exactly this reason.  The previous
+    #      revision specified -aes-256-gcm and had never been executed even
+    #      once, so nothing had ever told anyone it could not work.
+    assert "-aes-256-gcm" not in block, (
+        "`enc` does not support GCM on any OpenSSL this repository has measured; "
+        "use -aes-256-cbc"
     )
     # (3b) ...and it is invoked through the resolved OpenSSL 3 keg, not through
-    #      bare `openssl`.  macOS's /usr/bin/openssl is LibreSSL, whose `enc` has
-    #      no GCM, so `openssl enc -aes-256-gcm` fails there -- measured on run
-    #      40392771419, whose delivery encryption failed for exactly that reason
-    #      and left no line in the step log.  Asserting the variable rather than
-    #      the word is what keeps a future edit from putting the bare command
-    #      back: `bash -n` cannot tell the two apart and neither can a reviewer
-    #      skimming for "openssl".
-    assert '"$ossl" enc -aes-256-gcm' in block, block
+    #      bare `openssl`.  macOS's /usr/bin/openssl is LibreSSL, which lacks
+    #      more than the cipher does -- measured on run 40392771419, whose
+    #      delivery encryption failed for that reason and left no line in the
+    #      step log.  Asserting the variable rather than the word is what keeps a
+    #      future edit from putting the bare command back: `bash -n` cannot tell
+    #      the two apart and neither can a reviewer skimming for "openssl".
+    assert '"$ossl" enc -aes-256-cbc' in block, block
     assert not re.search(r"(?<![$\w])openssl\s+enc\s", block), (
-        "the encryption calls bare `openssl`, which on macOS is LibreSSL and has "
-        "no GCM; use the keg openssl_bin() resolves"
+        "the encryption calls bare `openssl`, which on macOS is LibreSSL; use "
+        "the keg openssl_bin() resolves"
     )
     # The failure is logged, not only recorded: ledger_add appends to an array
     # and prints nothing, so a refusal that lands only in the build report is one
@@ -904,14 +923,19 @@ def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
 
 
 def test_the_openssl_keg_is_on_path_not_only_in_the_environment() -> None:
-    """A bare ``openssl`` on macOS is LibreSSL, and LibreSSL has no GCM.
+    """A bare ``openssl`` on macOS is LibreSSL, and that is not the only problem.
 
     The workflow installs OpenSSL 3 and exports ``OPENSSL_PREFIX``, and the owner
     root chain passes that to ``build-os-root.py`` as ``--openssl-prefix``.  The
-    material delivery encrypts with ``openssl enc -aes-256-gcm`` and used to call
-    the bare command, which on macOS resolves to /usr/bin/openssl -- LibreSSL --
-    whose ``enc`` has no GCM.  Measured on run 40392771419: the delivery's
-    encryption failed and the step log carried no line about it.
+    material delivery used to call the bare command, which on macOS resolves to
+    /usr/bin/openssl -- LibreSSL.  Measured on run 40392771419: the delivery's
+    encryption failed and the step log carried no line about it, because the
+    cipher's stderr went to a file under private/ that is never uploaded.
+
+    LibreSSL turned out not to be the whole story -- OpenSSL 3's ``enc`` refuses
+    AEAD ciphers too, measured on run 40397080085 -- but resolving the keg is
+    still what makes the error message readable at all, and it is what the LLVM
+    step above already does for ``lld-link``.
 
     Putting the keg on PATH closes it for every caller rather than only the one
     that was measured, which is what the LLVM step above already does for
