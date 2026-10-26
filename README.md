@@ -5,6 +5,24 @@
 > 状态：代码阶段进行中。真机验收（在用户 Windows 本机启动 iPadOS）尚未执行，标记为 UNVERIFIED。
 > PRD：[`docs/PRD.md`](docs/PRD.md)（UniPad PRD v0.1，2026-10-22）
 
+## 先说清楚两件事
+
+**一、这个仓库不含任何 Apple 材料。** IPSW、内核缓存、设备树、trust cache、Data 种子、私钥全部不在库里，也不在任何一个提交里（`local-private/` 与 `vendor/` 都被 `.gitignore` 覆盖）。要跑起来，你需要**自备** iPadOS 17.7.11（build 21H461）的 IPSW，放进 `local-private/ipsw/`；其余都由 `config/sources.lock.json` 固定的提交构建或推导。这也是本项目对 PRD §12 的执行方式。
+
+**二、到 2026-10-26 为止，实测走到哪一步。** 下表只写**量到过的**，没量到的一律写未验证，不拿推断冒充证据：
+
+| 项 | 状态 |
+| --- | --- |
+| `qemu_root_defconfig` 内核构建 | **已实测**（macOS runner，run 40241617618 / 40250055465，`stages: ran=7 not_run=0 failed=0`） |
+| 本机从 IPSW 解出 OS 卷（UDIF→raw，纯 Python LZFSE） | **已实测**：6,077,580,800 字节，GPT + APFS 容器自相一致 |
+| 根卷挂载 | **已实测**（Windows QEMU TCG）：`mount-complete volume DawnUpdate21H461.J120J121J207J208OS`，卷 UUID `04769D26-…` 与 board.toml 逐字符相同 |
+| PID 1 | **已实测**：`init` pid 1 在跑；但内核在 7 分钟观测里一个字节日志都没长，是卡住不是慢 |
+| trust cache 链路 | **已实测**：内核 `attempting to load 2 external trust cache modules` → `completed loading external trust cache modules` |
+| **原始 launchd 作为 PID 1** | **未验证**。当前阻断很具体：OS 卷的快照元数据树是**空的**（`btn_nkeys=0`），而内核要一个具名 root snapshot（`failed to find named root snapshot: Need authenticator (81)`） |
+| SpringBoard / 输入 / 持久 Data / IPA 安装 / 十条验收 | **未验证** |
+
+完整的测量记录、每一次失败的归因，以及「哪些是代码完成、哪些是模拟通过、哪些是 runner 验证、哪些是本机实测」四种状态的分辨，在 `docs/implementation-plan.md` 与 `docs/audit-r8.md`。
+
 ## 当前基线
 
 | 项 | 值 |
