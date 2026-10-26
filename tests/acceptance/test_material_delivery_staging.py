@@ -69,6 +69,19 @@ def _script() -> str:
     return text
 
 
+def _code_only(text: str) -> str:
+    """``text`` with every full-line comment dropped.
+
+    The stage documents the construct it removed, so a check that reads comments
+    reports the documentation as the defect.  Same reason, and same limit, as the
+    comment stripper in ``test_shell_script_syntax.py``: whole lines only, not
+    trailing ones.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 def _staging_block(text: str) -> str:
     """The delivery-staging half of ``step_material_manifest``.
 
@@ -173,6 +186,12 @@ def test_a_role_with_no_source_is_refused_rather_than_skipped(tmp_path: Path) ->
     The old loop ``break``-ed out of a search that matched nothing and moved on,
     so the omission surfaced one step later as a hash mismatch on a file that
     was never there.  Refusing here names the role instead.
+
+    The refusal is a flag rather than a ``return`` inside the loop, and that is
+    asserted too: the loop reads from a temp file that has to be removed on every
+    path out, and a ``return`` from inside the body would skip the removal.  So
+    the ordering -- remove, then check the flag, then return -- is the contract,
+    not an implementation detail.
     """
     block = _staging_block(_script())
     assert 'path=\'\'' in block or 'path=""' in block, (
@@ -181,5 +200,49 @@ def test_a_role_with_no_source_is_refused_rather_than_skipped(tmp_path: Path) ->
     )
     assert "cannot be staged into the delivery" in block, block
     assert "is not on disk" in block, block
-    # Both are refusals, not ledger notes: the stage returns non-zero.
-    assert block.count("return 1") >= 2, block
+    # Both refusals set the flag and leave the loop...
+    assert block.count("stage_failed=1") == 2, block
+    # ...the temp file is removed before the flag is checked, so neither path
+    # out of the loop leaves it behind...
+    assert block.index('rm -f "$roles_list"') < block.index("if (( stage_failed ))"), block
+    # ...and the stage still fails.
+    assert "if (( stage_failed )); then" in block, block
+    assert "return 1" in block, block
+
+
+def test_the_roles_are_read_from_a_file_not_a_process_substitution(tmp_path: Path) -> None:
+    """macOS's bash 3.2 refuses a here-document inside ``<(...)``.
+
+    The staging loop used to end with
+
+        done < <(run_unipad - "$manifest" <<'PY' ... PY)
+
+    which ``bash -n`` on this host accepts -- this host's bash is 5.3 -- and
+    which Apple's bash 3.2 refuses.  Measured on run 40386064322, the first run
+    in this repository's history to reach that line, which died with
+    ``bad substitution: no closing `)'`` immediately after collecting a complete
+    manifest.  The construct is guarded script-wide by
+    ``test_shell_script_syntax.py``; this pins the replacement in the stage that
+    needed it, so the two cannot drift apart.
+    """
+    # The whole stage, not just the case: the file is made before the loop that
+    # reads it, and that is the part that has to be seen.  Comments stripped, so
+    # the stage's own documentation of the removed construct does not read as the
+    # construct being back.
+    stage = _script()
+    start = stage.index("step_material_manifest() {")
+    # Bounded at the next section banner, so the check is this stage and not
+    # every function after it -- the ten other ``done < <(...)`` in this script
+    # are all in other stages and are all legitimate.
+    end = stage.index("# stage plan", start)
+    body = _code_only(stage[start:end])
+    assert 'done < "$roles_list"' in body, body
+    assert "< <(" not in body, (
+        "the staging loop reads its roles through a process substitution again"
+    )
+    # The file is made by the same interpreter call, so the roles still come from
+    # the manifest rather than from a list spelled out here.
+    assert 'run_unipad - "$manifest" > "$roles_list"' in body, body
+    assert 'for role, entry in sorted(manifest["artifacts"].items())' in body, body
+    # And a manifest that cannot be read back is a refusal, not an empty loop.
+    assert "could not be read back" in body, body

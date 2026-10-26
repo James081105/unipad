@@ -186,3 +186,77 @@ def test_the_guard_covers_every_shell_script() -> None:
         "shell scripts exist that this module does not check: "
         f"{sorted(p.relative_to(ROOT).as_posix() for p in on_disk - named)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# portability: constructs bash -n accepts but macOS's bash 3.2 does not
+# ---------------------------------------------------------------------------
+def test_no_heredoc_inside_a_process_substitution() -> None:
+    """``bash -n`` here is bash 5; the runner's is Apple's bash 3.2.
+
+    ``scripts/macos/build-macos.sh`` staged its material delivery with
+
+        done < <(run_unipad - "$manifest" <<'PY'
+        ...
+        PY
+        )
+
+    and ``bash -n`` on this host accepts it, because this host's bash is 5.3.
+    macOS ships /bin/bash 3.2, which refuses it -- measured on run 40386064322,
+    the first run in this repository's history to reach that line at all, which
+    died with
+
+        bad substitution: no closing `)' in <(run_unipad - "$manifest" <<'PY'
+
+    immediately after collecting a complete manifest.  The construct is the only
+    one of its kind in a 4,000-line script: the ten other ``done < <(...)`` all
+    call a shell *function*, and none of them carries a here-document.  So it had
+    never been parsed by the interpreter that would run it -- every earlier run
+    refused in the Python half of the stage, one stage earlier, and the shell
+    half was never executed even once.
+
+    That is the shape this guard is for.  ``bash -n`` proves the file parses
+    under *some* bash; it does not prove it parses under the bash that will run
+    it, and a syntax error in a construct nobody has executed is invisible to
+    every other test in this repository.
+
+    The rule is narrow on purpose: a here-document anywhere in a process
+    substitution, in any script we ship.  It does not forbid process
+    substitutions, and it does not forbid here-documents -- ten of the first and
+    several of the second are load-bearing elsewhere.
+    """
+    offenders: list[str] = []
+    for script in SHELL_SCRIPTS:
+        text = script.read_text(encoding="utf-8")
+        # Full-line comments are dropped first.  The stage that carries the fix
+        # documents the construct it removed, so a scanner that reads comments
+        # reports the documentation as the defect -- which is a guard failing on
+        # its own prose, and a guard nobody trusts is a guard nobody keeps.
+        # Stripping whole lines only, not trailing comments, is the honest
+        # limit: an inline `# ... <(` after code is rare enough that missing it
+        # costs a false negative, and a quote-aware comment stripper costs more
+        # than the check is worth.
+        code = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+        for opening in range(len(code)):
+            if code[opening : opening + 2] != "<(":
+                continue
+            depth = 1
+            at = opening + 2
+            while at < len(code) and depth:
+                if code[at] == "(":
+                    depth += 1
+                elif code[at] == ")":
+                    depth -= 1
+                at += 1
+            body = code[opening + 2 : at - 1]
+            if "<<" in body:
+                offenders.append(
+                    f"{script.relative_to(ROOT).as_posix()}: {body.splitlines()[0][:60]!r}"
+                )
+    assert not offenders, (
+        "a here-document inside a process substitution is refused by macOS's "
+        "bash 3.2; write it to a temp file and redirect the loop from that "
+        f"instead: {offenders}"
+    )

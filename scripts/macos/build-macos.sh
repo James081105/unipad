@@ -1333,6 +1333,35 @@ step_material_manifest() {
     #     from is not a manifest of what was delivered, and the two differ by
     #     exactly the files that get left behind.
     local role path leaf
+    # The roles and their leaf names, read out of the manifest rather than out of
+    # a list here.  Written to a FILE rather than fed through a process
+    # substitution, and that is not style: `done < <(cmd <<'PY' ... PY)` is the
+    # only construct of its kind in this 4,000-line script -- the ten other
+    # `done < <(...)` all call a shell function -- and macOS ships bash 3.2,
+    # which refuses it.  Measured on run 40386064322, the first run in this
+    # repository's history to reach this line at all, which died with
+    #     bad substitution: no closing `)' in <(run_unipad - "$manifest" <<'PY'
+    # after collecting a complete manifest.  A construct that has never run is a
+    # construct nobody has measured, and this one is older than every fix in
+    # implementation-plan facts 89 through 93: the stage always refused before
+    # it got here, so the shell half was never executed even once.
+    local roles_list stage_failed=0
+    roles_list="$(mktemp 2>/dev/null || printf '%s/material-roles.%s.tmp' "$OUT_DIR" "$$")"
+    if ! run_unipad - "$manifest" > "$roles_list" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+for role, entry in sorted(manifest["artifacts"].items()):
+    # A role recorded without bytes (the two multi-GB members PRD 12 deletes) has
+    # nothing to copy; its identity is the board's pin, checked in step (4).
+    if entry.get("bytes"):
+        print(role + "\t" + entry["path"])
+PY
+    then
+        rm -f "$roles_list"
+        ledger_add "$name" 'failed' \
+            "the manifest's own roles could not be read back, so nothing can be staged into the delivery"
+        return 1
+    fi
     while IFS="$(printf '\t')" read -r role leaf; do
         [[ -n "$leaf" ]] || continue
         # Where this role's file is, named per role rather than searched for by
@@ -1379,24 +1408,21 @@ step_material_manifest() {
         if [[ -z "$path" ]]; then
             ledger_add "$name" 'failed' \
                 "no source path is known for role '$role', so it cannot be staged into the delivery"
-            return 1
+            stage_failed=1
+            break
         fi
         if [[ ! -f "$path" ]]; then
             ledger_add "$name" 'failed' \
                 "'$role' is recorded with bytes but $(shown_path "$path") is not on disk, so the delivery would be missing a file the build claims to have produced"
-            return 1
+            stage_failed=1
+            break
         fi
         cp "$path" "$delivery/$leaf"
-    done < <(run_unipad - "$manifest" <<'PY'
-import json, sys
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-for role, entry in sorted(manifest["artifacts"].items()):
-    # A role recorded without bytes (the two multi-GB members PRD 12 deletes) has
-    # nothing to copy; its identity is the board's pin, checked in step (4).
-    if entry.get("bytes"):
-        print(role + "\t" + entry["path"])
-PY
-)
+    done < "$roles_list"
+    rm -f "$roles_list"
+    if (( stage_failed )); then
+        return 1
+    fi
     if ! run_unipad -m unipad.host.material_manifest --verify \
             --manifest "$manifest" \
             --root "$delivery" \
