@@ -26,6 +26,7 @@ available on a Windows code-stage host, and pretending otherwise would be the
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -259,4 +260,51 @@ def test_no_heredoc_inside_a_process_substitution() -> None:
         "a here-document inside a process substitution is refused by macOS's "
         "bash 3.2; write it to a temp file and redirect the loop from that "
         f"instead: {offenders}"
+    )
+
+
+#: bash 4+ features, each with the spelling that would introduce it.  macOS
+#: ships /bin/bash 3.2, so any of these is a script that parses on a bash 5 host
+#: and fails on the runner.  ``mapfile`` is here even though the script only
+#: mentions it in comments -- two comments already record the constraint, and a
+#: constraint nobody enforces is a constraint the next edit forgets.
+BASH4_ONLY = (
+    (r"^\s*declare\s+-A\b", "an associative array"),
+    (r"^\s*local\s+-A\b", "an associative array"),
+    (r"\bmapfile\b", "mapfile"),
+    (r"\breadarray\b", "readarray"),
+    (r"\bcoproc\b", "coproc"),
+    (r";;&", "the ;;& case fall-through"),
+    (r"\$\{[A-Za-z_][A-Za-z0-9_]*\^\^\}", "the ${var^^} upper-case expansion"),
+    (r"\$\{[A-Za-z_][A-Za-z0-9_]*,,}", "the ${var,,} lower-case expansion"),
+    (r"\|\&", "the |& stderr pipe"),
+    (r"&>>", "the &>> append-both redirection"),
+)
+
+
+def test_no_bash4_only_construct() -> None:
+    """Nothing in a script we ship may need a bash newer than Apple's 3.2.
+
+    This is the same hazard as the here-document guard above, generalised.  The
+    repository already knows about it -- ``build-macos.sh`` carries two comments
+    recording that ``mapfile`` and ``shopt -s globstar`` are bash 4+ -- and the
+    here-document in a process substitution still shipped, because knowing is not
+    enforcing.  Measured on run 40386064322, which lost a full macOS run to
+    exactly that.
+    """
+    offenders: list[str] = []
+    for script in SHELL_SCRIPTS:
+        code = "\n".join(
+            line for line in script.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        for pattern, what in BASH4_ONLY:
+            for number, line in enumerate(code.splitlines(), start=1):
+                if re.search(pattern, line):
+                    offenders.append(
+                        f"{script.relative_to(ROOT).as_posix()}:{number}: {what}"
+                    )
+    assert not offenders, (
+        "macOS ships /bin/bash 3.2, so these need a bash the runner does not "
+        f"have: {sorted(set(offenders))}"
     )
