@@ -24,6 +24,19 @@ local-private/
 *.qcow2
 *.vmdk
 *.raw
+
+# The pinned third-party checkouts, and everything a build lays down inside
+# them.  NOT tracked: the lock (config/sources.lock.json) names the commits, and
+# a checkout is re-fetchable from them.
+#
+# This entry used to live only in .git/info/exclude, which is LOCAL state -- it
+# is not part of the repository, so a clone does not inherit it and a fresh
+# `git add -A` in one stages the whole checkout.  That mattered on 2026-10-26:
+# vendor/UniXNU/refer is a junction pointing at local-private/ipsw, so a single
+# 6.8 GiB Apple restore image sits inside the working tree, reachable by a glob,
+# excluded by a rule that only this machine has.  Moving the rule here is what
+# makes the exclusion travel with the repository instead of with the clone.
+vendor/
 *.sparseimage
 # PRD 12 names these two explicitly as material that must never enter the
 # source tree.  They were missing while the workflow's PRIVATE_PATTERNS listed
