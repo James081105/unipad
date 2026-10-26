@@ -15,6 +15,10 @@ Modules:
 - :mod:`unipad.host.input`     -- pointer/keyboard sinks and coordinate math
 - :mod:`unipad.host.display`   -- display/audio decisions and install progress
 - :mod:`unipad.host.httpsvc`   -- self-controlled HTTPS package service (PRD 3.2 P1)
+- :mod:`unipad.host.packed_ramdisk` -- the packed Data ramdisk format, as both the
+  bootloader and the kernel driver parse it
+- :mod:`unipad.host.apfs_checksum` -- APFS's object checksum, measured from the
+  containers this project boots rather than transcribed
 
 Nothing in this package talks to real hardware unless a caller starts a real
 QEMU process; simulation tests use the fakes under ``tests/fakes/``.

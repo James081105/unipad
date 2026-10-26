@@ -793,6 +793,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--derive-seed-from", default=None, metavar="COMMIT",
                         help="derive the seed from this commit instead of passing --seed")
     parser.add_argument("--accel", default=TCG_ACCEL, choices=("tcg",), help="guest accelerator")
+    parser.add_argument("--data-ramdisk", action="store_true",
+                        help="emit /chosen/memory-map/PackedRAMDisk, the zeroed 16-byte "
+                             "placeholder DarwinBoot patches with the packed Data ramdisk's "
+                             "address and size.  Required by, and only useful with, a boot "
+                             "that carries a data ramdisk (unipad.host.unixnu_boot "
+                             "--data-ramdisk): DarwinBoot accepts both or neither")
     parser.add_argument("--log", type=Path, default=None, help="write the tool's output here")
     args = parser.parse_args(argv)
 
@@ -814,12 +820,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         qemu=args.qemu,
         seed=seed,
         accel=args.accel,
+        data_ramdisk=args.data_ramdisk,
         log_path=args.log,
     )
     print(f"device tree: {record['bytes']} bytes, sha256 {record['sha256']}")
     print(f"  model {record['model']!r} target-type {record['target_type']!r} chip-id {record.get('chip_id')}")
     if "unique_chip_id" in record:
         print(f"  unique-chip-id {record['unique_chip_id']:x} timebase {record.get('timebase_hz')} Hz")
+    print(f"  packed-data-ramdisk: {bool(args.data_ramdisk)}")
     return 0
 
 

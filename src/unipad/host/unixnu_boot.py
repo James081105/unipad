@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from unipad.errors import ErrorCode, UniPadError
+from unipad.host import adt, packed_ramdisk
 from unipad.host.adt import read_board_adt
 from unipad.host.paths import safe_location
 
@@ -65,6 +66,7 @@ __all__ = [
     "pe_subsystem",
     "read_board_payload",
     "stage_esp",
+    "tree_ramdisk_placeholder",
     "unixnu_toml",
 ]
 
@@ -237,6 +239,21 @@ class BootInputs:
     #: one succeeds and produces a guest that cannot start a userland.  A boot
     #: input set that carries it can say so; one that does not must say that too.
     trust_cache: Optional[Path] = None
+    #: The packed Data ramdisk, staged beside the kernel and named by
+    #: ``unixnu.toml``'s ``initrd`` key.
+    #:
+    #: This and the device tree are two halves of one hand-off, and neither
+    #: works alone.  DarwinBoot refuses a boot that supplies one without the
+    #: other (``DarwinBoot.c:563-569``): with ``Request->Ramdisk != NULL`` it
+    #: requires ``/chosen/memory-map`` to carry a 16-byte **zeroed**
+    #: ``PackedRAMDisk`` (or ``RAMDisk``) property, and with ``Request->Ramdisk
+    #: == NULL`` it requires the tree *not* to carry one.  Measured
+    #: 2026-10-26: a tree generated without ``--packed-data-ramdisk`` plus an
+    #: ``initrd`` line is refused with ``EFI_COMPROMISED_DATA`` before the
+    #: kernel starts, and a tree carrying the placeholder with no ``initrd``
+    #: is refused with ``EFI_UNSUPPORTED``.  :func:`stage_esp` checks the pair
+    #: instead of trusting the caller to have got both halves right.
+    data_ramdisk: Optional[Path] = None
 
     def missing(self) -> list[str]:
         """The paths that do not exist, named by role."""
@@ -249,6 +266,8 @@ class BootInputs:
             absent.append(f"payload_toml={safe_location(Path(self.payload_toml))}")
         if self.trust_cache is not None and not Path(self.trust_cache).is_file():
             absent.append(f"trust_cache={safe_location(Path(self.trust_cache))}")
+        if self.data_ramdisk is not None and not Path(self.data_ramdisk).is_file():
+            absent.append(f"data_ramdisk={safe_location(Path(self.data_ramdisk))}")
         return absent
 
     def to_dict(self) -> dict[str, str]:
@@ -258,6 +277,8 @@ class BootInputs:
             record["payload_toml"] = safe_location(Path(self.payload_toml))
         if self.trust_cache is not None:
             record["trust_cache"] = safe_location(Path(self.trust_cache))
+        if self.data_ramdisk is not None:
+            record["data_ramdisk"] = safe_location(Path(self.data_ramdisk))
         return record
 
 
@@ -374,13 +395,107 @@ def kernel_args_line(spec: Mapping[str, Any], extra: Sequence[str] = ()) -> str:
     return line
 
 
-def unixnu_toml(spec: Mapping[str, Any], line: str) -> str:
+def tree_ramdisk_placeholder(devicetree: Path) -> Optional[str]:
+    """Which ramdisk placeholder the device tree carries, if any.
+
+    ``AdtNode`` (``DarwinBoot.c``) accepts **either** ``RAMDisk`` or
+    ``PackedRAMDisk`` inside ``/chosen/memory-map`` as the property it will
+    patch with the ramdisk's address and size, requires it to be exactly 16
+    bytes, requires those 16 bytes to be zero before it patches them, and
+    refuses a tree that carries both.  This reads the tree back and reports
+    which of the three states it is in.
+
+    Returns:
+        ``"PackedRAMDisk"``, ``"RAMDisk"``, or ``None``.
+
+    Raises:
+        UniPadError: ``config_invalid`` when the tree does not parse, carries
+            both properties, or carries one that is not a zeroed 16 bytes.
+            Those are not states a boot can recover from, and the alternative
+            -- returning ``None`` for "no placeholder" -- would let a
+            malformed tree pass as a tree without one.
+    """
+    tree = Path(devicetree)
+    if not tree.is_file():
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MISSING,
+            "the device tree is not at the path given",
+            tree=safe_location(tree),
+        )
+    blob = tree.read_bytes()
+    try:
+        root, end = adt.parse_adt(blob)
+    except Exception as exc:  # a tree that does not parse is a config error
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the device tree does not parse as an Apple device tree",
+            tree=safe_location(tree),
+            reason=type(exc).__name__,
+        ) from exc
+    if end != len(blob):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the device tree has trailing bytes after the root node",
+            tree=safe_location(tree),
+            bytes=len(blob) - end,
+        )
+    chosen = adt.find_node(root, "chosen")
+    memory_map = adt.find_node(chosen, "memory-map") if chosen else None
+    if memory_map is None:
+        return None
+
+    found: list[str] = []
+    for key in ("PackedRAMDisk", "RAMDisk"):
+        value = adt.node_property(memory_map, key)
+        if value is None:
+            continue
+        if len(value) != 16:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                f"/chosen/memory-map/{key} is {len(value)} bytes; DarwinBoot "
+                "requires exactly 16 and refuses the tree otherwise",
+                tree=safe_location(tree),
+                property=key,
+            )
+        if value != bytes(16):
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                f"/chosen/memory-map/{key} is not zeroed; DarwinBoot treats a "
+                "nonzero placeholder as compromised data",
+                tree=safe_location(tree),
+                property=key,
+            )
+        found.append(key)
+    if len(found) > 1:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "/chosen/memory-map carries both PackedRAMDisk and RAMDisk; "
+            "AdtNode refuses a tree that does",
+            tree=safe_location(tree),
+        )
+    return found[0] if found else None
+
+
+def unixnu_toml(
+    spec: Mapping[str, Any],
+    line: str,
+    initrd: Optional[str] = None,
+) -> str:
     """The ``EFI/UniXNU/unixnu.toml`` the ESP carries.
 
     A transcription of ``unixnu/payload.py:166-173``.  The ``[[driver]]`` entry
     is what makes UniXNU load DarwinBoot rather than expect the firmware to have
     run it, and ``run-qemu.py:96-98`` refuses a payload that does not carry it --
     so its absence is a build error here too, not a default.
+
+    ``initrd`` is the path, relative to ``\\EFI\\UniXNU``, of the packed Data
+    ramdisk.  ``Config.c:1189`` turns the entry's ``initrd`` key into
+    ``Entry->Initrd``, ``Boot.c:147`` reads that file off the ESP, and
+    ``Boot.c:165`` hands it to ``RunXnu`` as ``Request.Ramdisk`` -- so the line
+    and the staged file are the same thing seen from two ends.  Upstream writes
+    it immediately before ``args`` (``run-qemu.py:141``); :func:`stage_esp`
+    refuses a tree whose placeholder and this line do not agree, so a caller
+    cannot supply one without the other.
     """
     loader = spec.get("loader", "firmware")
     if loader != "driver":
@@ -405,8 +520,75 @@ def unixnu_toml(spec: Mapping[str, Any], line: str) -> str:
         f'title = "{spec.get("title", "UniXNU")}"\n'
         'type = "xnu"\n'
         'path = "Payloads/kernel.macho"\n'
-        f'args = "{line}"\n'
+        + (f'initrd = "{initrd}"\n' if initrd else "")
+        + f'args = "{line}"\n'
     )
+
+
+#: The name the packed Data ramdisk is staged under, beside the kernel.  It is
+#: the name ``unixnu.toml``'s ``initrd`` key has to spell, and the name the
+#: device repository's payload build uses (``build-macos.yml`` looks for
+#: ``owner-data/owner-data-1g.dbr`` and stages it as this).
+DATA_RAMDISK_NAME = "owner-data-1g.dbr"
+
+#: The ``initrd =`` line, as a compiled pattern.  Config.c reads the key with
+#: ``TomlGetString`` so whitespace is not significant, but this is only used to
+#: detect presence in a config this module did not write, so the simple form is
+#: enough -- and a config that spells it some other way is a config to read,
+#: not to guess at.
+_INITRD_LINE = re.compile(r'^\s*initrd\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _check_ramdisk_pair(
+    inputs: "BootInputs", config: str, written: dict[str, Any]
+) -> None:
+    """Refuse a boot whose ramdisk halves do not agree.
+
+    DarwinBoot's gate (``DarwinBoot.c:563-569``) is an exclusive-or::
+
+        if (Request->Ramdisk != NULL) {
+          if ((RamdiskOffset == MAX_UINTN) || (U64 (Tree + RamdiskOffset) != 0) ||
+              (U64 (Tree + RamdiskOffset + 8) != 0)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+        } else if (RamdiskOffset != MAX_UINTN) {
+          Status = EFI_UNSUPPORTED;
+          goto Fail;
+        }
+
+    so exactly one of {an initrd, a placeholder} is a boot that never reaches
+    the kernel, and both are needed for a Data volume to exist at all.  Neither
+    failure is visible in the serial log -- the firmware refuses before
+    DarwinBoot prints its hand-off banner -- which is why it is checked here,
+    where the cost is an exception instead of a seven-minute boot that looks
+    like a regression.
+    """
+    staged = f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}" in written
+    declared = _INITRD_LINE.search(config)
+    placeholder = tree_ramdisk_placeholder(inputs.devicetree)
+
+    if staged != (declared is not None):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the packed Data ramdisk and unixnu.toml disagree: one names an "
+            "initrd and the other does not carry the file",
+            staged=staged,
+            initrd_line=declared is not None,
+        )
+    if declared is not None and declared.group(1) != f"Payloads/{DATA_RAMDISK_NAME}":
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "unixnu.toml's initrd does not name the file that was staged",
+            initrd=declared.group(1),
+            expected=f"Payloads/{DATA_RAMDISK_NAME}",
+        )
+    if staged != (placeholder is not None):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the packed Data ramdisk and the device tree disagree: DarwinBoot "
+            "accepts both or neither, never one",
+            data_ramdisk=staged,
+            tree_placeholder=placeholder,
+            tree=safe_location(Path(inputs.devicetree)),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +606,9 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         EFI/UniXNU/Payloads/kernel.macho.adt      the QEMU device tree
         EFI/UniXNU/Payloads/DarwinBoot.efi
         EFI/UniXNU/Payloads/kernel.macho.trustcache      when the run has one
+        EFI/UniXNU/Payloads/owner-data-1g.dbr             when the run has a
+            packed Data ramdisk, which is also what puts an ``initrd`` line in
+            unixnu.toml and what requires the tree to carry the placeholder
 
     ``QemuRamfb.efi`` is *not* staged: it is a driver the payload build puts on
     the ESP ahead of DarwinBoot to set the frame-buffer geometry
@@ -464,16 +649,29 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         shutil.copyfile(inputs.trust_cache, target)
         written["EFI/UniXNU/Payloads/kernel.macho.trustcache"] = target.stat().st_size
 
+    # The packed Data ramdisk.  Validated before it is copied, against the
+    # format both the bootloader and the kernel driver parse, so a seed one of
+    # them would reject costs a second here rather than a boot.  The name is
+    # fixed because unixnu.toml's initrd is a path, not a lookup: whatever is
+    # staged has to be spelled exactly by the config.
+    if inputs.data_ramdisk is not None:
+        packed_ramdisk.validate_file(inputs.data_ramdisk)
+        target = esp / "EFI/UniXNU/Payloads" / DATA_RAMDISK_NAME
+        shutil.copyfile(inputs.data_ramdisk, target)
+        written[f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}"] = target.stat().st_size
+
+    initrd = f"Payloads/{DATA_RAMDISK_NAME}" if inputs.data_ramdisk is not None else None
     if inputs.payload_toml is not None:
         config = Path(inputs.payload_toml).read_text(encoding="utf-8")
     else:
-        config = unixnu_toml(spec, kernel_args_line(spec))
+        config = unixnu_toml(spec, kernel_args_line(spec), initrd=initrd)
     if "Payloads/DarwinBoot.efi" not in config:
         raise UniPadError(
             ErrorCode.CONFIG_INVALID,
             "unixnu.toml does not load DarwinBoot as a driver; board.toml "
             '[payload] loader must be "driver"',
         )
+    _check_ramdisk_pair(inputs, config, written)
     (esp / "EFI/UniXNU/unixnu.toml").write_text(config, encoding="utf-8")
     written["EFI/UniXNU/unixnu.toml"] = len(config.encode("utf-8"))
     written["_esp"] = str(safe_location(esp))
@@ -1049,6 +1247,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--unixnu", type=Path, required=True, help="UniXNU.efi, staged as EFI/BOOT/BOOTAA64.EFI")
     parser.add_argument("--payload-toml", type=Path, default=None,
                         help="an existing unixnu.toml to adopt instead of generating one")
+    parser.add_argument("--data-ramdisk", type=Path, default=None,
+                        help="the packed Data ramdisk (.dbr) to stage beside the kernel; "
+                             "the device tree must also carry the PackedRAMDisk "
+                             "placeholder, which unipad.host.adt --data-ramdisk writes")
     parser.add_argument("--workdir", type=Path, required=True, help="run directory (recreated)")
     parser.add_argument("--seconds", type=int, default=DEFAULT_SECONDS)
     parser.add_argument("--every", type=int, default=DEFAULT_EVERY)
@@ -1068,6 +1270,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         darwinboot=args.darwinboot,
         unixnu=args.unixnu,
         payload_toml=args.payload_toml,
+        data_ramdisk=args.data_ramdisk,
     )
     if args.kernel_arg:
         # Validated here so a bad extra argument fails before the ESP is staged,

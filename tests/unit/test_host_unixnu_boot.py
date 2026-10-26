@@ -48,7 +48,7 @@ import struct
 import tomllib
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -69,6 +69,72 @@ ESP_FILES = (
     "EFI/UniXNU/Payloads/kernel.macho.adt",
     "EFI/UniXNU/Payloads/DarwinBoot.efi",
 )
+
+
+# ---------------------------------------------------------------------------
+# a synthetic Apple device tree
+# ---------------------------------------------------------------------------
+def _adt_node(name: str, properties=(), children=()) -> list:
+    """One node of the format ``adt.parse_adt`` reads.
+
+    A transcription of ``make-qemu-adt.py:serialize``, the same way
+    ``tests/unit/test_host_adt.py`` builds its own trees: a property count and a
+    child count, then that many ``[32-byte key][u32 length][padded value]``
+    triples, then that many children.
+    """
+    return [name, [(key, value) for key, value in properties], list(children)]
+
+
+def _serialize_adt(node: list) -> bytes:
+    _, properties, children = node
+    out = struct.pack("<II", len(properties), len(children))
+    for key, data in properties:
+        out += struct.pack("<32sI", key.encode(), len(data)) + data + bytes(-len(data) % 4)
+    return out + b"".join(_serialize_adt(child) for child in children)
+
+
+def _synthetic_tree(
+    *,
+    ramdisk: Optional[bytes] = None,
+    ramdisk_key: str = "PackedRAMDisk",
+    both: bool = False,
+) -> bytes:
+    """A parseable tree whose ``/chosen/memory-map`` is the interesting part.
+
+    ``ramdisk`` is what the placeholder property carries; ``both`` writes the
+    two properties at once, which is the state ``AdtNode`` refuses.  Everything
+    else is the minimum a parse needs: names on the three nodes, and a
+    ``TrustCache`` so the tree is shaped like the real one.
+    """
+    memory_map = [("name", b"memory-map\0"), ("TrustCache", bytes(16))]
+    if both:
+        memory_map += [("PackedRAMDisk", bytes(16)), ("RAMDisk", bytes(16))]
+    elif ramdisk is not None:
+        memory_map.append((ramdisk_key, ramdisk))
+    return _serialize_adt(
+        _adt_node("", [("name", b"root\0")], [
+            _adt_node("chosen", [("name", b"chosen\0")], [
+                _adt_node("memory-map", memory_map),
+            ]),
+        ])
+    )
+
+
+def _synthetic_seed(*, logical: int = 1 << 30, extents=((0, 4096),)) -> bytes:
+    """A valid DBRDISK1 packed ramdisk, built here rather than shipped.
+
+    ``prepare-owner-data-fixture.py`` needs macOS to make a real one, and a real
+    one is Apple-derived material that does not belong in the repository (PRD
+    12).  What the tests need is a blob that satisfies the format contract, and
+    that contract is 32 header bytes plus one 16-byte extent per dirty region.
+    """
+    blob = struct.pack("<8sIIQQ", b"DBRDISK1", 1, 4096, logical, len(extents))
+    payload = b""
+    for _, length in extents:
+        payload += bytes(length)
+    return blob + b"".join(
+        struct.pack("<QQ", offset, length) for offset, length in extents
+    ) + payload
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +172,18 @@ def inputs(tmp_path: Path) -> BootInputs:
     two of them were swapped.  ``unixnu`` is a real PE32+ *application* because
     that is what ``BOOTAA64.EFI`` has to be, and a stand-in that is not one would
     make every ``boot`` test fail for the wrong reason.
+
+    The device tree is a *parseable* Apple tree, not a bag of bytes, because
+    :func:`stage_esp` now reads it back to check the packed-ramdisk pair -- and
+    a fixture that cannot be parsed would make every staging test fail on the
+    tree rather than on what the test is about.
     """
     firmware = tmp_path / "edk2-aarch64-code.fd"
     firmware.write_bytes(b"\0" * 4096)
     kernel = tmp_path / "kernel.macho"
     kernel.write_bytes(b"\xcf\xfa\xed\xfe" + b"synthetic kernelcache" * 8)
     devicetree = tmp_path / "kernel.macho.adt"
-    devicetree.write_bytes(b"synthetic device tree")
+    devicetree.write_bytes(_synthetic_tree())
     darwinboot = tmp_path / "DarwinBoot.efi"
     darwinboot.write_bytes(_pe32plus(11) + b"darwinboot-driver" * 3)
     unixnu = tmp_path / "UniXNU.efi"
@@ -1544,3 +1615,313 @@ def test_a_trust_cache_that_does_not_exist_is_named_by_missing(
     assert replace(inputs, trust_cache=absent).missing() == [
         "trust_cache=not-there.bundle"
     ], replace(inputs, trust_cache=absent).missing()
+
+
+# ---------------------------------------------------------------------------
+# the packed Data ramdisk, and the pair DarwinBoot insists on
+# ---------------------------------------------------------------------------
+def test_the_toml_names_the_initrd_when_a_data_ramdisk_is_supplied(
+    real_spec: dict[str, Any], real_line: str
+) -> None:
+    """``initrd`` is what turns a file on the ESP into ``Request->Ramdisk``.
+
+    ``Config.c:1189`` reads the entry's ``initrd`` key, ``Boot.c:147`` reads that
+    file off the ESP, and ``Boot.c:165`` hands it to ``RunXnu``.  Without the
+    line the file is staged and never read, so the line goes in the place
+    upstream writes it (``run-qemu.py:141``): immediately before ``args``.
+    """
+    text = ub.unixnu_toml(real_spec, real_line, initrd=f"Payloads/{ub.DATA_RAMDISK_NAME}")
+    assert f'initrd = "Payloads/{ub.DATA_RAMDISK_NAME}"\nargs = "{real_line}"' in text, text
+    entry = tomllib.loads(text)["entry"][0]
+    assert entry["initrd"] == f"Payloads/{ub.DATA_RAMDISK_NAME}", entry
+    assert entry["args"] == real_line, entry
+
+
+def test_no_initrd_line_is_written_when_there_is_no_data_ramdisk(
+    real_spec: dict[str, Any], real_line: str
+) -> None:
+    """The absent case has to stay byte-identical to what it always was.
+
+    Every boot without a Data seed is the state this module has produced since it
+    was written, and an empty ``initrd`` key would change the payload for no
+    reason -- ``Config.c`` would read it as a path.
+    """
+    assert ub.unixnu_toml(real_spec, real_line) == ub.unixnu_toml(
+        real_spec, real_line, initrd=None
+    )
+    assert "initrd" not in tomllib.loads(ub.unixnu_toml(real_spec, real_line))["entry"][0]
+
+
+def test_the_esp_carries_the_data_ramdisk_beside_the_kernel(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """Staged at the one name the config can spell, and validated on the way in."""
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+
+    esp = tmp_path / "esp"
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, data_ramdisk=seed), esp, real_spec
+    )
+    staged = esp / "EFI/UniXNU/Payloads" / ub.DATA_RAMDISK_NAME
+    assert staged.is_file(), "the seed was validated but not staged"
+    assert staged.read_bytes() == seed.read_bytes()
+    assert written[f"EFI/UniXNU/Payloads/{ub.DATA_RAMDISK_NAME}"] == seed.stat().st_size
+    assert f'initrd = "Payloads/{ub.DATA_RAMDISK_NAME}"' in (
+        esp / "EFI/UniXNU/unixnu.toml"
+    ).read_text(encoding="utf-8")
+
+
+def test_a_data_ramdisk_without_the_trees_placeholder_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """Half the pair is a boot that never reaches the kernel.
+
+    DarwinBoot's gate (``DarwinBoot.c:563-569``) refuses ``Request->Ramdisk !=
+    NULL`` with ``EFI_COMPROMISED_DATA`` when the tree carries no
+    ``RamdiskOffset``, and it does so *before* the hand-off banner -- so the
+    serial log reads as a firmware problem and not as a missing property.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "accepts both or neither" in error.message, error
+    assert error.details["data_ramdisk"] is True, error.details
+    assert error.details["tree_placeholder"] is None, error.details
+
+
+def test_a_tree_placeholder_without_a_data_ramdisk_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The other half, from the other branch of the same ``if``.
+
+    A tree carrying the placeholder with no ``initrd`` is refused with
+    ``EFI_UNSUPPORTED``, which is just as invisible in the serial log.
+    """
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    error = _refused(
+        ub.stage_esp, replace(inputs, devicetree=tree), tmp_path / "esp", real_spec
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "accepts both or neither" in error.message, error
+    assert error.details["data_ramdisk"] is False, error.details
+    assert error.details["tree_placeholder"] == "PackedRAMDisk", error.details
+
+
+def test_both_halves_together_are_accepted(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The state that actually boots, so the guard is not a guard against everything."""
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, data_ramdisk=seed), tmp_path / "esp", real_spec
+    )
+    assert f"EFI/UniXNU/Payloads/{ub.DATA_RAMDISK_NAME}" in written, written
+
+
+def test_a_data_ramdisk_that_is_not_the_packed_format_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """A seed the bootloader or the kernel driver would reject is refused here.
+
+    Both parse the same format (``PackedRamdisk.h`` and ``SparseDisk.h``), and
+    neither failure is visible until the guest has booted -- where it surfaces as
+    a Data volume that does not exist, which reads as a kernel bug.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(b"this is not a packed ramdisk, it is just prose" + b"." * 16)
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.ARTIFACT_MANIFEST_INVALID, error
+    assert "magic" in error.message, error
+
+
+def test_a_data_ramdisk_shorter_than_its_header_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The header itself is 32 bytes, so nothing smaller is a seed at all."""
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(b"DBRDISK1")
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.ARTIFACT_MANIFEST_INVALID, error
+    assert "shorter than the 32-byte header" in error.message, error
+
+
+def test_a_data_ramdisk_with_trailing_bytes_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """Both parsers end on ``cursor != size``, so extra bytes are a refusal too.
+
+    Truncating a seed does not reach that check -- the extent that runs off the
+    end is caught first, which is the more useful message.  What reaches it is a
+    file with bytes past the last extent, which is what a half-written packer
+    leaves behind.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed() + b"\0" * 4)
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.ARTIFACT_MANIFEST_INVALID, error
+    assert "account for" in error.message, error
+
+
+def test_a_truncated_data_ramdisk_names_the_extent_that_runs_off_the_end(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """A truncated file fails on the extent, and the message says which one."""
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed()[:-512])
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.ARTIFACT_MANIFEST_INVALID, error
+    assert "extent 0 needs 4096 bytes but only 3584 remain" in error.message, error
+
+
+def test_a_tree_with_both_ramdisk_properties_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """``AdtNode`` refuses a tree that carries both, so this module does too."""
+    tree = tmp_path / "both.adt"
+    tree.write_bytes(_synthetic_tree(both=True))
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "both PackedRAMDisk and RAMDisk" in error.message, error
+
+
+def test_a_placeholder_that_is_not_zeroed_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """DarwinBoot treats a nonzero placeholder as compromised data.
+
+    The 16 bytes are where it writes the ramdisk's address and size; a value
+    already there means something else has claimed them.
+    """
+    tree = tmp_path / "dirty.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=struct.pack("<QQ", 1, 2)))
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "not zeroed" in error.message, error
+
+
+def test_a_placeholder_that_is_not_16_bytes_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """``AdtNode`` requires exactly 16 and refuses the tree otherwise."""
+    tree = tmp_path / "short.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(8)))
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "exactly 16" in error.message, error
+
+
+def test_the_placeholder_is_reported_by_name_and_either_spelling_counts(
+    tmp_path: Path,
+) -> None:
+    """``AdtNode`` accepts either spelling, so the reader names which one it saw."""
+    packed = tmp_path / "packed.adt"
+    packed.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    assert ub.tree_ramdisk_placeholder(packed) == "PackedRAMDisk"
+    plain = tmp_path / "plain.adt"
+    plain.write_bytes(_synthetic_tree(ramdisk=bytes(16), ramdisk_key="RAMDisk"))
+    assert ub.tree_ramdisk_placeholder(plain) == "RAMDisk"
+    absent = tmp_path / "absent.adt"
+    absent.write_bytes(_synthetic_tree())
+    assert ub.tree_ramdisk_placeholder(absent) is None
+
+
+def test_a_tree_that_does_not_parse_is_refused_rather_than_read_as_absent(
+    tmp_path: Path,
+) -> None:
+    """An unparseable tree is not a tree without a placeholder.
+
+    Returning ``None`` for "could not read it" would let a corrupt payload pass
+    the ramdisk check and fail later, in the guest, where nothing can say why.
+    """
+    broken = tmp_path / "broken.adt"
+    broken.write_bytes(b"synthetic device tree")
+    error = _refused(ub.tree_ramdisk_placeholder, broken)
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "does not parse" in error.message, error
+
+
+def test_a_tree_with_trailing_bytes_is_refused(tmp_path: Path) -> None:
+    """``parse_adt`` returning before the end of the file is a truncated tree."""
+    tree = tmp_path / "trailing.adt"
+    tree.write_bytes(_synthetic_tree() + b"\0" * 8)
+    error = _refused(ub.tree_ramdisk_placeholder, tree)
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "trailing bytes" in error.message, error
+
+
+def test_a_tree_that_is_absent_is_missing_not_invalid(tmp_path: Path) -> None:
+    """``artifact_missing`` and ``config_invalid`` are different answers."""
+    error = _refused(ub.tree_ramdisk_placeholder, tmp_path / "not-there.adt")
+    assert error.code is ErrorCode.ARTIFACT_MISSING, error
+
+
+def test_a_data_ramdisk_that_does_not_exist_is_named_by_missing(
+    tmp_path: Path, inputs: BootInputs
+) -> None:
+    """The same contract ``missing()`` already keeps for the trust cache."""
+    absent = tmp_path / "not-there.dbr"
+    assert replace(inputs, data_ramdisk=absent).missing() == [
+        "data_ramdisk=not-there.dbr"
+    ], replace(inputs, data_ramdisk=absent).missing()
