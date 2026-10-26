@@ -1796,6 +1796,73 @@ def test_the_cli_prints_which_kind_of_run_it_was(
     assert "root volume attached: os-root.raw" not in unattached, unattached
 
 
+def test_the_cli_reaches_every_optional_input_bootinputs_has(
+    inputs: BootInputs, qemu: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """The unified path's own CLI must be able to say everything ``boot()`` can.
+
+    ``--data-ramdisk`` and ``--systemos-image`` exist because the official path
+    was dropping them.  ``--trust-cache`` did not exist, so the CLI of the very
+    module that carries ``BootInputs.trust_cache`` could not express one: the
+    diagnostics could (``probe-root-volume.py`` passes it into ``BootInputs``),
+    which is exactly how a verified configuration ended up reachable only from
+    the diagnostics.  ``stage_esp``, ``missing()``, ``to_dict()`` and
+    ``_check_carried`` all handle the field; the flag was the one place it was
+    not wired.
+
+    Two-sided, and the teeth are the flag itself rather than the behaviour: the
+    parser is asked for ``--trust-cache`` by name, so deleting the argument is a
+    red test even though every downstream assertion would then be vacuously
+    about the default branch.
+    """
+    import pytest as _pytest
+
+    bundle = tmp_path / "original-static-system.bundle"
+    bundle.write_bytes(b"synthetic trust bundle")
+
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited([]))
+    base = [
+        "--device", str(_synthetic_device(tmp_path)),
+        "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware),
+        "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree),
+        "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu),
+        "--workdir", str(tmp_path / "run"),
+    ]
+
+    assert ub.main([*base, "--trust-cache", str(bundle)]) == 1
+    attached = capsys.readouterr().out
+    assert "trust cache staged: original-static-system.bundle" in attached, attached
+    # The ESP is where "staged" has to be proven, not the line that claims it.
+    staged = tmp_path / "run" / "esp" / TRUSTCACHE_NAME
+    assert staged.is_file(), sorted(p.name for p in staged.parent.iterdir())
+    assert staged.read_bytes() == b"synthetic trust bundle", staged
+    # No absolute path in the operator's view, the rule the root-image test keeps.
+    assert str(tmp_path) not in attached, attached
+
+    assert ub.main(base) == 1
+    absent = capsys.readouterr().out
+    assert "no trust cache staged: AMFI will refuse to exec launchd" in absent, absent
+    # The full line, not the phrase -- and this is the same trap the root-image
+    # test two functions up documents: "no trust cache staged:" *contains*
+    # "trust cache staged:", so the substring form passes on the branch it is
+    # meant to exclude.  This test had that bug on its first run and the suite
+    # caught it, which is the argument for writing the assertion both ways.
+    assert "trust cache staged: original-static-system.bundle" not in absent, absent
+    assert not (tmp_path / "run" / "esp" / TRUSTCACHE_NAME).is_file()
+
+    # The flag exists.  Without this the three assertions above pass on a CLI
+    # that ignores ``--trust-cache`` entirely -- argparse rejects an unknown
+    # option, so a deleted flag fails with SystemExit(2) and the test dies on
+    # the return code, which is a weaker failure than naming the flag.
+    with _pytest.raises(SystemExit) as caught:
+        ub.main(["--device", "x", "--qemu", "y", "--trust-cache", str(bundle)])
+    assert caught.value.code == 2, caught.value
+
+
 # ---------------------------------------------------------------------------
 # the optional inputs, through boot() rather than through stage_esp
 # ---------------------------------------------------------------------------

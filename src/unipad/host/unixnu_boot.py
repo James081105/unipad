@@ -1488,6 +1488,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--unixnu", type=Path, required=True, help="UniXNU.efi, staged as EFI/BOOT/BOOTAA64.EFI")
     parser.add_argument("--payload-toml", type=Path, default=None,
                         help="an existing unixnu.toml to adopt instead of generating one")
+    # Every optional BootInputs field is reachable from here, and that is the
+    # whole point of the flag.  ``--data-ramdisk`` and ``--systemos-image`` were
+    # added by the commits that fixed the official path dropping them; this one
+    # was not, so the unified path's own CLI could not express a trust cache even
+    # though BootInputs, stage_esp, missing() and _check_carried all handle one.
+    # The diagnostics could (probe-root-volume.py passes it), which is how the
+    # gap survived: the config the diagnostics verified on 2026-10-26 was only
+    # reachable from the diagnostics.  Absent here means "boot without one", which
+    # build-os-root.py:26-27 records as a guest AMFI will not let run launchd.
+    parser.add_argument("--trust-cache", type=Path, default=None,
+                        help="the chain's trust bundle, staged as "
+                             "EFI/UniXNU/Payloads/kernel.macho.trustcache beside the "
+                             "kernel; without it AMFI refuses to exec launchd "
+                             "(build-os-root.py:26-27)")
     parser.add_argument("--data-ramdisk", type=Path, default=None,
                         help="the packed Data ramdisk (.dbr) to stage beside the kernel; "
                              "the device tree must also carry the PackedRAMDisk "
@@ -1516,6 +1530,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         darwinboot=args.darwinboot,
         unixnu=args.unixnu,
         payload_toml=args.payload_toml,
+        trust_cache=args.trust_cache,
         data_ramdisk=args.data_ramdisk,
     )
     if args.kernel_arg:
@@ -1536,6 +1551,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         systemos_image=args.systemos_image,
     )
     print(f"qemu exit {report.exit_code}; qmp ready: {report.reached_qmp}; serial {report.serial_bytes} bytes")
+    # From ``inputs`` and not from ``report``: BootReport deliberately does not
+    # carry the trust cache, because a report that names one unconditionally
+    # cannot tell a run that had one from a run that did not, and that difference
+    # is invisible in the serial log.  ``inputs.to_dict()`` omits the key when
+    # there is none, which is the same rule.
+    if inputs.trust_cache is not None:
+        print(f"trust cache staged: {inputs.trust_cache.name}")
+    else:
+        print("no trust cache staged: AMFI will refuse to exec launchd")
     if report.root_image:
         print(f"root volume attached: {report.root_image}")
     else:
