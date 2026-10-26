@@ -1749,11 +1749,59 @@ jobs:
           #     outputs into the checkout.
           log="$IPSW_WORK_DIR/os-root.log"
           echo "chain: running build-os-root.py --ipsw $refer --openssl-prefix $OPENSSL_PREFIX (cwd $tree)"
-          if ! ( cd "$tree" && python3 scripts/build-os-root.py \
-                   --ipsw "$refer" --openssl-prefix "$OPENSSL_PREFIX" ) 2>&1 | tee "$log"; then
-            echo "::error::build-os-root.py failed; see $log"
-            exit 1
-          fi
+          # Retried, because the chain RESUMES rather than restarts.  Every one of
+          # its steps is guarded by "is my output already on disk", so a second
+          # invocation skips both RSA block-verification policies (1,483,785 OS
+          # blocks and 806,400 SystemOS blocks), the verified-root probe and both
+          # block drivers and goes straight back to the step that failed.  That
+          # makes a retry seconds rather than minutes, which is what makes it the
+          # right response to the failure this step actually hit.
+          #
+          # MEASURED on run 40362810790, the first run after the tree/ path fix.
+          # The chain reached build-os-root.py:109 and died on a bare
+          # StopIteration --
+          #
+          #   container = next(entry['ContainerReference'] for entry in listing['Containers']
+          #                    if any(s['DeviceIdentifier'] == store
+          #                           for s in entry.get('PhysicalStores', [])))
+          #
+          # -- that is, `diskutil apfs list -plist` named no APFS container whose
+          # physical store was the device `hdiutil attach` had just returned.  The
+          # same pinned script, the same inputs and the same runner image produced
+          # a real 1 GiB seed on run 40339678974, and THAT run's log shows the
+          # container it found was a different device from the store it matched:
+          # "Resizing APFS Container designated by APFS Container Reference disk34"
+          # followed by "The specific APFS Physical Store being resized is disk33".
+          # So the lookup depends on how macOS lays the raw image out, and the
+          # script takes `system-entities[0]` without checking which of the two it
+          # got.  The device repository is a third-party pin and cannot be edited
+          # here -- the display-driver divergence above is worked around the same
+          # way, in this step rather than in vendor/ -- so the response is to
+          # retry, and to leave behind the listings the failing line reads if the
+          # retries run out.  This run could not say which half of that went
+          # wrong, because the script dumps neither query.
+          : > "$log"
+          attempt=1
+          max_attempts=3
+          until ( cd "$tree" && python3 scripts/build-os-root.py \
+                  --ipsw "$refer" --openssl-prefix "$OPENSSL_PREFIX" ) 2>&1 | tee -a "$log"; do
+            {
+              echo "== chain attempt $attempt of $max_attempts failed. The two queries the failing line reads:"
+              echo "-- diskutil apfs list -plist"
+              diskutil apfs list -plist 2>&1 || true
+              echo "-- diskutil list"
+              diskutil list 2>&1 || true
+              echo "-- hdiutil info"
+              hdiutil info 2>&1 | head -n 40 || true
+            } >> "$log"
+            if (( attempt >= max_attempts )); then
+              echo "::error::build-os-root.py failed $max_attempts times; see $log"
+              exit 1
+            fi
+            echo "chain: attempt $attempt failed; the chain resumes from its own outputs, retrying ($(( attempt + 1 ))/$max_attempts)"
+            attempt=$(( attempt + 1 ))
+            sleep 5
+          done
           # (5) the three inputs the kernel stage switches on, and the two the
           #     payload stage needs.  Named here so a chain that "succeeded" but
           #     left nothing is a failure rather than a silent one.
@@ -2673,6 +2721,31 @@ jobs:
           else
             echo "no unencrypted Data seed on this runner"
           fi
+
+      # A chain that was ATTEMPTED and failed is a failed run, and it must not be
+      # able to end green.  This is implementation-plan fact 88's shape a third
+      # time: the step is continue-on-error so the logs and the artifacts still
+      # upload, which is right, but the consequence was that run 40362810790 --
+      # whose chain died at build-os-root.py:109 -- reported
+      # `conclusion: success` with no Data seed, no manifest and no delivery,
+      # while every step that ran reported success beside it.
+      #
+      # `outcome` and not `conclusion`: continue-on-error rewrites the conclusion
+      # to success and leaves the outcome as what actually happened, so this
+      # condition is exactly "the step ran and failed".  The two ways the chain
+      # legitimately does not run are both excluded -- `not_run` is set (and the
+      # step exits 0) when it was refused for a missing input, and a step skipped
+      # because the volumes were never published has outcome 'skipped'.
+      #
+      # Placed here, after every upload and after the unencrypted seed is gone,
+      # so the failure costs nothing but the verdict.
+      - name: The owner root chain's outcome is part of the run's verdict
+        if: always() && steps.os_root.outcome == 'failure'
+        run: |
+          echo "::error::the owner root chain was attempted and FAILED, so this run produced no matched-build material."
+          echo "::error::See ipsw-work/os-root.log (uploaded with the build logs) for the failure and, if the retries ran out, for the diskutil listings the failing line reads."
+          echo "::error::No Data seed, no material manifest and no encrypted delivery exist for this run. Treat every artifact it uploaded as unmatched: a kernel built for a Data volume UUID nobody delivered."
+          exit 1
 
       - name: Step summary
         if: always()

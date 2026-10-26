@@ -784,3 +784,129 @@ def test_the_chain_hands_build_os_root_an_absolute_refer_path(tmp_path: Path) ->
         "would dangle and its tenth step would fail naming the symlink, not "
         "the target (measured on run 40203832707)."
     )
+
+
+# ---------------------------------------------------------------------------
+# the chain's failure mode, and the verdict it is allowed to produce
+# ---------------------------------------------------------------------------
+
+
+def _chain_step() -> dict:
+    """The workflow's "Build the owner root chain" step, as data."""
+    import yaml
+
+    document = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for step in document["jobs"]["build"]["steps"]:
+        if step.get("name") == "Build the owner root chain (build-os-root.py)":
+            return step
+    raise AssertionError("the workflow has no owner root chain step to check")
+
+
+def _steps() -> list[dict]:
+    import yaml
+
+    document = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    return document["jobs"]["build"]["steps"]
+
+
+def test_the_chain_retries_and_captures_the_listings_it_reads() -> None:
+    """The chain resumes, so a retry is seconds -- and a silent one is worthless.
+
+    MEASURED on run 40362810790, the first run after the tree/ path fix.  The
+    chain reached ``build-os-root.py:109`` and died on a bare ``StopIteration``:
+    ``diskutil apfs list -plist`` named no APFS container whose physical store
+    was the device ``hdiutil attach`` had just returned.  The same pinned script,
+    the same inputs and the same runner image produced a real 1 GiB seed on run
+    40339678974 -- and that run's log shows the container it found was a
+    *different device* from the store it matched ("Resizing APFS Container
+    designated by APFS Container Reference disk34" / "The specific APFS Physical
+    Store being resized is disk33").  So the lookup depends on how macOS lays the
+    raw image out, and the script takes ``system-entities[0]`` without checking
+    which of the two it got.  The device repository is a third-party pin and
+    cannot be edited here, so the response has to live in this step.
+
+    Two things are asserted, and they are the two halves of "respond without
+    guessing": the chain is RETRIED (every one of its steps is guarded by "is my
+    output already on disk", so a second invocation skips both RSA policies and
+    both block drivers and goes straight back to the failing line -- seconds, not
+    minutes), and when the retries run out the two queries the failing line reads
+    are LEFT BEHIND.  A retry with no diagnostics is a coin flip that costs a run
+    each time; diagnostics with no retry is a run spent learning something.  The
+    run that failed could say neither, because the script dumps neither query.
+    """
+    step = _chain_step()
+    script = step["run"]
+    assert "max_attempts=3" in script, (
+        "the chain step no longer retries, so a transient APFS registration "
+        "failure costs a whole run"
+    )
+    assert "until ( cd \"$tree\" && python3 scripts/build-os-root.py" in script, (
+        "the retry does not re-invoke the chain, so it cannot resume from the "
+        "chain's own on-disk outputs"
+    )
+    # The diagnostics, and specifically the query the failing line reads.
+    assert "diskutil apfs list -plist" in script, (
+        "the chain step no longer captures `diskutil apfs list -plist`, which is "
+        "the listing build-os-root.py:109 reads when it raises StopIteration"
+    )
+    assert "hdiutil info" in script, (
+        "the chain step no longer captures `hdiutil info`, which is the other "
+        "half: which device the attach actually returned"
+    )
+    # ...and they are appended to the uploaded log, not printed to a step log
+    # that disappears with the runner.
+    assert '>> "$log"' in script, (
+        "the diagnostics are not appended to $log, so they would not be uploaded "
+        "with the build logs and the next failure would be as silent as this one"
+    )
+    # continue-on-error stays: the logs and the artifacts still have to upload.
+    assert step.get("continue-on-error") is True, (
+        "the chain step no longer continues on error, so a chain failure would "
+        "cost the run its logs and its artifacts as well as its verdict"
+    )
+
+
+def test_a_chain_that_was_attempted_and_failed_is_a_failed_run() -> None:
+    """``conclusion: success`` beside no seed is fact 88 a third time.
+
+    Run 40362810790's chain died at ``build-os-root.py:109``.  The step is
+    ``continue-on-error`` so the logs and the artifacts still upload -- which is
+    right -- and the consequence was that the job reported
+    ``conclusion: success`` with no Data seed, no manifest and no delivery, while
+    every step that ran reported success beside it.  The step summary said
+    nothing about the chain, because it is written from the staging report and
+    the staging report has no chain in it.
+
+    The gate is ``outcome`` and not ``conclusion``: ``continue-on-error`` rewrites
+    the conclusion to success and leaves the outcome as what actually happened,
+    so ``outcome == 'failure'`` is exactly "the step ran and failed".  Both ways
+    the chain legitimately does not run are excluded -- ``not_run`` is set and the
+    step exits 0 when it was refused for a missing input, and a step skipped
+    because the volumes were never published has outcome 'skipped' -- so this gate
+    cannot fire on a run that never attempted the chain.
+    """
+    gate = None
+    for step in _steps():
+        if step.get("name") == "The owner root chain's outcome is part of the run's verdict":
+            gate = step
+            break
+    assert gate is not None, (
+        "nothing fails the run when the owner root chain was attempted and "
+        "failed, so such a run ends green with no matched-build material"
+    )
+    condition = str(gate.get("if") or "")
+    assert "steps.os_root.outcome == 'failure'" in condition, condition
+    # Not the conclusion, which continue-on-error rewrites to success.
+    assert "conclusion" not in condition, condition
+    assert "always()" in condition, (
+        "the gate is not `always()`, so it would be skipped on exactly the runs "
+        "where an earlier step already failed -- which is the run it is for"
+    )
+    assert gate["run"].strip().endswith("exit 1"), gate["run"]
+
+    # And it is placed after every upload and after the unencrypted seed is gone,
+    # so a failed chain costs the run its verdict and nothing else.
+    names = [str(step.get("name")) for step in _steps()]
+    assert names.index(gate["name"]) > names.index("Remove the unencrypted material from the runner"), names
+    assert names.index(gate["name"]) > names.index("Upload build artifact (allowlisted roles only, 30-day retention)"), names
+    assert names.index(gate["name"]) > names.index("Upload the boot inputs"), names
