@@ -16,10 +16,12 @@
 | `qemu_root_defconfig` 内核构建 | **已实测**（macOS runner，run 40241617618 / 40250055465，`stages: ran=7 not_run=0 failed=0`） |
 | 本机从 IPSW 解出 OS 卷（UDIF→raw，纯 Python LZFSE） | **已实测**：6,077,580,800 字节，GPT + APFS 容器自相一致 |
 | 根卷挂载 | **已实测**（Windows QEMU TCG）：`mount-complete volume DawnUpdate21H461.J120J121J207J208OS`，卷 UUID `04769D26-…` 与 board.toml 逐字符相同 |
-| PID 1 | **已实测**：`init` pid 1 在跑；但内核在 7 分钟观测里一个字节日志都没长，是卡住不是慢 |
+| PID 1 | **已实测**：`init` pid 1 在跑；内核日志在 `No POST boot-arg set.` 之后停止增长 |
 | trust cache 链路 | **已实测**：内核 `attempting to load 2 external trust cache modules` → `completed loading external trust cache modules` |
-| **原始 launchd 作为 PID 1** | **未验证**。当前阻断很具体：OS 卷的快照元数据树是**空的**（`btn_nkeys=0`），而内核要一个具名 root snapshot（`failed to find named root snapshot: Need authenticator (81)`） |
+| **原始 launchd 作为 PID 1** | **未验证**。阻断点已用 PC + 内核栈测量定位：访客**内核 panic 了**，CPU 停在 `panic_spin_forever()` 的 `wfe; b .` 终态循环（PC `0xfffffff00b8653fc`，三次采样逐位相同）。按保存的帧指针链走到的调用链是 `bsd_ast → bsdinit_task → load_init_program → panic_trap_to_debugger`，调用点在栈上留下的实参块给出 **`panic("offline owner SystemOS mount failed: 80 @kern_exec.c:8032")`**——`80` 是 `EAUTH`，出自 UniXNU 的 `patches/xnu/offline-owner-systemos-mount.patch` 里 `native_owner_cache_prepare()` 的 `root_authorized` 一道关。panic 文本进 `debug_buf` 不进 msgbuf，所以现有观测通道会在 panic 那一刻静默 |
 | SpringBoard / 输入 / 持久 Data / IPA 安装 / 十条验收 | **未验证** |
+
+> 前两版这里先后把阻断写成「OS 卷快照元数据树是空的」和「内核停在 `mach_vm_allocate_kernel`」，**两者都被测量否证**：前者被日志顺序否证（`failed to find named root snapshot` 打在 18.873 秒，40 毫秒后 `mount-complete` 照常出现，非致命）；后者被帧指针链否证（`load_init_program` 确实跑了，且它内部先执行的是 `native_owner_cache_prepare()`，不是分配）。**设备仓库自己为这个 panic 准备了 checker**（`vendor/UniXNU/scripts/check-owner-systemos-mount-checkpoints.py`），并把拒绝态与成功态的全局量写成断言——那两组值就是下一步的验收判据。
 
 完整的测量记录、每一次失败的归因，以及「哪些是代码完成、哪些是模拟通过、哪些是 runner 验证、哪些是本机实测」四种状态的分辨，在 `docs/implementation-plan.md` 与 `docs/audit-r8.md`。
 

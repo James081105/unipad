@@ -210,3 +210,75 @@
 68. **本机 APFS 阅读器的 catalog 遍历修好了 omap 一半，另一半需要按记录类型分别比较键——这是一个可描述能力的边界，不是一个能一行补上的 bug**（2026-10-26）：事实 67 说要修好它再列目录。**已经修好的**：`Node.__init__` 原来 `entries.sort()` 按 TOC 的 `(key_offset, value_offset)` 排序，而 TOC 是自由表、**不是键序**——实测 OS 卷 omap 的 level-1 块 67587，按 offset 走有 **33/140 处逆序**，于是每次下降都落到错误的叶上，报 `oid 18628 not found in omap tree 67578`。**中间还走错了一次**：改成按 16 字节原始字节串排序，结果把 `0x97d9` 排到 `0x67e3` 前面（`d9 < e3`）——APFS 的 omap 键是按**整数**比的，不是按小端字节串比的。**最终修法**是按键的前 8 字节按小端 u64 排序，omap 查找恢复工作。**修不好的一半**：catalog 树不能沿用同一个比较。catalog 根（块 65684，`flags=0x1` ROOT、`level=3`、`nkeys=6`）的键是**异构**的——同一个节点的键里既有 `01 00 00 00 00 00 00 90 …` 这种 obj_id 前缀的，也有 `70 72 69 76 61 74 65 2d 64 69 72 00`（`private-dir\0`）这种字符串键；APFS 对每类记录有各自的 `*_key_cmp`，通用阅读器不实现它们就只能猜。**所以「按目录列名字」这条可信路径还没有通**，事实 67 提出的问题仍然没有答案。**这条记下来是为了把「工具坏了」和「问题本身难」分开**：前者已经修了一半且有实测依据，后者是一个明确的、有边界的工作项（实现 catalog 各类键的比较），不是继续瞎试就能过的。
 
 69. **事实 67 那条「launchd 不在镜像里」的扫描结论作废——加上 DIR_REC 类型过滤之后，它一个真文件名都找不到，所以这个方法根本区分不出「不存在」和「没找到」**（2026-10-26，自驳）：事实 67 用一个「名字前一个字节等于名字长度」的判据扫描，得到 `SpringBoard` 1 条、其余全 0，我当时已经标了「仪器弱、不下结论」。**现在有了直接证据说明它比「弱」更糟**：给这个判据加上 APFS 目录记录的类型过滤——`j_drec_key` 的 `obj_id_and_type` 低 4 位是记录类型，`APFS_TYPE_DIR_REC = 9`，所以名字往前第 3 个字节的低半字节必须是 9——再扫一遍 OS 卷，**命中的「名字」是 `Td`、`eJfP`、`7Zvc`、`=Ys`、`'Y(`、`` G`PP ``、`481C`、`75-`、`RY;`、`393 `、`dA#a` 这类二进制噪声，真文件名 0 个**。**一个在真目录记录上一个名字都找不到的过滤器，没有资格断言任何名字不存在**；事实 67 里那个 `SpringBoard` 正样本 therefore 很可能只是巧合（它那条记录的上下文确实像 B-tree 叶记录，但一个只会偶中的仪器，偶中不能当证据）。**所以「活动根里有没有 `/sbin/launchd`」至今没有答案**，事实 66/67/68 三次尝试都没拿到它，这一次是把方法本身证伪。**顺带一条从内核日志能拿到的最强间接证据**：XNU 的 `load_init_program()` 在 exec 失败时会 `panic("cannot exec init process")`，而实测七分钟里没有 panic、PID 1 停在 `init`——所以要么 exec 正卡在读文件的路上，要么内核卡的地方根本不是 exec。**这条间接证据不足以定位，但足以排除「exec 已失败返回」这一种可能**，把它记下来免得下一轮重新推。
+
+70. **访客不是「卡住」，是 **panic 了**——PC 测量三次逐位相同，反汇编出的指令是 `wfe; b .`，即 XNU 的 `panic_spin_forever()`**（2026-10-26，本机证据 `local-private/boot18/blocked2/`、`local-private/boot19/panic/`）：事实 59–69 三轮都把这个状态描述成「内核卡住/没在长日志」，从未测过 PC。这次测了：`human-monitor-command` 的 `info registers` 给出 **PC `0xfffffff00b8653fc`，三个相隔 30 秒的样本逐位相同**（`SP=0xfffffff962ca7420`）。用 capstone 5.0.7 反汇编 `kernel.macho` 文件偏移 `0x48613fc`（`__TEXT_EXEC` vmaddr `0xfffffff00b828000` ↔ fileoff `0x4824000`），得到：
+
+```
+0xfffffff00b8653ec  adrp x0, #0xfffffff007047000
+0xfffffff00b8653f0  add  x0, x0, #0xaa4        ; "…Please go to https://panic.apple.com…"
+0xfffffff00b8653f4  bl   _paniclog_append_noflush
+0xfffffff00b8653f8  wfe                        <== LR
+0xfffffff00b8653fc  b    .                      <== 停住的 PC
+```
+
+再往上三条 `bl _panic_debugger_log` 的实参分别是 `'Original panic string:\n'`、`'panic(cpu %u caller 0x%lx): '`、`'\n'`——**这三条串只出现在 `panic_trap_to_debugger`（`osfmk/kern/debug.c:1129`）里**。而 `wfe; b .` 正是源码里 `panic_spin_forever()`（`osfmk/kern/debug.c:1240`）的 `for(;;) __builtin_arm_wfe();` 编译结果。**所以「7 分钟一个字都没长」不是慢，是已经 panic 完在自旋。** 顺带：`symbolize-kernel.py` 把这个 PC 报成 `_handle_debugger_trap+0x788`，那只是「最近的前一个符号」——`panic_spin_forever` 是小函数、符号表里没有它，属正常粗糙，不影响结论（结论靠指令和串，不靠符号名）。
+
+71. **panic 文本不进 msgbuf，进 `debug_buf`——所以现有观测通道（`GuestObserver.kernel_log()` 读 `msgbufp` 环形缓冲）会在 panic 那一刻精准静默，这解释了此前数轮「日志不再增长」的误读**（2026-10-26）：`kernel_log()` 的 docstring 写明它读的是 `msgbufp` 的 ring。而 panic 路径用的是 `_paniclog_append_noflush` 写 `debug_buf`、`_panic_debugger_log` / `__doprnt` 走另一条。实测：panic 发生后控制台环仍停在 `No POST boot-arg set.`（298 行，22761 字节），**一条 panic 文本都没有**。**这意味着此前所有「日志不再增长 ⇒ 内核卡住」的推理都建立在一条会静默的通道上**，事实 60/62/66/69 全都继承了它。另有一条操作性事实同轮量到：**`serial.log` 只是 DarwinBoot 的 UART 输出**——38 行、2193 字节、两次不同 run 逐字节相同，内核 `printf` 根本不进 QEMU 串口设备；内核加载行 `kernel   va 0xFFFFFFF00427C000  pa 0x4807C000` 在里面（第 28 行），但 `grep "kernel va 0x"`（一个空格）找不到它，日志里是三个空格——`guestobserve._LOAD_LINE` 用 `\s+` 正是为此。
+
+72. **panic 的精确身份：`panic("offline owner SystemOS mount failed: %d", cache_error)`，`kern_exec.c:8032`，来自 UniXNU 的 `offline-owner-systemos-mount.patch`**（2026-10-26，证据 `local-private/boot19/panic/`）：从原始栈转储按**保存的 x29 帧指针链**走（380 个词、31 个回指候选），得到无歧义的调用链：
+
+```
+Call_continuation → thread_bootstrap_return → user_take_ast → ast_taken_user
+  → bsd_ast → bsdinit_task → load_init_program → panic_trap_to_debugger
+    → DebuggerTrapWithState → fleh_synchronous → sleh_synchronous → handle_uncategorized
+```
+
+**所以 `load_init_program` 确实跑了**——事实 70 之前那一版 README 写的「内核停在 `mach_vm_allocate_kernel`、没走到第一条 printf」是**从源码推出来、没有测量支撑**的结论，被这条链直接否证（`printf` 的输出应该也进了 `debug_buf` 而非 msgbuf，所以「日志里没有 attempting to load」同样不构成证据）。调用点的立即数把身份钉死：
+
+```
+0xfffffff00bccb828  mov  w8, #0x1f60            ; 行号 8032
+0xfffffff00bccb830  add  x9, x9, #0x441         ; "kern_exec.c"
+0xfffffff00bccb838  str  x22, [sp]              ; %d 实参 = cache_error
+0xfffffff00bccb840  add  x0, x0, #0x6a6         ; "offline owner SystemOS mount failed: %d @%s:%d"
+0xfffffff00bccb844  bl   panic
+```
+
+栈上 `0xfffffff0070c8441` 就是 `'kern_exec.c'`。对应源码是 `vendor/UniXNU/patches/xnu/offline-owner-systemos-mount.patch:286`：`int cache_error = native_owner_cache_prepare(p, (user_addr_t)scratch_addr, &init_envp); if (cache_error) panic("offline owner SystemOS mount failed: %d", cache_error);`——它夹在 `mach_vm_allocate_kernel` 与 `memorystatus_init_at_boot_snapshot` 之间，正是上一版推断出的那个窗口，只是窗口里真正执行的是这次缓存挂载，不是分配。
+
+73. **设备仓库自己就为这个 panic 准备了 checker，并把「拒绝」和「成功」两种状态的全局量写成断言——于是阻断从「未知」变成「一个有名字的验收项」**（2026-10-26）：`vendor/UniXNU/scripts/check-owner-systemos-mount-checkpoints.py` 断言 `missing['stop_symbol'] == '_panic'` 且 `missing['argument_memory']['x0'].startswith('offline owner SystemOS mount failed: %d')`，并给出拒绝态的期望值：`_native_owner_cache_stage == 1`、`_native_owner_cache_status == 80`（EAUTH）、`_native_owner_cache_mount_status == -1`、`_native_owner_cache_selected_device == -1`、`_native_owner_cache_mounted_device == -1`、`_native_owner_cache_authorized == 0`、`_native_owner_cache_root_recheck == 1`、`_native_virtio_verified_devices == 1`。成功态是：stage 6、status/mount_status 0、readonly 1、authorized 1、root_recheck 1、selected == mounted == `0x01000004`、`actual_device_path == '/dev/disk2s1'`、verified_devices 2、read_requests 304、verified_blocks 478。**这两个状态集就是下一步的验收判据**，不需要我自己发明。`check-owner-dyld-startup-checkpoints.py` 还记录了更后面的一关：真 launchd 起来后会去 `openat('/private/preboot/System/Library/Caches/com.apple.dyld', …)` 要 `dyld_shared_cache_arm64`，而点火描述符被清掉后返回 `EBADF=9`，最终用户态退出 namespace 6「no dyld cache」——**dyld 缓存这一关在本轮测量里还没被触及**。
+
+74. **panic 的 `%d` 实参测出来了：`cache_error = 80 = EAUTH`，它来自 `root_authorized` 一道关，而不是设备仓库自己记录的拒绝态**（2026-10-26，证据 `local-private/boot21/state/`、`local-private/boot19/panic/stack.txt`）：事实 72 把调用点的立即数读出来了，但 `%d` 的值在寄存器里已被 panic 路径覆盖。**它在栈上**：反汇编显示调用前是 `str x22, [sp]`（`%d`）、`stp x9, x8, [sp, #8]`（`%s` 文件、`%d` 行号），而 `[sp+8]` 就是 `'kern_exec.c'`——于是在栈转储里定位到那一组：
+
+```
+[0xfffffff962ca7b90] = 0x50              = 80         <-- cache_error
+[0xfffffff962ca7b98] = 0xfffffff0070c8441 = "kern_exec.c"
+[0xfffffff962ca7ba0] = 0x1f60            = 8032
+```
+
+同窗口 `[0xfffffff962ca7b50] = 0x01000003` 就是 `root_device`（major 1 minor 3 = `disk1s1`，与内核日志 `BSD root: disk1s1, major 1, minor 3` 一致）。**所以 panic 的完整文本是 `offline owner SystemOS mount failed: 80 @kern_exec.c:8032`。** 对照补丁源码，`native_owner_cache_prepare()` 里 `int error = EAUTH;`，然后
+
+```c
+root_authorized = (vfs_flags(root_mount) & MNT_RDONLY) && root_device != NODEV &&
+    native_verified_block_root_authorized(root_device);
+if (!root_authorized) goto done;          // stage 停在 0
+native_owner_cache_stage = 1;
+```
+
+`done:` 里 `if (!root_recheck) error = EAUTH;`。**首发那次测量把 stage 读成 0、`read_requests` 读成 0，据此写下的「死在更早的 root_authorized」是错的**（见事实 76 的更正）：复测两次（boot21、boot22，PC 均 `0xfffffff00b8653fc`）得到**稳定且逐字段相同**的状态——`stage == 1`、`status == 80`、`mount_status == -1`、`readonly == 0`、`authorized == 0`、`root_recheck == 1`、`selected == mounted == NODEV`、`read_requests == 181`、`verified_blocks == 357`、`verified_devices == 1`。首发那次是一次**读数异常**，不是另一种失败模式；两次复测一致，以复测为准。
+
+75. **panic 文本哪里都读不到，因为 `debug_buf_base == 0`——`paniclog_append_noflush` 对空缓冲直接返回，这不是观测疏漏而是内核自身没分配**（2026-10-26）：事实 71 推断 panic 文本进 `debug_buf`，本轮去读了，`__DATA` 里 `_debug_buf_base`（`0xfffffff00c068668`）、`_debug_buf_ptr`（`0xfffffff00c068670`）、`_debug_buf_size`（`0xfffffff00c068678`）**三者皆为 0**。也就是说 panic 路径确实调了 `_paniclog_append_noflush`（PC 前一条 `bl` 就是它），但它拿到空指针就返回了，什么都没写。**所以「从 debug_buf 读 panic 串」这条路在这个构建里不存在**，事实 74 的栈上实参块是唯一拿到 `%d` 的途径。这条同时修正事实 71 的措辞：不是「panic 文本在 debug_buf 里而我们没去读」，而是「这个内核压根没建 panic 缓冲」。
+
+76. **拒绝态与设备仓库的 checker **完全一致（8/8）**，死点是 `native_verified_block_volume_device()` 找不到 UUID `8846FE78-2910-4297-AF97-D59BB6F8FC16` 的卷——而本机只挂了 OS 根卷，SystemOS cryptex 根本没有作为块设备接进去**（2026-10-26，证据 `local-private/boot21/state/`、`local-private/boot22/state/`，两次复测 PC 均为 `0xfffffff00b8653fc`、全局量逐字段相同）：把 `check-owner-systemos-mount-checkpoints.py` 的拒绝态断言搬过来逐条比（注意：这些全局量都是 `volatile int`/`dev_t`，**32 位**，而它们四个字节一个紧挨着排，读 8 字节会把下一个变量的低半字一起读进来——第一版探针因此报出「5 of 8 differ」，实际是 8/8 全中；另外期望值写 `-1` 而实测是无符号 `4294967295`，同一个数）：
+
+| 全局量 | 设备仓库期望（拒绝） | 实测 |
+| --- | --- | --- |
+| `_native_owner_cache_stage` | 1 | 1 |
+| `_native_owner_cache_status` | 80 (EAUTH) | 80 |
+| `_native_owner_cache_mount_status` | -1 | -1 |
+| `_native_owner_cache_selected_device` | -1 | -1 |
+| `_native_owner_cache_mounted_device` | -1 | -1 |
+| `_native_owner_cache_authorized` | 0 | 0 |
+| `_native_owner_cache_root_recheck` | 1 | 1 |
+| `_native_virtio_verified_devices` | 1 | 1 |
+
+**同时 root 一侧全绿**：`_native_owner_root_accepted = 1`、`_native_owner_root_readonly = 1`、`_native_owner_root_trust_enabled = 1`、`_native_owner_root_mount_device = _native_owner_root_selected_device = _native_verified_block_root_device = 0x01000003`（disk1s1）、`_native_verified_block_root_uuid_match = 1`、`_native_verified_block_root_media_matches = 1`、`_native_verified_block_root_provider_depth = 9`、`_native_verified_block_wrong_uuid_refused = 1`、`_native_owner_root_apple_autherr = 80`。**所以 `root_authorized` 三个合取项全部为真，内核确实越过了 root 检查、死在紧接着的 `native_verified_block_volume_device()`**（补丁源码里 `native_owner_cache_stage = 1;` 之后那一行），与 checker 记录的拒绝态是**同一处**。那个函数找的是 `XNU_OWNER_CACHE_VOLUME_UUID`，补丁里的缺省值是 **`8846FE78-2910-4297-AF97-D59BB6F8FC16`**。**而本机 QEMU 只给了两个块设备：ESP（fat:）与 `os-root.raw`（6,077,580,800 字节，卷 UUID `04769D26-…`，即 disk1s1）——没有任何设备携带 `8846FE78-…` 这个卷**，`_native_virtio_verified_devices == 1`（只验证了根）也正好对上；成功态要求 2。**被钉死的仓库自己写的接法就是两个 VirtIO 块设备**：`vendor/UniXNU-qemu/README.md:108`「把裸设备和 SystemOS 镜像作为两个 VirtIO 块设备交给 QEMU」。**IPSW 里两个候选都在**：`044-76034-038.dmg`（3,303,014,400 字节，事实 8 已证是**裸 APFS**、偏移 32 处 `NXSB`、无 koly 无 GPT，因此可直接当 raw 块设备）与 `044-76040-038.dmg`（5,157,406,069 字节，UDIF，已转成 `os-root.raw`）。本机 `local-private/ipsw/21H461/` 目前只有前者的 `.trustcache`，**镜像本体没有被抽取出来**。**所以下一步是一个具体的、有依据的动作：把 `044-76034-038.dmg` 从 IPSW 抽出来作为第二个 VirtIO 只读块设备接上，再测同一组全局量**——成功态的判据（stage 6、status/mount_status 0、readonly 1、authorized 1、selected == mounted == `0x01000004`、`verified_devices == 2`、read_requests 304、verified_blocks 478）已经由设备仓库写好，不需要我自己发明。
