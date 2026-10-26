@@ -2635,9 +2635,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: owner-data-material-${{ github.run_id }}
-          path: |
-            build-output/private/owner-data-1g.dbr.enc
-            build-output/private/material-manifest.json
+          # The whole directory, and NOT a list of names.  The manifest is the
+          # authority on what belongs to a matched build, and the material
+          # manifest stage already staged every role it names into this
+          # directory -- the kernel, the device tree, the trust bundle, the boot
+          # config, the donor kernelcache and the seed's ciphertext, beside the
+          # manifest that binds them.  Naming two of them here (which is what
+          # this step used to do) produced a delivery that could not be
+          # verified: `material_manifest --verify` refuses a root missing any
+          # role other than the two board-pinned IPSW members, so the host would
+          # download the seed and its index and then be told the kernel was
+          # absent.  The delivery is the one place a matched build is whole, so
+          # it ships whole -- and a role added later travels because the
+          # directory is shipped, not because someone remembered a second list.
+          #
+          # The public staging step excludes this same directory by pattern
+          # (`private/*`, above), so nothing here reaches the public artifact.
+          path: build-output/private/
           retention-days: 30
           if-no-files-found: error
 

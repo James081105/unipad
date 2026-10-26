@@ -46,6 +46,17 @@ The five, and the mutation each one catches:
    script both ways and asks the workflow's own pattern of each pass's log, so
    it holds in both directions and carries no literal of its own to drift.
 
+6. The material delivery upload named two files by hand -- the seed's ciphertext
+   and the manifest -- while ``material_manifest --verify`` refuses a root
+   missing any of the six roles the manifest names.  A run that built everything
+   correctly would deliver a seed the host could not verify, because the kernel,
+   the device tree, the trust bundle, the boot config and the donor kernelcache
+   were left in the public artifact the download never asked for.  The upload
+   now ships the whole ``build-output/private/`` directory and the test asserts
+   both halves of that: the path is the directory and not a list of names, and
+   the staging loop is manifest-driven so a role added later travels without a
+   second list to remember.
+
 What is still unproven here
 ---------------------------
 Everything that needs a macOS host: the Apple toolchain, a real clone from
@@ -749,3 +760,86 @@ def test_the_root_kernel_grep_and_the_kernel_stage_agree_in_both_directions(
         f"the workflow greps {pattern!r} and a pass with no owner root chain "
         f"matched it anyway: {_defconfig_lines(without_chain.stdout)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. The material delivery ships the whole directory the manifest names
+# ---------------------------------------------------------------------------
+
+
+def test_the_material_delivery_ships_the_directory_not_a_list_of_names() -> None:
+    """The delivery is a matched build, so it must arrive whole.
+
+    This is the sixth survivor, and it was found by reading the two ends against
+    each other rather than by a mutation.  The material manifest names six roles
+    -- the kernel, the device tree, the trust bundle, the boot config, the donor
+    kernelcache and the Data seed -- and ``material_manifest --verify`` refuses a
+    root that is missing any of them except the two board-pinned IPSW members
+    PRD 12 deletes.  The upload step named two of them by hand: the ciphertext
+    and the manifest.  So the host would download the seed and its index and be
+    told the kernel was absent, on a run that had built everything correctly --
+    the same shape as the path bug in implementation-plan fact 89, where a
+    consumer made an assumption about a producer's output instead of measuring
+    it, and it cost the run its whole delivery.
+
+    Shipping the directory is what closes it, and it closes it structurally
+    rather than by enumeration: the staging loop is manifest-driven (it iterates
+    ``manifest["artifacts"]``), so a role added later travels without anyone
+    remembering a second list.  Both halves are asserted here, because either
+    one alone leaves the other free to drift -- an upload of a directory nobody
+    stages into is as empty as a stage nobody uploads.
+    """
+    step = _step("Deliver the encrypted material (private channel)")
+    path = step["with"]["path"]
+    assert isinstance(path, str), path
+    # The directory, normalised.  A trailing slash is a spelling, not a contract.
+    assert path.strip().rstrip("/") == "build-output/private", path
+    # ...and NOT a list of names.  This is the assertion that fails on the
+    # delivered version of this step, which listed the ciphertext and the
+    # manifest and nothing else.
+    assert "owner-data-1g.dbr.enc" not in path, path
+    assert "material-manifest.json" not in path, path
+
+    # The other half: the stage that fills the directory stages EVERY role the
+    # manifest names, and it learns the roles from the manifest rather than from
+    # a list of its own.
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'delivery="$(material_delivery_dir)"' in script, (
+        "the material manifest stage no longer resolves its delivery directory "
+        "through material_delivery_dir(), so this test's other half has nothing "
+        "to check against"
+    )
+    assert 'cp "$path" "$delivery/$leaf"' in script, (
+        "the staging loop no longer copies into the delivery directory"
+    )
+    assert 'for role, entry in sorted(manifest["artifacts"].items())' in script, (
+        "the staging loop no longer iterates the manifest's own roles, so a role "
+        "added to the manifest would not be staged into the delivery"
+    )
+    # And the directory it resolves to is the one that is shipped.
+    assert 'material_delivery_dir() { printf \'%s\' "$OUT_DIR/private"; }' in script, (
+        "material_delivery_dir() no longer names $OUT_DIR/private, so the stage "
+        "and the upload would disagree about where the delivery is"
+    )
+
+
+def test_the_delivery_directory_is_excluded_from_the_public_artifact() -> None:
+    """The private channel is only private if the public one excludes it.
+
+    The same directory is uploaded twice on a successful run -- once through the
+    delivery step and once, if the staging step did not exclude it, through the
+    public build artifact.  The exclusion is the pattern list, and PRD 12 does
+    not get to rest on the two uploads happening to be ordered.
+    """
+    step = _step(STAGING_STEP)
+    patterns = _step_python(STAGING_STEP)
+    assert '"private/*"' in patterns, (
+        "the staging step's default-deny patterns no longer exclude the "
+        "delivery directory: " + patterns[:400]
+    )
+    assert '"*.enc"' in patterns, (
+        "the staging step's default-deny patterns no longer exclude the "
+        "ciphertext: " + patterns[:400]
+    )
+    # The step still exists and still has the patterns it claims to.
+    assert step["name"] == STAGING_STEP, step
