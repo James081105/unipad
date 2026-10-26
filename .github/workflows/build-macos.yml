@@ -1455,7 +1455,16 @@ jobs:
             exit 1
           fi
           echo "OPENSSL_PREFIX=$keg" >> "$GITHUB_ENV"
-          echo "root chain verifier: $keg"
+          # On PATH as well as in the environment.  macOS's /usr/bin/openssl is
+          # LibreSSL, whose `enc` has no GCM, so `openssl enc -aes-256-gcm` fails
+          # there -- measured on run 40392771419, whose material delivery
+          # encryption died for exactly that reason.  The LLVM step above already
+          # puts its keg on PATH for the same reason; this is the same asymmetry
+          # closed.  build-macos.sh resolves the keg itself too, so this is the
+          # belt over those braces: it protects any future caller that reaches
+          # for a bare `openssl`.
+          echo "$keg/bin" >> "$GITHUB_PATH"
+          echo "root chain verifier: $keg (and $keg/bin is on PATH)"
 
       # The four members build-os-root.py reads out of the image, published from
       # a fresh acquisition.  continue-on-error for the same reason the first

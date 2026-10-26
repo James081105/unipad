@@ -903,6 +903,29 @@ def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
         )
 
 
+def test_the_openssl_keg_is_on_path_not_only_in_the_environment() -> None:
+    """A bare ``openssl`` on macOS is LibreSSL, and LibreSSL has no GCM.
+
+    The workflow installs OpenSSL 3 and exports ``OPENSSL_PREFIX``, and the owner
+    root chain passes that to ``build-os-root.py`` as ``--openssl-prefix``.  The
+    material delivery encrypts with ``openssl enc -aes-256-gcm`` and used to call
+    the bare command, which on macOS resolves to /usr/bin/openssl -- LibreSSL --
+    whose ``enc`` has no GCM.  Measured on run 40392771419: the delivery's
+    encryption failed and the step log carried no line about it.
+
+    Putting the keg on PATH closes it for every caller rather than only the one
+    that was measured, which is what the LLVM step above already does for
+    ``lld-link``.  ``build-macos.sh`` resolves the keg itself as well, so the two
+    are belt and braces and either alone would have been enough.
+    """
+    step = _step("Install OpenSSL 3 (the root chain's host verifier)")
+    run = step["run"]
+    assert '"$keg/bin" >> "$GITHUB_PATH"' in run, run
+    # And the environment variable is still exported, because the chain step
+    # reads it and passes it on as --openssl-prefix.
+    assert '"OPENSSL_PREFIX=$keg" >> "$GITHUB_ENV"' in run, run
+
+
 def test_the_delivery_directory_is_excluded_from_the_public_artifact() -> None:
     """The private channel is only private if the public one excludes it.
 
