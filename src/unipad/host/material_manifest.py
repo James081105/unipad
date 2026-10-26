@@ -494,10 +494,12 @@ class BuildTree:
     device_root: Path
     #: The payload's ESP, which carries ``EFI/UniXNU/unixnu.toml``.
     esp: Optional[Path] = None
-    #: The device tree, when it is not at the standard place.  A field rather
+    #: The device tree, when it is not at either standard place.  A field rather
     #: than a fixed property for the reason ``esp`` and ``volumes`` are: a host
     #: that downloaded the material has its own layout, and a caller that cannot
     #: say where the device tree is would have to rename files to be believed.
+    #: Setting it also selects the ``devicetree`` role's recorded source, since
+    #: :attr:`devicetree_source` is derived from where the tree was found.
     devicetree: Optional[Path] = None
     #: Where the OS and SystemOS members were extracted.
     volumes: Optional[Path] = None
@@ -509,8 +511,94 @@ class BuildTree:
         return self.root / "kernel/kernel.macho"
 
     @property
+    def esp_dir(self) -> Path:
+        """The payload's ESP, which carries both the boot config and the tree.
+
+        ``build-macos.sh`` passes it as ``--esp "$OUT_DIR/payload-esp"``, and
+        ``$OUT_DIR`` is ``build-output`` -- NOT the work dir -- so this is a
+        parameter in practice and the work-dir spelling is only the shape a
+        caller with the default layout gets.
+        """
+        return self.esp or self.root / "payload-esp"
+
+    @property
     def devicetree_path(self) -> Path:
-        return self.devicetree or self.root / "kernel/kernel.macho.adt"
+        """The device tree this build holds, resolved rather than assumed.
+
+        A build tree carries up to three files named ``kernel.macho.adt`` and
+        they are NOT interchangeable.  Measured on run 40369137221, whose boot
+        inputs bundle lists all of them:
+
+        * ``payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt`` (17768 bytes) --
+          written by ``unixnu/scripts/unixnu/payload.py:149``
+          (``'--output', payloads / 'kernel.macho.adt'``).  This is the one the
+          guest boots: ``unixnu.toml`` names ``Payloads/kernel.macho.adt`` and
+          ``build-macos.sh:3031`` records exactly this path as the ``devicetree``
+          role.
+        * ``unixnu-out/qemu/tree/build/darwinboot-*/esp/.../kernel.macho.adt``
+          (17624 bytes, two of them) -- the bootloader stage's own ESPs, built
+          before the payload and stale relative to it.  The second build pass's
+          tree is 144 bytes larger because it carries ``--trust-cache`` and
+          ``--packed-data-ramdisk``, which is a difference a manifest that took
+          the wrong one would never show.
+        * ``unixnu-out/qemu/kernel/kernel.macho.adt`` -- written by
+          ``build-macos.sh:3430``'s ``build-devicetree/adt`` sub-step, which
+          ``build-macos.sh:3358-3365`` records ``skipped`` when the payload step
+          has already produced one, precisely to avoid leaving two.
+
+        So the order is the boot's own: the ESP tree first, the devicetree
+        stage's second.  The fallback is not dead code -- it is the tree that
+        exists on a run where build-payload did not produce one -- and without
+        it such a run is refused for a file that is sitting right there.
+
+        This reads the filesystem, which :attr:`kernel` and :attr:`trust_cache`
+        do not: the whole point is that the answer depends on which file the
+        build actually wrote, and a property that guessed would be the
+        ambiguity above made permanent.
+        """
+        if self.devicetree is not None:
+            return self.devicetree
+        for _, path in self.devicetree_candidates:
+            if path.is_file():
+                return path
+        # Nothing is on disk.  The ESP spelling is the one to name in the
+        # refusal, because that is the tree the build was supposed to produce
+        # and the one a boot loads.
+        return self.esp_dir / "EFI/UniXNU/Payloads/kernel.macho.adt"
+
+    @property
+    def devicetree_candidates(self) -> tuple[tuple[str, Path], ...]:
+        """Every place a device tree can be, each with the stage that writes it.
+
+        In the order :attr:`devicetree_path` looks.  The source travels with the
+        path so the manifest names the producer of the file it actually hashed;
+        a source restated beside a path that was resolved elsewhere is the
+        "somewhere is not a source" failure this module exists to catch.
+        """
+        return (
+            ("build-macos.sh/build-payload",
+             self.esp_dir / "EFI/UniXNU/Payloads/kernel.macho.adt"),
+            ("build-macos.sh/build-devicetree",
+             self.root / "kernel/kernel.macho.adt"),
+        )
+
+    @property
+    def devicetree_source(self) -> str:
+        """Which stage produced :attr:`devicetree_path`.
+
+        Derived from the resolved path rather than passed in, because the two
+        producers write two different paths and the manifest's ``source`` field
+        means nothing if it can name a stage that did not write the file it
+        describes.  An explicit ``--devicetree`` override outside both places is
+        attributed to the devicetree stage: that is the stage which produces a
+        tree anywhere other than the ESP, and it is what the previous
+        single-path version recorded.
+        """
+        try:
+            self.devicetree_path.relative_to(self.esp_dir)
+        except ValueError:
+            return "build-macos.sh/build-devicetree"
+        return "build-macos.sh/build-payload"
 
     @property
     def source_tree(self) -> Path:
@@ -579,7 +667,7 @@ class BuildTree:
 
     @property
     def boot_config(self) -> Path:
-        return (self.esp or self.root / "payload-esp") / "EFI/UniXNU/unixnu.toml"
+        return self.esp_dir / "EFI/UniXNU/unixnu.toml"
 
     @property
     def volumes_dir(self) -> Path:
@@ -677,7 +765,7 @@ def collect(
         )
     files: dict[str, tuple[str, Path]] = {
         "kernel": ("build-macos.sh/build-kernel", tree.kernel),
-        "devicetree": ("build-macos.sh/build-devicetree", tree.devicetree_path),
+        "devicetree": (tree.devicetree_source, tree.devicetree_path),
         "trust_cache": ("build-macos.sh/build-os-root", tree.trust_cache),
         "data_seed": ("build-macos.sh/build-os-root", tree.data_seed),
         "systemos_image": ("ipsw", tree.systemos_image),
@@ -698,6 +786,34 @@ def collect(
     #: leaf is refused instead of overwriting the first in a flat delivery.
     leaves: dict[str, str] = {}
     recorded: list[str] = list(notes)
+    # A tree that is not the boot's own, or a build carrying more than one, is
+    # recorded rather than silently resolved.  ``verify_manifest`` checks the
+    # tree it is given for the board's root-match UUID and every candidate above
+    # carries that, so a manifest that took the bootloader stage's stale tree
+    # would verify clean and describe a file no boot reads.  The note is what
+    # makes the choice visible; see :attr:`BuildTree.devicetree_path`.
+    #
+    # The note names the stage that was passed over rather than counting files:
+    # ``devicetree_candidates`` is where a tree may be looked for, not an
+    # inventory of a build -- run 40369137221 carried three files of this name
+    # and only two of them are candidates.
+    if tree.devicetree is None:
+        chosen = tree.devicetree_path
+        _, esp_tree = tree.devicetree_candidates[0]
+        others = [source for source, path in tree.devicetree_candidates
+                  if path != chosen and path.is_file()]
+        if chosen != esp_tree:
+            recorded.append(
+                "devicetree is the build-devicetree stage's own tree rather "
+                "than the payload's: build-payload did not produce one on the "
+                "ESP, so this is the tree the board has"
+            )
+        elif others:
+            recorded.append(
+                f"the build also carries the build-devicetree stage's own "
+                f"{chosen.name}; the manifest describes the payload's, which is "
+                "the one unixnu.toml loads"
+            )
     for role in MATERIAL_ROLES:
         if role == "volume_uuid":
             continue

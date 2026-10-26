@@ -1335,22 +1335,58 @@ step_material_manifest() {
     local role path leaf
     while IFS="$(printf '\t')" read -r role leaf; do
         [[ -n "$leaf" ]] || continue
-        # $(tree_dir) before $(work_dir), and both before everything else: the
-        # trust bundle is a script output and lives in the tree's build/
-        # (build-original-system-trust.py:54-56, ROOT from __file__), while the
-        # kernel and the device tree are the driver's own and live in work_dir.
-        # Same two-root split as the header check in (1); see the note there.
-        # Without the tree in this list the bundle is simply not copied, and the
-        # verify in (3) then refuses a delivery that is missing a file the build
-        # really did produce.
-        for path in "$(tree_dir)/$leaf" "$(work_dir)/$leaf" \
-                    "$DEVICE_DIR/.cache/firmware/owner-data/$leaf" \
-                    "$DEVICE_DIR/.cache/firmware/target-volumes/$leaf" \
-                    "$OUT_DIR/payload-esp/EFI/UniXNU/$leaf" "$kernelcache"; do
-            [[ -f "$path" ]] || continue
-            cp "$path" "$delivery/$leaf"
-            break
-        done
+        # Where this role's file is, named per role rather than searched for by
+        # leaf name.  The search this replaces looked for "$root/$leaf" across
+        # six roots and could not find three of the eight roles that carry
+        # bytes: the kernel is under kernel/, the device tree under
+        # EFI/UniXNU/Payloads/, and the trust bundle under
+        # build/original-static-system-trust/ -- none of which is a root, so
+        # "$root/$leaf" is a path no build writes.  Its last candidate was
+        # "$kernelcache" unconditionally, so a role it could not find was
+        # silently handed the donor Apple kernelcache under its own name, and
+        # the verify below then refused it as a hash mismatch on the wrong file.
+        # Measured on run 40369137221, whose boot inputs list names all three
+        # real paths; the two-root split the old comment cited is the same one
+        # the header check in (1) draws, but a root is not a directory.
+        #
+        # The order matches BuildTree.devicetree_candidates: the payload's tree
+        # is the one the guest boots, and the devicetree stage's is what exists
+        # on a pass where build-payload produced none.
+        case "$role" in
+            kernel)
+                path="$(work_dir)/kernel/kernel.macho" ;;
+            devicetree)
+                path="${PAYLOAD_ADT_PATH:-}"
+                [[ -n "$path" ]] || path="$(work_dir)/kernel/kernel.macho.adt" ;;
+            trust_cache)
+                path="$(tree_dir)/build/original-static-system-trust/original-static-system.bundle" ;;
+            data_seed)
+                path="$seed" ;;
+            boot_config)
+                path="$OUT_DIR/payload-esp/EFI/UniXNU/unixnu.toml" ;;
+            kernelcache)
+                path="$kernelcache" ;;
+            *)
+                # A role with bytes and no place to be is a role this stage
+                # cannot stage; the verify below refuses the delivery rather
+                # than a copy of something else standing in for it.
+                path='' ;;
+        esac
+        # Absent is a refusal, not a skip: a delivery that is missing a file the
+        # build really did produce is exactly what the verify in (3) exists to
+        # catch, and it catches it with the role named only if nothing was
+        # copied under that leaf.
+        if [[ -z "$path" ]]; then
+            ledger_add "$name" 'failed' \
+                "no source path is known for role '$role', so it cannot be staged into the delivery"
+            return 1
+        fi
+        if [[ ! -f "$path" ]]; then
+            ledger_add "$name" 'failed' \
+                "'$role' is recorded with bytes but $(shown_path "$path") is not on disk, so the delivery would be missing a file the build claims to have produced"
+            return 1
+        fi
+        cp "$path" "$delivery/$leaf"
     done < <(run_unipad - "$manifest" <<'PY'
 import json, sys
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1382,38 +1418,65 @@ PY
     packed_bytes="$(wc -c <"$delivery/owner-data-1g.dbr" 2>/dev/null | tr -d ' ' || printf '0')"
     log "material: Data seed $seed_bytes bytes packed (logical 1 GiB); the manifest is $(shown_path "$manifest")"
 
-    # (5) the private channel.  The seed is the OS volume's own private/var, so
-    #     it is Apple-derived material (PRD 12) and must not travel the public
-    #     artifact path however small it is.  Two things keep it out, and the
-    #     second is the one that is meant to matter: the staging step excludes
-    #     everything under private/ by pattern, and the plaintext is deleted
-    #     here the moment it has a ciphertext, so the plaintext never coexists
-    #     with the staging step at all.  The delivery stays flat -- the
+    # (5) the private channel.  Every Apple-derived member of the delivery is
+    #     encrypted, not only the seed.  The seed is the OS volume's own
+    #     private/var; the donor kernelcache is the original Apple binary
+    #     board.toml [kernel.prelink] pins; the trust bundle is the static and
+    #     System trust caches the chain lifted out of the same IPSW.  All three
+    #     are Apple material under PRD 12, and this repository is PUBLIC, so an
+    #     artifact uploaded from it is publicly downloadable -- "controlled
+    #     private" is not a property a public repo's artifact has.  Three things
+    #     keep the plaintext out, and the third is the one that is meant to
+    #     matter: the staging step excludes everything under private/ by
+    #     pattern, the plaintext is deleted here the moment it has a ciphertext
+    #     so it never coexists with the staging step at all, and what travels is
+    #     the ciphertext rather than the bytes.  The delivery stays flat -- each
     #     ciphertext sits beside the manifest that describes it, which is the
     #     same layout the manifest's leaf names assume.
+    #
+    #     The built artifacts (kernel.macho, kernel.macho.adt, unixnu.toml) are
+    #     NOT encrypted: they are this project's own output, and encrypting them
+    #     would make a delivery unreadable to anyone checking the build without
+    #     the key -- which is the opposite of what a verifiable delivery is for.
+    local -a apple_derived=('owner-data-1g.dbr' 'kernelcache.decompressed'
+                            'original-static-system.bundle')
+    local encrypted_count=0 member
     if [[ -n "${MATERIAL_DELIVERY_KEY:-}" ]]; then
-        if openssl enc -aes-256-gcm -pbkdf2 -salt \
-                -in "$delivery/owner-data-1g.dbr" \
-                -out "$delivery/owner-data-1g.dbr.enc" \
-                -pass env:MATERIAL_DELIVERY_KEY 2>>"$delivery/${name}.verify.log"; then
+        for member in "${apple_derived[@]}"; do
+            # Not a skip.  Reaching (5) means (3) staged every role the manifest
+            # records with bytes, and all three of these are required roles, so a
+            # member that is absent here is a member the manifest names and the
+            # delivery does not have -- which is the failure the verify in (3)
+            # exists to catch, and it cannot catch it if the file is simply not
+            # encrypted either.
+            if [[ ! -f "$delivery/$member" ]]; then
+                ledger_add "$name" 'failed' \
+                    "'$member' is an Apple-derived member the manifest records, but $(shown_path "$delivery/$member") is not in the delivery, so it can neither be encrypted nor verified"
+                return 1
+            fi
+            if ! openssl enc -aes-256-gcm -pbkdf2 -salt \
+                    -in "$delivery/$member" \
+                    -out "$delivery/$member.enc" \
+                    -pass env:MATERIAL_DELIVERY_KEY 2>>"$delivery/${name}.verify.log"; then
+                ledger_add "$name" 'failed' \
+                    "MATERIAL_DELIVERY_KEY was given but $member could not be encrypted; see $(shown_path "$delivery/${name}.verify.log")"
+                return 1
+            fi
             # Deleted the moment it has a ciphertext, for the reason the
             # workflow's own removal step gives: an exclusion is a record that a
             # file existed, and the file should not exist at all.  Verification
             # already ran against these exact bytes (step 3), so deleting them
             # costs nothing the manifest has not recorded.
-            rm -f "$delivery/owner-data-1g.dbr"
-            log "material: the Data seed is encrypted into $(shown_path "$delivery/owner-data-1g.dbr.enc") ($(wc -c <"$delivery/owner-data-1g.dbr.enc" | tr -d ' ') bytes of ciphertext); the plaintext is gone from this runner"
-        else
-            ledger_add "$name" 'failed' \
-                "MATERIAL_DELIVERY_KEY was given but the Data seed could not be encrypted; see $(shown_path "$delivery/${name}.verify.log")"
-            return 1
-        fi
+            rm -f "$delivery/$member"
+            log "material: $member is encrypted into $(shown_path "$delivery/$member.enc") ($(wc -c <"$delivery/$member.enc" | tr -d ' ') bytes of ciphertext); the plaintext is gone from this runner"
+            encrypted_count=$(( encrypted_count + 1 ))
+        done
         ledger_add "$name" 'ran' \
-            "the material manifest verifies and the Data seed is encrypted into $(shown_path "$delivery") ($(wc -c <"$delivery/owner-data-1g.dbr.enc" | tr -d ' ') bytes of ciphertext); decrypt with MATERIAL_DELIVERY_KEY"
+            "the material manifest verifies and $encrypted_count Apple-derived members are encrypted into $(shown_path "$delivery"); decrypt with MATERIAL_DELIVERY_KEY (the Data seed is $packed_bytes bytes packed)"
     else
         ledger_add "$name" 'ran' \
-            "the material manifest verifies ($packed_bytes bytes packed); the Data seed is Apple-derived (PRD 12) and was NOT encrypted because MATERIAL_DELIVERY_KEY is unset, so it must be collected from this runner directly and never from the public artifact path"
-        log 'material: MATERIAL_DELIVERY_KEY is unset, so the Data seed stays on this runner unencrypted.'
+            "the material manifest verifies ($packed_bytes bytes packed); MATERIAL_DELIVERY_KEY is unset, so the Apple-derived members were NOT encrypted and no delivery was uploaded -- the workflow's removal step deletes them from this runner and they must never reach the public artifact path (PRD 12)"
+        log 'material: MATERIAL_DELIVERY_KEY is unset, so the Apple-derived members stay on this runner unencrypted and nothing is uploaded.'
     fi
     return 0
 }

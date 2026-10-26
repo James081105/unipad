@@ -823,6 +823,67 @@ def test_the_material_delivery_ships_the_directory_not_a_list_of_names() -> None
     )
 
 
+def test_every_apple_derived_member_is_encrypted_not_only_the_seed() -> None:
+    """The delivery is uploaded from a PUBLIC repo, so every Apple member is ciphertext.
+
+    ``actions/upload-artifact`` on a public repository produces a publicly
+    downloadable artifact -- ``gh repo view`` answers ``PUBLIC`` for this one --
+    so "controlled private channel" is not a property the delivery step has.  The
+    stage used to encrypt exactly one member: the Data seed.  The donor
+    kernelcache is the *original Apple binary* board.toml [kernel.prelink] pins,
+    and the trust bundle is the static and System trust caches the chain lifted
+    out of the same IPSW.  Both are Apple material under PRD 12 and both would
+    have travelled in the clear.
+
+    The built artifacts are deliberately NOT encrypted, and that is asserted
+    too: a delivery nobody can read without the key is not a verifiable
+    delivery, which is the entire reason the manifest exists.
+    """
+    script = (ROOT / "scripts" / "macos" / "build-macos.sh").read_text(encoding="utf-8")
+    start = script.find("local -a apple_derived=")
+    assert start != -1, (
+        "step_material_manifest no longer declares an apple_derived list, so "
+        "either the encryption was rewritten or it encrypts a fixed set again; "
+        "this file has to be rewritten with it rather than left asserting the "
+        "shape of code that is gone"
+    )
+    block = script[start:script.index("return 0", start)]
+
+    # (1) every Apple-derived member is in the list.
+    for member in ("owner-data-1g.dbr", "kernelcache.decompressed",
+                   "original-static-system.bundle"):
+        assert f"'{member}'" in block, f"{member} is Apple-derived and is not encrypted"
+    # (2) ...and the built artifacts are not, so the delivery stays readable.
+    for built in ("kernel.macho", "kernel.macho.adt", "unixnu.toml"):
+        assert f"'{built}'" not in block, (
+            f"{built} is this project's own output; encrypting it would make the "
+            "delivery unreadable without the key"
+        )
+    # (3) the list is iterated, not one file hardcoded: a member added later is
+    #     encrypted because it is in the list, and the loop proves there is a
+    #     loop rather than a second copy of the openssl invocation.
+    assert 'for member in "${apple_derived[@]}"' in block, block
+    assert block.count("openssl enc -aes-256-gcm") == 1, (
+        "the ciphertext is produced by more than one invocation, so the list is "
+        "not what decides what gets encrypted"
+    )
+    # (4) the plaintext is deleted as it is encrypted, per member.
+    assert 'rm -f "$delivery/$member"' in block, block
+    # (5) no key is not a silent pass: the stage says so and uploads nothing.
+    assert "MATERIAL_DELIVERY_KEY is unset" in block, block
+
+    # (6) the other half: the runner's removal step deletes every one of them,
+    #     not only the seed.  On a run WITH the key the stage already deleted
+    #     each plaintext, so this is the belt over those braces.
+    removal = _step("Remove the unencrypted material from the runner")["run"]
+    for member in ("owner-data-1g.dbr", "kernelcache.decompressed",
+                   "original-static-system.bundle"):
+        assert member in removal, (
+            f"the removal step no longer deletes {member}, so an unencrypted "
+            "Apple-derived member would survive the job on a persistent runner"
+        )
+
+
 def test_the_delivery_directory_is_excluded_from_the_public_artifact() -> None:
     """The private channel is only private if the public one excludes it.
 

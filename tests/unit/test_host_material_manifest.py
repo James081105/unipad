@@ -196,7 +196,7 @@ def write_tree(
     (work / "kernel").mkdir(parents=True)
     (tree / "build/original-static-system-trust").mkdir(parents=True)
     (tree / "build/xnu").mkdir(parents=True)
-    (work / "payload-esp/EFI/UniXNU").mkdir(parents=True)
+    (work / "payload-esp/EFI/UniXNU/Payloads").mkdir(parents=True)
     device = where / "device"
     (device / ".cache/firmware/owner-data").mkdir(parents=True)
     (device / ".cache/firmware/target-volumes").mkdir(parents=True)
@@ -208,9 +208,15 @@ def write_tree(
         b"\xcf\xfa\xed\xfe" + b"\0" * 64 + kernel_uuid.encode() + b"\0" * 32
     )
     # The device tree publishes the root-match UUID as an XML string under
-    # /chosen/root-matching, so the bytes are the check.  Also ctx.work: the
-    # prelink step writes it beside the kernel (kernel.prelink() of kernel.py).
-    (work / "kernel/kernel.macho.adt").write_bytes(
+    # /chosen/root-matching, so the bytes are the check.  It goes on the ESP and
+    # NOT beside the kernel: ``unixnu/scripts/unixnu/payload.py:149`` writes
+    # ``payloads / 'kernel.macho.adt'``, ``kernel.py`` writes no .adt at all, and
+    # run 40369137221's boot inputs list shows ``unixnu-out/qemu/kernel/``
+    # holding only kernel.macho.  The previous revision of this fixture put the
+    # tree at ``kernel/kernel.macho.adt`` with a comment crediting the prelink
+    # step, which is what made ``BuildTree.devicetree_path`` look there and cost
+    # that run its material-manifest stage on a file no build ever wrote.
+    (work / "payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt").write_bytes(
         b"<dict><key>root-matching</key><string>" + adt_uuid.encode() + b"</string>"
     )
     # The two script-derived files, which are ctx.tree: the chain's trust bundle
@@ -766,7 +772,13 @@ def test_the_header_lives_in_the_drivers_tree_and_not_the_work_dir(tmp_path: Pat
     # ...and the driver's own outputs stay in the work dir: if these moved into
     # the tree, the split would be drawn in the wrong place the other way.
     assert tree.kernel == where / "qemu/kernel/kernel.macho"
-    assert tree.devicetree_path == where / "qemu/kernel/kernel.macho.adt"
+    # The device tree does NOT.  It is on the ESP, which is the one the guest
+    # boots, and ``kernel/kernel.macho.adt`` is the devicetree stage's fallback
+    # for a run where build-payload produced none.
+    assert tree.devicetree_path == (
+        where / "qemu/payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt"
+    )
+    assert tree.devicetree_source == "build-macos.sh/build-payload"
 
     # (2) the same header one level up -- exactly where run 40339678974 looked --
     #     is not read, so a build that wrote it there cannot be manifested.  The
@@ -795,6 +807,70 @@ def test_the_header_lives_in_the_drivers_tree_and_not_the_work_dir(tmp_path: Pat
     # stopped refusing.
     assert manifest.artifacts["volume_uuid"].value == DATA_UUID
     assert manifest.artifacts["trust_cache"].sha256 == hashlib.sha256(b"trust cache bundle\n").hexdigest()
+
+
+def test_the_device_tree_is_resolved_from_the_build_not_assumed(tmp_path: Path) -> None:
+    """The tree the manifest describes is the one the guest boots.
+
+    Measured on run 40369137221, which failed ``material-manifest`` with
+    ``the build did not produce 'devicetree': kernel.macho.adt``.  The build had
+    produced one -- three of them -- just not there:
+
+    * ``payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt``, 17768 bytes, written
+      by ``unixnu/scripts/unixnu/payload.py:149`` and the one ``unixnu.toml``
+      loads;
+    * two under ``unixnu-out/qemu/tree/build/darwinboot-*/esp/``, 17624 bytes,
+      the bootloader stage's own ESPs, stale relative to the payload's;
+    * ``unixnu-out/qemu/kernel/kernel.macho.adt``, which that run never wrote at
+      all -- ``kernel.py`` writes no ``.adt``.
+
+    All of them carry the board's root-match UUID, so ``verify_manifest`` cannot
+    tell them apart.  The only defence is taking the boot's own, and saying so.
+    """
+    where, board = write_tree(tmp_path)
+    esp_tree = where / "qemu/payload-esp/EFI/UniXNU/Payloads/kernel.macho.adt"
+    assert esp_tree.is_file(), "the fixture must put the tree where payload.py writes it"
+    # The spelling the failed run looked for is not merely absent here: writing
+    # one would make the assertion below pass for the wrong reason.
+    assert not (where / "qemu/kernel/kernel.macho.adt").exists()
+
+    manifest = collect_manifest(where, board)
+    entry = manifest.artifacts["devicetree"]
+    assert entry.path == "kernel.macho.adt", entry
+    # The source names the stage that WROTE the file hashed, which is how a
+    # manifest tells the payload's tree from the devicetree stage's.
+    assert entry.source == "build-macos.sh/build-payload", entry
+    # ...and the hash is the ESP tree's, byte for byte.
+    assert entry.sha256 == hashlib.sha256(esp_tree.read_bytes()).hexdigest(), entry
+
+    # A build that ALSO carries the devicetree stage's tree still describes the
+    # boot's, and records that the choice was made rather than made silently.
+    (where / "qemu/kernel/kernel.macho.adt").write_bytes(
+        b"<dict><key>root-matching</key><string>" + ROOT_UUID.encode() + b"</string>"
+    )
+    both = collect_manifest(where, board)
+    assert both.artifacts["devicetree"].sha256 == entry.sha256, both.artifacts["devicetree"]
+    assert any("kernel.macho.adt" in note for note in both.notes), both.notes
+
+    # And the fallback is real: with no ESP tree the devicetree stage's is taken,
+    # its source with it, rather than a refusal for a file that exists.
+    esp_tree.unlink()
+    fallback = collect_manifest(where, board)
+    assert fallback.artifacts["devicetree"].source == "build-macos.sh/build-devicetree"
+    assert any("build-payload did not produce" in note for note in fallback.notes), fallback.notes
+    assert fallback.artifacts["devicetree"].sha256 == hashlib.sha256(
+        (where / "qemu/kernel/kernel.macho.adt").read_bytes()
+    ).hexdigest()
+
+    # Neither is a way to manifest a build that produced no tree at all: the
+    # refusal names the ESP path, because that is the one the build owed.
+    (where / "qemu/kernel/kernel.macho.adt").unlink()
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        collect_manifest(where, board)
+    assert caught.value.rule == mm.RULE_ARTIFACT_ABSENT, caught.value
+    assert caught.value.details["role"] == "devicetree", caught.value
+    said = str(caught.value).replace("\\", "/")
+    assert "kernel.macho.adt" in said, said
 
 
 def test_a_manifest_needs_a_build_id(tmp_path: Path) -> None:

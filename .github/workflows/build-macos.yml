@@ -2714,12 +2714,26 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          seed=build-output/private/owner-data-1g.dbr
-          if [ -f "$seed" ]; then
-            rm -f "$seed"
-            echo "removed $seed: MATERIAL_DELIVERY_KEY was unset, so an unencrypted Apple-derived seed must not survive the job (PRD 12)"
-          else
-            echo "no unencrypted Data seed on this runner"
+          # Every Apple-derived member, not only the seed.  The donor kernelcache
+          # is the original Apple binary board.toml [kernel.prelink] pins and the
+          # trust bundle is the static and System trust caches out of the same
+          # IPSW; this repository is PUBLIC, so anything that survives the job on
+          # a persistent runner is a second copy of Apple material nobody
+          # accounted for.  On a run WITH the key the stage deleted each of these
+          # the moment it had a ciphertext, so this is a belt over that braces:
+          # it fires on a run with no key, and reports "nothing to remove" on a
+          # run that did its job.
+          removed=0
+          for member in owner-data-1g.dbr kernelcache.decompressed original-static-system.bundle; do
+            path="build-output/private/$member"
+            if [ -f "$path" ]; then
+              rm -f "$path"
+              echo "removed $path: MATERIAL_DELIVERY_KEY was unset, so an unencrypted Apple-derived member must not survive the job (PRD 12)"
+              removed=$(( removed + 1 ))
+            fi
+          done
+          if [ "$removed" -eq 0 ]; then
+            echo "no unencrypted Apple-derived material on this runner: either the key was set and each member was deleted as it was encrypted, or the material-manifest stage never produced any"
           fi
 
       # A chain that was ATTEMPTED and failed is a failed run, and it must not be
