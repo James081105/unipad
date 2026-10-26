@@ -470,6 +470,20 @@ redact('C:/Users/SomeBody/AppData/Local/Temp/x')
 **处置**：不因此停下本机工作。恢复条件是用户结清 GitHub 计费或提高 spending limit；恢复后第一件事是重跑 `build-macos`（stage=M3）验 `34fe029`。
 
 
+### 11.21 仓库已转公开，Actions 因此恢复
+
+2026-10-26，用户指示「将仓库转公开，私有额度用完了」。**转公开之前先做了审计**，因为这一步不可逆（fork、镜像、搜索引擎索引在重新转私之后依然存在），而 PRD 12 与项目自己的规则都写着绝不发布 Apple 二进制、私钥、个人 Data 或其派生物：
+
+- 205 个被跟踪文件，除一个 70 KiB 的合成测试 ELF（`tests/fixtures/arm64/boot-stub.elf`，本仓库测试自建）之外全是 UTF-8 文本；
+- `local-private/` 下 **0** 个被跟踪文件；
+- 树里与全部 113 个提交里，Apple 二进制、密钥、证书、seed **0** 个；`.git` 只有 4.2 MiB；
+- 最近 50 个提交里搜不到本机用户名。
+
+**审计中发现一个真实隐患并先修掉再转**：`/vendor` 只写在 `.git/info/exclude` 里——那是本地状态，克隆不继承，别处一次 `git add -A` 就会把整个被钉死的 checkout stage 进去。而 `vendor/UniXNU/refer` 是一个指向 `local-private/ipsw` 的 junction，**一个 6.8 GiB 的 Apple 恢复镜像因此就在工作树里、一个 glob 就能够到**，挡着它的是一条只有本机有的规则。提交 `b0ee427` 把 `/vendor` 移进提交内的 `.gitignore`，转公开之后 `git add -A --dry-run` 只会有文档文件。
+
+**转公开的直接后果：Actions 恢复。** 公开仓库的 Actions 计算是免费的，11.20 记的计费失败随之消失——随后手动触发的 `build-macos`（run 40250055465）正常启动并进入 in_progress。**所以 11.20 的「runner 验证暂停」已解除**，`34fe029` 的 trust cache 转发终于可以复验。
+
+
 ## 11. 结论与下一步
 
 代码阶段：**该做的都做完了**，包括本轮为产出内核镜像而写的 macOS 构建管线，以及它自己暴露并修掉的两个真实缺陷。
