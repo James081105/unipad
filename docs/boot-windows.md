@@ -463,3 +463,74 @@ UDIF 与否靠**嗅探 `koly` 尾部**判断，不看 `.dmg` 后缀：`044-76034
 只调用一次 `build-macos.sh`、从不传 `--ipsw`，它自己的 IPSW 步骤取完 kernelcache 就把
 6.8 GB 镜像删掉了。所以 runner 上 `build-os-root` 恒 `not_run`、无链、内核恒
 `qemu_defconfig`。详见 `docs/implementation-plan.md` 事实 45。
+
+---
+
+## 7. 统一启动入口：`python -m unipad.host.unixnu_boot`（2026-10-27）
+
+§6 的探针是**量具**，不是启动路径。它回答一个封闭问题（这个内核能不能枚举第二个块设备），
+顺带做了三件启动路径不该做的事：把 UDIF 容器解开、按 `board.toml [ipsw.sha256]` 给镜像点名、
+在 QEMU 运行期间反复读活访客。启动路径要的是同一份**配置**，不要那把尺子。
+本节记的就是这两边的边界，以及统一入口现在能表达的全部配置项。
+
+```
+python -m unipad.host.unixnu_boot \
+  --device vendor/UniXNU-qemu \
+  --qemu   local-private/tools/qemu/qemu-system-aarch64.exe \
+  --firmware local-private/tools/qemu/share/edk2-aarch64-code.fd \
+  --kernel <kernel.macho> --devicetree <kernel.macho.adt> \
+  --darwinboot <DarwinBoot.efi> --unixnu <UniXNU.efi> \
+  --workdir <run dir>
+```
+
+七个 `--device/--qemu/--firmware/--kernel/--devicetree/--darwinboot/--unixnu` 是必填
+（一个默认值就会造出没人清理的运行目录），其余全是可选项，而**每一个可选项都对应一样
+诊断脚本验证过、曾经只有诊断脚本能表达的东西**：
+
+| 旗标 | 挂上什么 | 缺了会怎样 |
+| :--- | :--- | :--- |
+| `--payload-toml` | 采用一份现成的 `unixnu.toml` 而不是按板级 spec 现生成 | 生成的那份；runner 的 payload 构建写的那份参数更准 |
+| `--trust-cache` | 拷成 `EFI/UniXNU/Payloads/kernel.macho.trustcache` | AMFI 拒绝 exec launchd（namespace 9 / EXC / code 8 / SECURITY_POLICY，`build-os-root.py:26-27` 自己写着） |
+| `--data-ramdisk` | 校验后按 `DATA_RAMDISK_NAME` 拷上，并往 `unixnu.toml` 写 `initrd` 行 | DarwinBoot 以 `EFI_COMPROMISED_DATA` 在内核启动前拒绝（`DarwinBoot.c:563-569`） |
+| `--root-image` | 第二个只读 virtio-blk 块设备 | 客体只有 ESP，堵在 `vfs_mountroot` |
+| `--systemos-image` | 第三个只读 virtio-blk 块设备 | `native_owner_cache_prepare()` 无可挂之物，panic `offline owner SystemOS mount failed: 80 (EAUTH)`（`kern_exec.c:8032`） |
+| `--kernel-arg NAME=VALUE` | 替换板级同名参数，可重复 | 用板级自己的 `kernel_args` |
+| `--display/--qmp-port/--seconds/--every` | 窗口、QMP TCP 端口、观测时长与间隔 | `none` / 默认端口 / 模块默认值 |
+
+`--trust-cache` 是 2026-10-27 补的，也是最后一项。补它之前出现过一个很难看的事实：
+`BootInputs.trust_cache` 有字段、`missing()` 查它、`to_dict()` 记它、`stage_esp()` 按
+`TRUSTCACHE_NAME` 拷它、`_check_carried()` 护它——**只有 CLI 的 argparse 没有这一项**。
+于是诊断脚本验证过的那份配置只能从诊断脚本到达。`--data-ramdisk` 与 `--systemos-image`
+当初是因为「正式路径在丢它们」才被补上的，`--trust-cache` 没有那样的触发事件，所以漏到现在。
+**「收敛」的实操含义因此不是把诊断的代码复制进正式路径，而是正式路径能表达诊断验证过的
+每一个配置项；差一项就不叫收敛。**
+
+`--trust-cache` 与 `--data-ramdisk` 是**一对**，不是两个独立开关：DarwinBoot 要求
+`Request->Ramdisk != NULL` 时 `/chosen/memory-map` 必须带一个 16 字节**全零**的
+`PackedRAMDisk`（或 `RAMDisk`）属性，`Request->Ramdisk == NULL` 时又要求树上**没有**它。
+`stage_esp()` 查这一对而不是信调用方两边都摆对了；设备树那一半由
+`unipad.host.adt --data-ramdisk` 写。
+
+### 7.1 运行输出会说这是哪一种运行
+
+`main()` 对每一个可选项都打印带没带，读的是 `inputs` 而不是 `report`：
+`BootReport` 故意不带 trust cache 字段——一份无条件声称带了 trust cache 的报告，
+分不出带过与没带过的运行，而这个差别在串口日志里看不见。同理
+`inputs.to_dict()` 在没有该项时**省略这个键**。断言这些输出时要用整行：
+`"no trust cache attached"` 包含 `"trust cache attached"`，子串形式会在它本该排除的
+分支上通过（这个错误在本文件与 `tests/unit/test_host_unixnu_boot.py` 里各犯过一次，
+`docs/implementation-plan.md` 事实 44 记着第三次）。
+
+### 7.2 探针做而统一入口不做的三件事，以及为什么
+
+1. **UDIF 解码。** `--root-image` 收到容器**直接拒**（`config_invalid`），不解开。
+   QEMU 的 `format=raw` 读不了 UDIF，而解开要一个 LZFSE 解码器；统一路径选择指名拒绝
+   而不是近似，探针选择解开因为它要量的就是那个镜像。要喂容器，先用探针或
+   `unipad.host.udif` 解开。
+2. **按板级摘要点名。** 探针把镜像的 sha256 对回 `board.toml [ipsw.sha256]` 并报出角色，
+   挂成 SystemOS 时告警。统一入口只验「可用」：不存在、为空、是 UDIF 容器是三种不同的拒绝，
+   但不判断它是哪个成员。材料身份属于交付与清单（`unipad.host.material_manifest`），
+   不属于启动 argv。
+3. **观测循环。** 探针在 QEMU 运行期间反复调 `unipad.host.guestobserve` 读 msgbuf，
+   直到出现 `Waiting on` / `bsd_autoconf` / `mountroot` / `IOMedia` 之一。`boot()` 自己也
+   截图、读串口、等 QMP `query-status`，但**不反复挖客体内存**——那是量具的职责。
