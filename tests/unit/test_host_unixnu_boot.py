@@ -54,7 +54,7 @@ import pytest
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host import unixnu_boot as ub
-from unipad.host.unixnu_boot import BootInputs, stage_esp
+from unipad.host.unixnu_boot import BootInputs, BootReport, stage_esp
 
 ROOT = Path(__file__).resolve().parents[2]
 REAL_DEVICE = ROOT / "vendor" / "UniXNU-qemu"
@@ -2665,3 +2665,1056 @@ def test_the_data_ramdisk_is_staged_under_the_name_the_build_writes() -> None:
     )
     # And the two halves of the pair the guard checks are the same spelling.
     assert f"Payloads/{ub.DATA_RAMDISK_NAME}" in source, source
+
+# ---------------------------------------------------------------------------
+# the Data-mount race, and the retry that covers it
+# ---------------------------------------------------------------------------
+# Why this section exists
+# ----------------------
+# ``selectVolumeSeed`` (NativeRamBlock.cpp:368-417) issues **one**
+# ``IOService::getMatchingServices`` for the Data volume's ``IOMedia`` and
+# returns 0 if that single match does not come back; ``load_init_program``
+# panics on the 0.  There is no retry, sleep or wait anywhere in it.
+#
+# Measured 2026-10-26: 7 of 8 boots of the matched build mounted the Data
+# volume; the 8th panicked inside ``load_init_program`` with ``offline scratch
+# Data mount failed``.  That is a 12.5% failure rate, and nothing in the boot
+# report showed it -- QEMU does not exit when XNU panics, because the panic
+# parks the CPU in a ``wfe; b wfe`` loop, so ``query-status`` keeps answering
+# ``running`` and the screendumps keep succeeding while the guest is dead.
+#
+# So two things were added: a probe that reads the guest's kernel log over QMP
+# and looks for the volume's own mount-complete line, and a retry that boots
+# again in a fresh directory until that line appears.  The kernel-side fix --
+# making ``load_init_program`` wait for the IOMedia instead of panicking on the
+# first missed match -- is deliberately *not* here: it needs a rebuilt kernel,
+# which is a different artifact from the one that was verified, so it belongs to
+# the next material delivery and not to this one.
+#
+# What is proven here is the detector, because that is the part that can be
+# wrong in a way nothing else catches: a detector that cannot tell a panicked
+# guest from a slow one turns a 12.5% failure into a silent one, which is worse
+# than the failure.
+
+
+def _probe(fingerprint: str, *, marker: bool = False) -> dict[str, Any]:
+    """A probe entry that read the log, in the shape ``_watch`` records."""
+    return {"ready": True, "bytes": 1024, "fingerprint": fingerprint, "marker": marker}
+
+
+class _AliveQEMU:
+    """A QEMU that is still running whenever ``_watch`` looks.
+
+    The counterpart of ``_ExitedQEMU``: that one exercises the path where the
+    child is already gone, and this one exercises the screendump loop, which is
+    where the guest-log probe was added.  ``stdout`` and ``stderr`` are ``None``
+    for the reason ``_ExitedQEMU`` gives -- ``_watch`` is handed handles ``boot``
+    opened and is still inside a ``with`` block for.
+    """
+
+    returncode = None
+    stdout = None
+    stderr = None
+
+    def poll(self) -> Optional[int]:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def _screendumping_qemu():
+    """A ``_qmp`` that answers ``query-status`` and writes a real PPM.
+
+    The PPM is written because ``_watch`` checks the file exists *and* converts
+    it, so a fake that only replied would leave every round reporting a
+    ``screendump_error`` -- and a test that passed with the probe never running
+    would prove nothing about the probe.
+    """
+    written: list[Path] = []
+
+    def run(port: int, command: str, **arguments: Any) -> dict[str, Any]:
+        if command == "screendump":
+            target = Path(arguments["filename"])
+            target.write_bytes(b"P6\n1 1\n255\n\x00\x00\x00")
+            written.append(target)
+            return {"return": {}}
+        return {"return": {"status": "running"}}
+
+    run.written = written  # type: ignore[attr-defined]
+    return run
+
+
+def test_the_detector_tells_a_panicked_guest_from_a_slow_one() -> None:
+    """The acceptance test for this task, in both directions.
+
+    A panicked guest's log stops advancing; a slow guest's does not.  Every
+    other observable is the same for the two -- QEMU alive, QMP answering,
+    screendumps succeeding -- so if this test fails the retry is retrying blind
+    and the 12.5% race is back with no evidence anywhere.
+    """
+    # A panicked guest: the ring stopped, so the last two probes are identical.
+    panicked = [_probe("a"), _probe("b"), _probe("c"), _probe("c")]
+    assert ub.guest_stopped_progressing(panicked) is True, panicked
+
+    # A slow guest: the ring keeps growing, so no two consecutive reads agree.
+    slow = [_probe("a"), _probe("b"), _probe("c"), _probe("d")]
+    assert ub.guest_stopped_progressing(slow) is False, slow
+
+    # The case that makes the threshold two rather than one: a *single* repeated
+    # read is also what a slow boot looks like between two screendumps, and
+    # treating it as a stall would retry boots that were working.
+    one_repeat = [_probe("a"), _probe("a"), _probe("b")]
+    assert ub.guest_stopped_progressing(one_repeat) is False, one_repeat
+
+    # And the case that makes it a detector rather than a liveness check: a
+    # guest that mounted the volume and then went idle has also stopped
+    # writing, and reporting that as a failure would retry every success.
+    mounted_then_idle = [_probe("a"), _probe("a", marker=True)]
+    assert ub.guest_stopped_progressing(mounted_then_idle) is False, mounted_then_idle
+
+
+def test_the_detector_ignores_a_probe_that_could_not_read_the_log() -> None:
+    """An unreadable log is not a stalled one.
+
+    Before the kernel publishes its load line there is no verified mapping
+    between its virtual and physical addresses, so the first probes of every
+    good boot cannot read anything.  Counting those as a stall would call the
+    first twenty seconds of a working boot a failure.
+    """
+    unreadable = [
+        {"ready": False, "reason": "no kernel load line in the serial log yet"},
+        {"ready": False, "reason": "no kernel load line in the serial log yet"},
+        _probe("a"),
+    ]
+    # Two unreadable probes and one readable read is not a stall, because the
+    # threshold counts *readable* probes and there is only one.
+    assert ub.guest_stopped_progressing(unreadable) is False, unreadable
+
+    # ...and adding a second readable read that agrees makes it one, however
+    # many unreadable probes came before it.  That is the same rule from the
+    # other side, and it is what stops an unreadable probe from silently
+    # resetting the count.
+    assert ub.guest_stopped_progressing([*unreadable, _probe("a")]) is True
+
+    # With nothing readable at all there is nothing to say.
+    assert ub.guest_stopped_progressing([]) is False
+    assert ub.guest_stopped_progressing(
+        [{"ready": False, "reason": "the kernel image could not be parsed"}]
+    ) is False
+
+
+def test_a_frozen_log_with_the_marker_is_a_success_not_a_stall() -> None:
+    """The marker wins, wherever it appears in the sequence.
+
+    The probe keeps the whole ring rather than a tail, because the ring wraps:
+    the Data volume's mount line can be anywhere in it, and a probe that only
+    kept the last few kilobytes would report no marker for a guest that mounted
+    the volume four hundred lines ago.
+    """
+    late_marker = [_probe("a"), _probe("b", marker=True), _probe("b"), _probe("b")]
+    assert ub.guest_stopped_progressing(late_marker) is False, late_marker
+    assert ub.DATA_MOUNT_MARKER == "mount-complete volume OwnerData"
+
+
+def test_the_probe_reports_instead_of_raising_when_there_is_no_load_line(
+    tmp_path: Path,
+) -> None:
+    """A probe that raised would abort a boot that is merely slow.
+
+    This is the normal state of the first twenty seconds: the firmware has not
+    printed the kernel's load line yet, so there is no verified address mapping
+    and nothing to translate with.  The probe has to say so and let the loop
+    continue.
+    """
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=tmp_path / "absent.log", scratch=tmp_path / "s.bin"
+    )
+    assert record == {
+        "ready": False,
+        "reason": "no kernel load line in the serial log yet "
+                  f"({ErrorCode.EVIDENCE_INCOMPLETE})",
+    }, record
+
+    # ...and the same for a serial log that exists but has no load line in it,
+    # which is the firmware-only case rather than the absent-file case.
+    partial = tmp_path / "serial.log"
+    partial.write_bytes(b"UNIXNU: starting\nDARWINBOOT: loading\n")
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=partial, scratch=tmp_path / "s.bin"
+    )
+    assert record["ready"] is False, record
+    assert "no kernel load line" in record["reason"], record
+
+
+def test_the_probe_reports_a_kernel_it_could_not_parse(tmp_path: Path) -> None:
+    """A kernel that cannot be read costs the probe, never the boot.
+
+    ``boot`` has already established the kernel file exists.  What can still
+    fail is ``KernelImage``'s verification -- a file that is not the digest it
+    was verified against, or that is not a Mach-O at all -- and a caller booting
+    such a kernel must still get a boot report rather than an exception from a
+    module whose job is to record what happened.
+    """
+    kernel = tmp_path / "kernel.macho"
+    kernel.write_bytes(b"not a mach-o at all")
+
+    image, reason = ub._kernel_image(kernel, "0" * 64)
+    assert image is None, image
+    assert reason, "a kernel that cannot be parsed must say why"
+    assert "image_hash_mismatch" in reason or "config_invalid" in reason, reason
+
+    # And the probe refuses with that reason rather than reaching for a QMP
+    # connection it has no use for.
+    record = ub._guest_log_probe(
+        14444, kernel=image, serial=tmp_path / "serial.log", scratch=tmp_path / "s.bin"
+    )
+    assert record == {"ready": False, "reason": "the kernel image could not be parsed"}, record
+
+
+def test_watch_records_the_guest_log_probe_alongside_the_screendumps(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe is wired in, interleaved, and does not cost the screendumps.
+
+    The interleaving is not an optimisation.  QEMU serves one QMP client at a
+    time, so a probe running alongside a screendump would be refused rather than
+    queued -- and a probe that fails must not take the screendumps with it,
+    because they are the only thing that has always worked.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    # A stand-in image: ``_watch`` parses the real one once and hands it to every
+    # probe, and the synthetic kernel in the fixture is not a Mach-O with the
+    # symbols this probe reads -- so without this the probe would correctly
+    # refuse and the wiring would never be exercised.
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    seen: list[dict[str, Any]] = []
+
+    def fake_probe(port: int, **_: Any) -> dict[str, Any]:
+        seen.append({"port": port})
+        # Two identical reads: the guest has stopped writing.
+        return _probe("frozen")
+
+    monkeypatch.setattr(ub, "_guest_log_probe", fake_probe)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    watched = ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=3, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    # The screendumps still happened, and so did the probes -- one of each per
+    # round, which is what "interleaved" means in practice.
+    assert len(watched.screenshots) == len(seen) >= 2, (watched.screenshots, seen)
+    assert all(entry["port"] == 14452 for entry in seen), seen
+    assert watched.qmp_evidence.get("screendump_error") is None, watched.qmp_evidence
+
+    # ...and what the probe saw is on the report, in order, stamped.
+    assert len(watched.guest_probes) == len(seen), watched.guest_probes
+    assert [entry["fingerprint"] for entry in watched.guest_probes] == ["frozen"] * len(seen)
+    assert all("at_seconds" in entry for entry in watched.guest_probes), watched.guest_probes
+    assert watched.guest_log_bytes == 1024, watched.guest_log_bytes
+    assert watched.guest_log_fingerprint == "frozen", watched.guest_log_fingerprint
+    assert watched.data_volume_mounted is False, watched.guest_probes
+    # A frozen log with no marker is exactly the panic this detects.
+    assert watched.qmp_evidence["guest_log_stalled"] is True, watched.qmp_evidence
+
+
+def test_watch_sets_the_marker_when_the_guest_reports_the_volume(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one field that describes something the *guest* did.
+
+    ``data_volume_mounted`` is set from the guest's own mount-complete line and
+    from nothing else.  A guest that mounted the volume and then stopped writing
+    is a success, not a stall, and that is the difference between this test and
+    the one above.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    monkeypatch.setattr(ub, "_guest_log_probe", lambda *a, **k: _probe("x", marker=True))
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    watched = ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=3, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    assert watched.data_volume_mounted is True, watched.guest_probes
+    assert watched.data_marker == ub.DATA_MOUNT_MARKER, watched.data_marker
+    assert watched.qmp_evidence["guest_log_stalled"] is False, watched.qmp_evidence
+
+
+def test_watch_keeps_screendumping_when_the_kernel_cannot_be_parsed(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe with nothing to read is recorded once and then left alone.
+
+    Every later round would report the same reason, and a report with fifteen
+    copies of one sentence is harder to read than a report with one.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (None, "not a mach-o"))
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    watched = ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=4, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    assert len(watched.screenshots) >= 2, watched.screenshots
+    assert len(watched.guest_probes) == 1, watched.guest_probes
+    assert "not a mach-o" in watched.guest_probes[0]["reason"], watched.guest_probes
+    assert watched.qmp_evidence.get("guest_log_stalled") is False, watched.qmp_evidence
+
+
+def test_watch_with_no_kernel_at_all_still_watches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_watch`` is reachable without a kernel, and says why there are no probes.
+
+    The default is ``None`` so a caller that only wants screendumps gets them;
+    the report says why there are no probes rather than implying there were none
+    to take.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    watched = ub._watch(_AliveQEMU(), report, work, qmp_port=14452, seconds=3, every=1)
+
+    assert watched.screenshots, watched.screenshots
+    # One entry, not none: a report with an empty probe list reads as "there was
+    # nothing to probe", and the reason is the difference between that and "this
+    # caller never asked".
+    assert len(watched.guest_probes) == 1, watched.guest_probes
+    assert "no kernel image" in watched.guest_probes[0]["reason"], watched.guest_probes
+    assert watched.qmp_evidence.get("guest_log_stalled") is False, watched.qmp_evidence
+
+
+def test_the_retry_boots_again_in_a_fresh_directory_until_the_volume_mounts(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry's two properties: a fresh workdir per attempt, and it stops.
+
+    A reused workdir would carry the previous attempt's ``vars.fd`` into this
+    one, and two boots into one directory are two different machines --
+    documented at :func:`boot`, and the reason each attempt gets its own.
+    """
+    import json
+
+    calls: list[Path] = []
+
+    def fake_boot(received: BootInputs, work: Path, **_: Any) -> BootReport:
+        calls.append(Path(work))
+        # The first attempt loses the race; the second wins it.
+        mounted = len(calls) >= 2
+        report = BootReport(
+            ok=True, workdir=str(work), data_volume_mounted=mounted,
+            data_marker=ub.DATA_MOUNT_MARKER if mounted else "",
+        )
+        # What ``boot`` does, and what ``boot_until_mounted`` relies on: it makes
+        # the directory and writes a provisional report, then corrects one field
+        # in that file once the chain's length is known.  A stand-in that skipped
+        # this would be standing in for a different function.
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "boot-report.json").write_text(
+            json.dumps(report.to_dict(), indent=2) + chr(10), encoding="utf-8"
+        )
+        return report
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+    workdir = tmp_path / "chain"
+
+    report = ub.boot_until_mounted(
+        inputs, workdir, qemu=qemu, device_dir=_synthetic_device(tmp_path), attempts=3
+    )
+
+    assert len(calls) == 2, calls
+    # Distinct directories, one per attempt, and the successful one is the one
+    # that is reported.
+    assert calls == [workdir / "attempt-1", workdir / "attempt-2"], calls
+    assert report.data_volume_mounted is True, report
+    assert report.attempt == 2, report
+    assert report.attempts == 2, report
+
+
+def test_the_retry_spends_the_whole_budget_and_says_so(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chain that never mounts returns the last report, with the count.
+
+    Without the count, "the Data volume never mounted" reads as a one-off -- and
+    a one-off at 12.5% is indistinguishable from a flake, which is the whole
+    reason the number is recorded.
+    """
+    import json
+
+    calls: list[Path] = []
+
+    def fake_boot(_received: BootInputs, work: Path, **_: Any) -> BootReport:
+        calls.append(Path(work))
+        report = BootReport(ok=True, workdir=str(work), data_volume_mounted=False)
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "boot-report.json").write_text(
+            json.dumps(report.to_dict(), indent=2) + chr(10), encoding="utf-8"
+        )
+        return report
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+    workdir = tmp_path / "chain"
+
+    report = ub.boot_until_mounted(
+        inputs, workdir, qemu=qemu, device_dir=_synthetic_device(tmp_path), attempts=3
+    )
+
+    assert len(calls) == 3, calls
+    assert report.data_volume_mounted is False, report
+    assert report.attempt == 3, report
+    assert report.attempts == 3, report
+    # The returned attempt's report on disk agrees with the object, because
+    # ``attempts`` is the chain's length and only the chain knows it.
+    written = json.loads((workdir / "attempt-3" / "boot-report.json").read_text(encoding="utf-8"))
+    assert written["attempts"] == 3, written
+    assert written["attempt"] == 3, written
+
+
+def test_the_retry_defaults_to_three_attempts(inputs: BootInputs, qemu: Path) -> None:
+    """Three, from the measured 1-in-8 failure rate.
+
+    Not a round number chosen for its own sake: 12.5% cubed is 0.2%, which is
+    below anything this project has measured, and three attempts is few enough
+    that a real regression still surfaces inside a few minutes.
+    """
+    import inspect
+
+    signature = inspect.signature(ub.boot_until_mounted)
+    assert signature.parameters["attempts"].default == ub.MAX_BOOT_ATTEMPTS
+    assert ub.MAX_BOOT_ATTEMPTS == 3, ub.MAX_BOOT_ATTEMPTS
+
+
+def test_the_cli_can_ask_for_the_retry(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """``--attempts`` reaches the retry, and the output says what happened.
+
+    The CLI is the only entry point most runs go through, and a retry that
+    existed in the module but not on the command line would be a retry nobody
+    took -- the same shape as the ``--trust-cache`` gap this module already
+    records.
+    """
+    import json
+
+    monkeypatch.setattr(ub, "boot", lambda *a, **k: pytest.fail("--attempts did not reach the retry"))
+    seen: list[dict[str, Any]] = []
+
+    def fake_boot(_received: BootInputs, work: Path, **_: Any) -> BootReport:
+        seen.append({"work": Path(work)})
+        return BootReport(ok=True, workdir=str(work), data_volume_mounted=False,
+                          attempts=3, attempt=2, guest_log_bytes=1024,
+                          guest_probes=[_probe("frozen")])
+
+    monkeypatch.setattr(ub, "boot_until_mounted", fake_boot)
+    workdir = tmp_path / "run"
+
+    code = ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(workdir),
+        "--attempts", "3",
+    ])
+
+    assert code == 0, capsys.readouterr().out
+    assert len(seen) == 1, seen
+    out = capsys.readouterr().out
+    assert "data volume mounted: False" in out, out
+    assert "boot attempts: 3 (this was attempt 2)" in out, out
+    assert "guest kernel log: 1024 bytes from 1 probes" in out, out
+
+
+# ---------------------------------------------------------------------------
+# the wiring the mutation review found unpinned
+# ---------------------------------------------------------------------------
+# Why this section exists
+# ----------------------
+# The first version of the retry passed 118/0 and still had a defect that would
+# have made it dead in the real path: ``boot`` could have stopped handing the
+# kernel to ``_watch`` and nothing would have noticed, because every test either
+# calls ``_watch`` directly with a synthetic kernel or monkeypatches ``boot``
+# away.  A 对质 review ran 55 mutations against the first version; 37 went red
+# and 18 stayed green, and these tests are the ones written after the green ones.
+#
+# The rule being enforced is the one in this module's own header: a test that
+# goes red on its own defect is worse than no test, and a test that stays green
+# while the behaviour it names is deleted is the same failure seen from the other
+# side.  Each test below is named after the mutation it kills.
+
+#: A load line in the shape DarwinBoot prints, which is the only thing
+#: ``load_addresses_from_serial`` accepts.  Both addresses are required and both
+#: must be at least eight hex digits: a truncated line used to match and produce
+#: a physical base of 4 (``guestobserve._LOAD_LINE``).
+LOAD_LINE = b"kernel va 0xfffffff007166000 pa 0x408166000\n"
+
+
+class _FakeQmpClient:
+    """A QMP client that connects and closes and does nothing else.
+
+    ``_guest_log_probe`` is the only caller, and it never issues a command
+    through the client directly -- it hands it to ``GuestMemory``, which is
+    faked separately.  So the only behaviour that matters is that ``connect``
+    and ``close`` are called once each, which is what pins "one connection for
+    the whole probe, opened after the serial log is read".
+    """
+
+    connected = 0
+    closed = 0
+
+    def __init__(self, *_: Any, **__: Any) -> None:
+        pass
+
+    def connect(self) -> dict[str, Any]:
+        type(self).connected += 1
+        return {"greeting": {}, "capabilities": {}}
+
+    def close(self) -> None:
+        type(self).closed += 1
+
+
+class _FakeGuestMemory:
+    """A ``GuestMemory`` that records what it was handed and reads nothing."""
+
+    def __init__(self, client: Any, scratch: Path) -> None:
+        self.client = client
+        self.scratch = Path(scratch)
+
+
+class _FakeGuestObserver:
+    """An observer whose ``kernel_log`` returns whatever the test says."""
+
+    ring = b""
+    last: "_FakeGuestObserver | None" = None
+
+    def __init__(self, memory: Any, image: Any, load: Any) -> None:
+        self.memory = memory
+        self.image = image
+        self.load = load
+        type(self).last = self
+
+    def kernel_log(self) -> bytes:
+        return type(self).ring
+
+
+def _stub_guestobserve(monkeypatch: pytest.MonkeyPatch, ring: bytes) -> None:
+    """Point ``_guest_log_probe``'s lazily-imported names at fakes.
+
+    The imports inside ``_guest_log_probe`` are function-local, so patching the
+    *modules* is what takes effect -- patching ``ub.GuestObserver`` would do
+    nothing, because that name does not exist there.
+    """
+    _FakeGuestObserver.ring = ring
+    _FakeQmpClient.connected = 0
+    _FakeQmpClient.closed = 0
+    monkeypatch.setattr("unipad.host.qmp.QmpClient", _FakeQmpClient)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestMemory", _FakeGuestMemory)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestObserver", _FakeGuestObserver)
+
+
+def test_boot_hands_the_verified_kernel_to_the_watch_loop(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``boot`` passes the kernel and its digest to ``_watch``.
+
+    This is the test the 对质 review asked for.  Deleting ``kernel=`` and
+    ``kernel_sha256=`` from the ``_watch`` call in :func:`boot` leaves the whole
+    suite green -- and the consequence is that no probe ever runs,
+    ``data_volume_mounted`` is permanently ``False``, and :func:`boot_until_mounted`
+    spends its whole three-attempt budget on every boot.  The 12.5% race comes
+    back with no evidence anywhere, which is the exact failure this module's
+    header says is worse than the race.
+
+    The reason it was invisible is structural and worth stating: every other test
+    either calls ``_watch`` directly with a synthetic kernel, or monkeypatches
+    ``boot`` away entirely.  This one spies on the seam between them.
+    """
+    import hashlib
+    import json
+
+    seen: dict[str, Any] = {}
+
+    def spy(_process: Any, report: BootReport, _work: Path, **kwargs: Any) -> BootReport:
+        seen.update(kwargs)
+        seen["returned"] = report
+        return report
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    monkeypatch.setattr(ub, "_watch", spy)
+    work = tmp_path / "run"
+
+    report = ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path))
+
+    assert launched, "boot never reached Popen"
+    assert "kernel" in seen, f"_watch was called without a kernel: {sorted(seen)}"
+    # The *resolved* path, because that is the file ``stage_esp`` copied onto the
+    # ESP and the only spelling whose digest means anything.
+    assert seen["kernel"] == inputs.kernel.resolve(), seen["kernel"]
+    expected = hashlib.sha256(inputs.kernel.read_bytes()).hexdigest()
+    assert seen["kernel_sha256"] == expected, seen["kernel_sha256"]
+    # ...and the digest is of the kernel that was actually staged, not of some
+    # other file that happens to be named kernel.macho.
+    staged_digest = hashlib.sha256(
+        (work / "esp" / "EFI" / "UniXNU" / "Payloads" / "kernel.macho").read_bytes()
+    ).hexdigest()
+    assert seen["kernel_sha256"] == staged_digest, (
+        "the digest handed to the probe is not the digest of the kernel the guest "
+        "was given, so every symbol address derived from it would be wrong"
+    )
+    # The report is the same object, so whatever the probe finds lands on the
+    # report ``boot`` returns.
+    assert seen["returned"] is report, "the watch loop was handed a different report"
+
+
+def test_watch_survives_a_probe_that_could_not_read_the_log(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A not-ready probe must not take the screendumps down with it.
+
+    Replacing ``if entry.get("ready"):`` with ``if True:`` in :func:`_watch`
+    leaves the suite green -- and the consequence is a ``KeyError: 'bytes'`` on
+    the *first* round of every real boot, because the probe cannot read anything
+    until the firmware has printed the kernel's load line, which is the normal
+    state of the first twenty seconds.  The whole screendump loop dies.
+
+    Every other test that reaches the probe monkeypatches it to return a *ready*
+    entry, which is why this was invisible.  The real ``_guest_log_probe`` returns
+    this exact record, and this test feeds exactly that record.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    rounds: list[int] = []
+
+    def not_ready(port: int, **_: Any) -> dict[str, Any]:
+        rounds.append(port)
+        # Verbatim what ``_guest_log_probe`` returns before the load line exists.
+        return {"ready": False,
+                "reason": "no kernel load line in the serial log yet "
+                          f"({ErrorCode.EVIDENCE_INCOMPLETE})"}
+
+    monkeypatch.setattr(ub, "_guest_log_probe", not_ready)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    watched = ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=4, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    # It kept probing, and the screendumps kept coming.
+    assert len(rounds) >= 2, rounds
+    assert len(watched.screenshots) == len(rounds), (watched.screenshots, rounds)
+    assert watched.qmp_evidence.get("screendump_error") is None, watched.qmp_evidence
+    # ...and nothing was recorded that a reader could mistake for a log.
+    assert all(entry["ready"] is False for entry in watched.guest_probes), watched.guest_probes
+    assert watched.guest_log_bytes == 0, watched.guest_log_bytes
+    assert watched.guest_log_fingerprint is None, watched.guest_log_fingerprint
+    assert watched.data_volume_mounted is False, watched.guest_probes
+    # An unreadable log is not a stalled one: this is the first twenty seconds of
+    # a *good* boot, and calling it a failure would retry every success.
+    assert watched.qmp_evidence["guest_log_stalled"] is False, watched.qmp_evidence
+
+
+def test_the_probe_finds_the_marker_anywhere_in_the_ring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole ring is searched, not its tail.
+
+    Substituting ``DATA_MOUNT_MARKER in text[-512:]`` for ``in text`` leaves the
+    suite green, and the consequence is a successful boot reported as a failure:
+    the ring wraps, so the Data volume's mount line can be anywhere in it, and a
+    tail-only search reports ``marker: False`` for a guest that mounted the volume
+    four hundred lines ago -- followed by a frozen log, ``stalled: True``, and a
+    retry of every success.
+
+    The ring here is shaped like the real one: the mount line early, then
+    hundreds of kilobytes of userland chatter after it.
+    """
+    before = b"UNIXNU: starting\nDARWINBOOT: loading\n" + LOAD_LINE
+    mount = b"disk5s1 mount-complete volume OwnerData\n"
+    # Well past any tail: the ring is a few hundred KiB and the marker is near
+    # its start, which is what a wrapped ring looks like from the reader's side.
+    after = b"launchd[1] doing its thing\n" * 4096
+    assert len(after) > 512, len(after)
+    assert mount not in after[-512:], "the fixture stopped discriminating"
+    _stub_guestobserve(monkeypatch, before + mount + after)
+
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(before)
+    scratch = tmp_path / "guest-kernel.log"
+
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=scratch
+    )
+
+    assert record["ready"] is True, record
+    assert record["marker"] is True, "the mount line was in the ring and was missed"
+    assert record["bytes"] == len(before) + len(mount) + len(after), record["bytes"]
+    # The whole ring is kept on disk, not a tail: the file is the evidence, and a
+    # truncated one cannot answer a question asked later.
+    assert scratch.read_bytes() == before + mount + after, "the ring was truncated on disk"
+    # One connection for the whole probe, opened and closed.
+    assert _FakeQmpClient.connected == 1, _FakeQmpClient.connected
+    assert _FakeQmpClient.closed == 1, _FakeQmpClient.closed
+
+
+def test_the_probe_fingerprints_the_raw_bytes_and_scrubs_the_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fingerprint is of the bytes read; the file on disk is scrubbed.
+
+    Two properties that had no pin.  The fingerprint is taken from the
+    *unscrubbed* bytes so it is comparable across probes; the file on disk is
+    scrubbed because it is evidence and PRD 9.2 forbids the account name in any
+    of it.  Getting either backwards is silent: a fingerprint of the scrubbed
+    text would still be stable within one run, and an unscrubbed file is only a
+    problem for whoever reads it.
+    """
+    import hashlib
+
+    from unipad.host.paths import account_name
+
+    name = account_name()
+    if not name:  # pragma: no cover - a stripped container has no account
+        pytest.skip("this host reports no account name, so there is nothing to scrub")
+    ring = LOAD_LINE + f"some line mentioning {name} in passing\n".encode() + b"more log\n"
+    _stub_guestobserve(monkeypatch, ring)
+
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+    scratch = tmp_path / "guest-kernel.log"
+
+    record = ub._guest_log_probe(14444, kernel=object(), serial=serial, scratch=scratch)
+
+    assert record["ready"] is True, record
+    # The fingerprint is of the raw bytes, so two probes of an unchanged guest
+    # agree however many times the account name appears.
+    assert record["fingerprint"] == hashlib.sha256(ring).hexdigest(), record["fingerprint"]
+    # The copy on disk is scrubbed, and the scrub is visible in it.
+    written = scratch.read_text(encoding="utf-8")
+    assert name not in written, "the account name reached the evidence file"
+    assert "<redacted:account>" in written, written
+    # The path in the record is redacted to its final component (PRD 9.2).
+    assert record["log"] == "guest-kernel.log", record["log"]
+    assert str(tmp_path) not in record["log"], record["log"]
+
+
+def test_the_probe_survives_losing_the_scratch_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A log that cannot be written costs the evidence, not the probe.
+
+    Turning the ``except OSError: pass`` around the scratch write into a
+    ``raise`` leaves the suite green, and the consequence is a boot that aborts
+    because a directory went read-only halfway through -- after the bytes were
+    already read and the fingerprint computed.
+    """
+    import hashlib
+
+    ring = LOAD_LINE + b"mount-complete volume OwnerData\n"
+    _stub_guestobserve(monkeypatch, ring)
+
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+    # A directory in the scratch path's place: writing a file *at* it fails, and
+    # it is a failure that has nothing to do with the guest.
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=blocked
+    )
+
+    assert record["ready"] is True, record
+    assert record["marker"] is True, record
+    assert record["fingerprint"] == hashlib.sha256(ring).hexdigest(), record["fingerprint"]
+
+
+def test_the_probe_hands_the_scratch_to_the_memory_it_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``pmemsave`` writes where it was told, and it was told the run directory.
+
+    Handing the probe ``qemu-stdout.log`` instead of ``serial.log``, or
+    ``screen.ppm`` instead of ``guest-kernel.log``, both leave the suite green --
+    pure plumbing, but plumbing that decides whether the guest's memory lands in
+    a file that gets overwritten by the next screendump.
+    """
+    _stub_guestobserve(monkeypatch, LOAD_LINE + b"x\n")
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+    scratch = tmp_path / "guest-kernel.log"
+
+    ub._guest_log_probe(14444, kernel=object(), serial=serial, scratch=scratch)
+
+    memory = _FakeGuestObserver.last.memory
+    assert memory.scratch == scratch, memory.scratch
+    assert memory.scratch.name == "guest-kernel.log", memory.scratch
+    # And the observer was built with the kernel image and the load addresses the
+    # serial log reported, not with defaults.
+    assert _FakeGuestObserver.last.load.kernel_va == 0xFFFFFFF007166000
+    assert _FakeGuestObserver.last.load.kernel_pa == 0x408166000
+    assert _FakeGuestObserver.last.image is not None
+
+
+def test_the_cli_forwards_the_attempt_count_it_was_given(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """``--attempts 3`` arrives as ``attempts=3``, not as whatever the default is.
+
+    The first version of ``test_the_cli_can_ask_for_the_retry`` replaced
+    ``boot_until_mounted`` with ``def fake_boot(_received, work, **_)`` -- the
+    ``**_`` swallowed the keyword -- so hard-coding ``attempts=1`` in ``main``
+    stayed green.  The test proved the destination and not the payload.
+    """
+    received: dict[str, Any] = {}
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: Any) -> BootReport:
+        received.update(kwargs)
+        return BootReport(ok=True, workdir=str(work), data_volume_mounted=False)
+
+    monkeypatch.setattr(ub, "boot_until_mounted", fake_boot)
+
+    ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(tmp_path / "run"),
+        "--attempts", "3",
+    ])
+
+    assert received.get("attempts") == 3, received
+
+
+def test_a_zero_attempt_count_means_one_boot_not_a_refusal(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``max(int(attempts), 1)`` is a floor, and dropping it is silent.
+
+    Without it, ``attempts=0`` turns "boot once" into ``UniPadError`` from a
+    guard marked ``# pragma: no cover`` -- which is a refusal nobody asked for,
+    arriving from a branch no test reaches.
+    """
+    import json
+
+    calls: list[Path] = []
+
+    def fake_boot(_inputs: BootInputs, work: Path, **_: Any) -> BootReport:
+        calls.append(Path(work))
+        report = BootReport(ok=True, workdir=str(work))
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "boot-report.json").write_text(
+            json.dumps(report.to_dict(), indent=2) + chr(10), encoding="utf-8"
+        )
+        return report
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    report = ub.boot_until_mounted(
+        inputs, tmp_path / "chain", qemu=qemu,
+        device_dir=_synthetic_device(tmp_path), attempts=0,
+    )
+
+    assert len(calls) == 1, calls
+    assert report.attempts == 1, report.attempts
+    assert report.attempt == 1, report.attempt
+
+
+def test_the_probe_runs_after_the_screendump_in_every_round(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order is pinned, not just the counts.
+
+    The first version of ``test_watch_records_the_guest_log_probe_alongside_the_screendumps``
+    asserted only that there was one probe per screendump, so moving the probe
+    *before* the screendump stayed green for any run that had a kernel.  The
+    reason the order matters is in :func:`_qmp`'s own docstring: QEMU serves one
+    QMP client at a time, so a probe issued while a screendump is in flight is
+    refused rather than queued -- and the screendump is the thing that has always
+    worked.
+    """
+    order: list[str] = []
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+
+    def recording_qmp(port: int, command: str, **arguments: Any) -> dict[str, Any]:
+        # The command's own name, not a label: ``_watch`` also issues ``quit``
+        # on the way out, and a recorder that called everything which is not a
+        # screendump a "query-status" would count that as a readiness probe.
+        order.append(command)
+        if command == "screendump":
+            target = Path(arguments["filename"])
+            target.write_bytes(b"P6\n1 1\n255\n\x00\x00\x00")
+        return {"return": {"status": "running"}}
+
+    monkeypatch.setattr(ub, "_qmp", recording_qmp)
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+
+    def probe(port: int, **_: Any) -> dict[str, Any]:
+        order.append("probe")
+        return _probe("a")
+
+    monkeypatch.setattr(ub, "_guest_log_probe", probe)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=4, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    # One query-status for readiness, then screendump/probe pairs, then one quit
+    # on the way out -- and never a probe before the screendump it belongs to.
+    assert order[0] == "query-status", order
+    assert order[-1] == "quit", order
+    pairs = order[1:-1]
+    assert len(pairs) >= 4, order
+    assert pairs == ["screendump", "probe"] * (len(pairs) // 2), order
+
+
+def test_a_broken_screendump_does_not_silence_the_data_mount_probe(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed screendump must cost the screendump and nothing else.
+
+    The screendump used to be inline in ``_watch`` with three ``continue``
+    statements, and every one of them skipped the probe as well.  So a run whose
+    screendumps broke -- QMP refused the command, or ``_write_png`` raised --
+    reported no ``guest_probes`` at all, ``data_volume_mounted`` stayed ``False``,
+    and :func:`boot_until_mounted` spent its whole three-attempt budget re-booting
+    a guest that had mounted its Data volume on the first try.
+
+    That is the worst shape a bug can take here, because it is *invisible on the
+    good path*: screendumps have never failed in a measured boot, so the coupling
+    never fires, and the retry that is supposed to make the 12.5% race go away
+    turns into a 100% failure rate the moment an unrelated subsystem breaks.  The
+    two observations answer different questions and must fail independently.
+    """
+    order: list[str] = []
+
+    def failing_qmp(port: int, command: str, **arguments: Any) -> dict[str, Any]:
+        order.append(command)
+        if command == "screendump":
+            # The exact shape QEMU answers with, which is one of the three ways
+            # the inline version used to skip the probe.
+            return {"error": {"class": "GenericError", "desc": "screendump is not available"}}
+        return {"return": {"status": "running"}}
+
+    monkeypatch.setattr(ub, "_qmp", failing_qmp)
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+
+    def probe(port: int, **_: Any) -> dict[str, Any]:
+        order.append("probe")
+        return _probe("mounted", marker=True)
+
+    monkeypatch.setattr(ub, "_guest_log_probe", probe)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14453, seconds=4, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    # The probe ran anyway, and its answer survived.
+    assert order.count("probe") >= 3, order
+    assert report.guest_probes, "the probe was suppressed by the screendump failure"
+    assert report.data_volume_mounted, report.to_dict()
+    assert report.data_marker == ub.DATA_MOUNT_MARKER
+    # The screendump failure is still *recorded* -- suppressing it would be the
+    # opposite bug.
+    assert "screendump_error" in report.qmp_evidence, report.qmp_evidence
+    assert report.screenshots == [], report.screenshots
+
+
+def test_a_screendump_that_cannot_be_encoded_does_not_silence_the_probe(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The third ``continue`` -- a PPM ``_write_png`` cannot decode.
+
+    This one is separate from the QMP-refusal case because it fails in different
+    code: the QMP round trip succeeds, the file exists, and only the encoding
+    raises.  The inline version caught it with ``continue`` too.
+    """
+    order: list[str] = []
+
+    def undecodable_qmp(port: int, command: str, **arguments: Any) -> dict[str, Any]:
+        order.append(command)
+        if command == "screendump":
+            Path(arguments["filename"]).write_bytes(b"not a ppm at all")
+        return {"return": {"status": "running"}}
+
+    monkeypatch.setattr(ub, "_qmp", undecodable_qmp)
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+
+    def probe(port: int, **_: Any) -> dict[str, Any]:
+        order.append("probe")
+        return _probe("mounted", marker=True)
+
+    monkeypatch.setattr(ub, "_guest_log_probe", probe)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14454, seconds=4, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    assert order.count("probe") >= 3, order
+    assert report.data_volume_mounted, report.to_dict()
+    assert "screendump_error" in report.qmp_evidence, report.qmp_evidence
+    # The scratch PPM is cleaned up even when it could not be decoded, so a run
+    # does not accumulate one per round.
+    assert not (work / "screen.ppm").exists()
+
+
+def test_the_probe_reports_a_port_it_cannot_even_construct_a_client_for(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad ``--qmp-port`` is reported, not raised.
+
+    ``QmpClient.__init__`` raises ``UniPadError(CONFIG_INVALID)`` for a port
+    outside 1..65535.  The probe used to construct the client *outside* its
+    ``try``, so that exception escaped ``_guest_log_probe`` -- and therefore
+    :func:`_watch`, and therefore :func:`boot` -- for a run that was merely
+    misconfigured.  The function's own docstring says "every failure mode returns
+    a record instead of raising"; this is the failure mode it was not covering,
+    and it is the one a caller hits by typing ``--qmp-port 0``.
+    """
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    work = tmp_path / "run"
+    work.mkdir()
+    serial = work / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+
+    # The real constructor, deliberately: a fake would not raise.
+    entry = ub._guest_log_probe(
+        0, kernel=object(), serial=serial, scratch=work / "guest-kernel.log",
+    )
+
+    assert entry["ready"] is False, entry
+    # The reason is ``f"{code}: {message}"``, and ``code`` is the enum's *value*,
+    # which is lowercase -- ``ErrorCode.CONFIG_INVALID.value`` is
+    # ``"config_invalid"``.  Asserting the uppercase spelling here is the mistake
+    # this line exists to prevent being "fixed" into.
+    assert "config_invalid" in entry["reason"], entry["reason"]
+    assert "qmp port" in entry["reason"], entry["reason"]

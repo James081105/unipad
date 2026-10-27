@@ -495,6 +495,7 @@ python -m unipad.host.unixnu_boot \
 | `--root-image` | 第二个只读 virtio-blk 块设备 | 客体只有 ESP，堵在 `vfs_mountroot` |
 | `--systemos-image` | 第三个只读 virtio-blk 块设备 | `native_owner_cache_prepare()` 无可挂之物，panic `offline owner SystemOS mount failed: 80 (EAUTH)`（`kern_exec.c:8032`） |
 | `--kernel-arg NAME=VALUE` | 替换板级同名参数，可重复 | 用板级自己的 `kernel_args` |
+| `--attempts N` | 每个 attempt 一个全新 `attempt-N/` 目录，见到 Data 挂载就停 | 启动一次（`boot()` 本身的行为） |
 | `--display/--qmp-port/--seconds/--every` | 窗口、QMP TCP 端口、观测时长与间隔 | `none` / 默认端口 / 模块默认值 |
 
 `--trust-cache` 是 2026-10-27 补的，也是最后一项。补它之前出现过一个很难看的事实：
@@ -521,7 +522,7 @@ python -m unipad.host.unixnu_boot \
 分支上通过（这个错误在本文件与 `tests/unit/test_host_unixnu_boot.py` 里各犯过一次，
 `docs/implementation-plan.md` 事实 44 记着第三次）。
 
-### 7.2 探针做而统一入口不做的三件事，以及为什么
+### 7.2 探针做而统一入口不做的两件事，以及为什么
 
 1. **UDIF 解码。** `--root-image` 收到容器**直接拒**（`config_invalid`），不解开。
    QEMU 的 `format=raw` 读不了 UDIF，而解开要一个 LZFSE 解码器；统一路径选择指名拒绝
@@ -531,6 +532,65 @@ python -m unipad.host.unixnu_boot \
    挂成 SystemOS 时告警。统一入口只验「可用」：不存在、为空、是 UDIF 容器是三种不同的拒绝，
    但不判断它是哪个成员。材料身份属于交付与清单（`unipad.host.material_manifest`），
    不属于启动 argv。
-3. **观测循环。** 探针在 QEMU 运行期间反复调 `unipad.host.guestobserve` 读 msgbuf，
-   直到出现 `Waiting on` / `bsd_autoconf` / `mountroot` / `IOMedia` 之一。`boot()` 自己也
-   截图、读串口、等 QMP `query-status`，但**不反复挖客体内存**——那是量具的职责。
+
+观测循环**原来**也在这份名单上，2026-10-27 之后不在：见 §7.3。
+
+### 7.3 统一入口现在也读活访客了：一次 1/8 的竞态
+
+§7.2 第 3 条原来的说法是「`boot()` 自己也截图、读串口、等 QMP `query-status`，但**不反复挖
+客体内存**——那是量具的职责」。这句话现在是错的，而且是被一次实测逼错的。
+
+**现象。** 同一套材料连启 8 次，7 次挂上 Data 卷并继续启动，1 次在内核里 panic。
+失败率 **1/8**（n=8，样本很小，只够定位机制、不够当概率用）。
+
+**机制。** `selectVolumeSeed`（`NativeRamBlock.cpp:368-417`）只发**一次**
+`IOService::getMatchingServices` 找 Data 卷的 `IOMedia`，`:414` 是
+`if (!selected || matches != 1) return 0;`——**没有重试、没有 sleep、没有任何等待**。
+`load_init_program` 在这个 0 上 panic。客体输掉这次竞态就是死了，而宿主看不见。
+
+**为什么看不见。** XNU 的 panic 路径把 CPU 停在 `wfe; b wfe`，**QEMU 因此不会退出**。
+实测：panic 之后 `query-status` 照样回 `running`、截图照样成功、`boot-report.json` 的
+其它每一个字段都像一次健康运行。能区分的只有客体内核日志——还在启动的客机会继续往
+`msgbuf` 写，panic 了的永远不会再写。
+
+**因此主机侧做重试。** 内核不能改（那是上游），竞态发生在客体里，但**重试可以发生在主机里**：
+
+| 位置 | 职责 |
+| :--- | :--- |
+| `_guest_log_probe()` | 每一轮观测读一次 msgbuf 环，返回字节数、原始字节的 sha256、有没有见到挂载标记 |
+| `guest_stopped_progressing()` | 判据：**日志停止写入且始终没有挂载标记** |
+| `boot_until_mounted()` | 换一个全新目录再启一次，见到挂载就停 |
+
+判据只看「日志还在不在长」，**不看日志内容**。这个构建里那两条 panic 字符串带一个
+`@%s:%d` 后缀，在 vendored 树里找不到来源（任务 #29），按 panic 文本匹配就是在匹配一个
+本工程还解释不了的字符串，后缀一改判据就失效。指纹只对**原始字节**取，落盘的那份要过
+`scrub_account()`——否则指纹会随主机账户名变化，而它是要跨机器可比的。
+
+`--attempts` 的 **CLI 默认是 1**，也就是「启一次」——`boot()` 本来的行为，命令行不因为多了一个
+开关就改变语义。**库函数 `boot_until_mounted()` 的默认是 3**（`MAX_BOOT_ATTEMPTS`），因为调它的
+代码已经决定要重试了。这两个默认值故意不同，别把它们对齐：1/8 的三次方是 1/512，低于本工程测过
+的任何东西，同时又小到真出现回归时调用方几分钟内就知道，而不是永远不知道。
+**每个 attempt 一个全新目录**（`attempt-N/`）：`boot()` 会用 firmware 自己的大小截断出 `vars.fd`，
+两次启动写进同一个目录就是两台不同的机器，两份看起来可比的报告描述的却不是同一台。
+
+探针与截图**串行**，不并发：QEMU 的 QMP 一次只服务一个客户端。`_watch()` 每轮先截图、再探一次，
+顺序由 `test_the_probe_runs_after_the_screendump_in_every_round` 钉住。但**截图失败不能连带杀掉探针**：
+截图原来是内联在 `_watch()` 里的，带三个 `continue`，每一个都把探针一起跳掉了——于是一次截图失败
+（QMP 拒绝、或 `_write_png` 解不了那个 PPM）会让整轮没有 `guest_probes`，`data_volume_mounted` 恒为
+`False`，`boot_until_mounted()` 把三次预算全花在一个第一次就挂好了的客体上。这个形态最难看的地方在于
+**它在好路径上完全隐形**：实测的启动里截图从来没失败过，所以这个耦合从不触发，而本该消掉 12.5% 的重试
+会在一个不相关子系统坏掉时变成 100% 失败率。现已抽成 `_take_screenshot()`，三种失败都只记录
+`screendump_error` 并返回 `None`，由两个回归测试钉住。读一页 4 KiB 要走 `pmemsave` 到暂存文件
+再读回，一次探针是一整个来回；实测环约 128 KiB，即一次探针约 32 个来回，16 MiB 的上界
+（4,096 个来回）是 `guestobserve` 的拒绝线而不是常态。
+
+报告新增：`data_volume_mounted` / `data_marker` / `guest_log_bytes` /
+`guest_log_fingerprint` / `guest_probes[]` / `attempts` / `attempt`。
+`attempts` 是这条链启了几次，`attempt` 是**这份报告来自第几次**——两个字段故意分开：
+前者是调用方收到的报告的性质，后者是它被写进哪个目录的性质。
+**只有最后那一个 attempt 的 `boot-report.json` 带真实的链长**：早先 attempt 的文件里
+`attempts` 是 1，因为那是写下它时所知道的事，事后改写就是伪造那次 attempt 实际报告的内容。
+所以那些文件要当作按 `attempt` 编号的单次记录读，返回的对象才是一条链的裁决。
+
+**状态：代码完成、单测与变异验证通过、未在真实启动上验收。** 重试本身要生效需要一次
+真实的 1/8 失败，而那正是它要消掉的东西。

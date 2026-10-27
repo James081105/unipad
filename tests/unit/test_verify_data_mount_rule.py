@@ -71,6 +71,16 @@ PASSING_GLOBALS: dict[str, Any] = {
 #: 280-283 for disk1s1), with the Data volume's device and UUID substituted:
 #: the whole point of the harness is that the Data volume's lines look like
 #: these and are absent today.
+#:
+#: The volume *name* here is deliberately not the measured one.  The real Data
+#: volume is named ``OwnerData`` (``disk5s1 mount-complete volume OwnerData``,
+#: ``docs/implementation-plan.md`` fact 103), and the boot path's own detector
+#: searches for exactly that string
+#: (``unipad.host.unixnu_boot.DATA_MOUNT_MARKER``).  This harness keys off the
+#: device and the UUID instead (``MOUNT_COMPLETE_RE`` plus
+#: ``DATA_VOLUME_UUID``), so the name is inert here -- which is why it must not
+#: be "corrected" to match, and equally why nobody should copy the generic name
+#: out of this fixture into something that does match on text.
 PASSING_CONSOLE = """\
 [   71.240328]: apfs_log_op_with_proc:3091: disk3s1 mounting volume DawnUpdate21H461.J120J121J207J208OS, requested by: kernel_task (pid 0); parent: kernel_task (pid 0)
 [   71.247614]: handle_mount:817: disk3s1 vol-uuid: 04769D26-2CA0-4825-B443-E2E5F88300F2 block size: 4096 block count: 1483776 (unencrypted; flags: 0x1; features: 8.0.12)

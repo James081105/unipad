@@ -36,6 +36,7 @@ and a ``query-status`` reply, and records the reply, exactly as
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -51,17 +52,21 @@ from typing import Any, Mapping, Optional, Sequence
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host import adt, packed_ramdisk
 from unipad.host.adt import read_board_adt
-from unipad.host.paths import safe_location
+from unipad.host.paths import safe_location, scrub_account
 
 __all__ = [
     "BootInputs",
     "BootReport",
+    "DATA_MOUNT_MARKER",
+    "MAX_BOOT_ATTEMPTS",
     "MEMORY_MIB",
     "PE_SUBSYSTEM_APPLICATION",
     "PE_SUBSYSTEM_NAMES",
     "SCREEN",
     "boot",
+    "boot_until_mounted",
     "build_argv",
+    "guest_stopped_progressing",
     "kernel_args_line",
     "pe_subsystem",
     "read_board_payload",
@@ -316,6 +321,45 @@ class BootReport:
     systemos_image: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    #: Whether the guest's own kernel log reported the Data volume mounted.  This
+    #: is the only field in this report that describes something the *guest* did,
+    #: and it is read out of guest memory over QMP rather than inferred from the
+    #: serial log -- the kernel console is not on the serial port (measured, see
+    #: :mod:`unipad.host.guestobserve`), so ``serial.log`` cannot answer it.
+    #:
+    #: It exists because of a measured failure that nothing else in this report
+    #: would have caught: in 1 of 8 boots of the matched build the guest panics
+    #: inside ``load_init_program`` with ``offline scratch Data mount failed``
+    #: because the Data volume's ``IOMedia`` was not published yet, and **QEMU
+    #: does not exit** -- the panic parks the CPU in a ``wfe; b wfe`` loop, so the
+    #: process stays alive, ``query-status`` keeps answering, and screendumps keep
+    #: succeeding.  Every other field here reports a healthy run.
+    data_volume_mounted: bool = False
+    #: The marker that was searched for, so a report that says ``False`` also says
+    #: what it failed to find.
+    data_marker: str = ""
+    #: Bytes of guest kernel log recovered by the last successful probe.
+    guest_log_bytes: int = 0
+    #: sha256 of the last recovered guest kernel log.  Two probes with the same
+    #: fingerprint and no marker mean the guest stopped writing, which is how a
+    #: panic is told apart from a slow boot without knowing anything about panics.
+    guest_log_fingerprint: Optional[str] = None
+    #: One entry per probe: the wall clock, the bytes, the fingerprint, and either
+    #: the marker hit or the reason the probe could not run.
+    guest_probes: list[dict[str, Any]] = field(default_factory=list)
+    #: Boot attempts this report represents.  Always 1 from :func:`boot`; more
+    #: only from :func:`boot_until_mounted`, and recorded there because a report
+    #: that says "mounted on the third try" without saying there were three tries
+    #: reads as a flake rather than as the 12.5% race it is.
+    attempts: int = 1
+    #: Which attempt this report is, counting from 1, or 0 when the boot was not
+    #: part of a chain.  Distinct from :attr:`attempts` on purpose: ``attempts``
+    #: is a property of the report a caller receives, ``attempt`` is a property
+    #: of the directory it was written to.  Reading ``attempt-3/boot-report.json``
+    #: and seeing ``attempts: 1`` would be a contradiction with nothing to
+    #: contradict it, so the two are separate fields and neither is derived from
+    #: the other.
+    attempt: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -333,6 +377,13 @@ class BootReport:
             "systemos_image": self.systemos_image,
             "error_code": self.error_code,
             "error_message": self.error_message,
+            "data_volume_mounted": self.data_volume_mounted,
+            "data_marker": self.data_marker,
+            "guest_log_bytes": self.guest_log_bytes,
+            "guest_log_fingerprint": self.guest_log_fingerprint,
+            "guest_probes": [dict(entry) for entry in self.guest_probes],
+            "attempts": self.attempts,
+            "attempt": self.attempt,
         }
 
 
@@ -1343,6 +1394,21 @@ def boot(
 
     stdout_path = work / "qemu-stdout.log"
     stderr_path = work / "qemu-stderr.log"
+    # The kernel's digest, computed once and handed to the guest-log probe.  It
+    # is not a check on the boot -- the inputs are matched by the delivery
+    # manifest -- it is the price of reading the kernel at all:
+    # :class:`~unipad.host.guestobserve.KernelImage` refuses an image without a
+    # digest it was verified against, because the symbol addresses the probe
+    # walks with come out of that file.
+    try:
+        kernel_sha256 = hashlib.sha256(Path(inputs.kernel).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise UniPadError(
+            ErrorCode.IMAGE_NOT_FOUND,
+            "the kernel image could not be read to verify it",
+            path=safe_location(inputs.kernel),
+            reason=type(exc).__name__,
+        ) from exc
     try:
         out_handle = stdout_path.open("wb")
         err_handle = stderr_path.open("wb")
@@ -1372,13 +1438,370 @@ def boot(
                 reason=type(exc).__name__,
             ) from exc
 
-        report = _watch(process, report, work, qmp_port=qmp_port, seconds=seconds, every=every)
+        report = _watch(
+            process, report, work, qmp_port=qmp_port, seconds=seconds, every=every,
+            kernel=Path(inputs.kernel), kernel_sha256=kernel_sha256,
+        )
 
     report.serial_bytes = (work / "serial.log").stat().st_size if (work / "serial.log").is_file() else 0
     report.serial_markers = _serial_markers(work / "serial.log")
     (work / "boot-report.json").write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
     (work / "esp-manifest.json").write_text(json.dumps(staged, indent=2) + "\n", encoding="utf-8")
     return report
+
+
+#: How many boots :func:`boot_until_mounted` will spend before giving up.  The
+#: measured failure rate is 1 in 8, so three attempts take it to 1 in 512 --
+#: below anything this project has measured, and small enough that the caller
+#: still learns about a real regression inside a few minutes rather than never.
+MAX_BOOT_ATTEMPTS = 3
+
+
+def boot_until_mounted(
+    inputs: BootInputs,
+    workdir: Path,
+    *,
+    qemu: Path,
+    device_dir: Path,
+    seconds: int = DEFAULT_SECONDS,
+    every: int = DEFAULT_EVERY,
+    qmp_port: int = DEFAULT_QMP_PORT,
+    display: str = "none",
+    root_image: Optional[Path] = None,
+    systemos_image: Optional[Path] = None,
+    attempts: int = MAX_BOOT_ATTEMPTS,
+) -> BootReport:
+    """Boot until the guest reports the Data volume mounted, or the budget ends.
+
+    This is the workaround for a measured race, not a wrapper for convenience.
+    ``selectVolumeSeed`` (NativeRamBlock.cpp:368-417) issues **one**
+    ``IOService::getMatchingServices`` for the Data volume's ``IOMedia`` and
+    returns 0 if that single match does not come back; ``load_init_program``
+    panics on the 0.  There is no retry, sleep or wait anywhere in it, so a guest
+    that loses the race is dead -- and QEMU does not exit, because an XNU panic
+    parks the CPU in ``wfe; b wfe``.  A caller watching the process sees nothing.
+
+    So the retry lives here, on the host, where it can be done without touching
+    the kernel.  Each attempt gets a **fresh** work directory, because
+    :func:`boot` leaves a ``vars.fd`` behind and two boots into one directory are
+    two different machines (documented at :func:`boot`).
+
+    Args:
+        attempts: How many boots to spend.  The last report is returned even
+            when it failed, with ``attempts`` set to how many were actually
+            spent, so "the Data volume never mounted" carries the number of
+            tries that produced it.
+
+    Returns:
+        The report of the **last** attempt.  ``data_volume_mounted`` is the
+        success condition; ``attempts`` is how many boots produced it.  A report
+        with ``attempts > 1`` and ``data_volume_mounted`` is a race that was
+        retried, and a report with ``attempts == 1`` is a boot that either
+        worked first time or was never retried -- the two are told apart by
+        ``data_volume_mounted`` and by nothing else in the report.
+
+    Note:
+        Only the returned attempt's ``boot-report.json`` carries the chain's
+        true length.  An earlier attempt's file says ``attempts: 1``, because
+        that is what was known when it was written, and rewriting it afterwards
+        would falsify the record of what that attempt actually reported.  Read
+        those files as per-attempt records keyed by ``attempt``; read the
+        returned object as the chain's verdict.
+    """
+    workdir = Path(workdir)
+    report: Optional[BootReport] = None
+    for attempt in range(1, max(int(attempts), 1) + 1):
+        # A fresh directory per attempt: ``boot`` seeds ``vars.fd`` only when it
+        # is missing or short, so reusing one directory would carry the previous
+        # attempt's UEFI variables into this one and make two reports that look
+        # comparable describe different machines.
+        run = workdir / f"attempt-{attempt}"
+        report = boot(
+            inputs, run,
+            qemu=qemu, device_dir=device_dir, seconds=seconds, every=every,
+            qmp_port=qmp_port, display=display, root_image=root_image,
+            systemos_image=systemos_image,
+        )
+        report.attempt = attempt
+        if report.data_volume_mounted:
+            break
+    if report is None:  # pragma: no cover - the range above is never empty
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "no boot was attempted",
+            attempts=attempts,
+        )
+    report.attempts = attempt
+    # The returned attempt's report is rewritten so the file and the object say
+    # the same thing.  ``attempts`` is the chain's length, which is only known
+    # once the chain ends, and a file that says 1 next to an object that says 3
+    # is a discrepancy nothing downstream can resolve.
+    (workdir / f"attempt-{attempt}" / "boot-report.json").write_text(
+        json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+    )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# reading what the guest did
+# ---------------------------------------------------------------------------
+#: The line the kernel prints when IOKit has published and mounted a volume.
+#: This is the guest's own report of the exact point at which
+#: ``selectVolumeSeed`` either finds the Data volume's ``IOMedia`` or returns 0
+#: -- and a 0 is what ``load_init_program`` panics on.
+#:
+#: It is searched for in the msgbuf ring and not in ``serial.log`` because the
+#: kernel console is not on the serial port (measured negative, see
+#: :mod:`unipad.host.guestobserve`): the serial log stops at the firmware and
+#: cannot answer this question at all.
+DATA_MOUNT_MARKER = "mount-complete volume OwnerData"
+
+#: How many consecutive probes with an identical fingerprint and no marker are
+#: read as "the guest stopped writing its log".  Two, not one: a single repeat
+#: is also exactly what a slow boot looks like between two screendumps, and the
+#: point of the fingerprint is to tell those apart without knowing anything
+#: about panics.
+STALLED_LOG_READS = 2
+
+
+def guest_stopped_progressing(probes: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether the guest stopped writing its kernel log without mounting Data.
+
+    This is the detector, and it is the only thing standing between a panicked
+    guest and a boot that is merely slow.  Every other signal is identical for
+    the two: QEMU does not exit when XNU panics (the panic parks the CPU in a
+    ``wfe; b wfe`` loop), ``query-status`` keeps answering ``running``, and
+    screendumps keep succeeding while the guest is dead.  What differs is the
+    log -- a guest that is still booting keeps writing to ``msgbuf``, and one
+    that has panicked writes nothing more, ever.
+
+    So the rule is "the last :data:`STALLED_LOG_READS` probes that produced a
+    log produced the same bytes".  It deliberately does **not** look at what the
+    log says: the two panic strings in this build carry a ``@%s:%d`` suffix that
+    appears nowhere in the vendored tree, so a detector matching on panic text
+    would be matching a string this project cannot yet explain, and would stop
+    working the moment the suffix changes.
+
+    A probe that could not read the log is skipped rather than counted.  An
+    unreadable log is not a stalled one -- before the kernel publishes its load
+    line there is no verified address mapping, and counting that as a stall
+    would call the first twenty seconds of every good boot a failure.
+
+    Args:
+        probes: The report's probe entries, in order.  Only entries with
+            ``ready`` and a ``fingerprint`` are considered.
+
+    Returns:
+        ``True`` when the tail of the readable probes is a run of identical
+        fingerprints *and* no probe ever found the marker.  The second half
+        matters: a guest that mounted the Data volume and then went idle has
+        also stopped writing, and reporting that as a failure would turn every
+        success into a retry.
+    """
+    if any(entry.get("marker") for entry in probes):
+        return False
+    fingerprints = [
+        entry["fingerprint"]
+        for entry in probes
+        if entry.get("ready") and entry.get("fingerprint")
+    ]
+    # Fewer readable probes than the threshold is not a stall, and the check is
+    # on the *count* rather than on the size of the tail.  A tail of one
+    # fingerprint is trivially "all identical", so without this a boot that has
+    # just started writing its log is reported as stalled -- measured by
+    # ``test_the_detector_ignores_a_probe_that_could_not_read_the_log``, which
+    # failed the first version of this function for exactly that reason.
+    if len(fingerprints) < STALLED_LOG_READS:
+        return False
+    return len(set(fingerprints[-STALLED_LOG_READS:])) == 1
+
+
+def _kernel_image(kernel: Path, digest: str) -> tuple[Optional[Any], Optional[str]]:
+    """A verified :class:`~unipad.host.guestobserve.KernelImage`, or a reason.
+
+    Parsing the kernel is expensive and it is done once per boot, here rather
+    than once per probe.  A kernel that cannot be parsed is *reported*, not
+    raised: :func:`boot` already checked the file exists, and a caller booting a
+    kernel this probe cannot read must still get a boot report rather than an
+    exception from a module whose job is to record what happened.
+    """
+    from unipad.host.guestobserve import KernelImage
+
+    try:
+        return KernelImage(kernel, expected_sha256=digest), None
+    except (UniPadError, OSError, struct.error) as exc:
+        return None, f"{getattr(exc, 'code', type(exc).__name__)}: {exc}"
+
+
+def _guest_log_probe(
+    qmp_port: int,
+    *,
+    kernel: Any,
+    serial: Path,
+    scratch: Path,
+) -> dict[str, Any]:
+    """One read of the guest's kernel log, or the reason it could not be taken.
+
+    This is the only channel through which anything the *guest* did can be seen
+    during a boot.  It exists because of a measured failure that nothing else
+    reports: in 1 of 8 boots of the matched build the guest panics inside
+    ``load_init_program`` with ``offline scratch Data mount failed``, and QEMU
+    does **not** exit -- the panic parks the CPU in a ``wfe; b wfe`` loop, so
+    ``query-status`` keeps answering ``running`` and screendumps keep succeeding
+    while the guest is dead.  A frozen log fingerprint is what distinguishes the
+    two, and it needs no knowledge of what the panic says.
+
+    Every failure mode returns a record instead of raising.  A probe that raised
+    would abort a boot that is merely slow: before the kernel's load line exists
+    in the serial log there is no verified mapping between the kernel's virtual
+    and physical addresses, and that is the normal state of the first twenty
+    seconds.
+
+    Returns:
+        ``{"ready": True, "bytes": int, "fingerprint": str, "marker": bool,
+        "log": Path}`` when the ring was read, or ``{"ready": False,
+        "reason": str}`` when it was not.  ``marker`` is whether
+        :data:`DATA_MOUNT_MARKER` appears anywhere in it.
+    """
+    from unipad.host.guestobserve import (
+        GuestMemory,
+        GuestObserver,
+        load_addresses_from_serial,
+    )
+    from unipad.host.qmp import QmpClient
+
+    if kernel is None:
+        return {"ready": False, "reason": "the kernel image could not be parsed"}
+    try:
+        blob = serial.read_bytes() if serial.is_file() else b""
+    except OSError as exc:
+        return {"ready": False, "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        load = load_addresses_from_serial(blob)
+    except UniPadError as exc:
+        # Not an error: the firmware prints this line, and until it does there
+        # is nothing to translate with.  Said in the reason so a report of
+        # "not ready" can be told apart from "the guest refused".
+        return {"ready": False, "reason": f"no kernel load line in the serial log yet ({exc.code})"}
+
+    # One connection for the whole probe, and it is opened *after* the serial log
+    # has been read: until the load line exists there is nothing to read, and a
+    # connection opened for a probe that cannot run is a connection QEMU has to
+    # drop and take again.  ``timeout`` is the greeting budget, and it is 60 s
+    # because this is the only command in the loop that can legitimately take
+    # that long -- a 16 MiB ring is four thousand ``pmemsave`` round trips.
+    #
+    # The constructor is inside the ``try`` on purpose: it raises
+    # ``UniPadError(CONFIG_INVALID)`` for a port outside 1..65535, and a probe
+    # that raised would abort a boot that is merely misconfigured -- which is the
+    # one thing this function's contract says it must not do.  Measured by
+    # ``test_the_probe_reports_a_port_it_cannot_even_construct_a_client_for``.
+    try:
+        client = QmpClient(port=qmp_port, timeout=60.0)
+    except (UniPadError, OSError, ValueError) as exc:
+        return {
+            "ready": False,
+            "reason": f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+        }
+    try:
+        client.connect()
+        # ``scratch`` is a plain ``Path``, so on Windows it stringifies with
+        # backslashes -- unlike the screendump filename, which has to be
+        # forward-slashed because QEMU reads a backslash in an argv *value* as
+        # an escape.  This is a QMP argument, not an argv value, and it is the
+        # spelling ``guestobserve``'s own CLI passes and the diagnostics used
+        # successfully.  Changing it here "for consistency" would change the one
+        # thing that has been measured to work.
+        observer = GuestObserver(
+            memory=GuestMemory(client, scratch), image=kernel, load=load
+        )
+        data = observer.kernel_log()
+    except (UniPadError, OSError) as exc:
+        return {
+            "ready": False,
+            "reason": f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+        }
+    finally:
+        client.close()
+
+    # The whole ring is kept, not just a tail: the ring wraps, so the Data
+    # volume's mount line can be anywhere in it, and a probe that only kept the
+    # last few kilobytes would report ``marker: False`` for a guest that mounted
+    # the volume four hundred lines ago.
+    #
+    # Scrubbed before it is written, for the same reason ``guestobserve``'s CLI
+    # scrubs its own stdout: this is evidence, and PRD 9.2 forbids the account
+    # name in any of it.  The fingerprint is taken from the *unscrubbed* bytes,
+    # because it has to be comparable across probes and scrubbing is not
+    # idempotent in general -- a run whose log contained the account name once
+    # would fingerprint differently after the first pass.
+    #
+    # Written as bytes, not text: Python's text mode translates ``\n`` to
+    # ``\r\n`` on Windows, and a copy of the guest's ring that has had its line
+    # endings rewritten is not a copy of the guest's ring.
+    text = data.decode("utf-8", "replace")
+    try:
+        scratch.write_bytes(scrub_account(text).encode("utf-8"))
+    except OSError:
+        # The bytes were already read; losing the copy on disk costs the
+        # evidence file and nothing else, so it must not fail the probe.
+        pass
+    return {
+        "ready": True,
+        "bytes": len(data),
+        "fingerprint": hashlib.sha256(data).hexdigest(),
+        "marker": DATA_MOUNT_MARKER in text,
+        "log": str(safe_location(scratch)),
+    }
+
+
+def _take_screenshot(
+    qmp_port: int,
+    work: Path,
+    started: float,
+    shots: list[str],
+    report: BootReport,
+) -> Optional[Path]:
+    """One screendump, or ``None`` -- and never an exception.
+
+    This exists so that a failed screendump cannot suppress the guest-log probe.
+    It was written inline in :func:`_watch` with three ``continue`` statements,
+    and each of them skipped the probe as well: a run whose screendumps broke
+    would report no ``guest_probes`` at all, so ``data_volume_mounted`` stayed
+    ``False`` and :func:`boot_until_mounted` spent every attempt re-booting a
+    guest that may have mounted its Data volume on the first try.  The two
+    observations are independent and must fail independently.
+
+    Returns the PNG's path when one was written, else ``None``.  Every failure is
+    recorded in ``report.qmp_evidence["screendump_error"]``.
+    """
+    ppm = work / "screen.ppm"
+    try:
+        # The same spelling the argv uses: absolute and forward-slashed.  A
+        # backslash is an escape in a QEMU value and a relative path resolves
+        # against the run directory (see :func:`build_argv`'s ``qpath``).
+        reply = _qmp(qmp_port, "screendump", filename=ppm.resolve().as_posix())
+    except (OSError, json.JSONDecodeError) as exc:
+        report.qmp_evidence["screendump_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    if "error" in reply or not ppm.is_file():
+        report.qmp_evidence["screendump_error"] = reply.get("error", "no screendump file")
+        return None
+    shot = work / f"screen-{int(time.monotonic() - started):03d}s.png"
+    try:
+        _write_png(ppm, shot)
+    except (OSError, ValueError, IndexError) as exc:
+        report.qmp_evidence["screendump_error"] = f"{type(exc).__name__}: {exc}"
+        # Removed here too, not only on the success path.  It is one filename
+        # reused every round rather than an accumulating pile, so leaving it
+        # costs a stale 1-pixel file and nothing else -- but a run directory
+        # that reports a screendump error should not also contain the PPM that
+        # caused it, and the next round's dump has to overwrite it anyway.
+        ppm.unlink(missing_ok=True)
+        return None
+    shots.append(str(safe_location(shot)))
+    ppm.unlink(missing_ok=True)
+    return shot
 
 
 def _watch(
@@ -1389,6 +1812,8 @@ def _watch(
     qmp_port: int,
     seconds: int,
     every: int,
+    kernel: Optional[Path] = None,
+    kernel_sha256: str = "",
 ) -> BootReport:
     """Wait for QMP, then take screendumps until the budget or the process ends."""
     started = time.monotonic()
@@ -1431,30 +1856,65 @@ def _watch(
         break
 
     shots: list[str] = []
+    # The kernel image is parsed lazily and at most once, because parsing it
+    # walks a whole symbol table and because a kernel that cannot be parsed must
+    # not cost the screendumps.
+    image: Any = None
+    image_reason: Optional[str] = None
+    if kernel is not None:
+        image, image_reason = _kernel_image(Path(kernel), kernel_sha256)
+
     while time.monotonic() < deadline and process.poll() is None:
         time.sleep(max(int(every), 1))
         if process.poll() is not None:
             break
-        ppm = work / "screen.ppm"
-        try:
-            # The same spelling the argv uses: absolute and forward-slashed.  A
-            # backslash is an escape in a QEMU value and a relative path resolves
-            # against the run directory (see :func:`build_argv`'s ``qpath``).
-            reply = _qmp(qmp_port, "screendump", filename=ppm.resolve().as_posix())
-        except (OSError, json.JSONDecodeError) as exc:
-            report.qmp_evidence["screendump_error"] = f"{type(exc).__name__}: {exc}"
+        # Interleaved with the probe, never concurrent with it: QEMU serves one
+        # QMP client at a time, so a probe running alongside a screendump would
+        # be refused rather than queued.  It comes first, for the same reason --
+        # the screendump has always worked, and a probe that fails must not cost
+        # it.  A screendump that fails costs *itself* and nothing else: see
+        # :func:`_take_screenshot` for why that used to be a bug.
+        _take_screenshot(qmp_port, work, started, shots, report)
+        if image is None:
+            # Not a probe that failed: there is no image to read symbols from,
+            # and every later round would report the same thing.  One entry
+            # says so and the screendumps carry on.
+            if not report.guest_probes:
+                report.guest_probes.append(
+                    {"ready": False, "at_seconds": round(time.monotonic() - started, 3),
+                     "reason": f"no kernel image to read: {image_reason or 'none was given'}"}
+                )
+            # Set here too, not only after a successful probe: a report from a
+            # run whose kernel could not be parsed must still answer the
+            # question, and an absent key reads as "never asked" rather than as
+            # "nothing was advancing".  Measured -- this branch used to skip it,
+            # and ``test_watch_with_no_kernel_at_all_still_watches`` caught the
+            # report coming back with no ``guest_log_stalled`` at all.
+            report.qmp_evidence["guest_log_stalled"] = guest_stopped_progressing(
+                report.guest_probes
+            )
             continue
-        if "error" in reply or not ppm.is_file():
-            report.qmp_evidence["screendump_error"] = reply.get("error", "no screendump file")
-            continue
-        shot = work / f"screen-{int(time.monotonic() - started):03d}s.png"
-        try:
-            _write_png(ppm, shot)
-        except (OSError, ValueError, IndexError) as exc:
-            report.qmp_evidence["screendump_error"] = f"{type(exc).__name__}: {exc}"
-            continue
-        shots.append(str(safe_location(shot)))
-        ppm.unlink(missing_ok=True)
+        entry = _guest_log_probe(
+            qmp_port,
+            kernel=image,
+            serial=work / "serial.log",
+            scratch=work / "guest-kernel.log",
+        )
+        entry["at_seconds"] = round(time.monotonic() - started, 3)
+        report.guest_probes.append(entry)
+        if entry.get("ready"):
+            report.guest_log_bytes = int(entry["bytes"])
+            report.guest_log_fingerprint = entry["fingerprint"]
+            if entry["marker"]:
+                report.data_volume_mounted = True
+                report.data_marker = DATA_MOUNT_MARKER
+        # Recomputed from the whole list rather than kept as a counter, so the
+        # rule exists once -- in :func:`guest_stopped_progressing`, which the
+        # tests exercise directly.  A counter here would be a second
+        # implementation of the same rule and the two would drift.
+        report.qmp_evidence["guest_log_stalled"] = guest_stopped_progressing(
+            report.guest_probes
+        )
 
     report.screenshots = shots
     if process.poll() is None:
@@ -1532,6 +1992,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              "the one --root-image prevents")
     parser.add_argument("--kernel-arg", action="append", default=[], metavar="NAME=VALUE",
                         help="replace the board's argument of the same name; repeatable")
+    parser.add_argument("--attempts", type=int, default=1,
+                        help="boot this many times, each in a fresh attempt-N "
+                             "directory, until the guest reports the Data volume "
+                             "mounted (see boot_until_mounted); 1 is the old "
+                             "single-boot behaviour")
     args = parser.parse_args(argv)
 
     inputs = BootInputs(
@@ -1549,7 +2014,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # not inside a run that has already started QEMU.
         kernel_args_line(read_board_payload(args.device), args.kernel_arg)
 
-    report = boot(
+    runner = boot_until_mounted if args.attempts > 1 else boot
+    report = runner(
         inputs,
         args.workdir,
         qemu=args.qemu,
@@ -1560,8 +2026,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         display=args.display,
         root_image=args.root_image,
         systemos_image=args.systemos_image,
+        **({"attempts": args.attempts} if args.attempts > 1 else {}),
     )
     print(f"qemu exit {report.exit_code}; qmp ready: {report.reached_qmp}; serial {report.serial_bytes} bytes")
+    # The guest's own answer, and the only line in this output that describes
+    # something the guest did rather than something the host did.  A run whose
+    # Data volume never mounted is otherwise indistinguishable from a good one:
+    # QEMU is alive, QMP answers, and the screendumps keep coming.
+    print(f"data volume mounted: {report.data_volume_mounted}"
+          + (f" (found {report.data_marker!r})" if report.data_volume_mounted else ""))
+    if report.attempts > 1:
+        print(f"boot attempts: {report.attempts} (this was attempt {report.attempt})")
+    if report.guest_probes:
+        stalled = report.qmp_evidence.get("guest_log_stalled")
+        last = report.guest_probes[-1]
+        print(f"guest kernel log: {report.guest_log_bytes} bytes from "
+              f"{len(report.guest_probes)} probes"
+              + (f"; stalled: {stalled}" if stalled else "")
+              + (f"; last probe: {last.get('reason')}" if not last.get("ready") else ""))
     # From ``inputs`` and not from ``report``: BootReport deliberately does not
     # carry the trust cache, because a report that names one unconditionally
     # cannot tell a run that had one from a run that did not, and that difference
