@@ -1933,7 +1933,11 @@ jobs:
             echo "::error::provisioning moved the volume UUID: $chain_uuid -> $before_uuid. The kernel was built for $chain_uuid, so this seed must not be booted"
             exit 1
           fi
-          echo "provision: volume UUID still $before_uuid${chain_uuid:+ (the chain's seed.json agrees)}"
+          if [ -n "$chain_uuid" ]; then
+            echo "provision: volume UUID still $before_uuid (the chain's own seed.json agrees)"
+          else
+            echo "provision: volume UUID still $before_uuid (seed.json records no UUID, so only the script's own before/after check applies)"
+          fi
           echo "provision: provisioned seed $(wc -c <"$seed" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$seed" | cut -d' ' -f1)"
           echo "provision_status=pass" >> "$GITHUB_OUTPUT"
 
@@ -1946,7 +1950,8 @@ jobs:
       - name: Remove the root chain's disk volumes
         if: always() && steps.os_root.outputs.os_root_status == 'pass'
         run: |
-          set -euo pipefail          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
+          set -euo pipefail
+          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
           if [ -d "$volumes" ]; then
             du -sh "$volumes" 2>/dev/null || true
             rm -f "$volumes"/*.dmg
@@ -2867,11 +2872,34 @@ jobs:
       #
       # Placed here, after every upload and after the unencrypted seed is gone,
       # so the failure costs nothing but the verdict.
+      #
+      # MEASURED on run 40447173615, dispatched with stage=M2: the chain printed
+      # THREE `::error::` lines -- naming payload.img, build-storage-abi.py:18,31,
+      # and "Trigger this workflow with stage=M3 or later" -- recorded
+      # `os_root_status=not_run`, exited 0, and the RUN concluded `success` with
+      # no seed, no manifest and no delivery.  Every step reported success beside
+      # it.  The `not_run` exit 0 is right for the step (the chain did not break,
+      # it was refused, and a failed step would read as the former) -- but
+      # nothing turned it into a run-level verdict, so "attempted and refused"
+      # and "never attempted" produced the same green run.
+      #
+      # `not_run` is now a verdict too, and it is distinguishable from the
+      # skipped case: a step SKIPPED because the volumes were never published has
+      # outcome 'skipped' and leaves os_root_status empty, so this condition
+      # cannot fire on it.  What it fires on is a run whose volumes WERE
+      # published and whose first build pass still did not produce the kernel or
+      # the payload -- which is an operator error, not an outcome.
       - name: The owner root chain's outcome is part of the run's verdict
-        if: always() && steps.os_root.outcome == 'failure'
+        if: always() && (steps.os_root.outcome == 'failure' || steps.os_root.outputs.os_root_status == 'not_run')
         run: |
-          echo "::error::the owner root chain was attempted and FAILED, so this run produced no matched-build material."
-          echo "::error::See ipsw-work/os-root.log (uploaded with the build logs) for the failure and, if the retries ran out, for the diskutil listings the failing line reads."
+          if [ "${{ steps.os_root.outputs.os_root_status }}" = 'not_run' ]; then
+            echo "::error::the owner root chain was REFUSED for a missing input (os_root_status=not_run), so this run produced no matched-build material."
+            echo "::error::The step exited 0 on purpose -- the chain did not break, it was refused -- but a refused chain is still a run with no seed, no manifest and no delivery, and it must not read as success."
+            echo "::error::The three ::error:: lines the chain step printed name the missing file and the fix. For the payload case: build-payload loads DarwinBoot.efi as a driver and plan_steps gates build-bootloader at n>=3, so a stage below M3 plans a payload stage with no bootloader to load. Trigger this workflow with stage=M3 or later."
+          else
+            echo "::error::the owner root chain was attempted and FAILED, so this run produced no matched-build material."
+            echo "::error::See ipsw-work/os-root.log (uploaded with the build logs) for the failure and, if the retries ran out, for the diskutil listings the failing line reads."
+          fi
           echo "::error::No Data seed, no material manifest and no encrypted delivery exist for this run. Treat every artifact it uploaded as unmatched: a kernel built for a Data volume UUID nobody delivered."
           exit 1
 

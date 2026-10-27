@@ -970,3 +970,265 @@ def test_the_delivery_directory_is_excluded_from_the_public_artifact() -> None:
     )
     # The step still exists and still has the patterns it claims to.
     assert step["name"] == STAGING_STEP, step
+
+
+# ---------------------------------------------------------------------------
+# 7. A refused chain is a failed run, not a green one
+# ---------------------------------------------------------------------------
+
+#: The step that turns the chain's outcome into the run's verdict.
+CHAIN_VERDICT = "The owner root chain's outcome is part of the run's verdict"
+#: The step that turns the provisioning outcome into the run's verdict.
+PROVISION_VERDICT = "The Data seed's provisioning outcome is part of the run's verdict"
+#: The step that does the provisioning, whose ``id`` the verdict keys on.
+PROVISION_STEP = "Provision the Data seed's runtime directories"
+
+
+def test_a_refused_chain_fails_the_run(tmp_path: Path) -> None:
+    """``os_root_status=not_run`` must reach the run's exit code.
+
+    MEASURED on run 40447173615, dispatched with stage=M2: the chain step printed
+    three ``::error::`` lines -- naming the missing ``payload.img``,
+    ``build-storage-abi.py:18,31``, and "Trigger this workflow with stage=M3 or
+    later" -- recorded ``os_root_status=not_run``, exited 0, and the RUN concluded
+    ``success`` with no seed, no manifest and no delivery.  Every step beside it
+    reported success.
+
+    The exit 0 is deliberate and correct for the STEP: the chain did not break,
+    it was refused for a missing input, and a failed step would read as the
+    former.  What was missing was the verdict -- nothing converted "attempted and
+    refused" into a run-level failure, so it and "never attempted" produced the
+    same green run.  This test runs the verdict step's own bash under both
+    conditions, because asserting on the ``if:`` string alone would still pass
+    with a step whose body forgot to exit.
+    """
+    step = _step(CHAIN_VERDICT)
+    script = step["run"]
+
+    # The not_run branch: refused, and it must say so in its own words rather
+    # than reusing the failure wording, because the two need different fixes.
+    refused, refused_text = _run_step_bash(script, tmp_path, os_root_status="not_run")
+    assert refused != 0, (
+        "the chain-verdict step exited 0 for a REFUSED chain, so a run whose "
+        "chain never started ends green"
+    )
+    assert "REFUSED" in refused_text, refused_text
+
+    # The failure branch still works, and still says something different.
+    failed, failed_text = _run_step_bash(script, tmp_path, os_root_status="pass")
+    assert failed != 0, failed_text
+    assert "FAILED" in failed_text, failed_text
+
+
+def test_a_skipped_chain_is_not_treated_as_a_refused_one() -> None:
+    """The two ways the chain legitimately does not run stay distinguishable.
+
+    ``not_run`` is set by the step when it is refused for a missing input.  A
+    step SKIPPED because the volumes were never published leaves the output
+    empty and has outcome 'skipped'.  If the verdict's condition could not tell
+    them apart, a run that never published its volumes would fail for a reason
+    that is not its own -- and the next operator would go looking for a chain
+    failure that never happened.
+    """
+    condition = _step(CHAIN_VERDICT)["if"]
+    assert "os_root.outputs.os_root_status == 'not_run'" in condition, condition
+    # The condition must not fire on a skipped step, whose outcome is 'skipped'
+    # and whose os_root_status is empty.
+    assert "outcome == 'failure'" in condition, condition
+    assert "== 'skipped'" not in condition, (
+        "the verdict would fire on a step that was never attempted: " + condition
+    )
+
+
+def test_a_provisioning_failure_after_the_swap_fails_the_run(tmp_path: Path) -> None:
+    """The one provisioning failure that can leave an unidentified seed.
+
+    The script refuses before it writes anything, so most of its failures leave
+    the chain's original seed on disk -- a valid matched build that merely still
+    lacks /private/var/containers, which is a warning.  The shell's own UUID
+    check runs AFTER the swap, so it is the one failure that can leave a seed
+    whose volume UUID moved under the real role's name.  That one must fail.
+    """
+    script = _step(PROVISION_VERDICT)["run"]
+    swapped, _ = _run_step_bash(script, tmp_path, provision_swapped="yes")
+    assert swapped != 0, (
+        "a provisioning failure after the seed was swapped in did not fail "
+        "the run, so a seed nobody identified can ship as a matched build"
+    )
+    before, before_text = _run_step_bash(script, tmp_path, provision_swapped="")
+    assert before == 0, (
+        "a provisioning failure BEFORE the swap failed the run; the original "
+        "seed is still on disk and still a matched build, so this is a warning "
+        "and not a verdict: " + before_text[:300]
+    )
+
+
+def test_the_provisioning_verdict_reads_an_output_not_a_file() -> None:
+    """The discriminator must survive the cleanup that deletes the report.
+
+    The "Remove the extracted firmware material" step deletes the whole
+    owner-data directory -- ``provision-report.json`` included -- before any
+    verdict runs.  A verdict that looked for the report would find nothing on
+    every run and take the warning branch unconditionally, which is the shape of
+    a guard that looks like it works.  It reads ``steps.provision.outputs``.
+    """
+    script = _step(PROVISION_VERDICT)["run"]
+    assert "provision-report.json" not in script, (
+        "the provisioning verdict reads a file the cleanup step deletes: "
+        + script[:400]
+    )
+    assert "provision_swapped" in script, script
+    # And the step that sets it really does, at the one point where the swap is
+    # known to have happened.
+    provision = _step(PROVISION_STEP)
+    assert "provision_swapped=yes" in provision["run"], provision["run"]
+    assert provision.get("id") == "provision", provision
+
+
+def _working_bash() -> str:
+    """A POSIX shell that actually runs here, or a skip saying why.
+
+    ``shutil.which("bash")`` is not enough on this host: it can resolve to
+    ``C:\\Windows\\System32\\bash.exe``, the WSL launcher, which fails with
+    ``Bash/Service/CreateInstance/MountDisk/HCS/ERROR_FILE_NOT_FOUND`` against
+    ``ext4.vhdx`` and returns nothing -- so a test that trusted it would fail
+    with a decode error instead of the assertion it was written for.  Each
+    candidate is therefore run once and the first that answers is used.
+    """
+    import shutil
+
+    for candidate in ("bash", "bash.exe", "sh"):
+        located = shutil.which(candidate)
+        if not located:
+            continue
+        probe = subprocess.run(
+            [located, "-c", "echo alive"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        if probe.returncode == 0 and "alive" in (probe.stdout or ""):
+            return located
+    pytest.skip("no working POSIX shell on this host (bash/sh resolve to WSL's launcher)")
+
+
+def _run_step_bash(
+    script: str, tmp_path: Path, **substitutions: str
+) -> tuple[int, str]:
+    """Run a step's bash; return ``(exit code, combined output)``.
+
+    Each keyword is the FULL expression body -- ``os_root_status="not_run"``
+    stands for ``${{ steps.os_root.outputs.os_root_status }}`` -- and is
+    replaced textually, which is what the runner does.  The exit code is
+    captured by a WRAPPER rather than read off the wrapper's own status,
+    because the step's ``exit 1`` ends it before any trailing echo could run.
+    """
+    body = script
+    for expression, value in substitutions.items():
+        needle = "${{ steps.%s.outputs.%s }}" % (_step_of(expression), expression)
+        assert needle in body, f"{needle!r} is not in the step's script"
+        body = body.replace(needle, value)
+    step = tmp_path / "step-body.sh"
+    step.write_text(body, encoding="utf-8")
+    runner = tmp_path / "step-runner.sh"
+    runner.write_text(f'bash "{step}"\necho "EXIT=$?"\n', encoding="utf-8")
+    done = subprocess.run(
+        [_working_bash(), str(runner)], capture_output=True, cwd=str(tmp_path),
+        encoding="utf-8", errors="replace", timeout=300,
+    )
+    output = (done.stdout or "") + (done.stderr or "")
+    code = output.rsplit("EXIT=", 1)[-1].strip()
+    assert code.isdigit(), f"the step did not report an exit code: {output[:400]}"
+    return int(code), output
+
+
+#: ``steps.<id>.outputs.<name>`` for the two steps whose verdicts are tested
+#: here.  Spelled out rather than derived, because the output names contain
+#: underscores that a naive split would put on the wrong side of the dot.
+STEP_OUTPUTS = {
+    "os_root_status": "os_root",
+    "provision_swapped": "provision",
+}
+
+
+def _step_of(output: str) -> str:
+    """The step id that owns ``output``, from the table above."""
+    return STEP_OUTPUTS[output]
+
+
+# ---------------------------------------------------------------------------
+# 8. Every step's shell is a shell, and `set` is alone on its line
+# ---------------------------------------------------------------------------
+
+
+def _all_steps() -> list:
+    from acceptance.test_p0p1_gate_main import _steps
+
+    return _steps(WORKFLOW)
+
+
+def test_every_steps_shell_parses(tmp_path: Path) -> None:
+    """``bash -n`` over every step's ``run:``.
+
+    A workflow whose step body does not parse fails at run time with a message
+    that names a line number in a temp file the job has already thrown away, so
+    the cheapest place to catch it is here.  This is a floor, not a ceiling: it
+    catches unbalanced quotes and broken heredocs, and it does not catch
+    semantics -- which is what the test below it is for.
+    """
+    checked = 0
+    for step in _all_steps():
+        run = step.get("run")
+        if not run or "${{" in run:
+            # A step with a GitHub expression in it may still be valid bash once
+            # substituted, but `bash -n` would reject the expression itself, so
+            # only the expression-free ones are checked here.
+            continue
+        path = tmp_path / "step.sh"
+        path.write_text(run, encoding="utf-8")
+        done = subprocess.run(
+            [_working_bash(), "-n", str(path)], capture_output=True,
+            encoding="utf-8", errors="replace", timeout=120,
+        )
+        assert done.returncode == 0, (
+            f"step {step.get('name')!r} does not parse as bash:\n"
+            f"{(done.stderr or '')[:600]}"
+        )
+        checked += 1
+    assert checked > 5, f"only {checked} steps were checked; the scan is not scanning"
+
+
+def test_set_is_alone_on_its_line() -> None:
+    """No statement may share a line with ``set -euo pipefail``.
+
+    MEASURED on run 40448291831, which is the run that finally provisioned the
+    Data seed -- and then died one step later with
+
+        line 2: volumes: unbound variable
+
+    because an edit had joined the first two lines of the "Remove the root
+    chain's disk volumes" step into
+
+        set -euo pipefail          volumes="vendor/UniXNU-qemu/...."
+
+    which bash reads as ``set`` with a POSITIONAL ARGUMENT, not as an
+    assignment.  ``$volumes`` is then never set, ``set -u`` turns that into a
+    hard failure, and the step exits 1 -- after the seed it was supposed to
+    clean up after had already been built.  ``bash -n`` accepts the joined line
+    happily, so only a line-level check catches it.
+
+    The check is on the idiom this repository uses in every step, and it is
+    narrow on purpose: a general "one statement per line" rule is not something
+    a test can decide, and a rule nobody can decide is a rule nobody enforces.
+    """
+    offenders = []
+    for step in _all_steps():
+        for number, line in enumerate((step.get("run") or "").splitlines(), 1):
+            stripped = line.strip()
+            if not stripped.startswith("set "):
+                continue
+            if stripped not in ("set -euo pipefail", "set -uo pipefail", "set -e"):
+                offenders.append(f"{step.get('name')!r} line {number}: {stripped!r}")
+    assert not offenders, (
+        "a `set` invocation shares its line with something else, which bash "
+        "reads as a positional argument rather than an assignment:\n  "
+        + "\n  ".join(offenders)
+    )
