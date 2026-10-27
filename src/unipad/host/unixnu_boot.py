@@ -534,10 +534,21 @@ def unixnu_toml(
 
 
 #: The name the packed Data ramdisk is staged under, beside the kernel.  It is
-#: the name ``unixnu.toml``'s ``initrd`` key has to spell, and the name the
-#: device repository's payload build uses (``build-macos.yml`` looks for
-#: ``owner-data/owner-data-1g.dbr`` and stages it as this).
-DATA_RAMDISK_NAME = "owner-data-1g.dbr"
+#: the name ``unixnu.toml``'s ``initrd`` key has to spell, and it is the name the
+#: device repository's payload build uses: ``unixnu/scripts/unixnu/payload.py:148``
+#: copies the ramdisk to ``payloads / 'scratch-data.img'`` and :172 writes
+#: ``initrd = "Payloads/scratch-data.img"``.  This is a *lookup*, exactly like
+#: :data:`TRUSTCACHE_NAME` below -- DarwinBoot opens the file the config names --
+#: so a second spelling stages a file nothing opens.
+#:
+#: It used to be ``owner-data-1g.dbr``, which is the name the seed has *on the
+#: host* and in the delivery, not on the ESP.  Measured on 2026-10-27: booting the
+#: first verified delivery was refused by ``_check_ramdisk_pair`` with "unixnu.toml's
+#: initrd does not name the file that was staged" -- the delivery's own
+#: ``unixnu.toml`` (which must come from the matched build) named
+#: ``Payloads/scratch-data.img`` and this module staged ``owner-data-1g.dbr``
+#: beside it.  The refusal was correct and the constant was wrong.
+DATA_RAMDISK_NAME = "scratch-data.img"
 
 #: The name the trust cache is staged under, beside the kernel.  One spelling,
 #: because it is a *lookup* rather than a label: ``unixnu/payload.py:143-144``

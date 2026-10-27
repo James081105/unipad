@@ -1939,16 +1939,29 @@ def test_a_boot_that_asks_for_a_trust_cache_and_a_data_ramdisk_carries_both(
 
     # ...and the report says so, in both the object and the file on disk.  These
     # are the two lines that used to name five files.
+    #
+    # ``report.inputs`` names the FILE THE CALLER GAVE -- ``owner-data-1g.dbr`` is
+    # the name :func:`_both_halves` writes the seed under -- and the staged
+    # manifest names what it became on the ESP.  They are deliberately separate
+    # assertions: they used to be the same string by coincidence, because
+    # DATA_RAMDISK_NAME was the seed's host name as well as its ESP name, and
+    # that coincidence is what let the ESP spelling drift from the payload
+    # build's until the first verified delivery was refused by
+    # ``_check_ramdisk_pair``.
     for role, expected in (
         ("trust_cache", "original-static-system.bundle"),
-        ("data_ramdisk", ub.DATA_RAMDISK_NAME),
+        ("data_ramdisk", "owner-data-1g.dbr"),
     ):
         assert report.inputs.get(role) == expected, (
             f"boot() dropped {role}: the report records {sorted(report.inputs)}"
         )
     written = json.loads((work / "boot-report.json").read_text(encoding="utf-8"))
     assert written["inputs"].get("trust_cache") == "original-static-system.bundle", written
-    assert written["inputs"].get("data_ramdisk") == ub.DATA_RAMDISK_NAME, written
+    assert written["inputs"].get("data_ramdisk") == "owner-data-1g.dbr", written
+    # ...and what it was staged as is the payload build's spelling, recorded in
+    # the ESP manifest rather than inferred from the input's own name.
+    staged_manifest = json.loads((work / "esp-manifest.json").read_text(encoding="utf-8"))
+    assert staged_manifest.get(f"EFI/UniXNU/Payloads/{ub.DATA_RAMDISK_NAME}"), staged_manifest
 
     # ...and the ESP manifest, which is the record of what was actually written.
     manifest = json.loads((work / "esp-manifest.json").read_text(encoding="utf-8"))
@@ -2613,3 +2626,42 @@ def test_a_data_ramdisk_that_does_not_exist_is_named_by_missing(
     assert replace(inputs, data_ramdisk=absent).missing() == [
         "data_ramdisk=not-there.dbr"
     ], replace(inputs, data_ramdisk=absent).missing()
+
+
+def test_the_data_ramdisk_is_staged_under_the_name_the_build_writes() -> None:
+    """``DATA_RAMDISK_NAME`` is the payload build's spelling, not the host's.
+
+    ``unixnu/scripts/unixnu/payload.py:148`` copies the data ramdisk to
+    ``payloads / 'scratch-data.img'`` and :172 writes
+    ``initrd = "Payloads/scratch-data.img"``.  This module stages the same file
+    under its own constant and ``unixnu.toml``'s ``initrd`` has to name what was
+    staged, so the constant has to be that spelling -- it is a *lookup*, exactly
+    like ``TRUSTCACHE_NAME``, not a label this module gets to choose.
+
+    Measured on 2026-10-27: the first verified delivery was refused by
+    ``_check_ramdisk_pair`` with "unixnu.toml's initrd does not name the file
+    that was staged".  The constant was ``owner-data-1g.dbr`` -- the seed's name
+    on the host and in the delivery -- while the delivery's own ``unixnu.toml``,
+    which must come from the matched build, named ``Payloads/scratch-data.img``.
+    The refusal was right and the constant was wrong.
+
+    Asserted against the vendored source rather than against a literal here, so
+    a pin bump that renames it reddens this test instead of silently staging a
+    file nothing opens.
+    """
+    payload_py = ROOT / "vendor" / "UniXNU" / "scripts" / "unixnu" / "payload.py"
+    if not payload_py.is_file():  # pragma: no cover - the pin is always fetched
+        pytest.skip(f"{payload_py} is not on this host")
+    source = payload_py.read_text(encoding="utf-8")
+
+    assert "payloads / 'scratch-data.img'" in source, (
+        "the payload build no longer stages the data ramdisk as scratch-data.img; "
+        "DATA_RAMDISK_NAME has to follow it"
+    )
+    assert ub.DATA_RAMDISK_NAME == "scratch-data.img", (
+        f"the data ramdisk is staged as {ub.DATA_RAMDISK_NAME!r} but the payload "
+        "build writes 'scratch-data.img', so unixnu.toml's initrd names a file "
+        "that was never staged"
+    )
+    # And the two halves of the pair the guard checks are the same spelling.
+    assert f"Payloads/{ub.DATA_RAMDISK_NAME}" in source, source
