@@ -1831,6 +1831,112 @@ jobs:
           echo "== os root: PASS (the owner root chain is on disk; build-kernel below builds qemu_root_defconfig)"
         continue-on-error: true
 
+      # The container skeleton, which the chain does not create and the OS image
+      # does not ship.
+      #
+      # MEASURED on 2026-10-27 against this build's own inputs: the OS root
+      # volume (044-76040-038.raw, APFS at file offset 0x4400) has NO catalog
+      # entry named `containers` anywhere -- not one, across 303,965 inodes and
+      # 349,284 directory records -- and its /private/var holds 29 entries.  The
+      # seed the chain produced from it holds the same 29, plus `.fseventsd` and
+      # `keybags`, minus `staged_system_apps`, which is exactly the two
+      # deviations prepare-owner-data-fixture.py documents.  So the seed is a
+      # FAITHFUL copy and `/private/var/containers` is missing from BOTH, because
+      # on a device it is created at first boot and an offline seed never gets
+      # one.
+      #
+      # The cost of leaving it out is measured in the guest: the kernel cached
+      # 24 container paths (15 UUID-shaped, under
+      # /private/var/containers/Data/System/<UUID> and
+      # /private/var/containers/Shared/SystemGroup/<UUID>), and the log carries
+      # 65 `Sandbox: no system container path found` / `no system group container
+      # path found` / `no application group container found` denials across 35
+      # distinct messages.  SpringBoard then crash-looped through 16 instances
+      # and never emitted a line of its own.
+      #
+      # `containermanagerd` is not the fix here: it was ALIVE in the guest (pids
+      # 64 and 92, state `run`) and the Data volume was mounted READ-WRITE (two
+      # tx_flush transactions on disk5, xid 28 and xid 48) -- and the volume's
+      # own spaceman reported 1,442 of 262,144 blocks used, against the seed's
+      # own extents ending at block 1,444.  It created nothing.  The directory
+      # has to be in the seed.
+      #
+      # This is upstream's own answer to the same problem, reused rather than
+      # reinvented: prepare-offline-data.py creates the skeleton with the safety
+      # property that no original file or symlink may change, and
+      # seed-data-skip-setup.py does the unpack/attach/repack cycle on a packed
+      # seed.  This step is that cycle for OUR seed, with both directory lists.
+      #
+      # The volume UUID is the one thing that must not move.  material_manifest
+      # --verify re-derives it from the seed's own resident volume superblock and
+      # requires it to equal the UUID the kernel was built with
+      # (implementation-plan fact 88 measured the failure of a mismatch: the
+      # guest's native_owner_data_stage stayed 0).  The script reads it before
+      # and after with diskutil and refuses a change; the verify then checks it
+      # again from the seed's bytes.  Two independent checks, because a
+      # provisioning step that moved the UUID would produce a seed that mounts
+      # and then binds to nothing.
+      - name: Provision the Data seed's runtime directories
+        id: provision
+        if: always() && steps.os_root.outputs.os_root_status == 'pass'
+        env:
+          DEVICE_REPO: vendor/UniXNU-qemu
+        # continue-on-error for the same reason os_root carries it: the evidence
+        # and the delivery matter most on a run that did not succeed, and a
+        # provisioning failure leaves the ORIGINAL seed on disk (the step only
+        # replaces it after the script has succeeded), so what still ships is a
+        # valid matched build that simply still lacks the container skeleton.
+        # The verdict step below is what stops that being read as success.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          owner="$DEVICE_REPO/.cache/firmware/owner-data"
+          seed="$owner/owner-data-1g.dbr"
+          seed_json="$owner/seed.json"
+          if [ ! -f "$seed" ]; then
+            echo "::error::the chain reported PASS but $seed is not on disk"
+            exit 1
+          fi
+          # The original is kept, under a name that says what it is.  It is
+          # Apple-derived like the seed is, and the "Remove the extracted
+          # firmware material" step removes this whole directory, so keeping it
+          # costs nothing on the runner's disk -- and it is what makes this step
+          # reversible and its effect measurable rather than asserted.
+          cp "$seed" "$owner/owner-data-1g.dbr.unprovisioned"
+          echo "provision: original seed $(wc -c <"$seed" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$seed" | cut -d' ' -f1)"
+
+          # Written to a fresh name and moved over, never written in place: the
+          # script refuses to overwrite its --out, and bypassing that guard to
+          # save an mv is how a half-written seed ends up under the real role's
+          # name.
+          staged="$owner/owner-data-1g.dbr.provisioned"
+          rm -f "$staged"
+          python3 scripts/macos/provision-data-seed.py \
+            --seed "$owner/owner-data-1g.dbr.unprovisioned" \
+            --out "$staged" \
+            --report "$owner/provision-report.json"
+          mv "$staged" "$seed"
+          # The signal the verdict step reads, and the only record of the swap
+          # that survives: the "Remove the extracted firmware material" step
+          # deletes this whole directory, including provision-report.json,
+          # before any verdict runs.  An output rather than a file for exactly
+          # that reason.
+          echo "provision_swapped=yes" >> "$GITHUB_OUTPUT"
+
+          # An independent check, in the shell, against the chain's own record.
+          # The script already refused a UUID change; this is the second reader,
+          # and it compares against seed.json rather than against the script's
+          # opinion of itself.
+          before_uuid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["volume_uuid"])' "$owner/provision-report.json")"
+          chain_uuid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("volume_uuid",""))' "$seed_json" 2>/dev/null || true)"
+          if [ -n "$chain_uuid" ] && [ "$before_uuid" != "$chain_uuid" ]; then
+            echo "::error::provisioning moved the volume UUID: $chain_uuid -> $before_uuid. The kernel was built for $chain_uuid, so this seed must not be booted"
+            exit 1
+          fi
+          echo "provision: volume UUID still $before_uuid${chain_uuid:+ (the chain's seed.json agrees)}"
+          echo "provision: provisioned seed $(wc -c <"$seed" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$seed" | cut -d' ' -f1)"
+          echo "provision_status=pass" >> "$GITHUB_OUTPUT"
+
       # The volumes are the chain's inputs and nothing else's, and they are 7.88
       # GiB.  Deleting them here -- before the second build pass, whose preflight
       # checks the same filesystem -- is what makes that pass possible at all,
@@ -1840,8 +1946,7 @@ jobs:
       - name: Remove the root chain's disk volumes
         if: always() && steps.os_root.outputs.os_root_status == 'pass'
         run: |
-          set -euo pipefail
-          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
+          set -euo pipefail          volumes="vendor/UniXNU-qemu/.cache/firmware/target-volumes"
           if [ -d "$volumes" ]; then
             du -sh "$volumes" 2>/dev/null || true
             rm -f "$volumes"/*.dmg
@@ -2769,6 +2874,39 @@ jobs:
           echo "::error::See ipsw-work/os-root.log (uploaded with the build logs) for the failure and, if the retries ran out, for the diskutil listings the failing line reads."
           echo "::error::No Data seed, no material manifest and no encrypted delivery exist for this run. Treat every artifact it uploaded as unmatched: a kernel built for a Data volume UUID nobody delivered."
           exit 1
+
+      # The same rule for the provisioning step, and the distinction between its
+      # two failure modes is the whole reason it is a separate step.
+      #
+      # The script fails BEFORE it writes anything -- it unpacks, attaches,
+      # provisions, checks the volume UUID, detaches, and only then packs -- so a
+      # script failure leaves the ORIGINAL seed on disk and the delivery that
+      # ships is a valid matched build that merely still lacks
+      # /private/var/containers.  That is a recorded outcome, not a failed run:
+      # the seed still binds to the kernel it was built with, and the guest still
+      # mounts it.  It is reported as a warning so nobody reads "provisioned"
+      # into a run that did not provision.
+      #
+      # The shell's own UUID check runs AFTER the swap, so it is the one failure
+      # that can leave an unidentified seed under the real role's name.  That one
+      # is a hard failure: a seed whose volume UUID moved no longer binds to the
+      # kernel, it would still mount, and every downstream check would pass on a
+      # machine nobody identified.
+      #
+      # `provision_swapped` is the discriminator, and it is an OUTPUT rather than
+      # a file on disk because the "Remove the extracted firmware material" step
+      # deletes the whole owner-data directory -- provision-report.json included
+      # -- before any verdict runs.  A file-based check here would find nothing
+      # on every run and take the warning branch unconditionally, which is the
+      # shape of a guard that looks like it works.
+      - name: The Data seed's provisioning outcome is part of the run's verdict
+        if: always() && steps.provision.outcome == 'failure'
+        run: |
+          if [ "${{ steps.provision.outputs.provision_swapped }}" = 'yes' ]; then
+            echo "::error::Data seed provisioning failed AFTER the seed was swapped in. The seed on disk may not be the one the kernel was built for; do not boot it."
+            exit 1
+          fi
+          echo "::warning::Data seed provisioning failed before it wrote anything, so the delivered seed is the chain's original: a valid matched build WITHOUT /private/var/containers. Expect the guest's sandbox to fail container resolution and SpringBoard to crash-loop (implementation-plan fact 99)."
 
       - name: Step summary
         if: always()
