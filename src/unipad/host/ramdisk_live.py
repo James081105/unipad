@@ -494,15 +494,26 @@ def _volume_from_table(
 
     # ``ramSparseImport`` and ``ramSparseIO`` both store the pointer and then add
     # 4096 to ``resident``, and neither ever frees a page, so the two counts are
-    # the same number computed twice.  A disagreement means either the struct
-    # found is not the one, or the guest changed under the scan -- and both are
-    # reasons to stop rather than to publish a volume.
+    # the same number computed twice -- *if nothing writes in between*.
+    #
+    # Something always writes in between.  ``resident`` is read while scanning
+    # physical memory and the table is read afterwards, page by page, over
+    # hundreds of QMP round trips; every write the userland makes in that window
+    # allocates a page and raises ``resident`` by 4096.  Measured on the real
+    # guest: a struct reporting 40,183 resident pages whose table held 40,426 --
+    # 243 pages of writes that landed between the two reads.
+    #
+    # So the check is one-sided.  A table with *fewer* live pointers than the
+    # struct reported means the struct is not the volume's.  A table with more
+    # means the guest kept writing, which is the expected case on a live system
+    # and is exactly what task #28 wants to capture.  Demanding equality turns a
+    # working extraction into a refusal on every boot that has a userland in it.
     allocated = sum(1 for page in pages if page)
-    if resident != allocated * PAGE_SIZE:
+    if allocated * PAGE_SIZE < resident:
         raise UniPadError(
             ErrorCode.EVIDENCE_INCOMPLETE,
-            "the RamSparseDisk's resident count does not match the pages it "
-            "points at, so the struct found is not the volume's",
+            "the RamSparseDisk's resident count exceeds the pages it points at, "
+            "so the struct found is not the volume's",
             struct_pa=f"{struct_pa:#x}",
             resident=resident,
             allocated=allocated * PAGE_SIZE,

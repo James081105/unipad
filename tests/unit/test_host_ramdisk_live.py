@@ -871,23 +871,48 @@ def test_a_struct_with_an_impossible_resident_count_is_not_a_match(
     assert refusal.value.details["matches"] == 0
 
 
-def test_a_resident_count_that_disagrees_with_the_page_array_is_a_refusal(
-    tmp_path: Path,
-) -> None:
-    """``resident`` and the array are the same number computed twice.
+def test_a_resident_count_above_the_page_array_is_a_refusal(tmp_path: Path) -> None:
+    """``resident`` claiming more pages than the array holds is not the volume.
 
     ``ramSparseImport`` and ``ramSparseIO`` both store the pointer and then add
-    4096, and neither frees, so a disagreement means the struct found is not the
-    volume's -- or the guest changed under the scan.  Either way the extractor
-    stops, because a volume assembled from a struct it cannot trust is a volume
-    assembled from a guess.
+    4096, and neither frees, so the array can only ever hold *at least* as many
+    pages as ``resident`` says.  The other direction is the measured one: on a
+    live guest the userland keeps writing while the table is read, so the array
+    holds more than the struct reported when it was scanned.  A struct claiming
+    more than its array can deliver is therefore the wrong struct.
     """
-    guest = FakeGuest(struct_resident=2 * PAGE)
+    # The array holds len(RESIDENT) pages; claim more than that.
+    guest = FakeGuest(struct_resident=(len(RESIDENT) + 1) * PAGE)
     with pytest.raises(UniPadError) as refusal:
         scan(guest, tmp_path / "scratch.bin")
     assert refusal.value.code == ErrorCode.EVIDENCE_INCOMPLETE
-    assert refusal.value.details["resident"] == 2 * PAGE
+    assert refusal.value.details["resident"] == (len(RESIDENT) + 1) * PAGE
     assert refusal.value.details["allocated"] == len(guest.resident) * PAGE
+
+
+def test_a_page_array_larger_than_resident_is_the_guest_still_writing(
+    tmp_path: Path,
+) -> None:
+    """More pages than ``resident`` reported is expected, not a refusal.
+
+    ``resident`` is read while scanning physical memory and the table is read
+    afterwards, page by page, over hundreds of QMP round trips.  Every write the
+    userland makes in that window allocates a page and raises ``resident`` by
+    4096, so the table is stale-low by however much landed in between.  Measured
+    on the real guest: 40,183 reported against 40,426 in the table, 243 pages of
+    writes between the two reads.
+
+    Demanding equality here would refuse every boot that has a userland in it --
+    which is the only kind of boot task #28 cares about.
+    """
+    guest = FakeGuest(struct_resident=PAGE)          # the array holds more
+    assert len(guest.resident) * PAGE > guest.struct_resident
+
+    disk = scan(guest, tmp_path / "scratch.bin")
+
+    assert disk.resident == PAGE                     # what the struct said
+    assert sum(1 for page in disk.pages if page) * PAGE > disk.resident
+    assert len(disk.pages) == LOGICAL // PAGE
 
 
 def test_a_struct_straddling_a_scan_chunk_boundary_is_still_found(tmp_path: Path) -> None:
