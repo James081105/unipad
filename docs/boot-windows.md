@@ -899,6 +899,54 @@ if(!native_legacy_surface_status && native_legacy_surface_found && !PE_current_c
 **一条附带的实测**：`IOSurfaceRoot` 的安装时刻在两次运行之间差了 34 秒
 （51.8s vs 86.1s），所以「探针跑在服务安装之前」不是一次偶然的竞态，
 而是一个**时窗不稳定、但探针只试一次**的结构性组合。
+**一条附带的实测**：`IOSurfaceRoot` 的安装时刻在两次运行之间差了 34 秒
+（51.8s vs 86.1s），所以「探针跑在服务安装之前」不是一次偶然的竞态，
+而是一个**时窗不稳定、但探针只试一次**的结构性组合。
+
+#### 7.5.11 一条必须记下来的**不可分辨**：现有计数器分不开两种早退（2026-10-28）
+
+上面把根因归到「5 秒窗早于 `IOSurfaceRoot` 安装」。**这个归因比证据强一步，
+在这里收回一半。**
+
+`native_legacy_display_late_probe()` 有**两道**可能早退的地方：
+
+```cpp
+IOService *display = pendingLegacyDisplay;
+if(!display) return;                                    // (A) 第一个探针把它 release 了
+pendingLegacyDisplay = nullptr;
+native_legacy_surface_status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
+native_legacy_surface_found  = (waitForMatchingService(nameMatching("IOCoreSurfaceRoot"), 5e9) != nullptr);
+if(!status && found && !PE_current_console(&video) && video.v_depth == 32 && ...) {   // (B)
+    native_legacy_video_base = video.v_baseAddr; ...创建 nub、attach、start...
+}
+```
+
+**(A) 和 (B) 在现有计数器下产出完全相同的读数**，因为
+`pendingLegacyDisplay` 是 `static IOService *`——**文件内链接，没有符号**，
+读不到；而 `native_legacy_surface_status`/`_found` 的 .bss 初值本来就是 0，
+「赋值成 0」和「从未赋值」分不开。
+
+**能确定的是这些**（`local-private/boot33/legacy-gate/counters-before.json`）：
+显示驱动**一件事都没做**——`native_legacy_registration_calls = 0`、
+`native_legacy_copy_n = 0`、`native_legacy_copy_bytes_sum = 0`、
+`native_legacy_presented_generation = 0`、`native_legacy_retired_frames = 0`、
+`native_legacy_frame_count = 0`；`native_legacy_nub = 0`、`dt_attached = 0`、
+`probe_match = 0`、`start_result = 0`、`native_gop_ready = 0`。
+**第一个探针的门（`:456`）显然过了**，因为对象分配成功
+（`native_legacy_object = 0x3E52_xxxx`）、`init_result = 1`、`parent_match = 1`——
+而那一道门同样要求 `video.v_depth == 32`。
+
+**所以诚然的结论是**：显示驱动在 `(A)` 或 `(B)` 之一停下，
+**现有仪器无法判定是哪一道**；`IOSurfaceRoot` 确实晚于 5 秒窗安装（t=51.8s / 86.1s）
+支持 `(B)`，但不排除 `(A)`——若 `PE_parse_boot_argn("offline-legacy-phase")`
+没把 ASCII `4` 解析成 4，第一个探针就会走 release 分支，
+而 `offline-legacy-phase=4` 确实在生成的 `unixnu.toml` 里（已核对）。
+
+**要分开它，需要的是一次带仪器的客体构建**（把 `pendingLegacyDisplay`
+或两道门各 publish 一个计数器），不是再读一遍同样的全局。
+**两条修法都在客体侧**：`(B)` → 拉长等待或挂 `addMatchingNotification` 重试；
+`(A)` → 查 `PE_parse_boot_argn` 对 `unsigned` 的 ASCII 解析，或把 phase 改成显式传递。
+在分开之前，**不要只按其中一条下手**。
 
 #### 7.5.7 串口最后一跳实测：**无法从客体外判定**，而不是失败（2026-10-28）
 
