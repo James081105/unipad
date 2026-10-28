@@ -1,13 +1,20 @@
 # Windows 本机启动链：实测记录
 
-- 日期：2026-10-24
+- 日期：2026-10-24（2026-10-28 修订：下面「内核」一行原本写的是更早那一束，已按当前束的
+  `manifest.json` 改正；§1.4 的串口摘录仍是**更早那个内核**上量到的，未改写）
 - 主机：Windows 11，QEMU **11.1.0**（`local-private/tools/qemu/qemu-system-aarch64.exe`，sha256 `952f8975…`），
   固件 `local-private/tools/qemu/share/edk2-aarch64-code.fd`（67,108,864 字节，sha256 `47765fe3…`）
-- 内核：runner run `40096928333` 的 `boot-inputs` 束内
-  `unixnu-out/qemu/kernel/kernel.macho`，51,859,456 字节，sha256 `9d4b1ab14d74fdfa…`
-  （**不是** run `40081850615` 的那个：那个是 `1f32f09bc7668de0…`。一次启动日志属于哪个内核，
-  只能由束里的 `manifest.json` 说，见 §1.4）
-- 设备树：`local-private/boot6/kernel.macho.adt`，17,624 字节，**本机生成**（见 §3），
+- 内核：`local-private/boot32/bundle` 束内
+  `unixnu-out/qemu/kernel/kernel.macho`，**125,431,808 字节**，sha256 `e6480f661dfa4efd…`
+  （该束 `manifest.json` 的记录；同束 `DarwinBoot.efi` 27,136 字节 sha256 `f78ad56a6635a710…`、
+  `UniXNU.efi` 93,696 字节 sha256 `59b7aa748848328b…`、trustcache 61,356 字节
+  sha256 `7416ca4f83771466…`——与 `vendor/UniXNU-qemu/board.toml` 的第一条
+  `trust_cache_sha256` 一致，所以这是一套**匹配的构建**）
+  更早那一束是 51,859,456 字节、sha256 `9d4b1ab14d74fdfa…`（runner run `40096928333`），
+  再往前一束是 `1f32f09bc7668de0…`（run `40081850615`）。**一次启动日志属于哪个内核，
+  只能由束里的 `manifest.json` 说**（见 §1.4）——这一行写错过一次，本机实际启动的早已不是
+  它描述的那个内核，而症状是全套启动测量看起来仍然成立。
+- 设备树：`local-private/boot32/bundle/kernel.macho.adt`，17,768 字节，**本机生成**（见 §3），
   `unique-chip-id` `02723f6de1295be8`
 - 代码：`src/unipad/host/adt.py`（生成 ADT）、`src/unipad/host/unixnu_boot.py`（搭 ESP 并启动）、
   `src/unipad/host/guestobserve.py`（读活访客的内核日志与进程表）、
@@ -282,7 +289,7 @@ python3 <tree>/scripts/make-qemu-adt.py --output kernel.macho.adt \
 | 内核进入用户态 / SpringBoard | **BLOCKED** | 见 §5 与 §6：OS root 卷已解出且 UUID 匹配，但本机内核无 `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`，第二个盘从未被枚举 |
 | 根卷挂载（第二个 virtio-blk） | **BLOCKED** | §6：缺的是内核配置，不缺镜像；挂载侧已完整验证 |
 | 内核串口输出 | 未观察到 | §3.4：**不是缺陷**，与上游一致；加 UART 节点的实验无效 |
-| `QemuRamfb.efi` 设置 1376x1024 | UNVERIFIED | 该驱动由 payload 构建放在 ESP 上，本机未生成 |
+| `QemuRamfb.efi` 设置 1376x1024 | **已测量，不是修复** | 见 §7.4：驱动确实被 staging 并运行（内容确定性地变了），但几何仍是 800x600，且画面依旧从不更新 |
 | 十条端到端验收 | BLOCKED | 同上 |
 
 **没有任何一项被写成"通过"以外的话。** 构建阶段名称、Actions 绿色、PE/Mach-O 格式正确，都不代替启动验收；
@@ -496,6 +503,7 @@ python -m unipad.host.unixnu_boot \
 | `--systemos-image` | 第三个只读 virtio-blk 块设备 | `native_owner_cache_prepare()` 无可挂之物，panic `offline owner SystemOS mount failed: 80 (EAUTH)`（`kern_exec.c:8032`） |
 | `--kernel-arg NAME=VALUE` | 替换板级同名参数，可重复 | 用板级自己的 `kernel_args` |
 | `--attempts N` | 每个 attempt 一个全新 `attempt-N/` 目录，见到 Data 挂载就停 | 启动一次（`boot()` 本身的行为） |
+| `--ramfb-driver` | 校验存在后按 `RAMFB_NAME` 拷上，`build_argv` 随之发出 `ramfb-size` fw_cfg 项 | 不拷：`ramfb_size` 恒为 `None`，画面停在 QEMU 的 800x600 默认值（§7.4 实测） |
 | `--display/--qmp-port/--seconds/--every` | 窗口、QMP TCP 端口、观测时长与间隔 | `none` / 默认端口 / 模块默认值 |
 
 `--trust-cache` 是 2026-10-27 补的，也是最后一项。补它之前出现过一个很难看的事实：
@@ -594,3 +602,160 @@ python -m unipad.host.unixnu_boot \
 
 **状态：代码完成、单测与变异验证通过、未在真实启动上验收。** 重试本身要生效需要一次
 真实的 1/8 失败，而那正是它要消掉的东西。
+
+### 7.4 `--ramfb-driver`：把一条死检查接上，以及它**没有**修好画面（2026-10-28）
+
+起因是一个不可能为真的判断。`build_argv()` 只在 ESP 上真有
+`EFI/UniXNU/Payloads/QemuRamfb.efi` 时才发
+`-fw_cfg name=opt/org.unixnu/ramfb-size,string=1376x1024`，`boot()` 也用同一个条件决定
+`ramfb_size`——**但本模块没有任何代码能把那个文件放上去**。`stage_esp()` 甚至明确拒绝 staging
+它，理由是会形成 `SCREEN` 的第二处定义。于是官方路径上这个判断恒为假，`ramfb_size` 是死代码；
+`--trust-cache` 那次的形状（正式路径表达不了诊断验证过的配置）在这里重演了一遍。
+
+现在 `BootInputs` 多一个可选 `ramfb_driver`，`stage_esp()` 按 `RAMFB_NAME` 拷它，
+CLI 多 `--ramfb-driver`。几何仍然只在 `SCREEN` 一处定义：驱动只**接收**这个值，不定义它。
+`RAMFB_NAME` 是 staging 和判断共用的唯一拼写，由
+`test_the_geometry_is_defined_in_exactly_one_place` 数源码里带引号的字面量钉住——
+那个测试是在第一次变异审查发现「两处拼写」的变种活下来之后补的。
+
+**然后量了，结论是它没有修好画面——而原因比假设更靠前一格。** 用本机已有的那份驱动
+（12,800 字节，sha256 `8aa46db3ac008aaa72aab10cc3efd97d5be29855aad00b1d7bd590941386d85c`，
+与事实 14 的记录一致，启动前逐字节校验）做了一次 24 分钟、每 45 秒一次 screendump 的启动：
+
+| | 不 staging 驱动（对照） | staging 驱动 |
+| :-- | :-- | :-- |
+| screendump 几何 | 800 600 | 800 600 |
+| screendump 大小 | 1,440,015 字节 | 1,440,015 字节 |
+| sha256 | `549bfa61991c` | `cc031c4ebefe` |
+| dump 次数 / 去重数 | 13 次 / 1 种 | 29 次 / 1 种 |
+
+**第一版读法，是错的，记在这里免得再错一次**：当时把 sha256 的变化读成「驱动确实被加载并
+运行了，它改了画面内容，只是没改几何」。**这个推论不成立。** 真实原因是：
+交付的 `unixnu.toml` 只列了一个 driver——`Payloads/DarwinBoot.efi`。
+UniXNU 加载**配置点名**的驱动，固件不会去枚举 `Payloads/` 目录；
+所以那个文件在 ESP 上，却没有任何东西会打开它。几何没变是必然的，
+sha256 的变化与驱动无关（最可能是 ESP 的 FAT 目录多了一项，改变了 UniXNU 菜单画的东西）。
+
+**所以缺的不只是 staging，还有配置里那一行。** `unixnu_toml()` 现在多一个 `ramfb` 参数，
+在 **DarwinBoot 之前**写一条 `[[driver]]`——顺序不是排版选择：
+`QemuRamfbPkg/QemuRamfb.c:1-7` 明说这个驱动的存在意义就是「在 DarwinBoot 取走帧缓冲之前」
+定好 ramfb 的尺寸，列在它后面就是去配置一个已经被认领的帧缓冲。
+由 `test_the_generated_config_loads_the_driver_before_darwinboot` 钉住顺序。
+
+**同时加了一条拒绝，因为「摆了个没人加载的文件」必须响一声。** `_check_ramfb_pair()` 在
+调用方**采用**（`payload_toml`）一份不点名该驱动的配置时直接拒绝。不注入那一行是刻意的：
+启动配置必须来自匹配的构建（目标原文：「启动配置必须来自匹配的构建」），
+改一份匹配构建交下来的配置就是伪造配置。缺的是 runner 侧 payload 构建的一行
+`[[driver]]`，那是构建改动，不是本模块该冒充的东西。
+
+**画面不更新与几何是两件事，而且前者才是阻塞项。** 29 次 dump 全同、跨 1,305 秒，
+和对照组的 13 次全同一样。画面有真实内容（23 种颜色，iOS 蓝、灰、DarwinBoot 的绿条，
+600 行里 342 行不同），说明开机阶段画过，之后**再也没有人画过第二帧**。
+§5.2 的第 2 条端到端用例要求「进入真实 SpringBoard，通过鼠标操作改变客体界面」，
+其机器化判据直接是 `framebuffer_before != framebuffer_after`——所以阻塞项是
+**没有第二帧**，不是分辨率。而 PRD:202 明确「输入必须先于交互验收完成」，
+所以下一步是输入链路，不是继续追分辨率。
+
+**状态：代码完成、单测与变异验证通过；上述启动测量为真实 Windows 验收，结论为「未修复」。**
+`--ramfb-driver` 本身照常可用——它把一条死检查接上了，但那不是画面不更新的解。
+
+---
+
+### 7.5 `--serial-port`：为什么从来没有一个按键到达过客体（2026-10-28）
+
+这一节修的是一个**链路本身**的缺陷，不是某个参数没配对。
+
+#### 7.5.1 结论：`-serial file:` 是单向的
+
+`build_argv` 过去只发 `-serial file:<run>/serial.log`。QEMU 对这一种的语义是：
+**客体往文件里写，主机写进去的一切被丢弃。** 所以「给客体发按键」这件事在这个配置下
+不是难，是**不可能**——与按键编码、坐标换算、QMP `send-key` 全都无关。
+
+#### 7.5.2 客体那边确实在听，而且听了很久
+
+这不是推测，是日志里有的。某次运行的串口日志在 **t=43.75s** 打印
+`Serial keyboard started`，而 XNU 的 `serial_keyboard_init()`
+（`osfsk/console/serial_general.c:51-68`）**只在** `serialmode & SERIALMODE_INPUT`
+时才打印这一行——`serial_protos.h:52,55` 里 `SERIALMODE_INPUT = 0x02`，
+本板 `serial=3` 正是 `SERIALMODE_OUTPUT|SERIALMODE_INPUT`。它启动的那个线程每 16 ms
+调一次 `_serial_getc(false)`，拿到的字节交给 `cons_cinput()`
+（`serial_general.c:79-97`），后者喂给 `km_tty[0]` 的行规程
+（`bsd/dev/arm/km.c:397-407`）。
+
+**这些符号不是从某份源码树引来的，是在被测内核二进制里数出来的**：
+`local-private/boot32/bundle/unixnu-out/qemu/kernel/kernel.macho`（125,431,808 字节，
+sha256 `e6480f661dfa4efd…`）里 `Serial keyboard started` 出现 1 次、
+`serial_keyboard_init` 3 次、`cons_cinput` 2 次、`_serial_getc` 4 次、`km_tty` 1 次——
+下面引的 `serial_general.c` / `km.c` 行号来自上一轮的源码查证，本地当前没有检出 XNU 树，
+所以**行号未经本轮复核**，符号的存在性已经复核。
+
+**所以客体在听一个主机写不进去的端口。** 这也解释了另一件事：这条链路是**内核 console tty**，
+不是 IOHIDFamily。字节落在 `km_tty[0]`，任何能打开 `/dev/console` 的进程都读得到——
+这是字符通道，不是指针/手势通道。
+
+#### 7.5.3 改法：同一个 UART，两种消费者
+
+`_serial_argv()` 现在在给了 `--serial-port` 时改发：
+
+```text
+-chardev socket,id=unixnu-serial,host=127.0.0.1,port=14533,server=on,wait=off,logfile=<run>/serial.log,logappend=on
+-serial  chardev:unixnu-serial
+```
+
+`logfile=` + `logappend=on` 是关键：**QEMU 自己仍然写 `serial.log`**，
+所以观察链路一个字节都没变——这恰恰是单向性一直没被发现的原因：
+两种配置产出的 `serial.log` 完全一样，从运行输出里看不出任何差别。
+不给 `--serial-port` 时行为与从前逐字节一致（`test_no_serial_port_keeps_the_file_spelling_it_always_had`、
+`test_boot_without_a_serial_port_writes_the_file_spelling` 两头钉住）。
+
+`main()` 现在会把这一项**打进运行输出**，理由和几何那一行相同：
+一个只写的 UART 和一个双向的 UART 产出同一份 `serial.log`，
+不说一声的话，事后没有任何办法从运行自己的输出里分辨是哪一种。
+
+#### 7.5.4 `SerialInputSink`：能做的一半，和拒绝的另一半
+
+`src/unipad/host/input.py` 新增 `SerialInputSink`，实现 `InputSink` 接口：
+
+| 方法 | 行为 | 为什么 |
+| :--- | :--- | :--- |
+| `text(s)` | 逐字符 `sendall` UTF-8 | 客体 `_serial_getc` 拿到的就是这些字节 |
+| `key("q")` | 等于 `text("q")` | 单字符就是它自己 |
+| `key(["ctrl","a"])` / `key("f1")` | **拒绝** | tty 行规程收字节不收键码；命名的键没有字符可发 |
+| `tap` / `drag` / `home` / `pointer_move` | **拒绝**（消息里点名 `km_tty`） | 字节进 `cons_cinput`，没有 `IOHIDDevice` 消费它 |
+
+**指针类方法拒绝而不是近似，这是刻意的。** 一个「收到 tap 就发个空格」的 sink 会让
+`input_journal` 记下一个从没发生过的手势——这正是 `InputSink` 契约要防的失败形状
+（丢掉的手势看起来像客体没响应，伪造的手势看起来像它能用）。
+
+#### 7.5.6 两条独立的主机→客体输入路径，不要混
+
+这一节加上去是因为「输入」在这个工程里其实是**两条路**，而十条 E2E 的第 2 条只吃其中一条：
+
+| 路径 | 主机侧 | 客体侧落点 | 能否改变帧缓冲 |
+| :--- | :--- | :--- | :--- |
+| **控制台字符** | `SerialInputSink` + `--serial-port` | `km_tty[0]` 行规程，经 `cons_cinput` | **不能** |
+| **USB HID** | `QmpInputSink.send_key()` / `input_send_event()` | `usb-kbd`（挂在 `qemu-xhci` 上） | **可能** |
+
+`build_argv` **一直就带着** `-device qemu-xhci` + `-device usb-kbd`（`unixnu_boot.py:1270-1271`），
+而 `QmpInputSink`（`input.py`）经 `QmpClient.send_key()`（`qmp.py:613`）发 QMP `send-key`。
+所以 §5.2 第 2 条端到端用例的机器判据 `framebuffer_before != framebuffer_after`
+**不该由串口这条路去满足**——串口是字符通道，SpringBoard 不读控制台字节。
+
+**一条诚实的未验证项**：`usb-kbd` 在 argv 里、`send-key` 有实现，但**客体那端的 IOHID 栈
+是否消费这个 USB 键盘，一次都没量过**。`-display none` 之下 QMP `send-key` 注入到哪个
+console 也没有量过。这两件事是 E2E 第 2 条的前置，记在这里而不是当成已有结论。
+
+#### 7.5.5 状态与下一步
+
+- **代码完成**：`SerialInputSink`、`_serial_argv`、`boot`/`boot_until_mounted`/CLI 的 `--serial-port` 贯通。
+- **单测与变异验证通过**：串口链路共 17 个测试函数 / 20 个用例
+  （`test_host_input.py` 9 个，其中 `pointer_shaped` 参数化 4 例；`test_host_unixnu_boot.py` 8 个）；
+  20 个变异体全部被杀（含「记录 journal 早于真正写出」、
+  「`close()` 不清 socket」、「tap 改发空格」、「`--serial-port` 不透传到 `boot`/重试链」）。
+- **真实 Windows 验收：未做。** 上面所有结论要么是代码层，要么是**既往运行日志**里的
+  `Serial keyboard started`；「主机写入的字节真的被 `cons_cinput` 取走」这一跳尚未实测。
+  下一步是一次 `--serial-port` 运行 + `SerialInputSink.text()` 发送，然后从客体侧证实收到
+  （串口回显，或 `/dev/console` 上可见的输入）。
+
+**四个状态分开记**：代码完成 ≠ 模拟测试通过 ≠ runner 验证 ≠ Windows 真实验收。
+本条目前只到达前两个。

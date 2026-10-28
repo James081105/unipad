@@ -463,16 +463,24 @@ class HostView:
 def default_view() -> HostView:
     """The view of this host: the repo, its run/artifact dirs, and the boot logs.
 
-    The boot roots are listed individually rather than as ``local-private``
-    because the whole tree is gigabytes of IPSW extracts and would blow
-    ``max_files`` before the gate reached anything.  ``boot7`` is the directory
-    every real boot on this host has read its kernel, device tree and EFI
-    loaders from -- it was missing, so the gate could not see the kernel it
-    was booting and reported "no built UniXNU kernel image" while one ran.
-    ``out/components`` is where the IPSW members the board pins by digest
-    live, which is what lets a probe say *which* image an experiment attached.
-    ``boot-inputs`` is deliberately not a separate root: it lies wholly inside
-    ``boot7`` (436 of its 518 files), so listing both walks the same tree twice.
+    The boot roots are **globbed**, not named.  This used to list one directory,
+    ``local-private/boot7``, on the reasoning that it was "the directory every
+    real boot on this host has read its kernel from" -- and when it was missing
+    the gate reported "no built UniXNU kernel image" while one ran, which is the
+    false negative :func:`_has_sparse_index_symbol`'s docstring records being
+    fixed once already.  It has since happened twice more, for two further
+    reasons: ``boot7`` was deleted in a disk-space reclaim while the bundle
+    actually in use had long since moved to ``local-private/boot32``; and globbing
+    only ``boot*/bundle`` left every real boot's ``serial.log`` outside the view,
+    so :func:`_probe_esp_efi_chain` selected an old experiment's
+    ``MiniEfi: alive`` log and reported ``darwinboot`` False on a host where
+    DarwinBoot had since run for real.
+
+    The directory is renumbered on every delivery, so naming one is a defect
+    waiting for the next reclaim; a glob cannot go stale that way.  It costs
+    1,634 files on this host against a ``max_files`` of 80,000, and the per-run
+    memory dumps are never read -- every probe globs for the artefact it wants
+    (``**/serial*.log``, ``**/*.macho``) instead of consuming the index.
     """
     root = _repo_root()
     roots = [
@@ -481,8 +489,8 @@ def default_view() -> HostView:
         root / "artifacts",
         root / "local-private" / "out" / "real-boot",
         root / "local-private" / "out" / "components",
-        root / "local-private" / "boot7",
     ]
+    roots.extend(sorted(root.glob("local-private/boot*")))
     return HostView(roots=tuple(path for path in roots if path.is_dir()), repo_root=root)
 
 

@@ -28,6 +28,8 @@ import pytest
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host.input import (
+    SerialInputSink,
+
     ABS_AXIS_MAX,
     InputSink,
     NullInputSink,
@@ -518,3 +520,190 @@ def test_qmp_input_sink_rejects_a_drag_without_steps(qmp_sink):
         sink.drag(0, 0, 10, 10, steps=0)
 
     assert excinfo.value.code == ErrorCode.CONFIG_INVALID
+
+
+# ---------------------------------------------------------------------------
+# the serial console: the one channel the guest has actually opened
+# ---------------------------------------------------------------------------
+class _Recorder:
+    """A socket stand-in that keeps every byte and nothing else."""
+
+    def __init__(self) -> None:
+        self.written = b""
+        self.closed = False
+
+    def sendall(self, data: bytes) -> None:
+        self.written += data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _serial_sink(recorder: _Recorder, port: int = 14544) -> SerialInputSink:
+    return SerialInputSink(port, connect=lambda host, prt, timeout: recorder)
+
+
+def test_text_reaches_the_console_as_the_characters_that_were_typed():
+    """The bytes on the wire are the string, unchanged.
+
+    This is the whole point of the class: the guest polls ``_serial_getc`` every
+    16 ms and hands each byte to ``cons_cinput``, so what is written here is
+    literally what the guest reads.  No escape sequence, no protocol, no
+    encoding beyond UTF-8 -- which is also why the channel is a *console* and
+    not a HID device.
+    """
+    recorder = _Recorder()
+    result = _serial_sink(recorder).text("Hello, UniPad")
+    assert recorder.written == b"Hello, UniPad", recorder.written
+    assert result["delivered"] is True, result
+    assert result["bytes"] == len(b"Hello, UniPad"), result
+
+
+def test_a_single_character_key_is_the_character_itself():
+    """``key('a')`` sends ``a``; there is no key-code layer to translate to."""
+    recorder = _Recorder()
+    _serial_sink(recorder).key("q")
+    assert recorder.written == b"q", recorder.written
+
+
+def test_a_named_key_or_chord_is_a_refusal_not_a_dropped_event():
+    """``ctrl-a`` has no console representation, so it must not be sent as ``a``.
+
+    The tty line discipline takes bytes, not key codes.  Sending the printable
+    half of a chord would deliver a keystroke the caller never asked for, and a
+    run whose ``input_journal`` claims ``ctrl-a`` while the guest received ``a``
+    is worse than one that refused.
+    """
+    sink = _serial_sink(_Recorder())
+    for requested in (["ctrl", "a"], ["f1"], ["ctrl"]):
+        with pytest.raises(UniPadError) as caught:
+            sink.key(requested)
+        assert caught.value.code == ErrorCode.INPUT_FAILED, caught.value
+
+
+@pytest.mark.parametrize("action", ["tap", "drag", "home", "pointer_move"])
+def test_the_pointer_shaped_methods_refuse_because_the_channel_has_no_hid(action):
+    """A tap cannot be expressed on a console, so it is refused.
+
+    Asserted per method rather than once, because a sink that accepted a tap and
+    sent a space would produce evidence of a gesture that never happened.  The
+    refusal names the reason, so a caller sees *why* and can go to
+    :class:`QmpInputSink` for the pointer path.
+    """
+    sink = _serial_sink(_Recorder())
+    with pytest.raises(UniPadError) as caught:
+        if action == "tap":
+            sink.tap(100, 200)
+        elif action == "drag":
+            sink.drag(1, 2, 3, 4)
+        elif action == "home":
+            sink.home()
+        else:
+            sink.pointer_move(5, 6)
+    assert caught.value.code == ErrorCode.INPUT_FAILED, caught.value
+    assert "km_tty" in caught.value.message, caught.value.message
+
+
+def test_a_chardev_nobody_is_listening_on_is_a_refusal_not_a_silent_drop():
+    """The connect failure is named, with the port.
+
+    A dropped tap "looks exactly like an unresponsive guest", so a sink that
+    swallowed the connection error would make an unrunnable channel look like a
+    working one.  The message also says the one thing that fixes it: the run has
+    to use ``build_argv(serial_port=...)``, because ``-serial file:`` cannot be
+    written to at all.
+    """
+    def refused(host: str, port: int, timeout: float) -> None:
+        raise ConnectionRefusedError("nothing is bound there")
+
+    sink = SerialInputSink(14544, connect=refused)
+    with pytest.raises(UniPadError) as caught:
+        sink.text("hello")
+    assert caught.value.code == ErrorCode.INPUT_FAILED, caught.value
+    assert "14544" in str(caught.value.details), caught.value.details
+    assert "serial_port" in caught.value.message, caught.value.message
+
+
+def test_the_socket_is_opened_once_and_reused_across_calls():
+    """One connection, not one per keystroke.
+
+    XNU's poller drains whatever is buffered whenever it wakes, so a persistent
+    connection is both cheaper and closer to a real terminal.  Counted because
+    the obvious implementation -- connect, send, close -- would also pass every
+    behavioural test above.
+    """
+    recorder = _Recorder()
+    opened: list[int] = []
+
+    def counting(host: str, port: int, timeout: float) -> _Recorder:
+        opened.append(port)
+        return recorder
+
+    sink = SerialInputSink(14544, connect=counting)
+    sink.text("a")
+    sink.text("b")
+    sink.key("c")
+    assert opened == [14544], opened
+    assert recorder.written == b"abc", recorder.written
+    assert recorder.closed is False, "the socket was closed mid-run"
+
+
+def test_close_is_idempotent_and_silences_the_channel():
+    """Closing twice is not an error, and the second close does nothing."""
+    recorder = _Recorder()
+    sink = _serial_sink(recorder)
+    sink.text("x")
+    sink.close()
+    sink.close()
+    assert recorder.closed is True, recorder.closed
+
+
+def test_close_drops_the_socket_so_the_next_call_reconnects():
+    """``close()`` clears the handle, not just the connection.
+
+    The mutation this closes is replacing ``self._socket = None`` with ``pass``:
+    the recorder still reports ``closed``, so the idempotence test above stays
+    green, and every later ``text()`` writes into a socket the host already
+    closed.  That is the worst of both shapes -- the caller believes the channel
+    is finished and the sink believes it is still open, and the bytes go nowhere.
+    """
+    first = _Recorder()
+    second = _Recorder()
+    made: list[_Recorder] = [first, second]
+
+    sink = SerialInputSink(14544, connect=lambda host, port, timeout: made.pop(0))
+    sink.text("a")
+    sink.close()
+    sink.text("b")
+
+    assert first.closed is True, first
+    assert first.written == b"a", first.written
+    assert second.written == b"b", second.written
+    assert not made, "the second write reused the closed socket"
+
+
+def test_a_send_after_the_peer_went_away_is_a_refusal_not_a_crash():
+    """A broken pipe mid-run is named, with the reason.
+
+    ``sendall`` on a socket the guest closed raises ``OSError``, and a sink that
+    let it through would surface as an unhandled exception from an input call --
+    the caller's journal would record an action it cannot know failed.
+    """
+    class Gone:
+        def sendall(self, data: bytes) -> None:
+            raise BrokenPipeError("the guest is not listening any more")
+
+        def close(self) -> None:
+            pass
+
+    sink = SerialInputSink(14544, connect=lambda host, port, timeout: Gone())
+    with pytest.raises(UniPadError) as caught:
+        sink.text("after the peer left")
+    assert caught.value.code == ErrorCode.INPUT_FAILED, caught.value
+    assert "stopped accepting" in caught.value.message, caught.value.message
+    # The journal stays empty.  Recording the text before the write is the
+    # mutation this closes: it survives every assertion above and produces a
+    # journal that claims a string the guest never received -- the same
+    # "a dropped tap looks exactly like an unresponsive guest" failure the
+    # ``InputSink`` contract exists to prevent, one layer down.
+    assert sink.sent == [], sink.sent

@@ -34,6 +34,7 @@ __all__ = [
     "InputSink",
     "QmpInputSink",
     "NullInputSink",
+    "SerialInputSink",
     "scale_point",
     "guest_to_qemu_abs",
     "qcode_for_char",
@@ -464,3 +465,173 @@ class NullInputSink:
                 for action, args, kwargs in self.calls
             ]
         }
+
+
+class SerialInputSink:
+    """Type into the guest's serial console, over the UART's TCP chardev.
+
+    This is the only host-to-guest input channel the pinned board has actually
+    opened, and the reason it was never usable is worth stating precisely:
+    ``-serial file:`` is **one-way**.  QEMU writes what the guest emits and
+    discards anything a host might send.  Measured: the guest's kernel log says
+    ``Serial keyboard started`` at t=43.75s, and XNU's ``serial_keyboard_init``
+    (``osfmk/console/serial_general.c:51-68``) only prints that when
+    ``serialmode & SERIALMODE_INPUT`` -- which the board's ``serial=3`` sets
+    (``SERIALMODE_OUTPUT|SERIALMODE_INPUT``, ``serial_protos.h:52,55``).  The
+    thread it starts polls ``_serial_getc(false)`` every 16 ms and hands each
+    byte to ``cons_cinput`` (``serial_general.c:79-97``), which feeds
+    ``km_tty[0]``'s line discipline (``bsd/dev/arm/km.c:397-407``).  So the guest
+    is listening -- to a port nothing could write to.
+
+    With ``unixnu_boot.build_argv(serial_port=...)`` the UART becomes a TCP
+    chardev and this class writes to it.
+
+    **What it can and cannot do, and why it is written this way.**  This channel
+    carries *console characters*, not HID events: the bytes land in the kernel
+    console tty, readable by a process that opens ``/dev/console``.  So
+    :meth:`text` and :meth:`key` are real, and :meth:`tap`, :meth:`drag` and
+    :meth:`home` are **refusals** rather than approximations.  A sink that
+    accepted a tap and sent a space would produce a run whose ``input_journal``
+    claims a gesture that never happened -- which is the failure mode the
+    ``InputSink`` contract exists to prevent ("a dropped tap looks exactly like
+    an unresponsive guest", and a faked one looks like a working one).
+
+    Args:
+        port: The TCP port ``build_argv`` bound the chardev to.
+        host: Loopback by default; a chardev is only ever on this machine.
+        timeout: Connect and send timeout in seconds.
+        connect: Inject the socket factory for tests.
+    """
+
+    #: Why the pointer-shaped methods refuse.  Stated once so every refusal
+    #: carries the same reason rather than four hand-written variants.
+    _NO_HID = (
+        "the serial console carries characters, not HID events: bytes written "
+        "here reach the kernel console tty (km_tty[0]) via cons_cinput, which "
+        "no IOHIDDevice consumes. A tap needs a device the board has not "
+        "exposed; see QmpInputSink for the pointer path."
+    )
+
+    def __init__(
+        self,
+        port: int,
+        *,
+        host: str = "127.0.0.1",
+        timeout: float = 10.0,
+        connect: Optional[Any] = None,
+    ) -> None:
+        self.port = int(port)
+        self.host = host
+        self.timeout = float(timeout)
+        self._connect = connect
+        self._socket: Optional[Any] = None
+        self.sent: list[str] = []
+
+    # -- connection ------------------------------------------------------
+
+    def _open(self) -> Any:
+        """The socket, connected once and reused.
+
+        One connection rather than one per keystroke: XNU's poller reads
+        whatever is buffered whenever it wakes, so a persistent connection is
+        both cheaper and closer to what a real terminal does.
+        """
+        if self._socket is not None:
+            return self._socket
+        factory = self._connect or _default_connect
+        try:
+            self._socket = factory(self.host, self.port, self.timeout)
+        except OSError as exc:
+            raise UniPadError(
+                ErrorCode.INPUT_FAILED,
+                "cannot reach the guest's serial chardev; is the run using "
+                "build_argv(serial_port=...)?",
+                host=self.host,
+                port=self.port,
+                reason=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        return self._socket
+
+    def close(self) -> None:
+        """Drop the connection.  Safe to call more than once."""
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+            self._socket = None
+
+    # -- the channel's actual capability ---------------------------------
+
+    def text(self, text: str, *, delay: Optional[float] = None) -> dict[str, Any]:
+        """Write ``text`` to the console, one character at a time.
+
+        ``delay`` is accepted for signature compatibility with
+        :class:`QmpInputSink` and honoured as a pause between characters; the
+        default is no pause, because the console buffers and XNU drains it.
+        """
+        if not isinstance(text, str):
+            raise UniPadError(
+                ErrorCode.INPUT_FAILED,
+                "text must be a string",
+                received_type=type(text).__name__,
+            )
+        encoded = text.encode("utf-8", errors="replace")
+        try:
+            self._open().sendall(encoded)
+        except OSError as exc:
+            raise UniPadError(
+                ErrorCode.INPUT_FAILED,
+                "the serial chardev stopped accepting characters",
+                port=self.port,
+                reason=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        self.sent.append(text)
+        if delay:
+            time.sleep(max(float(delay), 0.0))
+        return {"action": "text", "length": len(text), "bytes": len(encoded),
+                "delivered": True}
+
+    def key(self, names: str | Sequence[str]) -> dict[str, Any]:
+        """Send one key, as the character it stands for.
+
+        Named keys (``ctrl``, ``alt``, ``f1``) have no console representation --
+        the tty line discipline takes bytes, not key codes -- so they are
+        refusals rather than silently dropped chords.
+        """
+        wanted = [names] if isinstance(names, str) else list(names)
+        literal = "".join(part for part in wanted if len(part) == 1)
+        if not literal or any(len(part) != 1 for part in wanted):
+            raise UniPadError(
+                ErrorCode.INPUT_FAILED,
+                "the serial console takes single characters, not named keys or "
+                "chords; a key with no character has nothing to send",
+                requested=wanted,
+            )
+        return self.text(literal)
+
+    # -- what this channel is not ----------------------------------------
+
+    def _refused(self, action: str) -> UniPadError:
+        return UniPadError(ErrorCode.INPUT_FAILED, self._NO_HID, action=action)
+
+    def pointer_move(self, x: int, y: int) -> Any:
+        raise self._refused("pointer_move")
+
+    def tap(self, x: int, y: int) -> Any:
+        raise self._refused("tap")
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int, **kwargs: Any) -> Any:
+        raise self._refused("drag")
+
+    def home(self) -> Any:
+        raise self._refused("home")
+
+
+def _default_connect(host: str, port: int, timeout: float) -> Any:
+    """A TCP socket to the chardev, or an ``OSError`` the caller turns into a
+    refusal.  A module-level function rather than ``socket.create_connection``
+    inline so tests can substitute a recorder without patching ``socket``."""
+    import socket
+
+    return socket.create_connection((host, port), timeout=timeout)

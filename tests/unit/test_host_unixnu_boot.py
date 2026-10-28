@@ -698,6 +698,222 @@ def test_the_argv_is_the_boards_machine(
     assert _flag(argv, "-serial") == f"file:{(work / 'serial.log').resolve().as_posix()}", argv
 
 
+def test_the_serial_port_is_a_tcp_chardev_when_a_port_is_given(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The one change that makes guest input possible at all.
+
+    ``-serial file:`` is one-way.  QEMU writes what the guest emits and discards
+    anything a host might send, and that is why no keystroke has ever reached
+    this guest: the guest's own kernel log says ``Serial keyboard started``
+    (t=43.75s), and XNU's ``serial_keyboard_init``
+    (``osfmk/console/serial_general.c:51-68``) only prints that when
+    ``serialmode & SERIALMODE_INPUT`` -- which ``serial=3`` sets.  The thread it
+    starts polls ``_serial_getc(false)`` every 16 ms and feeds each byte to
+    ``cons_cinput`` (``serial_general.c:79-97``).  The guest is listening; the
+    port it listens on cannot be written to.
+
+    With a port the UART becomes a chardev, and the log is still written by QEMU
+    itself (``logfile=``/``logappend=``) so ``serial.log`` is unchanged.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, serial_port=14544, display="none"
+    )
+    chardev = _flag(argv, "-chardev")
+    assert chardev.startswith("socket,id=unixnu-serial,host=127.0.0.1,port=14544,"), chardev
+    # Both halves matter: the socket is what carries input, and the logfile is
+    # what keeps the run's serial evidence.  Dropping either produces a boot
+    # that either cannot be typed at or cannot be read.
+    assert f"logfile={(work / 'serial.log').resolve().as_posix()}" in chardev, chardev
+    assert "logappend=on" in chardev, chardev
+    assert "server=on,wait=off" in chardev, chardev
+    assert _flag(argv, "-serial") == "chardev:unixnu-serial", argv
+    assert not any(item.startswith("file:") for item in argv if "serial" in item), argv
+
+
+def test_a_serial_port_outside_the_tcp_range_is_refused(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """A port QEMU will refuse to bind is caught here, not by QEMU's exit.
+
+    The same rule ``qmp_port`` already follows, and the same reason: an argv
+    that cannot start costs a whole launch cycle to discover, and the report
+    says "QEMU exited" rather than naming the port.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    for bad in (0, 80, 70000):
+        caught = _refused(
+            ub.build_argv, qemu, inputs, work / "esp", work, serial_port=bad
+        )
+        assert caught.code == ErrorCode.CONFIG_INVALID, caught
+        assert bad == caught.details.get("port"), caught.details
+
+
+def test_no_serial_port_keeps_the_file_spelling_it_always_had(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The default is byte-for-byte what it was, chardev and all.
+
+    ``serial_port=None`` has to be a no-op: every existing caller and every
+    recorded boot used the file spelling, and a change here would silently move
+    the serial evidence somewhere else.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(qemu, inputs, work / "esp", work, display="none")
+    assert _flag(argv, "-serial") == f"file:{(work / 'serial.log').resolve().as_posix()}", argv
+    assert not any("unixnu-serial" in item for item in argv), argv
+
+
+def test_boot_passes_the_serial_port_to_the_command_it_builds(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``boot(serial_port=...)`` reaches ``build_argv``, not just its signature.
+
+    A keyword that exists on :func:`boot` and is never forwarded is the exact
+    shape of the ``--trust-cache`` gap recorded at ``--trust-cache`` in the CLI:
+    every layer handles it, the CLI cannot express it, and the run reports
+    success while ignoring what the caller asked for.  Asserted on the written
+    ``command.txt`` rather than on a captured call so the test fails if the
+    forwarding is added somewhere ``build_argv`` is not the consumer.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    # ``_watch`` must hand the report back: ``boot`` writes the serial
+    # byte count onto whatever it returns, so a ``None`` return turns the
+    # last line of every boot into an ``AttributeError``.
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: a[1])
+
+    ub.boot(
+        inputs, tmp_path / "run", qemu=qemu, device_dir=_synthetic_device(tmp_path),
+        seconds=0, serial_port=14533,
+    )
+
+    assert launched, "boot never reached Popen"
+    argv = launched[0]
+    assert "port=14533" in " ".join(argv), argv
+    assert "chardev:unixnu-serial" in argv, argv
+    # ``ok`` is deliberately not asserted: ``_watch`` is stubbed, so
+    # ``reached_qmp`` is false by construction and the report says so.  What
+    # this test is about is the command, and the command is the evidence above.
+
+
+def test_boot_without_a_serial_port_writes_the_file_spelling(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default is still the one-way file, end to end.
+
+    ``build_argv``'s own default is asserted above; this asserts that nothing
+    between :func:`boot` and ``build_argv`` invents one, which is what a
+    ``serial_port or DEFAULT`` fallback would do.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: a[1])
+
+    ub.boot(
+        inputs, tmp_path / "run", qemu=qemu, device_dir=_synthetic_device(tmp_path),
+        seconds=0,
+    )
+
+    assert launched, "boot never reached Popen"
+    argv = launched[0]
+    assert "unixnu-serial" not in argv, argv
+    assert _flag(argv, "-serial") == (
+        f"file:{(tmp_path / 'run' / 'serial.log').resolve().as_posix()}"
+    ), argv
+
+
+def test_the_cli_forwards_the_serial_port_it_was_given(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--serial-port 14533`` arrives as ``serial_port=14533``.
+
+    The same "prove the payload, not the destination" rule as the attempt-count
+    test: ``def fake_boot(_inputs, work, **_)`` would swallow the keyword and
+    leave a hard-coded value in ``main`` green.
+    """
+    received: dict[str, object] = {}
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        received.update(kwargs)
+        return BootReport(ok=True, workdir=str(work))
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(tmp_path / "run"),
+        "--serial-port", "14533",
+    ])
+
+    assert received.get("serial_port") == 14533, received
+
+
+def test_the_cli_leaves_the_serial_port_unset_when_no_flag_is_given(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No flag means ``None`` -- the one-way file -- and not a default port.
+
+    A default would move the serial evidence to a chardev nobody asked for, and
+    the run would look identical from the outside.
+    """
+    received: dict[str, object] = {}
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        received.update(kwargs)
+        return BootReport(ok=True, workdir=str(work))
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(tmp_path / "run"),
+    ])
+
+    assert "serial_port" in received, received
+    assert received["serial_port"] is None, received
+
+
+def test_the_retry_chain_forwards_the_serial_port_to_every_attempt(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each attempt is a fresh ``boot`` and gets the same channel.
+
+    Without the forwarding, attempt 1 is writable and attempt 2 is not -- a
+    difference that only shows up in the retry case, which is the case that
+    fires on the 12.5% Data-mount race.
+    """
+    import json
+
+    seen: list[object] = []
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        seen.append(kwargs.get("serial_port"))
+        work.mkdir(parents=True, exist_ok=True)
+        report = BootReport(ok=True, workdir=str(work))
+        (work / "boot-report.json").write_text(
+            json.dumps(report.to_dict(), indent=2) + chr(10), encoding="utf-8"
+        )
+        return report
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.boot_until_mounted(
+        inputs, tmp_path / "chain", qemu=qemu,
+        device_dir=_synthetic_device(tmp_path), attempts=2, serial_port=14533,
+    )
+
+    assert seen == [14533, 14533], seen
+
+
 def test_the_display_and_the_port_are_the_callers_to_choose(
     inputs: BootInputs, tmp_path: Path
 ) -> None:
@@ -2316,6 +2532,297 @@ def test_a_trust_cache_that_does_not_exist_is_named_by_missing(
     assert replace(inputs, trust_cache=absent).missing() == [
         "trust_cache=not-there.bundle"
     ], replace(inputs, trust_cache=absent).missing()
+
+
+# ---------------------------------------------------------------------------
+# the frame-buffer driver, and the check that could never pass
+# ---------------------------------------------------------------------------
+#: Where ``build_argv`` looks for the driver, and where ``stage_esp`` puts it.
+RAMFB_NAME = "EFI/UniXNU/Payloads/QemuRamfb.efi"
+
+
+def test_the_frame_buffer_driver_is_staged_at_the_path_build_argv_tests(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """The driver a caller supplies has to land where the geometry check looks.
+
+    This test is the whole reason the field exists.  ``build_argv`` emits
+    ``-fw_cfg name=opt/org.unixnu/ramfb-size`` only when ``RAMFB_NAME`` is on the
+    ESP, and ``boot`` decided :data:`SCREEN` the same way -- but nothing in this
+    module could place the file, so on the official path the test was always
+    false.  A check for something no caller can supply is not a check; it is a
+    branch that is dead, and the 800x600 framebuffer measured 2026-10-27 in a
+    run whose Data volume had mounted is what that branch cost.
+    """
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+    staged = stage_esp(replace(inputs, ramfb_driver=driver), tmp_path / "esp", real_spec)
+    assert staged[RAMFB_NAME] == driver.stat().st_size, staged
+    assert (tmp_path / "esp" / RAMFB_NAME).read_bytes() == b"synthetic frame-buffer driver"
+
+
+def test_a_boot_without_the_frame_buffer_driver_stages_exactly_the_old_files(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """The default is byte-for-byte what it was before the field existed.
+
+    The key is absent rather than present-with-zero, so a caller that does not
+    carry a driver sees the same record it always saw -- and so the record
+    answers "did this boot apply the geometry", which is the question a report
+    that says the framebuffer was 800x600 cannot otherwise answer.
+    """
+    staged = stage_esp(inputs, tmp_path / "esp", real_spec)
+    assert RAMFB_NAME not in staged, staged
+    assert not (tmp_path / "esp" / RAMFB_NAME).exists()
+    assert sorted(key for key in staged if key.startswith("EFI/")) == sorted(ESP_FILES), staged
+
+
+def test_the_geometry_is_emitted_only_when_the_driver_is_on_the_esp(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """``ramfb_size`` follows the staged file, not the caller's argument.
+
+    Measured consequence of the old behaviour: the item was never emitted, so
+    nothing applied :data:`SCREEN`, and QEMU's ``ramfb`` kept its own default --
+    800x600 rather than 1376x1024, in a framebuffer that then never changed.
+    """
+    without = stage_esp(inputs, tmp_path / "esp-a", real_spec)
+    argv = ub.build_argv(Path("qemu"), inputs, tmp_path / "esp-a", tmp_path,
+                         ramfb_size=ub.SCREEN if (tmp_path / "esp-a" / RAMFB_NAME).is_file() else None)
+    assert not any("ramfb-size" in item for item in argv), argv
+    assert RAMFB_NAME not in without, without
+
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+    stage_esp(replace(inputs, ramfb_driver=driver), tmp_path / "esp-b", real_spec)
+    argv = ub.build_argv(Path("qemu"), inputs, tmp_path / "esp-b", tmp_path,
+                         ramfb_size=ub.SCREEN if (tmp_path / "esp-b" / RAMFB_NAME).is_file() else None)
+    assert [item for item in argv if "ramfb-size" in item] == [
+        f"name=opt/org.unixnu/ramfb-size,string={ub.SCREEN}"
+    ], argv
+
+
+def test_a_frame_buffer_driver_that_does_not_exist_is_named_by_missing(
+    tmp_path: Path, inputs: BootInputs
+) -> None:
+    """A driver that was asked for and is not on disk is a refusal.
+
+    ``missing()`` is what ``boot`` checks before it starts QEMU.  A driver that
+    silently vanished would stage nothing, emit no geometry, and produce a
+    800x600 boot that reports success -- the failure this field exists to make
+    impossible, and the one the ``--ramfb-driver`` flag now surfaces.
+    """
+    absent = tmp_path / "not-there.efi"
+    # ``safe_location`` names only the final component, by design (PRD 9.2).
+    assert replace(inputs, ramfb_driver=absent).missing() == [
+        "ramfb_driver=not-there.efi"
+    ], replace(inputs, ramfb_driver=absent).missing()
+
+
+def test_the_frame_buffer_driver_appears_in_the_inputs_record_only_when_supplied(
+    tmp_path: Path, inputs: BootInputs
+) -> None:
+    """``to_dict`` omits the key, so the record says which kind of run it was.
+
+    A report that named the driver unconditionally could not tell a run that
+    applied the geometry from one that did not, and that difference is invisible
+    in the serial log -- both boots mount the Data volume and both take
+    screendumps.
+    """
+    assert "ramfb_driver" not in inputs.to_dict(), inputs.to_dict()
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+    assert replace(inputs, ramfb_driver=driver).to_dict()["ramfb_driver"] == "QemuRamfb.efi"
+
+
+def test_the_geometry_is_defined_in_exactly_one_place(tmp_path: Path) -> None:
+    """``SCREEN`` is the only definition, and the driver only receives it.
+
+    ``stage_esp`` used to refuse to stage the driver on the grounds that a second
+    copy would be a second definition of the geometry.  The reasoning was wrong:
+    the driver carries no geometry of its own, it reads the fw_cfg item this
+    module writes.  What was actually missing was a way to say *which* driver.
+    Asserted here because the alternative -- two places to change when the
+    geometry changes -- is the defect the refusal was trying to prevent.
+
+    The count is on the *quoted* literal, not the bare path: comments are
+    allowed to name the file, code is not.  A second quoted spelling is the
+    mutation where ``stage_esp`` writes one path and ``build_argv`` tests
+    another, which stages a driver nothing runs and reports a geometry nothing
+    applied -- and which passes every behavioural test above, because both
+    strings still hold the same value.
+    """
+    source = Path(ub.__file__).read_text(encoding="utf-8")
+    assert source.count(f'"{RAMFB_NAME}"') == 1, (
+        f"the payload path is spelled {source.count(chr(34) + RAMFB_NAME + chr(34))} "
+        f"times in code; staging and the geometry check must share one constant"
+    )
+    assert source.count('SCREEN = "1376x1024"') == 1, source
+
+
+def test_boot_emits_the_geometry_only_when_the_driver_was_staged(
+    tmp_path: Path, inputs: BootInputs, qemu: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``boot``'s decision, not just ``build_argv``'s parameter.
+
+    The mutation this closes is ``ramfb_size=SCREEN`` unconditionally in
+    :func:`boot` -- a geometry nothing set, emitted anyway.  Every test above
+    passes ``ramfb_size`` to ``build_argv`` by hand and so never exercises the
+    branch that decides it, which is how that mutation survived three rounds of
+    checking before this one was written.  What it costs is a run whose argv
+    claims 1376x1024 while the framebuffer is 800x600, and the comment at the
+    call site already says why that is not acceptable.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+
+    report = ub.boot(
+        replace(inputs, ramfb_driver=driver), tmp_path / "run",
+        qemu=qemu, device_dir=_synthetic_device(tmp_path),
+    )
+    command = launched[0]
+    assert f"name=opt/org.unixnu/ramfb-size,string={ub.SCREEN}" in command, command
+    # The driver really was on the ESP the guest was offered, which is the other
+    # half of the claim: an fw_cfg item nothing reads is as dead as a driver
+    # nothing stages.  ``to_dict`` stores the value; the ``role=`` form is only
+    # what ``missing()`` produces.
+    assert report.inputs.get("ramfb_driver") == "QemuRamfb.efi", report.inputs
+
+
+def test_boot_emits_no_geometry_when_no_driver_is_staged(
+    tmp_path: Path, inputs: BootInputs, qemu: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The measured 800x600 case, pinned so it cannot come back quietly.
+
+    Without the driver there is nothing to apply :data:`SCREEN`, so the item is
+    not emitted and QEMU's ``ramfb`` keeps its own default.  That is the run
+    whose 13 screendumps were byte-identical at 800x600 -- and the reason this
+    is asserted rather than left as "the caller's problem" is that the failure
+    is invisible: the boot succeeds, the Data volume mounts, and the only
+    symptom is a framebuffer that is the wrong size and never changes.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+
+    report = ub.boot(
+        inputs, tmp_path / "run", qemu=qemu, device_dir=_synthetic_device(tmp_path)
+    )
+    command = launched[0]
+    assert not any("ramfb-size" in item for item in command), command
+    assert "ramfb_driver" not in report.inputs, report.inputs
+
+
+def test_the_generated_config_loads_the_driver_before_darwinboot(
+    real_spec: dict[str, Any], real_line: str
+) -> None:
+    """The ``[[driver]]`` line, and why it comes first.
+
+    Staging the file is only half of it.  ``QemuRamfbPkg/QemuRamfb.c:1-7`` says
+    the driver exists to size ramfb "before DarwinBoot takes the frame buffer for
+    the kernel", so a manifest that lists it *after* DarwinBoot would configure a
+    framebuffer that has already been claimed.  The order is asserted, not
+    implied: it is the one property of this line a reader of the generated file
+    cannot check by eye.
+
+    This is the half that was missing when the measurement was taken -- the file
+    was staged, the fw_cfg item was emitted, and the framebuffer stayed at
+    800x600 because the manifest named only DarwinBoot.
+    """
+    text = ub.unixnu_toml(real_spec, real_line, ramfb=True)
+    drivers = [line.split('"')[1] for line in text.splitlines()
+               if line.strip().startswith("path = ")]
+    assert drivers == [
+        RAMFB_NAME.removeprefix("EFI/UniXNU/"), "Payloads/DarwinBoot.efi",
+        "Payloads/kernel.macho",
+    ], drivers
+
+
+def test_the_generated_config_is_unchanged_when_there_is_no_driver(
+    real_spec: dict[str, Any], real_line: str
+) -> None:
+    """The default config is byte-identical to what it was before this field.
+
+    ``ramfb=False`` has to be a no-op, because this function writes the config
+    for every boot that does not supply its own -- and a config that changed for
+    every such boot would be a regression in the common case.
+    """
+    assert ub.unixnu_toml(real_spec, real_line) == ub.unixnu_toml(
+        real_spec, real_line, ramfb=False
+    )
+
+
+def test_a_staged_driver_the_config_does_not_load_is_a_refusal(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """A driver nothing will open is a refusal, not a silently inert file.
+
+    This is the whole finding of the 24-minute measurement, turned into a guard.
+    The delivery's ``unixnu.toml`` names exactly one driver
+    (``Payloads/DarwinBoot.efi``), and UniXNU loads what the manifest names --
+    the firmware does not enumerate ``Payloads/``.  So a run that staged the
+    driver while adopting that config got a boot that looked fine and a
+    framebuffer that was never resized: 29 screendumps, all 800x600, all the
+    same sha256.
+
+    Refusing here costs a caller one exception instead of a boot that reports
+    success while ignoring what they asked for.  The real fix is a payload build
+    whose manifest names the driver, which is a build change and not something
+    this module should fake by editing a config that must come from the matched
+    build.
+    """
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+    adopted = tmp_path / "unixnu.toml"
+    adopted.write_text(
+        'version = 1\n[boot]\ntimeout = 3\ndefault = "xnu"\n[kits]\nautoload = false\n'
+        '[[driver]]\npath = "Payloads/DarwinBoot.efi"\n\n[[entry]]\nid = "xnu"\n'
+        'type = "xnu"\npath = "Payloads/kernel.macho"\n',
+        encoding="utf-8",
+    )
+    caught = _refused(
+        stage_esp,
+        replace(inputs, ramfb_driver=driver, payload_toml=adopted),
+        tmp_path / "esp", real_spec,
+    )
+    # ``_refused`` returns the exception itself, so ``caught`` *is* the
+    # ``UniPadError`` -- writing ``caught.value`` here raises ``AttributeError``
+    # and the test fails on its own bookkeeping instead of on the contract.
+    #
+    # The assertion is on the message and not only on the code, because
+    # ``config_invalid`` is raised by four different checks in ``stage_esp``:
+    # the fixture's synthetic tree carries a packed-ramdisk placeholder, so
+    # :func:`_check_ramdisk_pair` can refuse this same call for a reason that
+    # has nothing to do with the driver.  Asserting only the code made the
+    # "drop the guard" mutation survive a full round of checking -- the test
+    # was green on the *other* refusal.
+    assert caught.code == ErrorCode.CONFIG_INVALID, caught
+    assert "does not load it" in caught.message, caught.message
+    # The file was still written: the refusal is about the config, and a caller
+    # reading the ESP afterwards should see what was staged and be able to tell
+    # the two problems apart.
+    assert (tmp_path / "esp" / RAMFB_NAME).is_file()
+
+
+def test_a_driver_the_generated_config_loads_is_not_a_refusal(
+    tmp_path: Path, inputs: BootInputs, real_spec: dict[str, Any]
+) -> None:
+    """The other side of the same guard: no ``payload_toml`` means we write one.
+
+    When the caller does not adopt a config, :func:`stage_esp` generates it, and
+    the generated one names the driver -- so the guard must not fire.  Asserted
+    because a guard that refuses the case it was built to permit is worse than
+    no guard: it would make the field unusable on the only path where it can
+    work.
+    """
+    driver = tmp_path / "QemuRamfb.efi"
+    driver.write_bytes(b"synthetic frame-buffer driver")
+    written = stage_esp(replace(inputs, ramfb_driver=driver, payload_toml=None),
+                        tmp_path / "esp", real_spec)
+    config = (tmp_path / "esp" / "EFI/UniXNU/unixnu.toml").read_text(encoding="utf-8")
+    assert f'path = "{RAMFB_NAME.removeprefix("EFI/UniXNU/")}"' in config, config
+    assert written[RAMFB_NAME] == driver.stat().st_size, written
 
 
 # ---------------------------------------------------------------------------

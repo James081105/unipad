@@ -85,3 +85,10 @@ platform-seed.json
 # agent 中途被杀就会在 src/ 下留下一个，而 `git add -A` 分不清它和真源码——
 # 已实测发生过一次（src/unipad/host/unixnu_boot.py.tmp.<pid>.<hex>）。
 *.tmp.*
+
+# EnterWorktree / agent-isolation scratch.  A worktree is a full checkout with
+# its own .git and .pytest_cache, so `git add -A` from the parent would stage
+# megabytes of a second repository.  The acceptance gate's HostView prunes by
+# directory *name*, which covers the nested .git and .pytest_cache -- but that
+# is a reason not to rely on it, not a reason to commit them.
+/.claude/

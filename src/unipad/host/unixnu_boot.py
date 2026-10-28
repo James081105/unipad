@@ -85,9 +85,12 @@ MEMORY_MIB = 6144
 #: the picture has to be a multiple of 64 bytes or it lands 2-3 bytes off, and
 #: 1376 is the nearest such width (``run-qemu.py:41-45``).  ``QemuRamfb.efi``
 #: switches the frame buffer to this size before DarwinBoot starts, which is
-#: also why this module does not ship that driver: the runner's payload build
-#: puts it on the ESP, and a second copy here would be a second definition of
-#: the geometry.
+#: why :attr:`BootInputs.ramfb_driver` exists: without the driver nothing
+#: applies this value, ``build_argv`` declines to emit it, and QEMU's ``ramfb``
+#: falls back to 800x600 -- measured, in a run whose Data volume had mounted,
+#: as 13 byte-identical screendumps of a 800x600 framebuffer.  The geometry is
+#: still defined in exactly one place: the driver receives it, it does not
+#: define it.
 SCREEN = "1376x1024"
 
 #: The QMP port range start.  The port is chosen per run by the caller; this is
@@ -259,6 +262,25 @@ class BootInputs:
     #: is refused with ``EFI_UNSUPPORTED``.  :func:`stage_esp` checks the pair
     #: instead of trusting the caller to have got both halves right.
     data_ramdisk: Optional[Path] = None
+    #: ``QemuRamfb.efi``, staged as ``EFI/UniXNU/Payloads/QemuRamfb.efi``.
+    #:
+    #: This field exists because of a check that could never pass.
+    #: :func:`build_argv` emits ``-fw_cfg name=opt/org.unixnu/ramfb-size`` only
+    #: when that path exists on the ESP, and :func:`boot` therefore decided
+    #: :data:`SCREEN` the same way -- but nothing in this module could *put*
+    #: the file there, so on the official path the test was always false and
+    #: ``ramfb_size`` was dead code.  The consequence was measured, not
+    #: theorised: 13 screendumps from t=61s to t=783s of a run whose Data volume
+    #: had mounted were byte-identical (sha256 ``549bfa61991c``), and the
+    #: framebuffer they showed was 800x600 rather than 1376x1024 -- QEMU's
+    #: ``ramfb`` default, because nothing had set the geometry.
+    #:
+    #: :func:`stage_esp` used to refuse to stage it on purpose, on the grounds
+    #: that a second copy would be a second definition of :data:`SCREEN`.  That
+    #: reasoning is what produced the dead check: the geometry is still defined
+    #: exactly once, here, and the driver only *receives* it.  What was missing
+    #: was a way for a caller to say which driver, which is what this is.
+    ramfb_driver: Optional[Path] = None
 
     def missing(self) -> list[str]:
         """The paths that do not exist, named by role."""
@@ -273,6 +295,8 @@ class BootInputs:
             absent.append(f"trust_cache={safe_location(Path(self.trust_cache))}")
         if self.data_ramdisk is not None and not Path(self.data_ramdisk).is_file():
             absent.append(f"data_ramdisk={safe_location(Path(self.data_ramdisk))}")
+        if self.ramfb_driver is not None and not Path(self.ramfb_driver).is_file():
+            absent.append(f"ramfb_driver={safe_location(Path(self.ramfb_driver))}")
         return absent
 
     def to_dict(self) -> dict[str, str]:
@@ -284,6 +308,8 @@ class BootInputs:
             record["trust_cache"] = safe_location(Path(self.trust_cache))
         if self.data_ramdisk is not None:
             record["data_ramdisk"] = safe_location(Path(self.data_ramdisk))
+        if self.ramfb_driver is not None:
+            record["ramfb_driver"] = safe_location(Path(self.ramfb_driver))
         return record
 
 
@@ -539,6 +565,7 @@ def unixnu_toml(
     spec: Mapping[str, Any],
     line: str,
     initrd: Optional[str] = None,
+    ramfb: bool = False,
 ) -> str:
     """The ``EFI/UniXNU/unixnu.toml`` the ESP carries.
 
@@ -555,6 +582,19 @@ def unixnu_toml(
     it immediately before ``args`` (``run-qemu.py:141``); :func:`stage_esp`
     refuses a tree whose placeholder and this line do not agree, so a caller
     cannot supply one without the other.
+
+    ``ramfb`` adds a ``[[driver]]`` entry for the frame-buffer driver, **ahead
+    of** DarwinBoot's.  The order is the point and not a formatting choice:
+    ``QemuRamfbPkg/QemuRamfb.c:1-7`` says the driver exists to size ramfb
+    "before DarwinBoot takes the frame buffer for the kernel", so a driver
+    listed after it would configure a framebuffer that has already been claimed.
+
+    And without this line the file is inert, which is what a measurement showed
+    rather than what was assumed: staging ``QemuRamfb.efi`` on the ESP while the
+    config named only ``Payloads/DarwinBoot.efi`` left the framebuffer at
+    800x600, because this manifest is the *only* thing that makes UniXNU load a
+    driver -- the firmware does not enumerate ``Payloads/``.  A staged file with
+    no ``[[driver]]`` entry is a file nothing opens.
     """
     loader = spec.get("loader", "firmware")
     if loader != "driver":
@@ -571,7 +611,10 @@ def unixnu_toml(
         'default = "xnu"\n'
         "[kits]\n"
         "autoload = false\n"
-        '[[driver]]\n'
+        + ('[[driver]]\n'
+           f'path = "{RAMFB_NAME.removeprefix("EFI/UniXNU/")}"\n'
+           "\n" if ramfb else "")
+        + '[[driver]]\n'
         'path = "Payloads/DarwinBoot.efi"\n'
         "\n"
         "[[entry]]\n"
@@ -606,6 +649,14 @@ DATA_RAMDISK_NAME = "scratch-data.img"
 #: writes exactly this and UniXNU reads exactly this, so a second spelling would
 #: stage a file nothing opens.
 TRUSTCACHE_NAME = "EFI/UniXNU/Payloads/kernel.macho.trustcache"
+
+#: The name the frame-buffer driver is staged under, and the path
+#: :func:`build_argv` tests for before emitting ``ramfb_size``.  It has to be
+#: exactly this because it is also a *lookup*: ``run-qemu.py:105-116`` runs it
+#: by this path, so a driver staged under any other name would be present on
+#: the ESP and never executed -- which is the failure this constant makes
+#: impossible, and the reason the two spellings live in one place.
+RAMFB_NAME = "EFI/UniXNU/Payloads/QemuRamfb.efi"
 
 #: The ``initrd =`` line, as a compiled pattern.  Config.c reads the key with
 #: ``TomlGetString`` so whitespace is not significant, but this is only used to
@@ -667,6 +718,42 @@ def _check_ramdisk_pair(
         )
 
 
+def _check_ramfb_pair(inputs: "BootInputs", config: str) -> None:
+    """Refuse a boot that stages the frame-buffer driver nothing will load.
+
+    Measured, not reasoned: a 24-minute run with ``QemuRamfb.efi`` staged on the
+    ESP took 29 screendumps, every one of them 800x600 and every one carrying
+    the same sha256.  The driver had no effect at all, and the reason is in the
+    config -- the delivery's ``unixnu.toml`` lists exactly one driver,
+    ``Payloads/DarwinBoot.efi``.  UniXNU loads what that manifest names; the
+    firmware does not enumerate ``Payloads/``.  A staged file with no
+    ``[[driver]]`` entry is a file nothing opens.
+
+    So this refuses rather than staging a file the guest will ignore.  It is the
+    same trade :func:`_check_ramdisk_pair` makes: the failure is invisible in
+    the serial log and in the screendumps -- the boot succeeds, the Data volume
+    mounts, and the only symptom is a framebuffer at the wrong size.  A caller
+    that hits this needs a payload build whose ``unixnu.toml`` names the driver,
+    which is a build change and not something this module should fake by editing
+    a config that has to come from the matched build.
+    """
+    if inputs.ramfb_driver is None:
+        return
+    wanted = RAMFB_NAME.removeprefix("EFI/UniXNU/")
+    if f'path = "{wanted}"' not in config:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the frame-buffer driver is staged but unixnu.toml does not load it: "
+            "UniXNU loads only the drivers the manifest names, so this file "
+            "would be ignored and the geometry would not be applied",
+            driver=wanted,
+            config_names=[
+                line.split('"')[1] for line in config.splitlines()
+                if line.strip().startswith("path = ")
+            ],
+        )
+
+
 #: Where each optional input lands on the ESP, keyed by the role
 #: :class:`BootInputs` names it.  ``stage_esp`` writes exactly these keys, so
 #: this is the whole contract between "the caller asked for it" and "the guest
@@ -674,6 +761,7 @@ def _check_ramdisk_pair(
 _OPTIONAL_STAGED = {
     "trust_cache": TRUSTCACHE_NAME,
     "data_ramdisk": f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}",
+    "ramfb_driver": RAMFB_NAME,
 }
 
 
@@ -743,11 +831,19 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         EFI/UniXNU/Payloads/owner-data-1g.dbr             when the run has a
             packed Data ramdisk, which is also what puts an ``initrd`` line in
             unixnu.toml and what requires the tree to carry the placeholder
+        EFI/UniXNU/Payloads/QemuRamfb.efi                when the run carries
+            the frame-buffer driver, which is also what makes ``ramfb_size``
+            reachable at all (see :attr:`BootInputs.ramfb_driver`)
 
-    ``QemuRamfb.efi`` is *not* staged: it is a driver the payload build puts on
-    the ESP ahead of DarwinBoot to set the frame-buffer geometry
-    (``run-qemu.py:105-116``), and a second copy here would be a second
-    definition of :data:`SCREEN`.  A boot that needs it must carry it.
+    This used to refuse to stage ``QemuRamfb.efi``, on the grounds that the
+    runner's payload build already puts one on the ESP and a second copy here
+    would be a second definition of :data:`SCREEN`.  That was the wrong
+    trade: the geometry stayed defined once, but the file became something no
+    caller could supply, and :func:`build_argv`'s check for it was dead code on
+    the official path -- with the 800x600 framebuffer described under
+    :attr:`BootInputs.ramfb_driver` as the result.  A caller that wants the
+    driver supplies it and this stages it; a caller that does not gets the
+    behaviour it had before.
 
     Returns:
         A record of what was written, with each file's size, for the evidence
@@ -794,11 +890,24 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         shutil.copyfile(inputs.data_ramdisk, target)
         written[f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}"] = target.stat().st_size
 
+    # The frame-buffer driver.  Not validated: it is a PE image this module has
+    # no parser for, and the one thing that matters about it -- that it is the
+    # build's own driver and not some other EFI binary -- is the caller's
+    # decision, made by choosing the path.  What this records is *that it was
+    # staged*, because that is the fact ``build_argv`` then acts on and a report
+    # that says the geometry was 800x600 with no mention of why is not
+    # diagnosable.
+    if inputs.ramfb_driver is not None:
+        target = esp / RAMFB_NAME
+        shutil.copyfile(inputs.ramfb_driver, target)
+        written[RAMFB_NAME] = target.stat().st_size
+
     initrd = f"Payloads/{DATA_RAMDISK_NAME}" if inputs.data_ramdisk is not None else None
     if inputs.payload_toml is not None:
         config = Path(inputs.payload_toml).read_text(encoding="utf-8")
     else:
-        config = unixnu_toml(spec, kernel_args_line(spec), initrd=initrd)
+        config = unixnu_toml(spec, kernel_args_line(spec), initrd=initrd,
+                             ramfb=inputs.ramfb_driver is not None)
     if "Payloads/DarwinBoot.efi" not in config:
         raise UniPadError(
             ErrorCode.CONFIG_INVALID,
@@ -806,6 +915,7 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
             '[payload] loader must be "driver"',
         )
     _check_ramdisk_pair(inputs, config, written)
+    _check_ramfb_pair(inputs, config)
     (esp / "EFI/UniXNU/unixnu.toml").write_text(config, encoding="utf-8")
     written["EFI/UniXNU/unixnu.toml"] = len(config.encode("utf-8"))
     written["_esp"] = str(safe_location(esp))
@@ -815,6 +925,58 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
 # ---------------------------------------------------------------------------
 # the command line
 # ---------------------------------------------------------------------------
+def qpath(path: Path | str) -> str:
+    """A path as a QEMU option value: absolute, and forward slashes.
+
+    QEMU is started with the run directory as its working directory, so a
+    *relative* path resolves against the run directory rather than the caller's
+    -- which is how a firmware that exists becomes "Could not open" with a path
+    that looks right.  A backslash is an escape in a QEMU option value, so it is
+    never used.
+
+    Module level rather than nested in :func:`build_argv`, because
+    :func:`_serial_argv` needs the same conversion and a second copy of a
+    two-line function that decides how a path is spelled is exactly the kind of
+    duplication that lets the two spellings drift apart.
+    """
+    return Path(path).resolve().as_posix()
+
+
+def _serial_argv(port: Optional[int], log: Path) -> list[str]:
+    """The UART's argv: a file by default, a TCP chardev when a port is given.
+
+    Both spellings produce the same ``serial.log`` -- QEMU writes the log itself
+    in the chardev case too -- and they differ in exactly one respect: the
+    chardev can be *written to*.
+
+    ``logappend=on`` rather than QEMU's default truncate, because a workdir
+    reused across boots is documented to be a different machine and the earlier
+    log is evidence of it; truncating would make the second run look like the
+    first.  ``wait=off`` so a run with no client attached still starts -- the
+    guest's serial output is simply dropped, exactly as ``file:`` would drop a
+    host's input.
+
+    The port is validated here rather than left to QEMU's exit, the same way
+    ``qmp_port`` is: ``build_argv`` already refuses a port outside the ephemeral
+    range and this keeps the two consistent.
+    """
+    if port is None:
+        return ["-serial", f"file:{qpath(log)}"]
+    port = int(port)
+    if not 1024 <= port <= 65535:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the serial port must be a TCP port the host can bind",
+            port=port,
+        )
+    return [
+        "-chardev",
+        f"socket,id=unixnu-serial,host=127.0.0.1,port={port},server=on,wait=off,"
+        f"logfile={qpath(log)},logappend=on",
+        "-serial", "chardev:unixnu-serial",
+    ]
+
+
 def _raw_volume(path: Path, role: str, consequence: str) -> Path:
     """A raw block-device image, resolved, and refused if it cannot be one.
 
@@ -886,6 +1048,7 @@ def build_argv(
     ramfb_size: Optional[str] = None,
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
+    serial_port: Optional[int] = None,
 ) -> list[str]:
     """The QEMU argv (without the executable).
 
@@ -1040,14 +1203,6 @@ def build_argv(
             "kernel would panic with 'offline owner SystemOS mount failed'",
         )
 
-    def qpath(path: Path | str) -> str:
-        # Absolute, and forward slashes.  QEMU is started with this run directory
-        # as its working directory, so a *relative* path resolves against the run
-        # directory rather than the caller's -- which is how a firmware that
-        # exists becomes "Could not open" with a path that looks right.  A
-        # backslash is an escape in a QEMU option value, so it is never used.
-        return Path(path).resolve().as_posix()
-
     # The SystemOS cryptex, built last because that is where the verified run
     # puts it.  It carries the MMIO global with it when there is no OS root
     # volume to carry it: the cryptex is ``-device virtio-blk-device`` too, and
@@ -1116,7 +1271,27 @@ def build_argv(
         "-device", "usb-kbd",
         "-nic", "none",
         "-display", display,
-        "-serial", f"file:{qpath(Path(workdir) / 'serial.log')}",
+        # The UART, and the only route by which the guest can ever receive a
+        # keystroke.
+        #
+        # ``-serial file:`` is **one-way**: QEMU writes what the guest emits and
+        # discards anything a host might send.  That is not a detail -- it is why
+        # no input has ever reached this guest.  Measured: the guest's own kernel
+        # log says ``Serial keyboard started`` at t=43.75s, and XNU's
+        # ``serial_keyboard_init`` (``osfmk/console/serial_general.c:51-68``)
+        # only prints that when ``serialmode & SERIALMODE_INPUT``, which
+        # ``serial=3`` sets (``SERIALMODE_OUTPUT|SERIALMODE_INPUT``,
+        # ``serial_protos.h:52,55``).  The thread it starts polls
+        # ``_serial_getc(false)`` every 16 ms and feeds each byte to
+        # ``cons_cinput`` (``serial_general.c:79-97``).  So the guest *is*
+        # listening -- to a port the host cannot write to.
+        #
+        # With ``serial_port`` the UART becomes a TCP chardev instead.  QEMU
+        # still writes the log itself (``logfile=``/``logappend=``), so
+        # ``serial.log`` is byte-for-byte what it was, and a host that connects
+        # to the port can send bytes the guest will read.  Without it the
+        # behaviour is exactly what it always was.
+        *(_serial_argv(serial_port, Path(workdir) / "serial.log")),
         "-qmp", f"tcp:127.0.0.1:{int(qmp_port)},server=on,wait=off",
         "-monitor", "none",
         "-name", "unipad-unixnu",
@@ -1231,6 +1406,7 @@ def boot(
     seconds: int = DEFAULT_SECONDS,
     every: int = DEFAULT_EVERY,
     qmp_port: int = DEFAULT_QMP_PORT,
+    serial_port: Optional[int] = None,
     display: str = "none",
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
@@ -1370,10 +1546,11 @@ def boot(
             handle.truncate(code_size)
 
     command = build_argv(
-        qemu, inputs, esp, work, qmp_port=qmp_port, memory_mib=memory_mib, display=display,
+        qemu, inputs, esp, work, qmp_port=qmp_port, serial_port=serial_port,
+        memory_mib=memory_mib, display=display,
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
-        ramfb_size=SCREEN if (esp / "EFI/UniXNU/Payloads/QemuRamfb.efi").is_file() else None,
+        ramfb_size=SCREEN if (esp / RAMFB_NAME).is_file() else None,
         root_image=root_image,
         systemos_image=systemos_image,
     )
@@ -1466,6 +1643,7 @@ def boot_until_mounted(
     seconds: int = DEFAULT_SECONDS,
     every: int = DEFAULT_EVERY,
     qmp_port: int = DEFAULT_QMP_PORT,
+    serial_port: Optional[int] = None,
     display: str = "none",
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
@@ -1519,8 +1697,8 @@ def boot_until_mounted(
         report = boot(
             inputs, run,
             qemu=qemu, device_dir=device_dir, seconds=seconds, every=every,
-            qmp_port=qmp_port, display=display, root_image=root_image,
-            systemos_image=systemos_image,
+            qmp_port=qmp_port, serial_port=serial_port, display=display,
+            root_image=root_image, systemos_image=systemos_image,
         )
         report.attempt = attempt
         if report.data_volume_mounted:
@@ -1977,10 +2155,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="the packed Data ramdisk (.dbr) to stage beside the kernel; "
                              "the device tree must also carry the PackedRAMDisk "
                              "placeholder, which unipad.host.adt --data-ramdisk writes")
+    parser.add_argument("--ramfb-driver", type=Path, default=None,
+                        help="QemuRamfb.efi to stage at EFI/UniXNU/Payloads; without it "
+                             "nothing applies SCREEN, build_argv emits no ramfb-size "
+                             "fw_cfg item, and the framebuffer stays at QEMU's 800x600 "
+                             "default (see BootInputs.ramfb_driver)")
     parser.add_argument("--workdir", type=Path, required=True, help="run directory (recreated)")
     parser.add_argument("--seconds", type=int, default=DEFAULT_SECONDS)
     parser.add_argument("--every", type=int, default=DEFAULT_EVERY)
     parser.add_argument("--qmp-port", type=int, default=DEFAULT_QMP_PORT)
+    # Without this the UART is ``-serial file:``, which QEMU writes and never
+    # reads: the guest's serial keyboard polls the port every 16 ms and gets
+    # nothing, so no keystroke a host sends can ever arrive.  With it the UART is
+    # a TCP chardev on loopback and ``unipad.host.input.SerialInputSink`` can
+    # type into the kernel console.  The log is still written to serial.log by
+    # the chardev's own ``logfile=``, so observation is unchanged either way --
+    # which is exactly why the one-wayness was invisible for so long.
+    parser.add_argument("--serial-port", type=int, default=None,
+                        help="bind the guest's serial UART to this TCP port on "
+                             "127.0.0.1 as well as logging it to serial.log; "
+                             "without it the UART is a write-only file and no "
+                             "host keystroke can reach the guest")
     parser.add_argument("--display", default="none")
     parser.add_argument("--root-image", type=Path, default=None,
                         help="raw OS volume to attach as a second, read-only virtio-blk disk; "
@@ -2008,6 +2203,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         payload_toml=args.payload_toml,
         trust_cache=args.trust_cache,
         data_ramdisk=args.data_ramdisk,
+        ramfb_driver=args.ramfb_driver,
     )
     if args.kernel_arg:
         # Validated here so a bad extra argument fails before the ESP is staged,
@@ -2023,6 +2219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seconds=args.seconds,
         every=args.every,
         qmp_port=args.qmp_port,
+        serial_port=args.serial_port,
         display=args.display,
         root_image=args.root_image,
         systemos_image=args.systemos_image,
@@ -2053,6 +2250,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"trust cache staged: {inputs.trust_cache.name}")
     else:
         print("no trust cache staged: AMFI will refuse to exec launchd")
+    # The geometry line, printed because it is the one configuration whose
+    # absence is invisible: a run at 800x600 and a run at 1376x1024 both produce
+    # screendumps, both mount the Data volume, and only the framebuffer contents
+    # tell them apart -- and those are identical in the broken case.
+    if inputs.ramfb_driver is not None:
+        print(f"ramfb driver staged: {inputs.ramfb_driver.name}; "
+              f"frame buffer will be {SCREEN}")
+    else:
+        print(f"no ramfb driver staged: frame buffer stays at QEMU's ramfb default, "
+              f"not {SCREEN}")
+    # Printed for the same reason as the geometry line: a write-only UART and a
+    # bidirectional one both produce a serial.log full of guest output, so the
+    # only way to tell them apart from a run's own output is to say which one
+    # this was.
+    if args.serial_port is None:
+        print("serial UART is a write-only file: no host keystroke can reach "
+              "the guest (pass --serial-port to change that)")
+    else:
+        print(f"serial UART is a TCP chardev on 127.0.0.1:{args.serial_port}; "
+              f"SerialInputSink(port={args.serial_port}) can type into it")
     if report.root_image:
         print(f"root volume attached: {report.root_image}")
     else:
