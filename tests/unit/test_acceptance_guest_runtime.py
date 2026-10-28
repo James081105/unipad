@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -152,7 +153,6 @@ def test_every_unimplemented_case_names_what_it_needs(
     for name in (
         "install_hello_ipa", "launch_hello_ipa", "tap_button_ten_times",
         "import_notes_ipa_and_save_text", "shutdown_and_reboot_from_disk",
-        "repeat_cold_boot_three_times",
     ):
         observation = getattr(runtime, name)()
         assert isinstance(observation, StepObservation)
@@ -432,6 +432,199 @@ def test_case10_fails_when_the_registered_package_is_not_rejected(
 
     assert observation.ok is False, observation
     assert observation.reason == "the_registered_package_was_not_rejected", observation
+
+
+# ---------------------------------------------------------------------------
+# case 9
+# ---------------------------------------------------------------------------
+
+#: The three stages ``COLD_BOOT_STAGES`` names, as a cycle's result.
+SPRINGBOARD_REACHED = "springboard_reached"
+KERNEL_UP = "kernel_up_no_springboard"
+NEVER_REPORTED = "guest_never_reported"
+
+
+def _case9_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *stages: str,
+) -> tuple[RealGuestRuntime, list[str]]:
+    """A runtime whose cold boots land on ``stages``, in order.
+
+    ``start()`` is the seam: it is what a real run waits on, and it is what
+    raises when the guest never reports itself.  ``processes`` answers from the
+    stage the last ``start()`` reached, so the two cannot disagree about which
+    cycle they are in -- which is the mistake that would let a test pass while
+    the runtime read a stale process list.
+    """
+    runtime = _runtime(tmp_path)
+    staged: list[str] = []
+    seen: list[str] = []
+
+    class _Popen:
+        def __call__(self, argv: list[str], **_: object) -> FakeProcess:
+            return FakeProcess()
+
+    monkeypatch.setattr(runtime, "_popen", _Popen())
+    monkeypatch.setattr(runtime, "_sleep", lambda _: None)
+
+    def _stage(base: Path | None = None) -> Path:
+        run = (base if base is not None else tmp_path / "run") / "guest"
+        run.mkdir(parents=True, exist_ok=True)
+        staged.append(str(run))
+        return run
+
+    monkeypatch.setattr(runtime, "_stage", _stage)
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+
+    def _start() -> None:
+        stage = stages[len(seen)] if len(seen) < len(stages) else NEVER_REPORTED
+        seen.append(stage)
+        if stage == NEVER_REPORTED:
+            raise UniPadError(
+                ErrorCode.QEMU_TIMEOUT, "the guest never reported its serial keyboard")
+        # ``start()`` owns the child, and case 9 reads the pid back off it -- so a
+        # fake that returns without setting one would let the test pass while the
+        # real runtime reported ``pid: None``.
+        runtime._process = FakeProcess()
+
+    monkeypatch.setattr(runtime, "start", _start)
+
+    def _processes() -> tuple[Any, ...]:
+        if seen and seen[-1] == SPRINGBOARD_REACHED:
+            return (_FakeProc(1, "run", "launchd"), _FakeProc(27, "run", "SpringBoard"))
+        return ()
+
+    monkeypatch.setattr(runtime, "processes", _processes)
+    return runtime, staged
+
+
+def test_case9_passes_when_all_three_cold_boots_reach_springboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three identical cold boots are a pass, and each one is timed."""
+    runtime, staged = _case9_runtime(
+        tmp_path, monkeypatch, SPRINGBOARD_REACHED, SPRINGBOARD_REACHED,
+        SPRINGBOARD_REACHED)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert observation.ok is True, observation.reason
+    cycles = observation.facts["cycles"]
+    assert [c["cycle"] for c in cycles] == [1, 2, 3]
+    for cycle in cycles:
+        assert isinstance(cycle["duration_s"], (int, float)), cycle
+        assert cycle["result"] == SPRINGBOARD_REACHED, cycle
+        assert cycle["pid"] == 4242, cycle
+    assert len(set(observation.facts["evidence_paths"])) == 3
+    assert observation.facts["same_stage"] is True
+
+
+def test_case9_fails_when_the_three_boots_reach_different_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeated cold boot means the *same* boot.
+
+    Two boots that reach SpringBoard and one that does not is a divergence, and
+    the reason has to say so rather than averaging the three into a pass.
+    """
+    runtime, _ = _case9_runtime(
+        tmp_path, monkeypatch, SPRINGBOARD_REACHED, KERNEL_UP, SPRINGBOARD_REACHED)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert observation.ok is False, observation
+    assert observation.reason == (
+        "the_three_cold_boots_did_not_reach_the_same_stage"), observation
+    assert observation.facts["same_stage"] is False
+    assert observation.facts["stages"] == [
+        SPRINGBOARD_REACHED, KERNEL_UP, SPRINGBOARD_REACHED]
+
+
+def test_case9_fails_when_no_boot_reaches_springboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three identical *broken* boots are reproducible, but they are not a pass.
+
+    This is the guard against the case passing on a guest that never comes up:
+    ``same_stage`` is True here, so only the stage check keeps it red.
+    """
+    runtime, _ = _case9_runtime(tmp_path, monkeypatch, KERNEL_UP, KERNEL_UP, KERNEL_UP)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert observation.ok is False, observation
+    assert observation.reason == "no_cold_boot_reached_springboard:" + KERNEL_UP, (
+        observation)
+    assert observation.facts["same_stage"] is True
+
+
+def test_case9_stages_each_cycle_into_its_own_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold boot must not read the previous cycle's serial log.
+
+    Reusing one run directory would leave the previous ``serial.log`` in place,
+    so ``start()`` would find the previous cycle's marker and return at once and
+    every cycle after the first would report a millisecond boot.  The distinct
+    staging paths are what make the three timings mean anything, and they are
+    also what stops a failing cycle from overwriting the one before it.
+    """
+    runtime, staged = _case9_runtime(
+        tmp_path, monkeypatch, SPRINGBOARD_REACHED, SPRINGBOARD_REACHED,
+        SPRINGBOARD_REACHED)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert len(staged) == 3, staged
+    assert len(set(staged)) == 3, staged
+    assert all("case9-cycle-" in path for path in staged), staged
+    assert set(observation.facts["evidence_paths"]) == set(staged)
+
+
+def test_case9_records_a_cycle_that_never_reported_the_guest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cycle that never came up is that cycle's *result*, not an exception.
+
+    PRD 5.2 case 9 says a failing test must keep its evidence and not overwrite
+    the last failure, so the second cycle's timeout has to land in the cycle
+    list with its own directory -- and the first cycle's directory has to still
+    be there afterwards.
+    """
+    runtime, staged = _case9_runtime(
+        tmp_path, monkeypatch, SPRINGBOARD_REACHED, NEVER_REPORTED,
+        SPRINGBOARD_REACHED)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert observation.ok is False, observation
+    cycles = observation.facts["cycles"]
+    assert cycles[1]["result"] == NEVER_REPORTED, cycles
+    assert cycles[1]["error_code"] == ErrorCode.QEMU_TIMEOUT, cycles
+    assert "never reported" in str(cycles[1]["error"]), cycles
+    assert cycles[0]["result"] == SPRINGBOARD_REACHED, cycles
+    for path in staged:
+        assert Path(path).is_dir(), path
+
+
+def test_case9_never_claims_an_operable_desktop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SpringBoard pid is not the §5.3 "operable desktop" target.
+
+    Case 2 owns that claim -- the picture has to have changed -- and it is still
+    failing on the framebuffer.  Recording the flag as ``False`` keeps a passing
+    case 9 from being read as evidence the desktop works.
+    """
+    runtime, _ = _case9_runtime(
+        tmp_path, monkeypatch, SPRINGBOARD_REACHED, SPRINGBOARD_REACHED,
+        SPRINGBOARD_REACHED)
+
+    observation = runtime.repeat_cold_boot_three_times()
+
+    assert observation.ok is True, observation.reason
+    assert observation.facts["operable_desktop"] is False, observation.facts
 
 
 # ---------------------------------------------------------------------------

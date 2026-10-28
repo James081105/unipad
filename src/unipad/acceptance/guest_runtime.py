@@ -176,11 +176,16 @@ class RealGuestRuntime(E2ERuntime):
     def running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
-    def _stage(self) -> Path:
-        """Stage the ESP and build the argv, once per run."""
+    def _stage(self, base: Optional[Path] = None) -> Path:
+        """Stage the ESP and build the argv, once per run.
+
+        ``base`` is where the run directory is created; it defaults to
+        ``workdir``.  Case 9 passes a per-cycle base, because a *cold* boot must
+        not read the previous cycle's serial log.
+        """
         if self._run is not None:
             return self._run
-        self._run = self.workdir / "guest"
+        self._run = (base if base is not None else self.workdir) / "guest"
         self._run.mkdir(parents=True, exist_ok=True)
         ub.stage_esp(self.inputs, self._run / "esp",
                      ub.read_board_payload(self.device_dir))
@@ -467,9 +472,97 @@ class RealGuestRuntime(E2ERuntime):
         return StepObservation(
             False, reason="reboot_from_disk_needs_a_persisted_data_volume")
 
+    #: What a cycle reached, most advanced first.  ``reach_springboard`` is the
+    #: only stage that means the guest is usable, so it is the one a pass
+    #: requires; the others exist so a cycle that got *less* far is recorded as
+    #: such rather than folded into "it booted".
+    COLD_BOOT_STAGES = ("springboard_reached", "kernel_up_no_springboard",
+                        "guest_never_reported")
+
     def repeat_cold_boot_three_times(self) -> StepObservation:
-        return StepObservation(
-            False, reason="three_cold_boots_need_the_reboot_path_above")
+        """PRD 5.2 case 9 (docs/PRD.md:180) and PRD 5.3's three reported boots.
+
+        "重复冷启动流程三次，保存耗时和结果；测试失败时保留证据，不覆盖上次失败."
+
+        A *cold* boot is a fresh QEMU process, so each cycle stages into its own
+        directory.  That is not tidiness: reusing one run directory would leave
+        the previous cycle's ``serial.log`` in place, ``start()`` would find the
+        previous cycle's "Serial keyboard started" in it and return at once, and
+        every cycle after the first would report a boot time of milliseconds.
+        The per-cycle directory is what makes the timing mean anything, and it
+        is also what stops a failing cycle from overwriting the one before it.
+
+        A pass needs all three cycles to reach the *same* stage, and that stage
+        to be SpringBoard: three boots that land in three different places are
+        not a repeated cold boot, and three boots that none of them reach a
+        desktop are not a repeated cold boot of *this* system either.  The
+        §5.3 "operable desktop" target is deliberately not claimed by a
+        SpringBoard pid alone -- case 2 is the case that has to prove the
+        picture changed, and it is still failing on the framebuffer.
+        """
+        cycles: list[dict[str, Any]] = []
+        evidence_paths: list[str] = []
+        stages: list[str] = []
+        for index in range(1, 4):
+            # Kill the previous cycle before staging the next one, so its QMP
+            # port and its serial log are both free.
+            self.stop()
+            self._run = None
+            run = self._stage(base=self.workdir / f"case9-cycle-{index}")
+            evidence_paths.append(str(run))
+            started = time.monotonic()
+            stage = "guest_never_reported"
+            error: Optional[str] = None
+            error_code: Optional[str] = None
+            pid: Optional[int] = None
+            try:
+                self.start()
+                pid = self._process.pid if self._process is not None else None
+                board = any(p.name == SPRINGBOARD for p in self.processes())
+                stage = ("springboard_reached" if board
+                         else "kernel_up_no_springboard")
+            except Exception as exc:  # noqa: BLE001 - a cycle's failure is its result
+                # The code is recorded separately from the message because the
+                # gate branches on codes; a bare ``str(exc)`` would make a
+                # ``qemu_timeout`` and a ``qemu_launch_failed`` indistinguishable
+                # in the report.
+                error = f"{type(exc).__name__}: {exc}"
+                code = getattr(exc, "code", None)
+                error_code = code if isinstance(code, str) else None
+            stages.append(stage)
+            cycles.append({
+                "cycle": index,
+                "duration_s": round(time.monotonic() - started, 3),
+                "result": stage,
+                "stage": stage,
+                "pid": pid,
+                "error": error,
+                "error_code": error_code,
+                "evidence": str(run),
+                "command_file": str(run / "command.txt"),
+            })
+
+        facts = {
+            "cycles": cycles,
+            "evidence_paths": evidence_paths,
+            "stages": stages,
+            "same_stage": len(set(stages)) == 1,
+            "operable_desktop": False,
+        }
+        if len(set(stages)) != 1:
+            return StepObservation(
+                False,
+                reason="the_three_cold_boots_did_not_reach_the_same_stage",
+                facts=facts)
+        if stages[0] != "springboard_reached":
+            return StepObservation(
+                False,
+                reason=f"no_cold_boot_reached_springboard:{stages[0]}",
+                facts=facts)
+        if len(set(evidence_paths)) != 3:
+            return StepObservation(
+                False, reason="case9_evidence_paths_are_not_distinct", facts=facts)
+        return StepObservation(True, facts=facts)
 
     def import_unsupported_platform_package(self) -> StepObservation:
         """PRD 5.2 case 10: reject an unsupported platform package, with a reason.
