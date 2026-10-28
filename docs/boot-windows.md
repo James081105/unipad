@@ -948,6 +948,60 @@ if(!status && found && !PE_current_console(&video) && video.v_depth == 32 && ...
 `(A)` → 查 `PE_parse_boot_argn` 对 `unsigned` 的 ASCII 解析，或把 phase 改成显式传递。
 在分开之前，**不要只按其中一条下手**。
 
+#### 7.5.12 时间线把 (A)/(B) 分开了：是 (B)；而「把等待拉长」这个最直觉的修法是**错的**（2026-10-28）
+
+上一节说现有计数器分不开 (A) 和 (B)。**分开了**，用的不是新计数器，
+是**采样频率**：`native_legacy_stage` 在第一个探针 retain 时停在 **3**，
+在 release 时直接 3→7→8。所以只要采样密到能落进两个探针之间，就能看出来。
+
+一次每 1 秒采样的运行（`local-private/boot33/stage-timeline-2/`，
+诊断脚本 `local-private/tmp/stage-timeline.py`）：
+
+```
+t=  14.1s stage=0
+t=  17.2s stage=3      <-- 第一个探针 RETAIN 了对象
+t=  27.8s stage=8      <-- late probe 跑完，早退
+```
+
+**所以 (A) 是假的**：第一个探针没有 release 对象，`offline-legacy-phase=4`
+确实被正确解析了。**(B) 是真的**：late probe 在 t≈27.8s 跑，
+5 秒窗在 t≈32.8s 关，而 `IOSurfaceRoot::installMemoryRegions()` 在
+t=51.8s / t=86.1s 才出现——**晚了 24-58 秒**。
+
+**然后是最重要的那条：把 5 秒改成 90 秒这个最直觉的修法，会死锁。**
+
+`offline-legacy-start.patch` 把 `native_legacy_display_late_probe()` 放在
+`bsd_autoconf()` 的末尾（`IOKitBSDInit()` 之后）。客体日志里
+`IOSurfaceRoot::installMemoryRegions()` 与 `nx_mount` 的几行**交错**：
+
+```
+[   51.792319]: nx_mount:1275: disk4 initializing cache w/hash_size 4096
+[   51.800540]: IOSurfaceRoot::installMemoryRegions()
+[   51.806378]: nx_mount:1617: disk4 checkpoint search
+```
+
+`nx_mount` 属于 `mountroot`，而 `mountroot` 在 `bsd_init()` 里是
+**`bsd_autoconf()` 返回之后**才跑的。所以：探针阻塞 → `bsd_autoconf` 不返回 →
+`mountroot` 不跑 → `IOSurfaceRoot` 不安装 → 等待永远不成功。
+**拉长等待是在阻塞它自己要等的东西。**
+
+**这条是推理，不是测量**，标记清楚：交错只证明两行在 8 ms 内，
+不证明同一线程。但它足以判「拉长等待」这个修法**未经检验就上线是不负责任的**。
+
+**正确的修法只剩两个，都在客体侧**：
+(1) 把调用点挪到 `mountroot` 之后（驱动树的 `offline-legacy-start.patch`）；
+(2) 用 `addMatchingNotification` 让发布时回调，不阻塞 `bsd_init`。
+两者都需要能编译内核的环境。
+
+**一个外部阻塞，记下来免得反复撞**：`vendor/UniXNU-qemu` 的远端
+`https://github.com/xVanTuring/UniXNU-qemu.git` 对 `James081105` **只有读权限**
+（`git push` 返回 `Permission to xVanTuring/UniXNU-qemu.git denied`）。
+该仓库是 PUBLIC 且非 fork，所以 fork 不涉及私有素材泄露；
+但在拿到写权限或决定 fork 之前，**客体侧修复无法交付**。
+本轮按此把一个改好的 `LegacyDisplayProbe.cpp`（把等待改成
+`offline-legacy-surface-wait-ms` 启动参数、默认 90 s、并回读计数器）
+**撤回**了——因为上述死锁推理，不把一个未经检验的改动留在被钉住的上游树上。
+
 #### 7.5.7 串口最后一跳实测：**无法从客体外判定**，而不是失败（2026-10-28）
 
 一次真实 Windows 运行（`local-private/boot33/serial-input/`，kernel sha256
