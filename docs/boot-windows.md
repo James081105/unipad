@@ -791,6 +791,71 @@ console 也没有量过。这两件事是 E2E 第 2 条的前置，记在这里�
 所以 E2E 第 2 条的判据 `framebuffer_before != framebuffer_after` 目前卡在
 「没人画第二帧」，不再卡在「输入进不去」。`native_hid_input_command` 是否被
 `NativeHidInput` 取走、SpringBoard 是否因此动作，尚未测量。
+**仍未解决的是另一件事，与输入无关**：帧缓冲哈希在按键前后逐字节相同
+（`c2cfec2e70fc`，1376x1024）。客体数到了按键，但**没有第二帧**。
+所以 E2E 第 2 条的判据 `framebuffer_before != framebuffer_after` 目前卡在
+「没人画第二帧」，不再卡在「输入进不去」。`native_hid_input_command` 是否被
+`NativeHidInput` 取走、SpringBoard 是否因此动作，尚未测量。
+
+#### 7.5.9 「没有第二帧」的根因定位到客体自己的一行代码（2026-10-28）
+
+先纠正 §7.5.8 结尾的说法：当时写「卡在没人画第二帧」，那只是现象。
+**根因已经量出来了，而且是客体驱动自己公布的计数器说的**，
+诊断脚本 `local-private/tmp/legacy-gate.py`（沿用事实 103 的做法：按符号名读活客体内核全局）。
+
+`package/LegacyDisplayProbe.cpp` 的 `native_legacy_display_late_probe()` 在创建
+GOP nub **之前**有一道门（`:490-494`）：
+
+```cpp
+native_legacy_surface_status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
+OSDictionary *matching = IOService::nameMatching("IOCoreSurfaceRoot");
+IOService *surface = matching ? IOService::waitForMatchingService(matching, 5000000000ULL) : nullptr;
+native_legacy_surface_found = surface != nullptr;          // <-- 这一条
+PE_Video video = {};
+if(!native_legacy_surface_status && native_legacy_surface_found && !PE_current_console(&video)
+    && video.v_baseAddr && ... && video.v_depth == 32 ...) {
+    native_legacy_video_base = video.v_baseAddr;           // <-- 从来没跑到这里
+    ...创建 IOPlatformDevice nub、attach、start、挂到 /arm-io ...
+}
+```
+
+**实测这一道门死在哪一条，已经分离出来了**：
+
+| 计数器 | 值 | 含义 |
+| :--- | :--- | :--- |
+| `native_legacy_surface_status` | **0** | IOSurface kext **加载成功** |
+| `native_legacy_surface_found` | **0** | **`IOCoreSurfaceRoot` 在 5 秒内从未出现** |
+| `native_legacy_video_base` | 0 | 门没过，从未记录帧缓冲地址 |
+| `native_legacy_nub` | 0 | 门没过，从未创建 nub |
+| `native_legacy_dt_attached` | 0 | 从未挂到设备树 |
+| `native_legacy_probe_match` | 0 | 显示驱动从未 probe 成功 |
+| `native_legacy_start_result` | 0 | 显示驱动从未 start |
+| `native_gop_ready` / `native_gop_bytes` | 0 / 0 | presenter 从未就绪，从未 present |
+| `native_legacy_frame_count` | 0 | 从未有帧 |
+
+**所以链条是**：`IOCoreSurfaceRoot` 不出现 → `native_legacy_surface_found = 0` →
+早退，`native_legacy_video_base` 保持 0、nub 从未创建 → `native_gop_ready = 0` →
+没有任何东西 present → **帧缓冲永远是 DarwinBoot 留下的那一帧**。
+这与「输入进不去」完全无关，输入那条路已经打通（§7.5.8）。
+
+**两个必须一起说的边界，否则会得出过头结论**：
+
+1. **帧缓冲地址其实是到了内核的。** 客体日志 t=12.8s 有
+   `initialize_screen: b=1BBEF0000, w=00000560, h=00000400, r=00001580, d=00000000`
+   （1376x1024，行 5504），而且**没有**打印 `No video - forcing serial mode`。
+   所以 §7.5.7 里「内核从未被告知帧缓存在哪」那句**只对 `native_legacy_video_base`
+   这个变量成立，对 `PE_state.video` 不成立**——前者是这道门没过所以没赋值。
+2. **`d=00000000` 与 DarwinBoot 的 `depth=32` 不一致**，而驱动两处都要求
+   `video.v_depth == 32`。第一个探针的门（`:456`）显然过了（对象分配成功、
+   `init_result=1`、`parent_match=1`），所以**至少在那个时刻 depth 是 32**；
+   但 `initialize_screen` 打的是 0。两者谁在反映同一个 `PE_state.video` 未经确认，
+   **不要据此断言 depth 一定是问题**。
+
+**下一步就一件事**：查 `IOCoreSurfaceRoot` 为什么从不出现。两个候选，
+代价不同也不要混：(a) IOSurface kext 加载了但没 start（`OSKextLoadKextWithIdentifier`
+只加载不启动，而 `IOCoreSurfaceRoot` 是它的 `IOService` 发布物）；(b) 启动得太晚，
+5 秒窗口（`waitForMatchingService(..., 5e9)`）不够。判别式：把窗口内
+`IOService::waitForMatchingService` 的等待拉到更久，或在客体侧确认 IOSurface 是否 start。
 
 #### 7.5.7 串口最后一跳实测：**无法从客体外判定**，而不是失败（2026-10-28）
 
