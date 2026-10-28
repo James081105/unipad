@@ -868,3 +868,42 @@ def test_the_ramdisk_and_trust_cache_switches_reach_the_command(tmp_path: Path) 
     )
     for flag in ("--packed-data-ramdisk", "--trust-cache", "--ipad-identity"):
         assert flag in command, (flag, command)
+
+
+#: A seed whose first byte is below 0x10, which is what makes the comparison
+#: defect below visible: ``f"{value:x}"`` renders it without the leading zero
+#: while the seed's own spelling keeps it.
+LEADING_ZERO_SEED = 0x05534C4FC3C9B6FA
+LEADING_ZERO_HEX = f"{LEADING_ZERO_SEED:016x}"
+assert LEADING_ZERO_HEX == "05534c4fc3c9b6fa", LEADING_ZERO_HEX
+
+
+def test_a_seed_whose_first_byte_is_small_still_verifies(tmp_path: Path) -> None:
+    """``f"{value:x}"`` drops a leading zero; the seed's spelling keeps it.
+
+    ``verify_adt`` compared ``f"{record['unique_chip_id']:x}"`` against the seed
+    string as given, so a seed whose first byte is below 0x10 -- one seed in
+    sixteen -- was refused no matter how correct the device tree was.  Measured:
+    the previous device pin derived 15720504d715213f, whose first byte is 0x15,
+    and every build passed; the next derived 05534c4fc3c9b6fa, whose first byte is
+    0x05, and ``verify_adt`` refused a tree carrying exactly that value.
+
+    A defect in the comparison, not in the tree -- and invisible for as long as
+    the seed happens not to start with a zero, which is why a whole build failed
+    the first time the pin moved.
+    """
+    board = _synthetic_board(tmp_path)
+    path = tmp_path / "kernel.macho.adt"
+    path.write_bytes(_tree(unique_chip_id=LEADING_ZERO_SEED))
+
+    for spelling in (LEADING_ZERO_HEX, f"0x{LEADING_ZERO_HEX}", LEADING_ZERO_HEX.upper()):
+        record = adt.verify_adt(path, board, seed=spelling)
+        assert record["unique_chip_id"] == LEADING_ZERO_SEED, record
+
+    # ...and a tree carrying a different value is still refused, so the fix is a
+    # comparison and not the removal of the check.
+    other = tmp_path / "other.adt"
+    other.write_bytes(_tree(unique_chip_id=0x15720504D715213F))
+    with pytest.raises(adt.UniPadError) as caught:
+        adt.verify_adt(other, board, seed=LEADING_ZERO_HEX)
+    assert "unique-chip-id" in str(caught.value), caught.value

@@ -570,13 +570,29 @@ def verify_adt(path: Path, board: BoardAdt, seed: Optional[str] = None) -> dict[
                 found=None if unique is None else len(unique),
             )
         record["unique_chip_id"] = struct.unpack("<Q", unique)[0]
-        if f"{record['unique_chip_id']:x}" != seed.strip().lower().removeprefix("0x"):
+        # Compared as integers, not as hex spellings.  ``f"{value:x}"`` renders a
+        # value whose first byte is below 0x10 without its leading zero, while the
+        # seed's own spelling keeps it -- so the string comparison refused one
+        # seed in sixteen however correct the tree was.  Measured: pin 38d4db14
+        # derives 15720504d715213f (first byte 0x15) and every build passed; pin
+        # f6e2910c derives 05534c4fc3c9b6fa (first byte 0x05) and a tree carrying
+        # exactly that value was refused.
+        try:
+            wanted = int(seed.strip().lower().removeprefix("0x"), 16)
+        except ValueError as exc:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "the platform seed is not a hexadecimal number, so it cannot be "
+                "compared against the device tree at all",
+                seed=seed,
+            ) from exc
+        if record["unique_chip_id"] != wanted:
             raise UniPadError(
                 ErrorCode.VERIFICATION_FAILED,
                 "/chosen/unique-chip-id is not the platform seed that was passed",
                 path=safe_location(path),
-                found=f"{record['unique_chip_id']:x}",
-                expected=seed,
+                found=f"{record['unique_chip_id']:016x}",
+                expected=f"{wanted:016x}",
             )
 
     if board.root_match_volume_uuid:
