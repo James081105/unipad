@@ -1,233 +1,213 @@
 {
-  "schema_version": 1,
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
-  "unixnu": {
-    "repo": "https://github.com/James081105/UniXNU",
-    "commit": "ab3199c90b13478c80fbfb7242f1d56a3c3bae83",
-    "commit_note": "Pinned 2026-10-28. A fork of UniXNU/UniXNU at the previous pin b881ac7dc1695ce676c856873051a487c6a9f963 (verified through api.github.com as this commit's parent) plus exactly one commit, which moves native_legacy_display_late_probe() from the end of bsd_autoconf() to just after IOSecureBSDRoot(rootdevice). The five-second waitForMatchingService for \"IOCoreSurfaceRoot\" used to block the mountroot that publishes the service. Upstream is read-only for this account, so the fix cannot be delivered there; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
-    "upstream_repo": "https://github.com/UniXNU/UniXNU",
-    "upstream_commit": "b881ac7dc1695ce676c856873051a487c6a9f963"
-  },
   "device_repo": {
-    "repo": "https://github.com/James081105/UniXNU-qemu",
-    "commit": "38d4db14f99679a11f45d89f676b7b9867c59700",
+    "commit": "f6e2910c0778ff85d1343a33039ac186155fcb1a",
     "commit_note": "Pinned 2026-10-28. A fork of xVanTuring/UniXNU-qemu at the previous pin 97b75b1f63c6b7e895cd7646029db741d5fe5488 (verified through api.github.com as this commit's parent) plus exactly one commit, which runs the legacy display's IOSurface wait on its own thread instead of on the boot thread. Measured: mountroot completes at t=49.6 s and IOSurfaceRoot::installMemoryRegions() lands at t=63.6 s, interleaved with the Data and SystemOS mounts both \"requested by: init (pid 1)\" -- so the service is published by work that cannot start until bsd_init() returns. Upstream is read-only for this account; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
-    "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
-    "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488"
+    "repo": "https://github.com/James081105/UniXNU-qemu",
+    "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
+    "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu"
   },
-  "uefi_sheng": {
-    "repo": "https://github.com/UniXNU/uefi-sheng",
-    "ref": "sheng",
-    "commit": "20ac23d5e0937106c2129303dfc931b3390ae660",
-    "commit_note": "Pinned 2026-10-25 at the tip of the default branch `sheng` (tarball UniXNU-uefi-sheng-v4.0-52-g20ac23d). The third pinned checkout: NOT a feed and NOT part of either repository above. board.toml [payload] panic_screen = true (UniXNU-qemu/board.toml:94) makes `unixnu build payload` run the device repository's patch-xnu-entry-probe.py --panic-screen, which compiles scripts/xnu-panic-screen.c; that file's ONLY include is \"Font.h\" (xnu-panic-screen.c:294) and patch-xnu-entry-probe.py:183 takes it from (UNIXNU_UEFI or <tree>/uefi-sheng)/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib. The assembled build tree never contains uefi-sheng/ (tree.py:assemble creates only drivers/ kits/ patches/ refer/ build/ .cache/ package/ scripts/), so without this pin the payload stage died in clang with \"fatal error: 'Font.h' file not found\" -- measured on run 40094234507.",
-    "license": "BSD-2-Clause. The repository's own README: \"All code except drivers in GPLDrivers & GPLApplications & GPLLibrary directories are licensed under BSD-2-Clause.\" Credits named there: Microsoft (Project Mu), WOA-Project (mu_andromeda_platforms, the base), Project Aloha (mu_aloha_platforms), Open Surface RT (Tegra), sonic011gamer and halal-beef (Exynos).",
-    "font_header": {
-      "path": "Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h",
-      "sha256": "d2a3687db67b069f4e34a961e17fd28b0242986e3fa8dd8a7545cab70834fa8e",
-      "bytes": 3692,
-      "git_blob_sha1": "2ea15a28fe1ad2ddddf1cbbac766aeceb9243183",
-      "copyright": "Copyright (C) 2008, The Android Open Source Project, All rights reserved. (the file's own header, redistributed under the Android/BSD-2-Clause notice above)",
-      "why": "The 5x16 glyph table gFont that scripts/xnu-panic-screen.c draws panic() messages with (xnu-panic-screen.c:294-295). It is the ONLY file this build takes from the Mu-Silicium checkout; the payload stage never builds the firmware, so nothing else in the tree is needed.",
-      "verified": "2026-10-25 through api.github.com: repos/UniXNU/uefi-sheng/contents/... at 20ac23d5e0937106c2129303dfc931b3390ae660 reports 3692 bytes and blob sha1 2ea15a28fe1ad2ddddf1cbbac766aeceb9243183; the sha256 above was computed from those exact bytes."
-    },
-    "checkout_note": "A full checkout IS a Mu-Silicium checkout (Resources/Scripts/mkbootimg.py and BootShim/BootShim.S are present at this commit), which is what --uefi of the driver documents (cli.py:24) and what step_assemble_image validates (build-macos.sh:2654). Do not replace it with a sparse checkout of the font directory alone."
-  },
-  "submodules": [
-    {
-      "path": "drivers/ArmCpu",
-      "commit": "1951cc8444b340d7d8879e9418220cf29eb711d7"
-    },
-    {
-      "path": "drivers/ArmDTPlatform",
-      "commit": "0d544705c2e89725caabc0542bb96bc8febd8c70"
-    },
-    {
-      "path": "drivers/ArmVirtPlatform",
-      "commit": "532de8c017e394e69a0b48dc0ffc4ac0d0701177"
-    },
-    {
-      "path": "drivers/DarwinBoot",
-      "commit": "d099354d0eab34df5088ca1ba89c9c88bc3260bb"
-    },
-    {
-      "path": "drivers/NativeAES",
-      "commit": "a34964b8c2fec2e83c8e4f68fb7d6fb7e4b2227b"
-    },
-    {
-      "path": "drivers/NativeAdreno",
-      "commit": "cedcaa2949c795e71a47e78ae413c8a41b17d7d0"
-    },
-    {
-      "path": "drivers/NativeGeniSpi",
-      "commit": "b5399b5646c4d7415deec6d887fd51715a97a024"
-    },
-    {
-      "path": "drivers/NativeHidInput",
-      "commit": "28f9b463b48e862f2def91d29c11b9143785715e"
-    },
-    {
-      "path": "drivers/NativeKeyStoreEvents",
-      "commit": "e59bac4ad1ac8825919ae94da8440a64d8ab90b3"
-    },
-    {
-      "path": "drivers/NativeMetal",
-      "commit": "a96feceda55e8fed1e20c0a2998736cef7aab006"
-    },
-    {
-      "path": "drivers/NativeMobileDisplay",
-      "commit": "eb9c949164826c2e52f2771eac19e4b8bd8a3dae",
-      "gitlink_commit": "c031d882b9721d943383d11f66dc4748252ce929",
-      "commit_note": "MOVED BACK one commit from UniXNU's own gitlink, deliberately and on evidence. Measured on run 40187668943 (stage M4): build-os-root.py reached step 9 for the first time -- storage-abi, both signed policies, the verified-root probe, NativeVirtioBlock/NativeRamBlock verified bindings, the grown 1 GiB OwnerData volume (675761EF-5622-4F5B-89DF-4CAD5BA456F6) and the packed ramdisk all passed -- and then died in build-native-legacy-display.py -> build-arm-driver.py NativeLegacyDisplay with `NativeLegacyDisplay.cpp:206:59: error: only virtual member functions can be marked 'override'` and `:207:13: error: no member named 'getRefreshAttributes' in 'IOMobileFramebufferLegacy'`. The pinned device repository (xVanTuring/UniXNU-qemu 97b75b1f, its only branch, at its tip) generates OriginalLegacyFramebufferABI.h from a fixed slot table that has no entry for slot 301, and its own invariant then refuses the override: `require(i in (0,1,7,14,84,86,87,141,155,184,188,288,290,296) or i in pure, 'Only qualified own methods and guarded leaves override')`. So the device repository is incompatible with c031d882 and with everything after it, and there is no newer device commit to move to. c031d882 is `feat(display): report the panel refresh rate`; eb9c949 is its parent `fix(gop): re-kick the swap queue after each retirement`, whose override set is exactly the one the device repository's generator declares. What is given up is the sheng-vsync refresh-rate report, which is gated on a boot argument this board does not pass and affects no root-mount or launchd path (PRD/Goal 6: the display is not a gate for them). gitlink_commit records what UniXNU b881ac7d actually pins so the divergence is auditable rather than silent; build-macos.yml forces the assembled tree's checkout to `commit` before it runs the chain."
-    },
-    {
-      "path": "drivers/NativeRamBlock",
-      "commit": "d4d22d9819b0162eda49f6402235dddc2279410d"
-    },
-    {
-      "path": "drivers/NativeUfs",
-      "commit": "af785c1777161a62931425c2faaa536ce0bebd5b"
-    },
-    {
-      "path": "drivers/NativeVirtioBlock",
-      "commit": "98909eb9198a4360d7a43be831887cb8b74d814d"
-    },
-    {
-      "path": "drivers/NativeVirtioConsole",
-      "commit": "066f9bded311233ed56824e13a5628077619efda"
-    },
-    {
-      "path": "kits/AdrenoFirmware",
-      "commit": "40fdb8ea87606612ac6f1e80bbb49955d0ce4051"
-    },
-    {
-      "path": "kits/AdrenoPM4",
-      "commit": "445f8fe6d115738352b9d78dc70af6d61aa7f62f"
-    },
-    {
-      "path": "kits/AirNir",
-      "commit": "032a867b5dc3121164bbd706e4e81e3b9fcd2b8f"
-    },
-    {
-      "path": "kits/ArmSmmu4K",
-      "commit": "4d0d6598b1a36aeec3de01091893fa6660e49388"
-    },
-    {
-      "path": "kits/NativePrelink",
-      "commit": "2b6ffb50117eee820b98aca9bd51b5c7dfb2970e"
-    },
-    {
-      "path": "kits/VerifiedRoot",
-      "commit": "2854c61f6c4dfda870ac3d93e1f03d9181edb041"
-    }
-  ],
   "feeds": [
     {
-      "name": "xnu",
-      "git": "https://github.com/apple-oss-distributions/xnu.git",
-      "ref": "xnu-10063.141.1",
       "commit": "d8b80295118ef25ac3a784134bcf95cd8e88109f",
       "darwin": "23.6.0",
+      "git": "https://github.com/apple-oss-distributions/xnu.git",
+      "name": "xnu",
+      "ref": "xnu-10063.141.1",
       "version": "10063.141.1"
     },
     {
-      "name": "libplatform",
+      "commit": "a00a4cc36da2110578bcf3b8eeeeb93dcc7f4e11",
       "git": "https://github.com/apple-oss-distributions/libplatform.git",
-      "ref": "libplatform-316.100.10",
-      "commit": "a00a4cc36da2110578bcf3b8eeeeb93dcc7f4e11"
+      "name": "libplatform",
+      "ref": "libplatform-316.100.10"
     },
     {
-      "name": "libdispatch",
+      "commit": "30fe6a7d945340ce69cef121132f049e810089a5",
       "git": "https://github.com/apple-oss-distributions/libdispatch.git",
-      "ref": "libdispatch-1477.100.9",
-      "commit": "30fe6a7d945340ce69cef121132f049e810089a5"
+      "name": "libdispatch",
+      "ref": "libdispatch-1477.100.9"
     },
     {
-      "name": "AvailabilityVersions",
+      "commit": "933f9360f1b70dfbda5548386a3d65e0358b4f7d",
       "git": "https://github.com/apple-oss-distributions/AvailabilityVersions.git",
-      "ref": "AvailabilityVersions-141.1",
-      "commit": "933f9360f1b70dfbda5548386a3d65e0358b4f7d"
+      "name": "AvailabilityVersions",
+      "ref": "AvailabilityVersions-141.1"
     },
     {
-      "name": "edk2",
+      "commit": "cfb93724a06ff86ff5ba971413368a7809ee42a5",
       "git": "https://github.com/microsoft/mu_basecore.git",
-      "ref": "release/202608",
-      "commit": "cfb93724a06ff86ff5ba971413368a7809ee42a5"
+      "name": "edk2",
+      "ref": "release/202608"
     },
     {
-      "name": "libpthread",
+      "commit": "c0e60fb5ecfc54cf379c261d3f9572cc22ded891",
       "git": "https://github.com/apple-oss-distributions/libpthread.git",
-      "ref": "libpthread-519.120.4",
-      "commit": "c0e60fb5ecfc54cf379c261d3f9572cc22ded891"
+      "name": "libpthread",
+      "ref": "libpthread-519.120.4"
     },
     {
-      "name": "corecrypto-2023",
+      "commit": "11fba65b12d8830630e248dfa8344caf8b065f26",
       "git": "https://github.com/ONLYA/corecrypto-2023.git",
-      "commit": "11fba65b12d8830630e248dfa8344caf8b065f26"
+      "name": "corecrypto-2023"
     },
     {
-      "name": "IOStorageFamily",
-      "git": "https://github.com/apple-oss-distributions/IOStorageFamily.git",
-      "ref": "IOStorageFamily-315",
       "commit": "e45fbe30a7879e0b16e26dddb78538f1b00e0bff",
+      "git": "https://github.com/apple-oss-distributions/IOStorageFamily.git",
+      "name": "IOStorageFamily",
+      "ref": "IOStorageFamily-315",
       "ref_note": "the device repository's feeds.toml overrides UniXNU's ref 'main' with this tag; the commit is identical, but re-fetching by the old ref is how a pin silently stops being a pin"
     },
     {
-      "name": "dyld",
+      "commit": "a571176e8e00c47e95b95e3156820ebec0cbd5e6",
       "git": "https://github.com/apple-oss-distributions/dyld.git",
-      "ref": "dyld-1165.3",
-      "commit": "a571176e8e00c47e95b95e3156820ebec0cbd5e6"
+      "name": "dyld",
+      "ref": "dyld-1165.3"
+    }
+  ],
+  "feeds_note": "The union of TWO feeds.toml files, not one: UniXNU/feeds.toml and the device repository's UniXNU-qemu/feeds.toml (which 'adds to' UniXNU's and may override a ref). dyld comes from the device repository alone and IOStorageFamily's ref is the device's override. A lock derived from UniXNU's feeds.toml by itself is missing dyld -- that is exactly the gap this note exists to prevent, found by cross-checking `unixnu status` against this array on 2026-10-24 (8 of 9 agreed; dyld was absent here). Re-derive with `unixnu status -D <device>` and compare every `refer` line.",
+  "frozen": false,
+  "frozen_note": "Not frozen, and the reason is the BUILD, not the compiler. tools.clang IS proven to cross-compile AArch64/iOS on this host (three independent lines of evidence, see tools.clang.note); what is missing is a clean XNU build run against these pins, which needs six build blockers cleared (docs/kernel-build-windows.md) and two required XNU patches applied to the build tree (kits/NativePrelink/patches/xnu-10063.141.1-sparse-index.patch and -security-init.patch, both currently UNAPPLIED). The firmware layer IS verified on the host (see tools.firmware_boot). Set frozen=true only after a clean XNU build succeeds against these pins. CLOSED 2026-10-23: gpu.vram_gb is now MEASURED at 4.0 GB (NVIDIA GeForce RTX 3060 Laptop GPU, from Win32_VideoController.AdapterRAM; host-inventory.json gpu.vram_evidence), and VT-x is now MEASURED as present but DISABLED IN FIRMWARE (Win32_Processor.VirtualizationFirmwareEnabled) -- which makes -accel tcg the only option on this host rather than a preference, and is recorded in host-inventory.json cpu.vt_x_note. STILL OUTSTANDING and not to be counted as done: PRD 6 row M0 names an AI/Step API smoke test as pass evidence, and no such smoke test exists on this host yet.",
+  "ipsw": {
+    "component_pins": {
+      "044-76034-038.dmg": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f",
+      "044-76040-038.dmg": "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+    },
+    "name": "iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw",
+    "note": "Apple IPSW stays in local-private/ and is never committed (PRD 12).",
+    "sha256": "c84ad24b6981a859eec499b1802be9ac593acfd3dc0a185a76d06e4d767a1451",
+    "size": 6835124840,
+    "source": "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+  },
+  "pinned_checkouts_note": "Three repositories are pinned here, and only two of them are in `feeds`. `unixnu` and `device_repo` are the two the driver cannot clone for itself (cli.py has no subcommand that clones either; scripts/unixnu/config.py raises 'no device repository' without -D), so the workflow's acquisition step clones them into vendor/. `uefi_sheng` is NOT a feed on purpose: the driver's feeds.fetch() resolves sources named by a feeds.toml and writes them into out/<board>/feeds, and uefi-sheng is named by no feeds.toml -- it is the Mu-Silicium checkout the driver's --uefi option points at (cli.py:24). Adding it to `feeds` would make the workflow's cross-check demand it in the driver's own unixnu.lock, where it will never appear, and would fail every run. So it is pinned here, acquired by the same step, and verified by the one file the build actually reads (uefi_sheng.font_header.sha256) rather than by a feed pin. Measured 2026-10-25: with it absent, build-payload failed on run 40094234507 and 40096928333 with 'Font.h is missing'.",
+  "schema_version": 1,
+  "submodules": [
+    {
+      "commit": "1951cc8444b340d7d8879e9418220cf29eb711d7",
+      "path": "drivers/ArmCpu"
+    },
+    {
+      "commit": "0d544705c2e89725caabc0542bb96bc8febd8c70",
+      "path": "drivers/ArmDTPlatform"
+    },
+    {
+      "commit": "532de8c017e394e69a0b48dc0ffc4ac0d0701177",
+      "path": "drivers/ArmVirtPlatform"
+    },
+    {
+      "commit": "d099354d0eab34df5088ca1ba89c9c88bc3260bb",
+      "path": "drivers/DarwinBoot"
+    },
+    {
+      "commit": "a34964b8c2fec2e83c8e4f68fb7d6fb7e4b2227b",
+      "path": "drivers/NativeAES"
+    },
+    {
+      "commit": "cedcaa2949c795e71a47e78ae413c8a41b17d7d0",
+      "path": "drivers/NativeAdreno"
+    },
+    {
+      "commit": "b5399b5646c4d7415deec6d887fd51715a97a024",
+      "path": "drivers/NativeGeniSpi"
+    },
+    {
+      "commit": "28f9b463b48e862f2def91d29c11b9143785715e",
+      "path": "drivers/NativeHidInput"
+    },
+    {
+      "commit": "e59bac4ad1ac8825919ae94da8440a64d8ab90b3",
+      "path": "drivers/NativeKeyStoreEvents"
+    },
+    {
+      "commit": "a96feceda55e8fed1e20c0a2998736cef7aab006",
+      "path": "drivers/NativeMetal"
+    },
+    {
+      "commit": "eb9c949164826c2e52f2771eac19e4b8bd8a3dae",
+      "commit_note": "MOVED BACK one commit from UniXNU's own gitlink, deliberately and on evidence. Measured on run 40187668943 (stage M4): build-os-root.py reached step 9 for the first time -- storage-abi, both signed policies, the verified-root probe, NativeVirtioBlock/NativeRamBlock verified bindings, the grown 1 GiB OwnerData volume (675761EF-5622-4F5B-89DF-4CAD5BA456F6) and the packed ramdisk all passed -- and then died in build-native-legacy-display.py -> build-arm-driver.py NativeLegacyDisplay with `NativeLegacyDisplay.cpp:206:59: error: only virtual member functions can be marked 'override'` and `:207:13: error: no member named 'getRefreshAttributes' in 'IOMobileFramebufferLegacy'`. The pinned device repository (xVanTuring/UniXNU-qemu 97b75b1f, its only branch, at its tip) generates OriginalLegacyFramebufferABI.h from a fixed slot table that has no entry for slot 301, and its own invariant then refuses the override: `require(i in (0,1,7,14,84,86,87,141,155,184,188,288,290,296) or i in pure, 'Only qualified own methods and guarded leaves override')`. So the device repository is incompatible with c031d882 and with everything after it, and there is no newer device commit to move to. c031d882 is `feat(display): report the panel refresh rate`; eb9c949 is its parent `fix(gop): re-kick the swap queue after each retirement`, whose override set is exactly the one the device repository's generator declares. What is given up is the sheng-vsync refresh-rate report, which is gated on a boot argument this board does not pass and affects no root-mount or launchd path (PRD/Goal 6: the display is not a gate for them). gitlink_commit records what UniXNU b881ac7d actually pins so the divergence is auditable rather than silent; build-macos.yml forces the assembled tree's checkout to `commit` before it runs the chain.",
+      "gitlink_commit": "c031d882b9721d943383d11f66dc4748252ce929",
+      "path": "drivers/NativeMobileDisplay"
+    },
+    {
+      "commit": "d4d22d9819b0162eda49f6402235dddc2279410d",
+      "path": "drivers/NativeRamBlock"
+    },
+    {
+      "commit": "af785c1777161a62931425c2faaa536ce0bebd5b",
+      "path": "drivers/NativeUfs"
+    },
+    {
+      "commit": "98909eb9198a4360d7a43be831887cb8b74d814d",
+      "path": "drivers/NativeVirtioBlock"
+    },
+    {
+      "commit": "066f9bded311233ed56824e13a5628077619efda",
+      "path": "drivers/NativeVirtioConsole"
+    },
+    {
+      "commit": "40fdb8ea87606612ac6f1e80bbb49955d0ce4051",
+      "path": "kits/AdrenoFirmware"
+    },
+    {
+      "commit": "445f8fe6d115738352b9d78dc70af6d61aa7f62f",
+      "path": "kits/AdrenoPM4"
+    },
+    {
+      "commit": "032a867b5dc3121164bbd706e4e81e3b9fcd2b8f",
+      "path": "kits/AirNir"
+    },
+    {
+      "commit": "4d0d6598b1a36aeec3de01091893fa6660e49388",
+      "path": "kits/ArmSmmu4K"
+    },
+    {
+      "commit": "2b6ffb50117eee820b98aca9bd51b5c7dfb2970e",
+      "path": "kits/NativePrelink"
+    },
+    {
+      "commit": "2854c61f6c4dfda870ac3d93e1f03d9181edb041",
+      "path": "kits/VerifiedRoot"
     }
   ],
   "system_identity": {
     "board": "iPad7,1",
-    "product": "iPad_Pro_HFR",
-    "system": "iPadOS 17.7.11",
-    "build": "21H461",
-    "device_class": "j120ap",
-    "chip_id": "0x8011",
     "board_id": 12,
+    "build": "21H461",
     "build_candidates": [
       "21H161",
       "21H461"
     ],
-    "resolved_to": "21H461",
+    "chip_id": "0x8011",
+    "device_class": "j120ap",
+    "product": "iPad_Pro_HFR",
     "resolution": "RESOLVED 2026-10-23 (ADR-0001 open item 3). Evidence: (a) the pinned device_repo board.toml line 18 declares build = \"21H461\"; (b) the same board.toml line 15 pins the IPSW URL whose filename carries 21H461; (c) the downloaded IPSW's BuildManifest.plist reports ProductBuildVersion 21H461. The PRD appendix A spelling 21H161 is therefore the transcription error and is superseded.",
     "resolution_evidence": [
       "local-private/upstream/UniXNU-qemu/board.toml:15-18",
       "local-private/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw BuildManifest.plist ProductBuildVersion"
-    ]
-  },
-  "ipsw": {
-    "name": "iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw",
-    "sha256": "c84ad24b6981a859eec499b1802be9ac593acfd3dc0a185a76d06e4d767a1451",
-    "size": 6835124840,
-    "source": "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw",
-    "component_pins": {
-      "044-76040-038.dmg": "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d",
-      "044-76034-038.dmg": "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
-    },
-    "note": "Apple IPSW stays in local-private/ and is never committed (PRD 12)."
+    ],
+    "resolved_to": "21H461",
+    "system": "iPadOS 17.7.11"
   },
   "tools": {
-    "qemu": {
-      "version": "11.1.0",
-      "build": "native Windows",
-      "accel": "tcg",
-      "sha256": "952f897511177803722efed6fefe79bc3e7e5a51a026112dfc40f9a37fb0dad2",
-      "binary": "local-private/tools/qemu/qemu-system-aarch64.exe",
-      "full_version": "QEMU emulator version 11.1.0 (v11.1.0-12130-ge470268ff4)",
-      "firmware": {
-        "path": "local-private/tools/qemu/share/edk2-aarch64-code.fd",
-        "size": 67108864,
-        "sha256": "47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d",
-        "note": "Exactly 64 MiB, matching qemu-virt.c VIRT_FLASH size/2. edk2-aarch64-vars.fd is NOT shipped by this build; vars.fd must be created and truncated to 67108864 bytes per run."
+    "clang": {
+      "companions": {
+        "bison": "local-private/tools/msys64/usr/bin/bison.exe",
+        "cmake": "local-private/tools/msys64/ucrt64/bin/cmake.exe",
+        "flex": "local-private/tools/msys64/usr/bin/flex.exe",
+        "ld_lld": "local-private/tools/msys64/ucrt64/bin/ld.lld.exe",
+        "make": "local-private/tools/msys64/usr/bin/make.exe",
+        "mig": "local-private/tmp/kernel-macho/bootstrap_cmds-cross_platform/migcom.tproj/migcom.exe -- BUILT AND WORKING (bootstrap_cmds-138); runs and fails correctly on an empty input",
+        "mtools": "local-private/tools/msys64/usr/bin/mtools.exe (4.0.49)",
+        "unifdef": "local-private/tools/msys64/usr/bin/unifdef.exe (2.12)",
+        "zig": "local-private/out/xnu-port/toolchain/ziglang/zig.exe (ziglang 0.16.0)"
       },
-      "note": "Measured 2026-10-23 from the installed QEMU under local-private/tools/qemu. sha256 is of qemu-system-aarch64.exe. The installer is an NSIS flat layout, so <exe>/share/qemu/ is the firmware dir, not <exe>/../share/qemu."
+      "note": "Present on this host as a HOST compiler (x86_64-w64-windows-gnu) AND PROVEN to cross-compile AArch64/iOS. Three independent lines of evidence, all re-run on this host: (1) clang -target arm64-apple-ios17.0 -c emits real Mach-O arm64 objects whose disassembly shows genuine AArch64 instructions, and ld64.lld links a real Mach-O arm64 executable (docs/implementation-plan.md fact 4); (2) docs/kernel-build-windows.md records 61 of 123 osfmk/kern translation units compiled to genuine Mach-O 64-bit arm64 objects, including the 138 KB / 174-symbol osfmk/kern/bsd_kern.c; (3) an 80-line shim plus three -D rewrites for the Apple-clang-only builtins takes that to 79 of 123 with zero regressions. CORRECTION to an earlier note here, which said 'NOT yet proven to cross-compile AArch64/iOS: no iOS sysroot' -- that conflated two different facts. There is indeed no iOS sysroot, and that is still true; but cross-compiling to a Mach-O arm64 object does not require one when the headers are supplied, which is exactly what the freestanding header shim does. The claim of 'not proven' was wrong. What is NOT done is a clean XNU BUILD against these pins -- six build blockers remain (iig, csh/doconf, the five SETUP host tools, ditto/python3 wiring, the Darwin freestanding header set, the Apple-clang builtins; docs/kernel-build-windows.md has the detail), and two required XNU patches are still unapplied in the build tree. availability.pl is present and runs under the host Python (907 lines / 292 macros emitted), so it is not a blocker. mig IS built and working (bootstrap_cmds-138, 73/73 kernel MIG outputs); unifdef and mtools are present in the MSYS2 tree.",
+      "path": "local-private/tools/msys64/ucrt64/bin/clang.exe",
+      "sha256": null,
+      "target": "x86_64-w64-windows-gnu",
+      "version": "23.1.3"
     },
     "firmware_boot": {
-      "status": "VERIFIED-ON-HOST",
-      "verified": "2026-10-23",
-      "what": "The pinned edk2-aarch64-code.fd boots under the real QEMU 11.1.0 TCG with the pinned board parameters and reaches an interactive UEFI Shell prompt.",
       "evidence": [
         "tests/acceptance/test_real_boot_edk2.py",
         "serial log carries: UEFI firmware (version edk2-stable202408-prebuilt.qemu.org ...)",
@@ -235,37 +215,57 @@
         "UEFI Interactive Shell v2.2 / EDK II / UEFI v2.70",
         "Shell> prompt reached"
       ],
-      "not_proved": "Nothing about XNU, UniXNU, iPadOS or any payload of ours. The shell is the firmware's own built-in firmware-volume option, not our image, and no ESP is attached."
-    },
-    "xcode": {
-      "version": null,
-      "note": "macOS runner only; recorded from the Actions job. Not applicable to this Windows host."
+      "not_proved": "Nothing about XNU, UniXNU, iPadOS or any payload of ours. The shell is the firmware's own built-in firmware-volume option, not our image, and no ESP is attached.",
+      "status": "VERIFIED-ON-HOST",
+      "verified": "2026-10-23",
+      "what": "The pinned edk2-aarch64-code.fd boots under the real QEMU 11.1.0 TCG with the pinned board parameters and reaches an interactive UEFI Shell prompt."
     },
     "python": {
-      "version": "3.12.9",
-      "note": "host inventory 2026-10-22. `python` only; `python3` does not exist on this host, which several upstream build scripts invoke by name."
+      "note": "host inventory 2026-10-22. `python` only; `python3` does not exist on this host, which several upstream build scripts invoke by name.",
+      "version": "3.12.9"
     },
-    "clang": {
-      "version": "23.1.3",
-      "path": "local-private/tools/msys64/ucrt64/bin/clang.exe",
-      "target": "x86_64-w64-windows-gnu",
-      "sha256": null,
-      "companions": {
-        "ld_lld": "local-private/tools/msys64/ucrt64/bin/ld.lld.exe",
-        "make": "local-private/tools/msys64/usr/bin/make.exe",
-        "cmake": "local-private/tools/msys64/ucrt64/bin/cmake.exe",
-        "flex": "local-private/tools/msys64/usr/bin/flex.exe",
-        "bison": "local-private/tools/msys64/usr/bin/bison.exe",
-        "zig": "local-private/out/xnu-port/toolchain/ziglang/zig.exe (ziglang 0.16.0)",
-        "unifdef": "local-private/tools/msys64/usr/bin/unifdef.exe (2.12)",
-        "mtools": "local-private/tools/msys64/usr/bin/mtools.exe (4.0.49)",
-        "mig": "local-private/tmp/kernel-macho/bootstrap_cmds-cross_platform/migcom.tproj/migcom.exe -- BUILT AND WORKING (bootstrap_cmds-138); runs and fails correctly on an empty input"
+    "qemu": {
+      "accel": "tcg",
+      "binary": "local-private/tools/qemu/qemu-system-aarch64.exe",
+      "build": "native Windows",
+      "firmware": {
+        "note": "Exactly 64 MiB, matching qemu-virt.c VIRT_FLASH size/2. edk2-aarch64-vars.fd is NOT shipped by this build; vars.fd must be created and truncated to 67108864 bytes per run.",
+        "path": "local-private/tools/qemu/share/edk2-aarch64-code.fd",
+        "sha256": "47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d",
+        "size": 67108864
       },
-      "note": "Present on this host as a HOST compiler (x86_64-w64-windows-gnu) AND PROVEN to cross-compile AArch64/iOS. Three independent lines of evidence, all re-run on this host: (1) clang -target arm64-apple-ios17.0 -c emits real Mach-O arm64 objects whose disassembly shows genuine AArch64 instructions, and ld64.lld links a real Mach-O arm64 executable (docs/implementation-plan.md fact 4); (2) docs/kernel-build-windows.md records 61 of 123 osfmk/kern translation units compiled to genuine Mach-O 64-bit arm64 objects, including the 138 KB / 174-symbol osfmk/kern/bsd_kern.c; (3) an 80-line shim plus three -D rewrites for the Apple-clang-only builtins takes that to 79 of 123 with zero regressions. CORRECTION to an earlier note here, which said 'NOT yet proven to cross-compile AArch64/iOS: no iOS sysroot' -- that conflated two different facts. There is indeed no iOS sysroot, and that is still true; but cross-compiling to a Mach-O arm64 object does not require one when the headers are supplied, which is exactly what the freestanding header shim does. The claim of 'not proven' was wrong. What is NOT done is a clean XNU BUILD against these pins -- six build blockers remain (iig, csh/doconf, the five SETUP host tools, ditto/python3 wiring, the Darwin freestanding header set, the Apple-clang builtins; docs/kernel-build-windows.md has the detail), and two required XNU patches are still unapplied in the build tree. availability.pl is present and runs under the host Python (907 lines / 292 macros emitted), so it is not a blocker. mig IS built and working (bootstrap_cmds-138, 73/73 kernel MIG outputs); unifdef and mtools are present in the MSYS2 tree."
+      "full_version": "QEMU emulator version 11.1.0 (v11.1.0-12130-ge470268ff4)",
+      "note": "Measured 2026-10-23 from the installed QEMU under local-private/tools/qemu. sha256 is of qemu-system-aarch64.exe. The installer is an NSIS flat layout, so <exe>/share/qemu/ is the firmware dir, not <exe>/../share/qemu.",
+      "sha256": "952f897511177803722efed6fefe79bc3e7e5a51a026112dfc40f9a37fb0dad2",
+      "version": "11.1.0"
+    },
+    "xcode": {
+      "note": "macOS runner only; recorded from the Actions job. Not applicable to this Windows host.",
+      "version": null
     }
   },
-  "frozen": false,
-  "frozen_note": "Not frozen, and the reason is the BUILD, not the compiler. tools.clang IS proven to cross-compile AArch64/iOS on this host (three independent lines of evidence, see tools.clang.note); what is missing is a clean XNU build run against these pins, which needs six build blockers cleared (docs/kernel-build-windows.md) and two required XNU patches applied to the build tree (kits/NativePrelink/patches/xnu-10063.141.1-sparse-index.patch and -security-init.patch, both currently UNAPPLIED). The firmware layer IS verified on the host (see tools.firmware_boot). Set frozen=true only after a clean XNU build succeeds against these pins. CLOSED 2026-10-23: gpu.vram_gb is now MEASURED at 4.0 GB (NVIDIA GeForce RTX 3060 Laptop GPU, from Win32_VideoController.AdapterRAM; host-inventory.json gpu.vram_evidence), and VT-x is now MEASURED as present but DISABLED IN FIRMWARE (Win32_Processor.VirtualizationFirmwareEnabled) -- which makes -accel tcg the only option on this host rather than a preference, and is recorded in host-inventory.json cpu.vt_x_note. STILL OUTSTANDING and not to be counted as done: PRD 6 row M0 names an AI/Step API smoke test as pass evidence, and no such smoke test exists on this host yet.",
-  "feeds_note": "The union of TWO feeds.toml files, not one: UniXNU/feeds.toml and the device repository's UniXNU-qemu/feeds.toml (which 'adds to' UniXNU's and may override a ref). dyld comes from the device repository alone and IOStorageFamily's ref is the device's override. A lock derived from UniXNU's feeds.toml by itself is missing dyld -- that is exactly the gap this note exists to prevent, found by cross-checking `unixnu status` against this array on 2026-10-24 (8 of 9 agreed; dyld was absent here). Re-derive with `unixnu status -D <device>` and compare every `refer` line.",
-  "pinned_checkouts_note": "Three repositories are pinned here, and only two of them are in `feeds`. `unixnu` and `device_repo` are the two the driver cannot clone for itself (cli.py has no subcommand that clones either; scripts/unixnu/config.py raises 'no device repository' without -D), so the workflow's acquisition step clones them into vendor/. `uefi_sheng` is NOT a feed on purpose: the driver's feeds.fetch() resolves sources named by a feeds.toml and writes them into out/<board>/feeds, and uefi-sheng is named by no feeds.toml -- it is the Mu-Silicium checkout the driver's --uefi option points at (cli.py:24). Adding it to `feeds` would make the workflow's cross-check demand it in the driver's own unixnu.lock, where it will never appear, and would fail every run. So it is pinned here, acquired by the same step, and verified by the one file the build actually reads (uefi_sheng.font_header.sha256) rather than by a feed pin. Measured 2026-10-25: with it absent, build-payload failed on run 40094234507 and 40096928333 with 'Font.h is missing'."
+  "uefi_sheng": {
+    "checkout_note": "A full checkout IS a Mu-Silicium checkout (Resources/Scripts/mkbootimg.py and BootShim/BootShim.S are present at this commit), which is what --uefi of the driver documents (cli.py:24) and what step_assemble_image validates (build-macos.sh:2654). Do not replace it with a sparse checkout of the font directory alone.",
+    "commit": "20ac23d5e0937106c2129303dfc931b3390ae660",
+    "commit_note": "Pinned 2026-10-25 at the tip of the default branch `sheng` (tarball UniXNU-uefi-sheng-v4.0-52-g20ac23d). The third pinned checkout: NOT a feed and NOT part of either repository above. board.toml [payload] panic_screen = true (UniXNU-qemu/board.toml:94) makes `unixnu build payload` run the device repository's patch-xnu-entry-probe.py --panic-screen, which compiles scripts/xnu-panic-screen.c; that file's ONLY include is \"Font.h\" (xnu-panic-screen.c:294) and patch-xnu-entry-probe.py:183 takes it from (UNIXNU_UEFI or <tree>/uefi-sheng)/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib. The assembled build tree never contains uefi-sheng/ (tree.py:assemble creates only drivers/ kits/ patches/ refer/ build/ .cache/ package/ scripts/), so without this pin the payload stage died in clang with \"fatal error: 'Font.h' file not found\" -- measured on run 40094234507.",
+    "font_header": {
+      "bytes": 3692,
+      "copyright": "Copyright (C) 2008, The Android Open Source Project, All rights reserved. (the file's own header, redistributed under the Android/BSD-2-Clause notice above)",
+      "git_blob_sha1": "2ea15a28fe1ad2ddddf1cbbac766aeceb9243183",
+      "path": "Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h",
+      "sha256": "d2a3687db67b069f4e34a961e17fd28b0242986e3fa8dd8a7545cab70834fa8e",
+      "verified": "2026-10-25 through api.github.com: repos/UniXNU/uefi-sheng/contents/... at 20ac23d5e0937106c2129303dfc931b3390ae660 reports 3692 bytes and blob sha1 2ea15a28fe1ad2ddddf1cbbac766aeceb9243183; the sha256 above was computed from those exact bytes.",
+      "why": "The 5x16 glyph table gFont that scripts/xnu-panic-screen.c draws panic() messages with (xnu-panic-screen.c:294-295). It is the ONLY file this build takes from the Mu-Silicium checkout; the payload stage never builds the firmware, so nothing else in the tree is needed."
+    },
+    "license": "BSD-2-Clause. The repository's own README: \"All code except drivers in GPLDrivers & GPLApplications & GPLLibrary directories are licensed under BSD-2-Clause.\" Credits named there: Microsoft (Project Mu), WOA-Project (mu_andromeda_platforms, the base), Project Aloha (mu_aloha_platforms), Open Surface RT (Tegra), sonic011gamer and halal-beef (Exynos).",
+    "ref": "sheng",
+    "repo": "https://github.com/UniXNU/uefi-sheng"
+  },
+  "unixnu": {
+    "commit": "ab3199c90b13478c80fbfb7242f1d56a3c3bae83",
+    "commit_note": "Pinned 2026-10-28. A fork of UniXNU/UniXNU at the previous pin b881ac7dc1695ce676c856873051a487c6a9f963 (verified through api.github.com as this commit's parent) plus exactly one commit, which moves native_legacy_display_late_probe() from the end of bsd_autoconf() to just after IOSecureBSDRoot(rootdevice). The five-second waitForMatchingService for \"IOCoreSurfaceRoot\" used to block the mountroot that publishes the service. Upstream is read-only for this account, so the fix cannot be delivered there; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
+    "repo": "https://github.com/James081105/UniXNU",
+    "upstream_commit": "b881ac7dc1695ce676c856873051a487c6a9f963",
+    "upstream_repo": "https://github.com/UniXNU/UniXNU"
+  }
 }
