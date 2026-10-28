@@ -2,9 +2,11 @@
   "schema_version": 1,
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "unixnu": {
-    "repo": "https://github.com/UniXNU/UniXNU",
-    "commit": "b881ac7dc1695ce676c856873051a487c6a9f963",
-    "commit_note": "Pinned 2026-10-22 from the working clone under local-private/upstream/UniXNU. Do not build from a moving branch."
+    "repo": "https://github.com/James081105/UniXNU",
+    "commit": "511147c1dd98a1af33586db78241701791868d1b",
+    "commit_note": "Pinned 2026-10-28. A fork of UniXNU/UniXNU at the previous pin b881ac7dc1695ce676c856873051a487c6a9f963 (verified as this commit's parent) plus exactly one commit: zzzz-display-surface-after-mountroot.patch, which moves the legacy display's five-second IOSurface wait out of bsd_autoconf() to immediately after a successful vfs_mountroot(). Upstream is read-only for this account, so the fix cannot be delivered there; the fork is public and carries no private material. Remove this fork and re-pin to upstream the moment the change is accepted upstream.",
+    "upstream_repo": "https://github.com/UniXNU/UniXNU",
+    "upstream_commit": "b881ac7dc1695ce676c856873051a487c6a9f963"
   },
   "device_repo": {
     "repo": "https://github.com/xVanTuring/UniXNU-qemu",
