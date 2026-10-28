@@ -43,6 +43,7 @@ absent from every checkout by design (PRD 12).
 from __future__ import annotations
 
 import dataclasses
+import getpass
 import socket
 import struct
 import tomllib
@@ -3452,6 +3453,290 @@ def test_the_probe_reports_a_kernel_it_could_not_parse(tmp_path: Path) -> None:
     assert record == {"ready": False, "reason": "the kernel image could not be parsed"}, record
 
 
+# --------------------------------------------------------------------------
+# the probe's two files, which are not the same file
+# --------------------------------------------------------------------------
+
+#: A load line in the shape DarwinBoot prints, which is the only thing
+#: ``load_addresses_from_serial`` accepts.  Both addresses are required and both
+#: must be at least eight hex digits: a truncated line used to match and produce
+#: a physical base of 4 (``guestobserve._LOAD_LINE``).
+LOAD_LINE = b"kernel va 0xfffffff007166000 pa 0x408166000\n"
+
+#: The account name this module's evidence must never carry.  ``getpass`` is the
+#: same source :func:`unipad.host.paths.scrub_account` uses, so a test that
+#: passes proves the scrub covers the name it will actually meet.
+try:
+    ACCOUNT = getpass.getuser()
+except Exception:  # pragma: no cover - a host with no passwd entry
+    ACCOUNT = "SomeBody"
+
+
+class _LeakingGuestMemory:
+    """A ``GuestMemory`` that writes raw guest memory where the real one does.
+
+    The real one cannot return bytes: ``pmemsave`` writes to a *file*, so
+    :meth:`unipad.host.guestobserve.GuestMemory.read` hands QEMU a filename and
+    reads it back.  A fake that only records the path -- which is what the fake
+    above does -- cannot see what that means, because it never puts anything on
+    disk.  This one does, and what it puts there is what a guest's RAM holds.
+    """
+
+    def __init__(self, client: Any, scratch: Path) -> None:
+        self.client = client
+        self.scratch = Path(scratch)
+
+    def read(self, physical: int, size: int) -> bytes:
+        self.scratch.parent.mkdir(parents=True, exist_ok=True)
+        # A guest whose RAM holds the account name: a shell that exported it, a
+        # path in a config file, anything.  This is not a contrived string --
+        # it is the reason PRD 9.2 exists.
+        self.scratch.write_bytes(f"guest ram {ACCOUNT} secrets\n".encode() * 64)
+        return self.scratch.read_bytes()
+
+
+class _FailingObserver:
+    """An observer whose ``kernel_log`` refuses, as a corrupt ring does."""
+
+    def __init__(self, *_: Any, **__: Any) -> None:
+        pass
+
+    def kernel_log(self) -> bytes:
+        raise ub.UniPadError(ErrorCode.EVIDENCE_INCOMPLETE, "the ring is not readable")
+
+
+def test_the_watch_loop_gives_the_probe_two_different_paths(
+    inputs: BootInputs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The call site, which is where the defect actually was.
+
+    Every test above exercises ``_guest_log_probe``'s contract in isolation, and
+    the contract was correct the whole time the bug was live -- because the bug
+    was not in the probe, it was in the one production call site that passed a
+    single path and let the probe's default make the scratch *be* the evidence
+    file.  A test that only pins the contract pins a rule nobody broke.
+
+    Reverting the call site to ``scratch=work / "guest-kernel.log"`` leaves the
+    whole suite green without this one, and the consequence is a real leak: the
+    guest's raw RAM persisted at the path ``boot-report.json`` names.
+    """
+    monkeypatch.setattr(ub, "_qmp", _screendumping_qemu())
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    seen: list[dict[str, Any]] = []
+
+    def spy(port: int, **kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs)
+        return {"ready": False, "reason": "stubbed"}
+
+    monkeypatch.setattr(ub, "_guest_log_probe", spy)
+    work = tmp_path / "run"
+    work.mkdir()
+    report = BootReport(ok=False, workdir=str(work))
+
+    ub._watch(
+        _AliveQEMU(), report, work, qmp_port=14452, seconds=2, every=1,
+        kernel=inputs.kernel, kernel_sha256="0" * 64,
+    )
+
+    assert seen, "_watch never called the guest-log probe"
+    for call in seen:
+        scratch = Path(call["scratch"])
+        # ``call.get("log", scratch)`` and not ``call["log"]``: the mutation this
+        # test kills is the call site dropping ``log=`` entirely, and that has to
+        # read as "one path for both" rather than as a KeyError.
+        log = Path(call["log"]) if "log" in call else scratch
+        assert log != scratch, (
+            f"the probe was handed one path for both the raw guest memory and the "
+            f"evidence file: {scratch}"
+        )
+        assert log.name == "guest-kernel.log", (
+            f"the evidence file is no longer named guest-kernel.log: {log.name}"
+        )
+        assert "memory" in scratch.name, (
+            f"the raw-memory scratch no longer says what it holds: {scratch.name}"
+        )
+
+
+def test_a_failed_probe_leaves_no_raw_guest_memory_in_the_evidence_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe's scratch file must not be the file the report points at.
+
+    ``GuestMemory.read`` cannot hand bytes back -- ``pmemsave`` writes to a
+    filename -- so whatever path the probe passes as ``scratch`` is filled with
+    the guest's physical memory by QEMU itself, before anything has been read or
+    scrubbed.  Passing the evidence file as that path means a probe that fails
+    *after* the read (a corrupt ring, a short read, a dead QMP connection) leaves
+    the guest's raw RAM sitting at the path the report names as evidence, with
+    no scrub having run and nothing to scrub it later.
+
+    Measured, not theorised: the run directory is under ``local-private`` so the
+    leak is not a publication, but the report's ``log`` field and every consumer
+    that follows it treat that path as the guest's *kernel log*, and PRD 9.2
+    forbids the account name in any of it.  A failed probe is exactly the run a
+    human goes and reads.
+
+    Removing the ``log=`` argument at the call site and deleting the guard below
+    both leave the suite green without this test.
+    """
+    monkeypatch.setattr("unipad.host.qmp.QmpClient", _FakeQmpClient)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestMemory", _LeakingGuestMemory)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestObserver", _FailingObserver)
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+
+    evidence = tmp_path / "guest-kernel.log"
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial,
+        scratch=tmp_path / "guest-memory.bin", log=evidence,
+    )
+
+    assert record["ready"] is False, record
+    assert not evidence.exists(), (
+        f"the evidence file exists and holds {evidence.stat().st_size} bytes after "
+        f"a probe that never read anything: {evidence.read_bytes()[:120]!r}"
+    )
+
+
+def test_the_probe_refuses_a_scratch_that_is_the_evidence_file(tmp_path: Path) -> None:
+    """Two paths, because one path cannot hold both a raw read and a scrubbed copy.
+
+    The refusal rather than a silent rename: a caller that passes one path twice
+    has made the mistake this module exists to prevent, and the report has to say
+    so.  Deriving a different name behind the caller's back would leave the
+    evidence file absent with a report that claims success.
+    """
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+    same = tmp_path / "guest-kernel.log"
+
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=same, log=same
+    )
+
+    assert record["ready"] is False, record
+    assert "evidence" in record["reason"] and "scratch" in record["reason"], record
+    assert "guest-kernel.log" not in record["reason"], (
+        "the refusal names the file, and a run directory is not safe to print"
+    )
+
+
+def test_the_probe_scrubs_the_account_out_of_the_evidence_it_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scrub has to be load-bearing, not decorative.
+
+    Deleting the ``scrub_account`` call at the write leaves the suite green --
+    which is the shape of a guard that reads as though it ran.  This test fails
+    without it, because the ring the fake returns contains the account name and
+    the file on disk must not.
+    """
+    ring = (
+        b"DarwinBoot: handoff\n"
+        + f"launchd: {ACCOUNT} exported a token\n".encode()
+        + b"mount-complete volume OwnerData\n"
+    )
+    monkeypatch.setattr("unipad.host.qmp.QmpClient", _FakeQmpClient)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestMemory", _FakeGuestMemory)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestObserver", _FakeGuestObserver)
+    _stub_guestobserve(monkeypatch, ring)
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+
+    evidence = tmp_path / "guest-kernel.log"
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial,
+        scratch=tmp_path / "guest-memory.bin", log=evidence,
+    )
+
+    assert record["ready"] is True, record
+    assert record["marker"] is True, record
+    on_disk = evidence.read_bytes()
+    assert ACCOUNT.encode() not in on_disk, (
+        f"the evidence file carries the account name: {on_disk[:200]!r}"
+    )
+    assert b"mount-complete volume OwnerData" in on_disk, (
+        "the scrub removed more than the account name and took the marker with it"
+    )
+
+
+def test_the_probe_reason_never_names_the_run_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError from the scratch file stringifies with the whole path.
+
+    ``str(FileNotFoundError)`` is ``[Errno 2] No such file or directory:
+    'F:\\...\\USERR~1.WIN\\nested'`` -- the 8.3 short-name spelling of the
+    account, which ``scrub_account`` does not match because it is not the account
+    name.  The reason goes straight into ``boot-report.json`` and onto stdout, so
+    a probe whose scratch could not be written prints the username while
+    reporting a failure.
+
+    Measured, not assumed: the first version of this test asserted
+    ``str(tmp_path) not in reason`` and passed *with the fix deleted*, because
+    ``str(tmp_path)`` is the long form and the message carries the short one.
+    The assertion below is on the thing that is true either way -- a redacted
+    reason names no directory, so it contains no path separator -- and the short
+    name is what makes it necessary.
+
+    Windows-specific in what it *reproduces*: the short name exists because the
+    profile directory has a space in it.  On a host whose account name has no
+    spaces there is nothing to shorten, and the OSError still reprs its filename,
+    so the separator assertion holds everywhere.
+    """
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    boom = OSError(2, "No such file or directory")
+    boom.filename = str(nested)
+
+    monkeypatch.setattr("unipad.host.qmp.QmpClient", _FakeQmpClient)
+    monkeypatch.setattr("unipad.host.guestobserve.GuestMemory", _FakeGuestMemory)
+    serial = tmp_path / "serial.log"
+    serial.write_bytes(LOAD_LINE)
+    # Raise from the line the code guards, not from somewhere convenient: the
+    # ``except OSError`` below exists for ``serial.read_bytes()``, and patching
+    # ``load_addresses_from_serial`` instead would test a branch that cannot be
+    # reached this way -- it is handed bytes, not a path.
+    real_is_file, real_read = Path.is_file, Path.read_bytes
+
+    def only_this_serial(self: Path) -> bool:
+        return True if self == serial else real_is_file(self)
+
+    def read_or_refuse(self: Path) -> bytes:
+        if self == serial:
+            raise boom
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "is_file", only_this_serial)
+    monkeypatch.setattr(Path, "read_bytes", read_or_refuse)
+
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=tmp_path / "s.bin"
+    )
+
+    assert record["ready"] is False, record
+    reason = record["reason"]
+    # A drive root is the signature of an absolute path, and it is the part that
+    # carries the profile directory the account name is rendered into.  The
+    # separator *between* final components is not a disclosure -- after the
+    # redaction the message reads ``'<run dir name>\nested'``, which names the
+    # file that failed and nothing above it.  Asserting on ``"\\"`` instead would
+    # be satisfied only by deleting the message.
+    assert ":\\" not in reason and ":/" not in reason, (
+        f"the reason still carries an absolute path, so it still carries the "
+        f"directory the account name is rendered into: {reason}"
+    )
+    assert "nested" in reason, (
+        "the redaction removed the whole message instead of the directory that is "
+        f"not safe to print: {reason}"
+    )
+    # The short-name spelling specifically: this is what ``str(tmp_path)`` misses
+    # and what the first version of this test missed with it.
+    assert ACCOUNT.split(" ")[0][:8].upper() not in reason.upper(), (
+        f"the 8.3 short name of the account is in the reason: {reason}"
+    )
+
+
 def test_watch_records_the_guest_log_probe_alongside_the_screendumps(
     inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3737,12 +4022,6 @@ def test_the_cli_can_ask_for_the_retry(
 # while the behaviour it names is deleted is the same failure seen from the other
 # side.  Each test below is named after the mutation it kills.
 
-#: A load line in the shape DarwinBoot prints, which is the only thing
-#: ``load_addresses_from_serial`` accepts.  Both addresses are required and both
-#: must be at least eight hex digits: a truncated line used to match and produce
-#: a physical base of 4 (``guestobserve._LOAD_LINE``).
-LOAD_LINE = b"kernel va 0xfffffff007166000 pa 0x408166000\n"
-
 
 class _FakeQmpClient:
     """A QMP client that connects and closes and does nothing else.
@@ -3938,10 +4217,13 @@ def test_the_probe_finds_the_marker_anywhere_in_the_ring(
 
     serial = tmp_path / "serial.log"
     serial.write_bytes(before)
-    scratch = tmp_path / "guest-kernel.log"
+    # Two paths: the raw memory QEMU writes, and the evidence the probe writes.
+    # They were one path, and that is the defect these tests now spell out.
+    scratch = tmp_path / "guest-memory.bin"
+    log = tmp_path / "guest-kernel.log"
 
     record = ub._guest_log_probe(
-        14444, kernel=object(), serial=serial, scratch=scratch
+        14444, kernel=object(), serial=serial, scratch=scratch, log=log
     )
 
     assert record["ready"] is True, record
@@ -3949,7 +4231,7 @@ def test_the_probe_finds_the_marker_anywhere_in_the_ring(
     assert record["bytes"] == len(before) + len(mount) + len(after), record["bytes"]
     # The whole ring is kept on disk, not a tail: the file is the evidence, and a
     # truncated one cannot answer a question asked later.
-    assert scratch.read_bytes() == before + mount + after, "the ring was truncated on disk"
+    assert log.read_bytes() == before + mount + after, "the ring was truncated on disk"
     # One connection for the whole probe, opened and closed.
     assert _FakeQmpClient.connected == 1, _FakeQmpClient.connected
     assert _FakeQmpClient.closed == 1, _FakeQmpClient.closed
@@ -3979,16 +4261,19 @@ def test_the_probe_fingerprints_the_raw_bytes_and_scrubs_the_copy(
 
     serial = tmp_path / "serial.log"
     serial.write_bytes(LOAD_LINE)
-    scratch = tmp_path / "guest-kernel.log"
+    scratch = tmp_path / "guest-memory.bin"
+    log = tmp_path / "guest-kernel.log"
 
-    record = ub._guest_log_probe(14444, kernel=object(), serial=serial, scratch=scratch)
+    record = ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=scratch, log=log
+    )
 
     assert record["ready"] is True, record
     # The fingerprint is of the raw bytes, so two probes of an unchanged guest
     # agree however many times the account name appears.
     assert record["fingerprint"] == hashlib.sha256(ring).hexdigest(), record["fingerprint"]
     # The copy on disk is scrubbed, and the scrub is visible in it.
-    written = scratch.read_text(encoding="utf-8")
+    written = log.read_text(encoding="utf-8")
     assert name not in written, "the account name reached the evidence file"
     assert "<redacted:account>" in written, written
     # The path in the record is redacted to its final component (PRD 9.2).
@@ -4013,13 +4298,14 @@ def test_the_probe_survives_losing_the_scratch_file(
 
     serial = tmp_path / "serial.log"
     serial.write_bytes(LOAD_LINE)
-    # A directory in the scratch path's place: writing a file *at* it fails, and
+    # A directory in the evidence file's place: writing a file *at* it fails, and
     # it is a failure that has nothing to do with the guest.
     blocked = tmp_path / "blocked"
     blocked.mkdir()
 
     record = ub._guest_log_probe(
-        14444, kernel=object(), serial=serial, scratch=blocked
+        14444, kernel=object(), serial=serial,
+        scratch=tmp_path / "guest-memory.bin", log=blocked,
     )
 
     assert record["ready"] is True, record
@@ -4032,21 +4318,31 @@ def test_the_probe_hands_the_scratch_to_the_memory_it_builds(
 ) -> None:
     """``pmemsave`` writes where it was told, and it was told the run directory.
 
-    Handing the probe ``qemu-stdout.log`` instead of ``serial.log``, or
-    ``screen.ppm`` instead of ``guest-kernel.log``, both leave the suite green --
+    Handing the probe ``qemu-stdout.log`` instead of a dedicated scratch, or
+    ``screen.ppm`` instead of the evidence file, both leave the suite green --
     pure plumbing, but plumbing that decides whether the guest's memory lands in
     a file that gets overwritten by the next screendump.
+
+    The scratch is asserted to be its own file and *not* the evidence file, which
+    is the half of this that was once wrong: the two were one path, so QEMU wrote
+    the guest's raw memory into the file the report names as evidence.
     """
     _stub_guestobserve(monkeypatch, LOAD_LINE + b"x\n")
     serial = tmp_path / "serial.log"
     serial.write_bytes(LOAD_LINE)
-    scratch = tmp_path / "guest-kernel.log"
+    scratch = tmp_path / "guest-memory.bin"
+    log = tmp_path / "guest-kernel.log"
 
-    ub._guest_log_probe(14444, kernel=object(), serial=serial, scratch=scratch)
+    ub._guest_log_probe(
+        14444, kernel=object(), serial=serial, scratch=scratch, log=log
+    )
 
     memory = _FakeGuestObserver.last.memory
     assert memory.scratch == scratch, memory.scratch
-    assert memory.scratch.name == "guest-kernel.log", memory.scratch
+    assert memory.scratch.name == "guest-memory.bin", memory.scratch
+    assert memory.scratch != log, (
+        "the raw guest memory and the evidence file are the same path again"
+    )
     # And the observer was built with the kernel image and the load addresses the
     # serial log reported, not with defaults.
     assert _FakeGuestObserver.last.load.kernel_va == 0xFFFFFFF007166000
@@ -4288,7 +4584,8 @@ def test_the_probe_reports_a_port_it_cannot_even_construct_a_client_for(
 
     # The real constructor, deliberately: a fake would not raise.
     entry = ub._guest_log_probe(
-        0, kernel=object(), serial=serial, scratch=work / "guest-kernel.log",
+        0, kernel=object(), serial=serial,
+        scratch=work / "guest-memory.bin", log=work / "guest-kernel.log",
     )
 
     assert entry["ready"] is False, entry

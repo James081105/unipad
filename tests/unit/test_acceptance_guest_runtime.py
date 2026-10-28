@@ -748,3 +748,51 @@ def test_runtime_from_manifest_refuses_a_missing_role(
         )
 
     assert caught.value.details.get("role") == "kernel", caught.value.details
+
+
+def test_the_runtime_hands_the_probe_two_paths_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second production call site, which had the same defect.
+
+    ``unixnu_boot._watch`` is not the only caller of ``_guest_log_probe``: the
+    runtime reads the guest's ring through it as well, and it passed one path for
+    both the raw memory QEMU writes and the evidence file it then writes.  Fixing
+    the probe's contract fixes neither caller -- the contract was correct the
+    whole time the bug was live, because the bug was at both call sites.
+
+    Reverting this one to ``scratch=log`` leaves the whole suite green without
+    this test, and the consequence is the same as it was in ``_watch``: a probe
+    that fails after its read leaves the guest's unscrubbed RAM at the path a
+    human is pointed at.
+    """
+    runtime = _runtime(tmp_path)
+    run = tmp_path / "run" / "guest"
+    run.mkdir(parents=True, exist_ok=True)
+    runtime._run = run
+    monkeypatch.setattr(runtime, "_stage", lambda: run)
+    seen: dict[str, object] = {}
+
+    def spy(port: int, **kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"ready": False, "reason": "stubbed"}
+
+    monkeypatch.setattr(ub, "_guest_log_probe", spy)
+    monkeypatch.setattr(ub, "_kernel_image", lambda kernel, digest: (object(), None))
+    runtime._image = object()
+
+    log = run / "guest-kernel.log"
+    assert runtime._guest_log(run / "serial.log", log) == b""
+
+    scratch = Path(str(seen["scratch"]))
+    assert "log" in seen, (
+        "the runtime handed the probe one path for both the raw guest memory and "
+        f"the evidence file: {sorted(seen)}"
+    )
+    assert Path(str(seen["log"])) == log, seen
+    assert scratch != log, (
+        f"the raw guest memory and the evidence file are the same path: {scratch}"
+    )
+    assert "memory" in scratch.name, (
+        f"the raw-memory scratch no longer says what it holds: {scratch.name}"
+    )

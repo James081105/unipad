@@ -1837,12 +1837,53 @@ def _kernel_image(kernel: Path, digest: str) -> tuple[Optional[Any], Optional[st
         return None, f"{getattr(exc, 'code', type(exc).__name__)}: {exc}"
 
 
+def _safe_reason(reason: str, *roots: Optional[Path]) -> str:
+    """``reason`` with every named directory reduced to its final component.
+
+    ``str(OSError)`` carries the whole filename, and it carries it *repr'd*:
+    CPython's ``OSError.__str__`` formats the filename with ``{filename!r}``, so a
+    Windows path arrives with every backslash doubled.  A literal comparison
+    against ``str(root)`` therefore never matches, which is why this exists as a
+    list of spellings rather than one ``replace``.
+
+    Two separate things make the directory unsafe to print, and both are live on
+    this host.  The profile directory contains a space, so Windows renders the
+    account as its 8.3 short name (``ZHUANZ~1``) -- a spelling
+    :func:`unipad.host.paths.scrub_account` cannot match, because it is not the
+    account name.  And the run directory itself is under a path a report has no
+    business naming.
+
+    Only the directories the caller names are redacted, and only as whole
+    strings.  Two things that look like improvements are not:
+    :func:`unipad.host.paths.safe_location` cannot be used, because it takes
+    ``Path(path).name`` and this is a sentence rather than a path; and a regex
+    for ``drive:\\...`` would take the useful part of the message with it.  The
+    final component is kept, because two directories that differ anywhere differ
+    in their final component, and a reason that says *which* file failed is the
+    whole value of the reason.
+    """
+    for root in roots:
+        if root is None:
+            continue
+        name = Path(root).name
+        # Both separator conventions, and both escaped and unescaped, because
+        # the message may quote the path (``OSError``) or not (most other
+        # exceptions) and may spell it either way (a QMP argument is passed
+        # forward-slashed even on Windows).
+        for text in {str(root), str(root).replace("\\", "/")}:
+            for spelling in {text, text.replace("\\", "\\\\")}:
+                if spelling and spelling in reason:
+                    reason = reason.replace(spelling, name)
+    return scrub_account(reason)
+
+
 def _guest_log_probe(
     qmp_port: int,
     *,
     kernel: Any,
     serial: Path,
     scratch: Path,
+    log: Optional[Path] = None,
 ) -> dict[str, Any]:
     """One read of the guest's kernel log, or the reason it could not be taken.
 
@@ -1866,6 +1907,16 @@ def _guest_log_probe(
         "log": Path}`` when the ring was read, or ``{"ready": False,
         "reason": str}`` when it was not.  ``marker`` is whether
         :data:`DATA_MOUNT_MARKER` appears anywhere in it.
+
+    ``scratch`` and ``log`` are two different files and must never be the same
+    one.  ``scratch`` is where QEMU writes the guest's physical memory, because
+    ``pmemsave`` writes to a filename and there is no QMP command that returns
+    bytes -- so that path holds raw, unscrubbed guest RAM from the moment the
+    first read is issued.  ``log`` is the evidence file: the kernel ring, decoded
+    and scrubbed.  Passing one path for both means a probe that fails after the
+    read leaves the guest's RAM at the path the report names as evidence, with
+    no scrub having run and nothing left to run it.  The probe refuses rather
+    than deriving a name behind the caller's back.
     """
     from unipad.host.guestobserve import (
         GuestMemory,
@@ -1874,12 +1925,24 @@ def _guest_log_probe(
     )
     from unipad.host.qmp import QmpClient
 
+    scratch = Path(scratch)
+    log = Path(log) if log is not None else scratch.parent / "guest-kernel.log"
+    if log == scratch:
+        return {
+            "ready": False,
+            "reason": "the guest-memory scratch and the evidence file are the "
+                      "same path; they must be two files, because the scratch "
+                      "holds unscrubbed guest RAM",
+        }
+
     if kernel is None:
         return {"ready": False, "reason": "the kernel image could not be parsed"}
     try:
         blob = serial.read_bytes() if serial.is_file() else b""
     except OSError as exc:
-        return {"ready": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"ready": False,
+                "reason": _safe_reason(f"{type(exc).__name__}: {exc}",
+                                       scratch.parent, serial)}
     try:
         load = load_addresses_from_serial(blob)
     except UniPadError as exc:
@@ -1905,7 +1968,8 @@ def _guest_log_probe(
     except (UniPadError, OSError, ValueError) as exc:
         return {
             "ready": False,
-            "reason": f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+            "reason": _safe_reason(f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+                                   scratch.parent, serial),
         }
     try:
         client.connect()
@@ -1916,6 +1980,10 @@ def _guest_log_probe(
         # spelling ``guestobserve``'s own CLI passes and the diagnostics used
         # successfully.  Changing it here "for consistency" would change the one
         # thing that has been measured to work.
+        #
+        # It is also *not* ``log``: see the docstring.  QEMU writes the guest's
+        # physical memory into this path, so it must not be the path the report
+        # points a human at.
         observer = GuestObserver(
             memory=GuestMemory(client, scratch), image=kernel, load=load
         )
@@ -1923,7 +1991,8 @@ def _guest_log_probe(
     except (UniPadError, OSError) as exc:
         return {
             "ready": False,
-            "reason": f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+            "reason": _safe_reason(f"{getattr(exc, 'code', type(exc).__name__)}: {exc}",
+                                   scratch.parent, serial),
         }
     finally:
         client.close()
@@ -1943,9 +2012,14 @@ def _guest_log_probe(
     # Written as bytes, not text: Python's text mode translates ``\n`` to
     # ``\r\n`` on Windows, and a copy of the guest's ring that has had its line
     # endings rewritten is not a copy of the guest's ring.
+    #
+    # ``log``, never ``scratch``: the scratch still holds the raw memory QEMU
+    # wrote into it, and this write is what replaces that with something a human
+    # may read.  Overwriting the scratch instead would leave the evidence file
+    # absent on every path that fails before here.
     text = data.decode("utf-8", "replace")
     try:
-        scratch.write_bytes(scrub_account(text).encode("utf-8"))
+        log.write_bytes(scrub_account(text).encode("utf-8"))
     except OSError:
         # The bytes were already read; losing the copy on disk costs the
         # evidence file and nothing else, so it must not fail the probe.
@@ -1955,7 +2029,7 @@ def _guest_log_probe(
         "bytes": len(data),
         "fingerprint": hashlib.sha256(data).hexdigest(),
         "marker": DATA_MOUNT_MARKER in text,
-        "log": str(safe_location(scratch)),
+        "log": str(safe_location(log)),
     }
 
 
@@ -2102,7 +2176,14 @@ def _watch(
             qmp_port,
             kernel=image,
             serial=work / "serial.log",
-            scratch=work / "guest-kernel.log",
+            # Two paths, deliberately.  ``pmemsave`` writes the guest's physical
+            # memory into the scratch, so that file is raw guest RAM and is not
+            # evidence; the scrubbed kernel ring goes to the log, which is the
+            # path the report names.  They were one path until a review measured
+            # that a probe failing after its read left the guest's RAM at the
+            # path a human is pointed at, with no scrub having run.
+            scratch=work / "guest-memory.bin",
+            log=work / "guest-kernel.log",
         )
         entry["at_seconds"] = round(time.monotonic() - started, 3)
         report.guest_probes.append(entry)

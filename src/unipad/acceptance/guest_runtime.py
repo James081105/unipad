@@ -270,13 +270,21 @@ class RealGuestRuntime(E2ERuntime):
     def _guest_log(self, serial: Path, log: Path) -> bytes:
         """The kernel ring, through the one probe that has been measured to work.
 
-        ``scratch`` is a *file* path: ``_guest_log_probe`` writes the scrubbed ring
-        there and hands the same path back as ``log``.  Passing a directory makes
-        the write raise ``OSError`` inside the probe -- which is swallowed on
-        purpose -- and every read then returns ``b""``.
+        Two paths, because they are two different things.  ``scratch`` is where
+        QEMU writes the guest's physical memory -- ``pmemsave`` writes to a file
+        and there is no QMP command that returns bytes -- so that file is raw,
+        unscrubbed guest RAM from the first read onwards.  ``log`` is the
+        evidence: the ring, decoded and scrubbed, and the only one of the two a
+        human should ever be pointed at.  They were one path here too, which meant
+        a probe that failed after its read left the guest's RAM at this method's
+        own ``log``.
+
+        ``scratch`` is a *file* path, not a directory: a directory makes
+        ``pmemsave`` fail, and the probe returns not-ready for every read.
         """
         entry = ub._guest_log_probe(
-            self.qmp_port, kernel=self._image, serial=serial, scratch=log)
+            self.qmp_port, kernel=self._image, serial=serial,
+            scratch=log.parent / "guest-memory.bin", log=log)
         if not entry.get("ready"):
             return b""
         return log.read_bytes() if log.is_file() else b""
