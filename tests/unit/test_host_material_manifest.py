@@ -1177,3 +1177,62 @@ def test_a_lock_missing_a_pin_is_a_refusal_not_a_disabled_check(tmp_path: Path) 
     with pytest.raises(mm.MaterialManifestError) as caught:
         mm.read_source_pins(partial)
     assert caught.value.rule == mm.RULE_SCHEMA, caught.value
+
+
+def test_the_source_pin_check_is_on_by_default(tmp_path: Path) -> None:
+    """A provenance check nobody has to ask for is the only kind that runs.
+
+    ``--lock`` was opt-in for exactly one revision, and that is the wrong
+    default: the check exists for the caller who does *not* know which build to
+    ask for -- someone downloading "the latest" material -- so a check they must
+    remember to enable is a check that does not run.
+
+    Asserted through the CLI rather than through ``--help``, because help text
+    wraps and a wrapped sentence is a substring that stops matching.  What is
+    pinned is the behaviour: ``--verify`` with no ``--lock`` at all still refuses
+    a manifest built from another checkout's source.
+    """
+    import subprocess
+    import sys
+
+    where, board = write_tree(tmp_path)
+    manifest = collect_manifest(where, board, device_commit="d" * 40)
+    staged = stage_flat(where, manifest)
+    written = tmp_path / "material-manifest.json"
+    manifest.write(written)
+
+    done = subprocess.run(
+        [sys.executable, "-m", "unipad.host.material_manifest", "--verify",
+         "--manifest", str(written), "--root", str(staged)],
+        cwd=ROOT, capture_output=True, text=True, timeout=300,
+    )
+    # Both streams: the refusal is raised, and where it lands is the CLI
+    # envelope's business, not this test's.
+    both = done.stdout + done.stderr
+    assert done.returncode != 0, (
+        f"--verify without --lock accepted a manifest built from another "
+        f"source: {both[-600:]}"
+    )
+    # Both commits are named, because "which one is wrong" is the whole question
+    # a human asks of the refusal.
+    assert "d" * 40 in both, both[-600:]
+    assert mm.read_source_pins(mm.DEFAULT_LOCK).device_commit in both, both[-600:]
+    assert mm.DEFAULT_LOCK.is_file(), mm.DEFAULT_LOCK
+    pins = mm.read_source_pins(mm.DEFAULT_LOCK)
+    assert pins.device_commit and pins.unixnu_commit, pins
+
+
+def test_a_lock_named_but_absent_refuses_rather_than_skipping(tmp_path: Path) -> None:
+    """The default must not degrade into "no check" when the file is missing.
+
+    ``--lock`` pointing at a path that does not exist is a caller who asked for
+    the check; answering "nothing to compare" would be the silent-disable
+    failure mode again.  The default path is different -- a checkout without a
+    lock cannot enforce one -- and that is why the default is a path that is
+    asserted to exist rather than a flag.
+    """
+    absent = tmp_path / "no-such-lock.json"
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        mm.read_source_pins(absent)
+    assert caught.value.rule == mm.RULE_SCHEMA, caught.value
+    assert "no-such-lock.json" in caught.value.message, caught.value.message

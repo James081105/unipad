@@ -116,6 +116,14 @@ __all__ = [
 #: The manifest's own schema tag.  A manifest without it is not a manifest.
 MATERIAL_SCHEMA = "unipad-material-manifest/1"
 
+#: Where the source pins live, relative to the repository root.  ``--verify``
+#: reads them by default rather than on request: the whole point of the check is
+#: that a caller downloading "the latest" material does not know which build to
+#: ask for, so a check they have to remember to ask for is a check that does not
+#: run.  Resolved from this file's location, not the process's cwd, so the CLI
+#: behaves the same from any directory.
+DEFAULT_LOCK = Path(__file__).resolve().parents[3] / "config" / "sources.lock.json"
+
 #: The APFS block size.  Every checksummed object occupies a whole block.
 APFS_BLOCK_SIZE = 4096
 
@@ -354,7 +362,7 @@ def read_source_pins(path: Path) -> SourcePins:
         raise _refuse(
             RULE_SCHEMA,
             ErrorCode.CONFIG_INVALID,
-            f"the sources lock cannot be read: {type(exc).__name__}",
+            f"the sources lock {Path(path).name} cannot be read: {type(exc).__name__}",
         ) from exc
     pins = SourcePins(
         unixnu_commit=str((lock.get("unixnu") or {}).get("commit") or ""),
@@ -1424,9 +1432,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--root", type=Path, help="the directory the manifest's paths resolve against (--verify)")
     parser.add_argument("--expect-build", default="", help="refuse a manifest from any other build (--verify)")
     parser.add_argument(
-        "--lock", type=Path,
+        "--lock", type=Path, default=DEFAULT_LOCK,
         help="config/sources.lock.json; a delivery built from any other source "
-             "commit is refused (--verify)",
+             f"commit is refused (--verify).  Defaults to {DEFAULT_LOCK} so the "
+             "check runs unless it is switched off, because a provenance check "
+             "nobody passes is a provenance check that does not run",
     )
     parser.add_argument("--board", type=Path, help="board.toml, for the pins")
     parser.add_argument("--build-id", default="", help="the build identifier every artifact must share")
