@@ -241,6 +241,21 @@ def _refuse(rule: str, code: str, message: str, **details: Any) -> MaterialManif
 # the board's pins, read rather than restated
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
+class SourcePins:
+    """The two source commits a build must have been made from.
+
+    ``config/sources.lock.json``'s ``unixnu`` and ``device_repo`` pins.  They are
+    recorded in every manifest, and checking a delivery against them is the one
+    provenance test that needs no run id: a delivery from a different build is
+    internally consistent -- its hashes match its own manifest -- so the only
+    thing that can expose it is the pair of commits it was built against.
+    """
+
+    unixnu_commit: str = ""
+    device_commit: str = ""
+
+
+@dataclass(frozen=True)
 class BoardPins:
     """The values ``board.toml`` pins that a boot's material must satisfy.
 
@@ -323,6 +338,36 @@ class BoardPins:
 def read_board_pins(path: Path) -> BoardPins:
     """:meth:`BoardPins.from_board`, spelled the way the other readers are."""
     return BoardPins.from_board(path)
+
+
+def read_source_pins(path: Path) -> SourcePins:
+    """``config/sources.lock.json``'s two source commits, or a refusal.
+
+    A lock that does not parse, or that is missing either pin, is a refusal
+    rather than an empty :class:`SourcePins`: an empty one silently disables the
+    check it was passed to enable, which is the shape of a guard that reads as
+    though it ran.
+    """
+    try:
+        lock = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _refuse(
+            RULE_SCHEMA,
+            ErrorCode.CONFIG_INVALID,
+            f"the sources lock cannot be read: {type(exc).__name__}",
+        ) from exc
+    pins = SourcePins(
+        unixnu_commit=str((lock.get("unixnu") or {}).get("commit") or ""),
+        device_commit=str((lock.get("device_repo") or {}).get("commit") or ""),
+    )
+    if not (pins.unixnu_commit and pins.device_commit):
+        raise _refuse(
+            RULE_SCHEMA,
+            ErrorCode.CONFIG_INVALID,
+            "the sources lock does not pin both 'unixnu' and 'device_repo', so a "
+            "delivery cannot be shown to come from this checkout's source",
+        )
+    return pins
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1075,7 @@ def verify_manifest(
     board_pins: Optional[BoardPins] = None,
     kernel_image: Optional[Path] = None,
     expected_build_id: Optional[str] = None,
+    source_pins: Optional[SourcePins] = None,
 ) -> VerifyReport:
     """Refuse unless every piece of material belongs to ``manifest.build_id``.
 
@@ -1043,6 +1089,15 @@ def verify_manifest(
     names the build it is about to boot and anything else is refused.  A caller
     that does not know which build it wants gets the structural and byte checks
     and not this one, and that is said in the report rather than assumed.
+
+    ``source_pins`` is the other half, and it is the one that needs no run id to
+    be useful.  Every manifest records the ``device_commit`` and ``unixnu_commit``
+    its build read from ``config/sources.lock.json``; a delivery whose recorded
+    commits differ from the pins *this* checkout is building against was built
+    from different source, whatever its internal hashes say.  That is not
+    hypothetical: a delivery was measured carrying a kernel whose sha256 matched
+    its own manifest perfectly, while the manifest named a device commit that
+    predated the fix under test -- self-consistent, and the wrong build.
 
     The order is deliberate: structure first, then bytes, then bindings.  A
     manifest that names a role nobody knows is refused before anything is
@@ -1075,6 +1130,31 @@ def verify_manifest(
             on_disk=manifest.build_id,
             wanted=expected_build_id,
         )
+    if source_pins is not None:
+        # The check that needs no run id.  A delivery from another build is
+        # self-consistent -- its own hashes match its own manifest -- so nothing
+        # inside it can tell you it is the wrong one.  What it *does* carry is
+        # the two source commits its build read from the lock, and those are
+        # comparable against this checkout without knowing anything about runs.
+        for role, recorded, pinned in (
+            ("device", manifest.device_commit, source_pins.device_commit),
+            ("unixnu", manifest.unixnu_commit, source_pins.unixnu_commit),
+        ):
+            if not pinned.strip():
+                continue
+            if recorded.strip().lower() != pinned.strip().lower():
+                raise _refuse(
+                    RULE_BUILD_ID,
+                    ErrorCode.VERIFICATION_FAILED,
+                    f"the manifest was built against {role} commit "
+                    f"{recorded or '(none)'}, but this checkout pins {pinned}: "
+                    f"the delivery is from a different build, whatever its own "
+                    f"hashes say",
+                    role=role,
+                    on_disk=recorded,
+                    wanted=pinned,
+                )
+        checked.append("source-pins")
     for role in MATERIAL_ROLES:
         if role not in manifest.artifacts:
             raise _refuse(
@@ -1343,6 +1423,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--manifest", type=Path, help="the manifest to read or write")
     parser.add_argument("--root", type=Path, help="the directory the manifest's paths resolve against (--verify)")
     parser.add_argument("--expect-build", default="", help="refuse a manifest from any other build (--verify)")
+    parser.add_argument(
+        "--lock", type=Path,
+        help="config/sources.lock.json; a delivery built from any other source "
+             "commit is refused (--verify)",
+    )
     parser.add_argument("--board", type=Path, help="board.toml, for the pins")
     parser.add_argument("--build-id", default="", help="the build identifier every artifact must share")
     parser.add_argument("--board-name", default="qemu_root_defconfig")
@@ -1389,6 +1474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.root or Path("."),
         board_pins=pins,
         expected_build_id=args.expect_build or None,
+        source_pins=read_source_pins(args.lock) if args.lock else None,
     )
     if not args.quiet:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

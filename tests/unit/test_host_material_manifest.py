@@ -1087,3 +1087,93 @@ def test_the_rule_set_covers_every_refusal_the_module_can_make() -> None:
     # ...and the constants are what the names say they are, so a renamed rule
     # cannot quietly take another rule's place.
     assert declared == {name for name in dir(mm) if name.startswith("RULE_")}
+
+
+# ---------------------------------------------------------------------------
+# the source pins
+# ---------------------------------------------------------------------------
+def test_a_delivery_from_another_builds_source_is_refused(tmp_path: Path) -> None:
+    """The provenance check that needs no run id -- measured on a real delivery.
+
+    ``expected_build_id`` only helps a caller that already knows which run it
+    wants.  This one helps everyone, and it exists because of a delivery that was
+    measured carrying a kernel whose sha256 matched its own manifest perfectly
+    while the manifest named a device commit predating the fix under test:
+    internally consistent, and the wrong build.  Every byte check in this module
+    passed it.
+
+    The two source commits are the only externally-comparable thing a delivery
+    carries, so they are what gets compared.  Nothing inside the delivery can
+    catch this, because the delivery is a coherent whole -- it is just the wrong
+    one.
+    """
+    where, board = write_tree(tmp_path)
+    manifest = collect_manifest(
+        where, board, unixnu_commit="a" * 40, device_commit="c" * 40)
+    lock = tmp_path / "sources.lock.json"
+    lock.write_text(json.dumps({
+        "unixnu": {"commit": "a" * 40},
+        "device_repo": {"commit": "b" * 40},
+    }), encoding="utf-8")
+
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        mm.verify_manifest(
+            manifest, stage_flat(where, manifest),
+            board_pins=mm.read_board_pins(board),
+            source_pins=mm.read_source_pins(lock),
+        )
+
+    assert caught.value.rule == mm.RULE_BUILD_ID, caught.value
+    assert "device" in caught.value.message, caught.value.message
+    # Both commits are named, because "which one is wrong" is the whole question
+    # a human asks of it -- and neither is a secret.
+    assert "c" * 40 in caught.value.message, caught.value.message
+    assert "b" * 40 in caught.value.message, caught.value.message
+
+
+def test_a_delivery_from_this_checkouts_source_passes_the_pin_check(
+    tmp_path: Path,
+) -> None:
+    """The check refuses a *different* build, not every build.
+
+    A pin check that fires on a matching delivery is worse than none: it would be
+    disabled the first time somebody booted real material, and then the delivery
+    above would go through.  Case-insensitively, because a sha is a sha however
+    it was typed.
+    """
+    where, board = write_tree(tmp_path)
+    manifest = collect_manifest(
+        where, board, unixnu_commit="a" * 40, device_commit="B" * 40)
+    lock = tmp_path / "sources.lock.json"
+    lock.write_text(json.dumps({
+        "unixnu": {"commit": "A" * 40},
+        "device_repo": {"commit": "b" * 40},
+    }), encoding="utf-8")
+
+    report = mm.verify_manifest(
+        manifest, stage_flat(where, manifest),
+        board_pins=mm.read_board_pins(board),
+        source_pins=mm.read_source_pins(lock),
+    )
+
+    assert "source-pins" in report.checked, report.checked
+
+
+def test_a_lock_missing_a_pin_is_a_refusal_not_a_disabled_check(tmp_path: Path) -> None:
+    """An empty ``SourcePins`` silently switches the check off.
+
+    Passing ``--lock`` and then having it resolve to no pins is the failure mode
+    where the guard reads as though it ran.  Both a lock that does not parse and
+    one that is missing a key are refusals.
+    """
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        mm.read_source_pins(broken)
+    assert caught.value.rule == mm.RULE_SCHEMA, caught.value
+
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps({"unixnu": {"commit": "a" * 40}}), encoding="utf-8")
+    with pytest.raises(mm.MaterialManifestError) as caught:
+        mm.read_source_pins(partial)
+    assert caught.value.rule == mm.RULE_SCHEMA, caught.value

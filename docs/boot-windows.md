@@ -592,6 +592,24 @@ python -m unipad.host.unixnu_boot \
 再读回，一次探针是一整个来回；实测环约 128 KiB，即一次探针约 32 个来回，16 MiB 的上界
 （4,096 个来回）是 `guestobserve` 的拒绝线而不是常态。
 
+**探针用两个文件，不能是同一个。** `pmemsave` 写文件、没有返回字节的 QMP 命令，所以
+`scratch` 那个路径从第一次读开始就装着客体物理内存——QEMU 写的，未 scrub。`log` 才是证据
+文件：内核环、解码过、`scrub_account` 过。二者原本是同一个 `guest-kernel.log`，后果是
+**任何一次「读完内存之后才失败」的探针**（环损坏、短读、QMP 断开）都把客体原始 RAM 留在
+报告 `log` 字段指向的路径上：成功路径会覆盖它，失败路径直接 return，什么都不写。现在
+`scratch=guest-memory.bin`、`log=guest-kernel.log`，并且探针**拒绝**同一个路径传两次——
+替调用方偷偷改个名字会让证据文件消失而报告照样写 success。生产调用点在 `_watch()` 里，
+盯着这条缝的测试是 `test_the_watch_loop_gives_the_probe_two_different_paths`：缺陷从来不在
+探针的契约里，在唯一的生产调用点上。
+
+**reason 也要过一道。** `except OSError` 分支原来把 `f"{type(exc).__name__}: {exc}"` 原样
+当 reason。CPython 的 `OSError.__str__` 用 `{filename!r}` 格式化文件名，所以 Windows 路径
+进来时每个反斜杠都是双份的，与 `str(root)` 做字面替换永远不匹配；本机 profile 目录含空格，
+Windows 又把账户名渲染成 8.3 短名（`ZHUANZ~1`），`scrub_account` 匹配不到这个拼写。修复前
+实测 reason 里出现 `C:\Users\ZHUANZ~1\AppData\Local\Temp\...\nested`。现在由 `_safe_reason()`
+对每个根目录试四种拼写（两种分隔符 × 转义/未转义），命中的整串换成最后一段分量，再整体过
+`scrub_account`——保留最后一段，因为「哪个文件失败了」正是 reason 的全部价值。
+
 报告新增：`data_volume_mounted` / `data_marker` / `guest_log_bytes` /
 `guest_log_fingerprint` / `guest_probes[]` / `attempts` / `attempt`。
 `attempts` 是这条链启了几次，`attempt` 是**这份报告来自第几次**——两个字段故意分开：
