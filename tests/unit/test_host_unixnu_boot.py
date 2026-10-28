@@ -650,6 +650,62 @@ def test_a_missing_source_is_a_plain_error_not_a_partial_esp(
 # ---------------------------------------------------------------------------
 # the command line
 # ---------------------------------------------------------------------------
+def test_the_hid_devices_arrive_with_the_os_root(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The guest's HID devices are VirtIO ones, and they come with the OS root.
+
+    This is the finding that explains why no input has ever moved the
+    framebuffer, turned into a guard.
+
+    ``run-qemu.py:208-210`` emits ``virtio-tablet-device`` +
+    ``virtio-keyboard-device`` and its comment names the consumer:
+    ``package/VirtioInput.cpp``.  ``build_argv`` emitted ``qemu-xhci`` +
+    ``usb-kbd`` instead -- a USB keyboard the guest cannot see, because
+    ``kernel.macho.adt`` contains **zero** occurrences of ``usb``, ``xhci``,
+    ``dwc3`` or ``hid`` and 32 of ``virtio-mmio``.  There is no USB controller
+    node for an xHCI driver to bind to; the 32 VirtIO MMIO nodes are the
+    transport ``VirtioInput.cpp`` uses.
+
+    The consequence was measured, not reasoned: a real run with ``usb-kbd``
+    answered QMP ``send-key`` with ``{}`` and changed neither the guest log nor
+    the framebuffer hash over 65 seconds.  QEMU accepted the event; the guest
+    had no device to receive it.
+
+    Gated on ``root`` for upstream's reason: without an OS root there is no
+    userland to consume a touch, and a device the guest enumerates but nothing
+    drives is a silent difference between two runs that look identical.
+    """
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                         root_image=root)
+    devices = _values(argv, "-device")
+    assert "virtio-tablet-device" in devices, devices
+    assert "virtio-keyboard-device" in devices, devices
+    assert "usb-kbd" not in devices, devices
+    assert "qemu-xhci" not in devices, devices
+
+
+def test_without_an_os_root_there_are_no_hid_devices(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The other side of the same gate.
+
+    A guard that permits the case it was built to permit and refuses the case it
+    was built to refuse is only half a guard.  Asserted because the obvious
+    implementation -- emitting the pair unconditionally -- passes every test
+    above.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none")
+    devices = _values(argv, "-device")
+    assert "virtio-tablet-device" not in devices, devices
+    assert "virtio-keyboard-device" not in devices, devices
+    assert devices == ["virtio-blk-pci,drive=esp,bootindex=0", "ramfb"], devices
+
+
 def test_the_argv_is_the_boards_machine(
     inputs: BootInputs, tmp_path: Path
 ) -> None:
@@ -676,11 +732,13 @@ def test_the_argv_is_the_boards_machine(
     assert _flag(argv, "-monitor") == "none", argv
     assert _flag(argv, "-name") == "unipad-unixnu", argv
     assert _flag(argv, "-qmp") == "tcp:127.0.0.1:14444,server=on,wait=off", argv
+    # No root image, so no VirtIO input devices either -- see
+    # ``test_the_hid_devices_arrive_with_the_os_root`` for why they are gated
+    # there.  ``usb-kbd`` is gone: the device tree has no USB/xHCI node at all,
+    # so it was a keyboard the guest had no driver for.
     assert _values(argv, "-device") == [
         "virtio-blk-pci,drive=esp,bootindex=0",
         "ramfb",
-        "qemu-xhci",
-        "usb-kbd",
     ], argv
 
     drives = _values(argv, "-drive")
@@ -1081,8 +1139,11 @@ def test_the_root_volume_is_a_second_read_only_mmio_disk(
         "virtio-blk-pci,drive=esp,bootindex=0",
         "virtio-blk-device,drive=osroot",
         "ramfb",
-        "qemu-xhci",
-        "usb-kbd",
+        # The guest's actual HID devices.  ``usb-kbd`` was here instead, and
+        # ``kernel.macho.adt`` has zero usb/xhci/dwc3/hid nodes against 32
+        # virtio-mmio ones, so the guest had no driver for it at all.
+        "virtio-tablet-device",
+        "virtio-keyboard-device",
     ], argv
     # The ESP stays on PCI: EDK II has to find it on the virtual PCI bus
     # (BdsDxe loads Boot0001 from PciRoot(0x0)/Pci(0x1,0x0)), so the two disks
@@ -1106,7 +1167,9 @@ def test_without_a_root_image_the_argv_is_exactly_what_it_was(
     root drive with a different spelling, would still satisfy every assertion
     about the root drive itself while silently changing the machine every
     earlier run described.  So the no-root argv is asserted to be the root argv
-    with exactly six tokens removed -- the ``-global`` pair, and the drive pair.
+    with exactly ten tokens removed -- the ``-global`` pair, the root drive
+    pair, the root block-device pair, and the two VirtIO input device pairs
+    that arrive with the OS root.
     """
     root = tmp_path / "os-root.raw"
     root.write_bytes(b"\0" * (1 << 20))
@@ -1117,11 +1180,13 @@ def test_without_a_root_image_the_argv_is_exactly_what_it_was(
     without = ub.build_argv(
         tmp_path / "qemu-system-aarch64.exe", inputs, tmp_path / "esp", tmp_path / "run"
     )
-    assert len(with_root) - len(without) == 6, (len(with_root), len(without))
-    # The six added tokens, removed, leave the argv exactly as it was.  A change
-    # that reordered anything would still pass every assertion above while
-    # changing the machine every earlier run described.
+    assert len(with_root) - len(without) == 10, (len(with_root), len(without))
+    # The ten added tokens, removed, leave the argv exactly as it was.  A
+    # change that reordered anything would still pass every assertion above
+    # while changing the machine every earlier run described.
     added_at = next(i for i, token in enumerate(with_root) if "id=osroot" in token)
+    # The transport pair and the drive pair, asserted as a contiguous block so a
+    # reordering cannot pass by accident.
     assert with_root[added_at - 3 : added_at + 3] == [
         "-global",
         "virtio-mmio.force-legacy=false",
@@ -1130,7 +1195,15 @@ def test_without_a_root_image_the_argv_is_exactly_what_it_was(
         "-device",
         "virtio-blk-device,drive=osroot",
     ], with_root[added_at - 3 : added_at + 3]
-    assert with_root[: added_at - 3] + with_root[added_at + 3 :] == without, without
+    remainder = with_root[: added_at - 3] + with_root[added_at + 3 :]
+    # Then the two HID device pairs, which ``run-qemu.py:208-210`` also emits as
+    # a contiguous pair.  Removing both blocks has to leave exactly the no-root
+    # argv -- that is the whole claim of this test.
+    hid_at = remainder.index("virtio-tablet-device")
+    assert remainder[hid_at - 1 : hid_at + 3] == [
+        "-device", "virtio-tablet-device", "-device", "virtio-keyboard-device",
+    ], remainder[hid_at - 1 : hid_at + 3]
+    assert remainder[: hid_at - 1] + remainder[hid_at + 3 :] == without, without
 
 
 def test_a_missing_root_image_is_refused_before_qemu_starts(
@@ -1309,8 +1382,8 @@ def test_the_systemos_cryptex_is_a_third_read_only_mmio_disk(
         "virtio-blk-pci,drive=esp,bootindex=0",
         "virtio-blk-device,drive=osroot",
         "ramfb",
-        "qemu-xhci",
-        "usb-kbd",
+        "virtio-tablet-device",
+        "virtio-keyboard-device",
         "virtio-blk-device,drive=systemos",
     ], argv
     assert "virtio-blk-pci,drive=systemos" not in argv, argv
@@ -1436,7 +1509,7 @@ def test_without_a_systemos_image_the_argv_has_no_third_disk(
     assert "virtio-blk-device,drive=systemos" not in argv, argv
     assert not any(item.startswith("if=none,id=systemos") for item in argv), argv
     assert _values(argv, "-device") == [
-        "virtio-blk-pci,drive=esp,bootindex=0", "ramfb", "qemu-xhci", "usb-kbd",
+        "virtio-blk-pci,drive=esp,bootindex=0", "ramfb",
     ], argv
     assert len(_values(argv, "-drive")) == 3, argv
     assert _values(argv, "-global") == [], argv

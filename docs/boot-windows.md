@@ -745,6 +745,94 @@ sha256 `e6480f661dfa4efd…`）里 `Serial keyboard started` 出现 1 次、
 是否消费这个 USB 键盘，一次都没量过**。`-display none` 之下 QMP `send-key` 注入到哪个
 console 也没有量过。这两件事是 E2E 第 2 条的前置，记在这里而不是当成已有结论。
 
+#### 7.5.8 USB HID 路实测：客体要的是 **VirtIO** 设备，而这条路已经**通到驱动层**（2026-10-28）
+
+先纠错：上一版这里写的是「`usb-kbd` 在 argv 里、客体是否消费它未量过」。**这个问法本身
+就是错的**，因为 `usb-kbd` 根本不是客体能看到的设备。
+
+**实测：`kernel.macho.adt` 里 `usb`/`xhci`/`dwc3`/`hid` 各出现 0 次，`virtio-mmio` 出现
+32 次。** 所以这块板上没有 USB 控制器节点，xHCI 驱动无处可绑；而 32 个 VirtIO MMIO 节点
+正是 `package/VirtioInput.cpp` 用的传输层。上游自己的 `run-qemu.py:208-210` 也只在这条
+`--os-root` 路径上发一对 **`virtio-tablet-device` + `virtio-keyboard-device`**，注释逐字
+点名消费者：
+
+> The pointer and keyboard of the QEMU window for `package/VirtioInput.cpp`: a click and
+> drag is a touch, Home or F1 is the Home button. QEMU sends its input to them once the
+> driver has started them.
+
+**所以这是第三个同形状的缺口**（前两个是 `--trust-cache` 和 `--ramfb-driver`）：
+诊断脚本验证过的配置只有诊断脚本发得出来，统一入口发的是 `qemu-xhci` + `usb-kbd`——
+一个客体没有驱动的键盘。`build_argv` 现在补上这一对（同样只在有 `--root-image` 时发，
+理由与上游一致：没有 OS root 就没有用户态去消费触摸，而一个客体枚举了却没人驱动的设备
+是两次看起来一样的运行之间一个无声的差异）。
+
+**补上之后的实测，用的是客体自己公布的计数器**（`local-private/tmp/virtio-counters.py`）：
+
+| 计数器（`VirtioInput.cpp` 的 `volatile uint32_t` 全局） | 发送前 | `send-key home` 后 |
+| :--- | :--- | :--- |
+| `native_virtio_input_devices` | **2** | 2 |
+| `native_virtio_input_events` | 0 | **4** |
+| `native_virtio_input_keys` | 0 | **2** |
+| `native_virtio_input_touches` | 0 | 0 |
+| `native_virtio_input_failures` | 0 | 0 |
+
+**结论：QMP `send-key` → QEMU `virtio-keyboard-device` → 客体 `VirtioInput.cpp` 这条路
+已经实测打通**，客体自己数到了两次按键。这条不是从帧缓冲推断的，是从客体内核全局量出来的
+（做法同事实 103 的持久化状态：按符号名读活客体，而不是 grep 一个早就绕圈的环形缓冲）。
+
+**顺带修掉一个会让人反复发错键的坑**：先发的是 `ctrl-alt-del`，`events` 从 0 涨到 12 而
+`keys` 恒 0——因为 `VirtioInput.cpp:30` 只把 **Home（evdev 102）和 F1（59）** 当成按键，
+其余键只进 `events`。上游 `qemu-input.py` 的说明也是「Home or F1 is the Home button」。
+**发错键时的现象（有事件、无按键、帧缓冲不变）和链路不通时的现象一模一样**，这是这条路上
+最容易得出错误结论的地方。
+
+**仍未解决的是另一件事，与输入无关**：帧缓冲哈希在按键前后逐字节相同
+（`c2cfec2e70fc`，1376x1024）。客体数到了按键，但**没有第二帧**。
+所以 E2E 第 2 条的判据 `framebuffer_before != framebuffer_after` 目前卡在
+「没人画第二帧」，不再卡在「输入进不去」。`native_hid_input_command` 是否被
+`NativeHidInput` 取走、SpringBoard 是否因此动作，尚未测量。
+
+#### 7.5.7 串口最后一跳实测：**无法从客体外判定**，而不是失败（2026-10-28）
+
+一次真实 Windows 运行（`local-private/boot33/serial-input/`，kernel sha256
+`e6480f661dfa4efd…`，诊断脚本 `local-private/tmp/serial-input-check.py`）：
+
+| 观测 | 结果 |
+| :--- | :--- |
+| chardev 进入 argv | **是**，`socket,…,port=14533,…,logfile=serial.log,logappend=on` |
+| 客体串口键盘线程 | **在跑**，客体 t=48.985174s 打印 `Serial keyboard started` |
+| 主机写入 | **成功**，`SerialInputSink.text("UNIPAD-SERIAL-OK")` 返回 `delivered: True`，16 字节 |
+| 客体日志增长 | 发送后 **+250 字节**，之后 37 秒冻结 |
+| 帧缓冲 | **1376x1024**，发送前后哈希相同 |
+| marker 回显 | **无** |
+
+**那 +250 字节不是输入造成的，这一点必须说清楚**：它们是客体 t=50.089076 的
+`disk5s1 mount-complete volume OwnerData` 与 t=50.15s 的 `load_init_program: attempting
+to load /sbin/launchd`——Data 卷挂载与 launchd 启动，是开机进程本身，与 marker 无关。
+把这段增长当成「客体对输入有反应」就是又一次读错证据。
+
+**所以这一跳的结论是「无法从客体外判定」，不是「失败」。** 理由是结构性的：
+字节即使到达 `cons_cinput`，也只会进 `km_tty[0]` 的输入队列，而**客体上没有任何进程
+读 `/dev/console`**（iPadOS 没有 getty/login），行规程也没有可见的回显路径；
+内核环形缓冲 `msgbuf` 记的是 `printf`，不是 tty 输出。**「没有回显」证明不了「没到达」。**
+反过来也成立：主机侧 `sendall` 成功只证明字节离开了主机，证明不了它们被客体取走。
+
+**要判定它，需要的是一次有消费者的实验**，而不是更好的探针。可行的下一步按代价排序：
+(1) 让客体侧有东西读 `/dev/console`（这要求能往客体里放一个程序，即 IPA/文件系统写入）；
+(2) 直接读客体内存里 tty 输入队列的字节数（需要符号，脆弱）；
+(3) **换一条有可见消费者的路**——即 §7.5.6 的 USB HID 路，SpringBoard 就是消费者，
+帧缓冲变化就是可见证据。第 (3) 条同时也是 E2E 第 2 条真正需要的路。
+
+**顺带一个已经被这次运行证明的结果**：帧缓冲几何从 800x600 变成 **1376x1024**
+（serial.log 里 DarwinBoot 自己打印 `video base 0x1BBEF0000  1376x1024  row 5504 bytes
+32 bpp`）。这是 `--ramfb-driver` + 生成的 `unixnu.toml` + `_check_ramfb_pair` 三者合起来的
+第一个正面证据：驱动确实在 DarwinBoot 取走帧缓冲**之前**跑到了。
+**但画面内容依旧不变**（发送前后 screendump 哈希逐字节相同），所以「几何修好了」
+与「没有第二帧」是两件事，后者仍是 E2E 第 2 条的阻塞项。
+
+**状态**：串口路代码完成、单测与变异通过、Windows 实测量为**无法判定**；
+几何修复为**已证实的正面结果**；画面不更新仍为**未修复**。
+
 #### 7.5.5 状态与下一步
 
 - **代码完成**：`SerialInputSink`、`_serial_argv`、`boot`/`boot_until_mounted`/CLI 的 `--serial-port` 贯通。

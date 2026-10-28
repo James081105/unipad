@@ -1267,8 +1267,34 @@ def build_argv(
         "-device", "virtio-blk-device,drive=osroot",
     ] if root is not None else []) + [
         "-device", "ramfb",
-        "-device", "qemu-xhci",
-        "-device", "usb-kbd",
+        # The guest's HID devices, and the reason no input has ever moved the
+        # framebuffer.
+        #
+        # These are **VirtIO** devices, not USB ones.  ``run-qemu.py:208-210``
+        # emits exactly this pair, and its comment names the consumer:
+        # "The pointer and keyboard of the QEMU window for
+        # package/VirtioInput.cpp: a click and drag is a touch, Home or F1 is
+        # the Home button.  QEMU sends its input to them once the driver has
+        # started them."
+        #
+        # ``build_argv`` emitted ``qemu-xhci`` + ``usb-kbd`` instead, which the
+        # guest cannot see.  Measured 2026-10-28: ``kernel.macho.adt`` contains
+        # **zero** occurrences of ``usb``, ``xhci``, ``dwc3`` or ``hid``, and 32
+        # of ``virtio-mmio`` -- so there is no USB controller node for an xHCI
+        # driver to bind to, while the 32 VirtIO MMIO nodes are exactly the
+        # transport ``VirtioInput.cpp`` uses.  A run with ``usb-kbd`` therefore
+        # answers QMP ``send-key`` with ``{}`` and changes nothing: QEMU accepts
+        # the event, and the guest has no device to receive it.  That is the
+        # same shape as the ``--trust-cache`` and ``--ramfb-driver`` gaps -- the
+        # configuration the diagnostics verified was only reachable from the
+        # diagnostics.
+        #
+        # Both are kept behind ``root`` for the same reason upstream gates them
+        # there: without an OS root there is no userland to consume a touch, and
+        # a device the guest enumerates but nothing drives is a silent
+        # difference between two runs that look identical.
+        *(["-device", "virtio-tablet-device",
+           "-device", "virtio-keyboard-device"] if root is not None else []),
         "-nic", "none",
         "-display", display,
         # The UART, and the only route by which the guest can ever receive a
