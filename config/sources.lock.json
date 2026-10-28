@@ -9,9 +9,11 @@
     "upstream_commit": "b881ac7dc1695ce676c856873051a487c6a9f963"
   },
   "device_repo": {
-    "repo": "https://github.com/xVanTuring/UniXNU-qemu",
-    "commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
-    "commit_note": "Pinned 2026-10-22 from the working clone under local-private/upstream/UniXNU-qemu. Its board.toml is the source of the system_identity fields below."
+    "repo": "https://github.com/James081105/UniXNU-qemu",
+    "commit": "38d4db14f99679a11f45d89f676b7b9867c59700",
+    "commit_note": "Pinned 2026-10-28. A fork of xVanTuring/UniXNU-qemu at the previous pin 97b75b1f63c6b7e895cd7646029db741d5fe5488 (verified through api.github.com as this commit's parent) plus exactly one commit, which runs the legacy display's IOSurface wait on its own thread instead of on the boot thread. Measured: mountroot completes at t=49.6 s and IOSurfaceRoot::installMemoryRegions() lands at t=63.6 s, interleaved with the Data and SystemOS mounts both \"requested by: init (pid 1)\" -- so the service is published by work that cannot start until bsd_init() returns. Upstream is read-only for this account; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
+    "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
+    "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488"
   },
   "uefi_sheng": {
     "repo": "https://github.com/UniXNU/uefi-sheng",
