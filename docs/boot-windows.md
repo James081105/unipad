@@ -856,6 +856,49 @@ if(!native_legacy_surface_status && native_legacy_surface_found && !PE_current_c
 只加载不启动，而 `IOCoreSurfaceRoot` 是它的 `IOService` 发布物）；(b) 启动得太晚，
 5 秒窗口（`waitForMatchingService(..., 5e9)`）不够。判别式：把窗口内
 `IOService::waitForMatchingService` 的等待拉到更久，或在客体侧确认 IOSurface 是否 start。
+**下一步就一件事**：查 `IOCoreSurfaceRoot` 为什么从不出现。两个候选，
+代价不同也不要混：(a) IOSurface kext 加载了但没 start（`OSKextLoadKextWithIdentifier`
+只加载不启动，而 `IOCoreSurfaceRoot` 是它的 `IOService` 发布物）；(b) 启动得太晚，
+5 秒窗口（`waitForMatchingService(..., 5e9)`）不够。判别式：把窗口内
+`IOService::waitForMatchingService` 的等待拉到更久，或在客体侧确认 IOSurface 是否 start。
+
+#### 7.5.10 判别式跑完了：服务**会**出现，只是晚于探针的 5 秒窗口，而且**没有重试**（2026-10-28）
+
+上一节的两个候选，实测答案是 **(b)，而且比 (b) 更严重一层**。
+
+一次专门等 `IOSurfaceRoot::installMemoryRegions()` 出现再读计数器的运行
+（`local-private/boot33/surface-race/`，诊断脚本 `local-private/tmp/surface-race.py`）：
+
+| 量 | 值 |
+| :--- | :--- |
+| `IOSurfaceRoot::installMemoryRegions()` 首次出现 | 客体 **t=86.1s** |
+| `native_legacy_surface_found`（服务已经存在之后读） | **0** |
+| `native_legacy_surface_status` | 0（kext 加载成功） |
+| `native_gop_ready` | **0** |
+| `native_legacy_nub` / `native_legacy_video_base` | 0 / 0 |
+| `native_legacy_frame_count` | **0** |
+
+**所以「`IOCoreSurfaceRoot` 从不出现」这个说法是错的，要改**：它出现，只是晚于
+探针那一次 5 秒 `waitForMatchingService`。而 `native_legacy_surface_found` 是
+**一次性赋值、没有任何重试**的，所以服务后来出现了也没用——`native_gop_ready`
+在服务存在之后仍然是 0，`native_legacy_frame_count` 仍然是 0。
+
+**这就是「没有第二帧」的完整根因，一句话**：
+`native_legacy_display_late_probe()` 的 5 秒等待窗早于 `IOSurfaceRoot` 安装
+（本次 t=86.1s，observe2 那次 t=51.8s——**两次差 34 秒，说明这个先后不是固定的**），
+窗一关 `surface_found` 就永久为 0，GOP nub 永不创建，`native_gop_ready` 永为 0，
+没有任何东西 present，帧缓冲永远是 DarwinBoot 留下的那一帧。
+
+**修法在客体侧，不在主机侧**：`package/LegacyDisplayProbe.cpp:490-494` 要么把等待拉长、
+要么在超时后挂一个通知重试（`IOService::publishNotification` / `addMatchingNotification`），
+这是 `vendor/UniXNU-qemu` 树的改动，要重新构建内核并经 runner 交付——
+**不是 `src/unipad/` 能修的，也不要试图用主机侧的启动参数绕过**。
+主机侧唯一能做的是把它记录成阻塞项，并保证一旦内核修好，
+现有链路（`--ramfb-driver`、VirtIO HID、`send-key`）不需要再改一次。
+
+**一条附带的实测**：`IOSurfaceRoot` 的安装时刻在两次运行之间差了 34 秒
+（51.8s vs 86.1s），所以「探针跑在服务安装之前」不是一次偶然的竞态，
+而是一个**时窗不稳定、但探针只试一次**的结构性组合。
 
 #### 7.5.7 串口最后一跳实测：**无法从客体外判定**，而不是失败（2026-10-28）
 
