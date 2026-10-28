@@ -1,7 +1,7 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "f6e2910c0778ff85d1343a33039ac186155fcb1a",
+    "commit": "4830db3dd9c63c3cdcd0da68903260147f07e9c7",
     "commit_note": "Pinned 2026-10-28. A fork of xVanTuring/UniXNU-qemu at the previous pin 97b75b1f63c6b7e895cd7646029db741d5fe5488 (verified through api.github.com as this commit's parent) plus exactly one commit, which runs the legacy display's IOSurface wait on its own thread instead of on the boot thread. Measured: mountroot completes at t=49.6 s and IOSurfaceRoot::installMemoryRegions() lands at t=63.6 s, interleaved with the Data and SystemOS mounts both \"requested by: init (pid 1)\" -- so the service is published by work that cannot start until bsd_init() returns. Upstream is read-only for this account; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
