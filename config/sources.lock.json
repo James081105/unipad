@@ -3,8 +3,8 @@
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "unixnu": {
     "repo": "https://github.com/James081105/UniXNU",
-    "commit": "511147c1dd98a1af33586db78241701791868d1b",
-    "commit_note": "Pinned 2026-10-28. A fork of UniXNU/UniXNU at the previous pin b881ac7dc1695ce676c856873051a487c6a9f963 (verified as this commit's parent) plus exactly one commit: zzzz-display-surface-after-mountroot.patch, which moves the legacy display's five-second IOSurface wait out of bsd_autoconf() to immediately after a successful vfs_mountroot(). Upstream is read-only for this account, so the fix cannot be delivered there; the fork is public and carries no private material. Remove this fork and re-pin to upstream the moment the change is accepted upstream.",
+    "commit": "ab3199c90b13478c80fbfb7242f1d56a3c3bae83",
+    "commit_note": "Pinned 2026-10-28. A fork of UniXNU/UniXNU at the previous pin b881ac7dc1695ce676c856873051a487c6a9f963 (verified through api.github.com as this commit's parent) plus exactly one commit, which moves native_legacy_display_late_probe() from the end of bsd_autoconf() to just after IOSecureBSDRoot(rootdevice). The five-second waitForMatchingService for \"IOCoreSurfaceRoot\" used to block the mountroot that publishes the service. Upstream is read-only for this account, so the fix cannot be delivered there; the fork is public and carries no private material. Re-pin to upstream as soon as the change is accepted there.",
     "upstream_repo": "https://github.com/UniXNU/UniXNU",
     "upstream_commit": "b881ac7dc1695ce676c856873051a487c6a9f963"
   },
