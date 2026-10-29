@@ -68,6 +68,33 @@ EXECUTABLE_NAMES = frozenset({"NativeAdrenoMetal", "libvulkan_freedreno.dylib"})
 #: here because the packer compresses at level 9 precisely to stay inside it.
 PAYLOAD_HEADROOM = int(201_326_592 * 0.95) - 121_178_596
 
+#: The longest path this host can create.  Windows' MAX_PATH is 260 characters
+#: including the terminator; every other platform the suite runs on is bounded by
+#: something far larger than any fixture here needs.  Used by one test whose
+#: fixture cannot be expressed on a host whose %TEMP% is already ~107 characters
+#: deep -- see the comment there for why that is arithmetic and not taste.
+_MAX_PATH = 260 if sys.platform.startswith("win") else 1 << 20
+
+
+def _assert_the_packer_still_refuses_a_long_path() -> None:
+    """Pin the 160-byte cap on the source, where no host limit applies.
+
+    The behavioural test below needs a >127-byte relative path, which needs a
+    ~290-character absolute path, which Windows cannot create under this host's
+    temp directory.  When it has to skip, this is what keeps the contract
+    covered: the cap is still asserted, just not exercised.
+    """
+    packer = (DRIVER / PACKER).read_text(encoding="utf-8")
+    assert "len(encoded) > 160" in packer, (
+        "make-gpu-addon.py no longer refuses a member name over 160 bytes; the "
+        "kernel's materialise path is a fixed buffer, so an over-long name is "
+        "either truncated or overrun, never padded"
+    )
+    assert "'Bad addon path '" in packer, (
+        "make-gpu-addon.py no longer says 'Bad addon path'; the refusal the "
+        "behavioural test looks for would be gone"
+    )
+
 
 def _packer() -> Path:
     """The pinned packer, or a skip naming the exact path that is missing."""
@@ -293,6 +320,24 @@ def test_a_path_the_kernel_would_reject_is_refused_rather_than_padded(tmp_path):
     deep = bundle
     for _ in range(4):
         deep = deep / ("d" * 30)
+    # That shape still does not fit on THIS host, and the reason is arithmetic
+    # rather than taste: the relative path must be at least 128 bytes, the
+    # packer's own prefix adds 47, and pytest's tmp_path sits under this host's
+    # non-ASCII user directory, which is ~107 characters on its own.  The
+    # fixture therefore needs ~290 characters where Windows allows 260.
+    #
+    # A skip with those numbers is the honest outcome -- the alternative is a
+    # FileNotFoundError about MAX_PATH, which is precisely the "something about
+    # the filesystem instead of about the packer" this test exists to avoid.  The
+    # contract itself is still pinned below, on the source, where no host limit
+    # applies.
+    if len(str(deep / "leaf.bin")) > _MAX_PATH:
+        _assert_the_packer_still_refuses_a_long_path()
+        pytest.skip(
+            f"the fixture needs a {len(str(deep / 'leaf.bin'))}-character path and "
+            f"this host allows {_MAX_PATH}; the cap itself is pinned on the source "
+            f"by _assert_the_packer_still_refuses_a_long_path"
+        )
     deep.mkdir(parents=True)
     (deep / "leaf.bin").write_bytes(b"fixture")
     assert len("addons/NativeAdrenoMetal.bundle/" + "d" * 30 + "/") * 4 + len("leaf.bin") + 1 > 160

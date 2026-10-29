@@ -28,8 +28,18 @@
 #     called from check-native-metal-frontend-host.py:43) is not on this chain.
 set -uo pipefail
 
-REPO="${1:?usage: build-gpu-addon.sh REPO_ROOT [OUTPUT]}"
-OUTPUT="${2:-vendor/UniXNU/build/gpu-addon.ngpu}"
+# Paths that arrive from the environment or argv are normalised to forward
+# slashes.  This script runs on macOS, where every path is already POSIX and the
+# substitution is a no-op; it exists because a Windows host invoking it is not a
+# hypothetical -- this repository is developed on one, and a test does exactly
+# that.  MEASURED: passing a Windows path through unchanged made `$LOG` become
+# "$PWD/C:\Users\...\logs/build-gpu-addon.log", which is a path no mkdir can
+# create, so the script died with "cannot write the log" and a message that
+# showed the mangling rather than naming the cause.
+to_posix() { printf '%s' "$1" | tr '\\' '/'; }
+
+REPO="$(to_posix "${1:?usage: build-gpu-addon.sh REPO_ROOT [OUTPUT]}")"
+OUTPUT="$(to_posix "${2:-vendor/UniXNU/build/gpu-addon.ngpu}")"
 
 # Absolute, and load-bearing for the same reason bootstrap-mesa-turnip.sh gives:
 # every upstream script resolves its own paths from __file__, so they are already
@@ -44,9 +54,15 @@ else PY=''; fi
 [[ -n "$PY" ]] || { echo "no python interpreter on PATH" >&2; exit 1; }
 
 LOGDIR="${ADDON_LOG_DIR:-$REPO/build-output}"
+LOGDIR="$(to_posix "$LOGDIR")"
 mkdir -p "$LOGDIR" || { echo "cannot create $LOGDIR" >&2; exit 1; }
 LOG="$LOGDIR/build-gpu-addon.log"
-case "$LOG" in /*) ;; *) LOG="$PWD/$LOG" ;; esac
+# Absolute is /* on POSIX and X:/ on Windows, and both are left alone.  A
+# relative path is resolved against $PWD, because a log that moves when the
+# script moves is a log nobody can find -- the neighbouring bootstrap lost a
+# failure's own output that way (its bison build's subshell), and the lesson
+# generalises.
+case "$LOG" in /*|[A-Za-z]:/*) ;; *) LOG="$PWD/$LOG" ;; esac
 : > "$LOG" || { echo "cannot write the log $LOG" >&2; exit 1; }
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
@@ -93,8 +109,39 @@ glslc --version >>"$LOG" 2>&1 || die "glslc is on PATH but does not answer --ver
 spirv-val --version >>"$LOG" 2>&1 || die "spirv-val is on PATH but does not answer --version"
 log "preflight: glslc and spirv-val both answer"
 
+# The Vulkan headers at /opt/homebrew/include.  check-turnip-darwin-host.py:55
+# and :75 compile vulkan_smoke.c and deferred_bo.cpp with `-I
+# /opt/homebrew/include`, and vulkan_smoke.c:9 includes <vulkan/vulkan.h>.
+# Nothing puts those headers there by default: `brew install glslang`, which is
+# what the Mesa bootstrap installs, provides glslangValidator and the spirv-*
+# tools and NOT the Vulkan headers -- they come from vulkan-headers.  Without
+# this the ring fails on its fifth compile, after the four ArmSmmu4K objects and
+# the IOKit shim have already been built, which is the expensive place to learn
+# a formula was missing.
+#
+# And a header that is present is not the same as a header that is usable, so it
+# is proved by compiling a translation unit against it rather than by testing
+# for the file.  The instrument answers a known-present question before its
+# answer is trusted.
+if ! printf '#include <vulkan/vulkan.h>\nint main(void){return 0;}\n' \
+        | xcrun clang -x c -I /opt/homebrew/include -o /dev/null - >>"$LOG" 2>&1; then
+    log "the Vulkan headers are not usable at /opt/homebrew/include; installing vulkan-headers"
+    brew install vulkan-headers >>"$LOG" 2>&1 || die "cannot install vulkan-headers, which provides /opt/homebrew/include/vulkan/vulkan.h"
+    printf '#include <vulkan/vulkan.h>\nint main(void){return 0;}\n' \
+        | xcrun clang -x c -I /opt/homebrew/include -o /dev/null - >>"$LOG" 2>&1 \
+        || die "vulkan-headers is installed but <vulkan/vulkan.h> still does not compile against /opt/homebrew/include"
+fi
+log "preflight: <vulkan/vulkan.h> compiles against /opt/homebrew/include"
+
 command -v codesign >/dev/null 2>&1 || die "codesign is absent; build-adreno-metal-plugin.py signs the bundle and the Turnip library with it"
 command -v xcrun    >/dev/null 2>&1 || die "xcrun is absent; every ring that compiles resolves its SDK through it"
+# build-adreno-metal-plugin.py:47 and :62 call `strip -x` on the bundle
+# executable and on the Turnip library.  It ships with the Xcode command-line
+# tools, so in practice it is always there -- which is exactly why it is worth
+# naming, because a runner image without the CLT fails here in one line instead
+# of forty minutes into ring 6.
+command -v strip    >/dev/null 2>&1 || die "strip is absent; build-adreno-metal-plugin.py:47,62 strip the bundle executable and the Turnip library with it"
+command -v git      >/dev/null 2>&1 || die "git is absent; the pin checks in this script and in build-turnip-darwin.py:34 resolve through it"
 
 # The Rust toolchain pin is spelled in build-native-metal-bridge.py:82 as
 # `cargo +1.98.0`, so the check is the same invocation: if the pin is not
