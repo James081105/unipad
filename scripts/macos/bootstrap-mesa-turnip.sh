@@ -143,48 +143,21 @@ log "bison $BISON_VERSION ($BISON_SHA256)"
 # anonymous clones, and a runner that dies halfway through a 500 MB fetch has
 # spent its minutes on nothing.  The mirror is Google's, which does not.
 #
-# The line endings are pinned BEFORE any file is written, and that ordering is
-# the whole reason this is `init` + `fetch` rather than `clone`.  `git clone -c
-# core.autocrlf=false` does not persist the setting, and a `clone` writes its
-# checkout before any later `git config` could take effect -- MEASURED on this
-# Windows host, whose global git sets autocrlf=true, where a `-c`-flagged clone
-# still produced CRLF on disk.  The consequence is not cosmetic: `git show
-# HEAD:<path>` returns LF, so the driver's own patch verifier refused the tree
-# with "Recorded Mesa patches do not reconstruct pinned source" -- after all nine
-# patches had applied cleanly.  The same difference would change
-# `git diff HEAD --binary`, which build-turnip-darwin.py hashes into its build
-# profile, so a Windows-produced tree and a macOS-produced one would get
-# different source ids and the builtin pack check ("not from this exact compiler
-# source/profile") would refuse a pack built from byte-identical source.
-GIT_LF='-c core.autocrlf=false -c core.eol=lf'
-if [[ ! -d "$SOURCE/.git" ]]; then
-    rm -rf "$SOURCE"
-    mkdir -p "$SOURCE"
-    git $GIT_LF init -q "$SOURCE" || die "cannot initialise $SOURCE"
-    git -C "$SOURCE" remote add origin "$MESA_MIRROR" 2>>"$LOG" \
-        || die "cannot add the Mesa mirror as a remote"
-fi
-git -C "$SOURCE" config core.autocrlf false
-git -C "$SOURCE" config core.eol lf
-head="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null)" || head=""
-if [[ "$head" == "$MESA_COMMIT" ]]; then
-    log "mesa source already at $MESA_COMMIT"
-else
-    # MEASURED: fetching by sha works on the googlesource mirror ("* branch
-    # <sha> -> FETCH_HEAD"), while `clone --branch <sha>` does not ("Remote
-    # branch <sha> not found in upstream origin").  So the fetch is the only
-    # mechanism here, and a shallow one keeps the runner's disk and minutes down.
-    log "mesa source at ${head:0:12}, fetching $MESA_COMMIT"
-    git -C "$SOURCE" fetch --depth 1 origin "$MESA_COMMIT" 2>>"$LOG"         || die "cannot fetch $MESA_COMMIT from the Mesa mirror"
-    git -C "$SOURCE" checkout --detach "$MESA_COMMIT" 2>>"$LOG"         || die "cannot check out $MESA_COMMIT"
-fi
-[[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$MESA_COMMIT" ]] \
-    || die "the Mesa source is not at the pinned commit"
-# The commit alone says which change was made; the tree says what the source
-# actually is.  The pin records both, and checking only the first is how a
-# rewritten history with the same subject line gets in.
-[[ "$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')" == "$MESA_TREE" ]] \
-    || die "the Mesa source's tree is not the pinned tree; the commit id matches but its content does not"
+# The checkout, the commit proof, the tree proof and the patch set are
+# scripts/macos/lib/pinned-source.sh, shared with bootstrap-metal2vulkan.sh.
+# That is the same four steps applied to a different upstream, and every guard
+# in them was paid for here first -- see the comments in that file for what
+# each one is, and the ones below for why this caller is the shape it is.
+#
+# The library is resolved from THIS file's own location, not from $REPO or
+# $PWD: the workflow invokes this as `bash
+# scripts/macos/bootstrap-mesa-turnip.sh .` from the repository root, and a
+# relative path would break the moment either of those changed.
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/pinned-source.sh"
+[[ -f "$LIB" ]] || { echo "no $LIB; the shared pinned-source library is missing" >&2; exit 1; }
+. "$LIB"
+
+pinned_source_checkout "$SOURCE" "$MESA_MIRROR" "$MESA_COMMIT" "$MESA_TREE" "" "mesa source"
 
 # --- 2. the recorded patches ----------------------------------------------
 # build-turnip-darwin.py:35 calls validate_recorded_patches(), which does not
@@ -207,34 +180,7 @@ PY
 }
 PATCH_LIST="$(mesa_patches)" || die "cannot read the patch list from the pin"
 
-# The set is applied from a clean tree, every time.  Per-patch idempotence --
-# `apply --reverse --check` on each patch alone, skipping the ones that already
-# applied -- is NOT sound here, and was MEASURED failing: several recorded
-# patches touch the same file (src/freedreno/vulkan/tu_knl.cc is in three of
-# them), so reverse-checking one of them against a tree that also carries the
-# others fails even though the set is complete, and the run then dies with
-# "cannot apply offline-adreno-compiler-probe.patch" on a tree that already had
-# all nine.  Resetting costs one `git checkout` and makes the outcome a function
-# of the pin rather than of whatever the previous run left behind.
-git -C "$SOURCE" reset --hard --quiet HEAD 2>>"$LOG" \
-    || die "cannot reset the Mesa tree to the pinned commit"
-# The verifier refuses untracked files as "Unrecorded Mesa source changes", so
-# anything a previous run left behind has to go too.  Without -x, so files the
-# source's own .gitignore covers are kept -- those are not in `ls-files --others
-# --exclude-standard` and the verifier never sees them.
-git -C "$SOURCE" clean -fdq 2>>"$LOG" || true
-
-applied=0
-while IFS= read -r patch; do
-    [[ -n "$patch" ]] || continue
-    [[ -f "$UP/$patch" ]] || die "the pin names $patch and it is not in the driver checkout"
-    git -C "$SOURCE" apply "$UP/$patch" 2>>"$LOG" \
-        || die "cannot apply $patch onto Mesa $MESA_COMMIT"
-    applied=$((applied + 1))
-done <<PATCHES
-$PATCH_LIST
-PATCHES
-log "mesa patches: $applied applied"
+pinned_source_apply_patches "$SOURCE" "$UP" "$PATCH_LIST" "mesa" "$MESA_COMMIT"
 
 # Verified with the driver's own verifier rather than with a second
 # implementation of it.  This is the check build-turnip-darwin.py will run, so

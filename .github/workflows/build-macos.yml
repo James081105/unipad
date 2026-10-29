@@ -1326,6 +1326,47 @@ jobs:
           fi
           exit 0
 
+      # The metal2vulkan translator source, and the toolchain that compiles it,
+      # for the same reason the step above exists for Mesa: without it the
+      # GPU-addon chain dies on its first line with a message about a missing
+      # .cache directory rather than about the missing stage.  Four readers
+      # resolve `vendor/UniXNU/.cache/gpu-reference/metal2vulkan` from
+      # `Path(__file__).resolve().parents[1]` -- build-native-metal-bridge.py:17,
+      # check-metal-vulkan-probe.py:23, probe-metal-vulkan-host.py:101 and
+      # check-priming-cache-host.py:167 -- so a producer that put it anywhere
+      # else would satisfy itself and starve all four.
+      #
+      # It is a SEPARATE step rather than two more lines in the Mesa one,
+      # because the two bootstraps fail independently and the log has to say
+      # which: a Mesa checkout that cannot be fetched and a Rust toolchain that
+      # cannot be installed are different problems with different fixes, and one
+      # `available=false` line covering both would name neither.
+      #
+      # Not fatal, for the same reason the Mesa bootstrap is not: a runner that
+      # cannot install the toolchain still produces a kernel, a device tree and
+      # a Data volume.  What changes is that the chain now has its ring-0 input:
+      # build-gpu-addon.sh:116 dies with "no $TRANSLATOR; ring 0's
+      # bootstrap-metal2vulkan.sh has not run" until this step has run, so every
+      # previous run of the addon chain stopped there.
+      #
+      # Sits immediately after the Mesa bootstrap and immediately before the
+      # addon chain, which is the only position that can hand anything over.
+      - name: Bootstrap the metal2vulkan translator source and Rust toolchain
+        id: metal2vulkan
+        if: always()
+        env:
+          BOOTSTRAP_LOG: build-output/bootstrap-metal2vulkan.log
+        run: |
+          set -uo pipefail
+          mkdir -p build-output
+          if bash scripts/macos/bootstrap-metal2vulkan.sh . ; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the metal2vulkan bootstrap failed; the GPU addon chain will stop at its ring-0 preflight and say so"
+          fi
+          exit 0
+
       # Rings 1..7 of the addon chain.  Sits here, immediately after the
       # bootstraps and immediately before the build, for the reason the step
       # above gives: the blob has to exist before build-macos.sh runs, because
@@ -2229,6 +2270,7 @@ jobs:
             ipsw-work/chain.log
             ipsw-work/os-root.log
             build-output/bootstrap-mesa.log
+            build-output/bootstrap-metal2vulkan.log
             build-output/build-gpu-addon.log
             build-output/addon-*.log
           retention-days: 30
