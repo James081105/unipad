@@ -17,9 +17,12 @@
 # change is visible in the artifact contract.  Even on an arm64 runner, HVF
 # nesting is NOT assumed to exist: the build must stand alone.
 #
-# Cost note (PRD 8.4): the job timeout is also the per-run macOS budget ceiling
-# (~60 min of standard macOS overage is roughly 3.72 USD on a private repo), so
-# the job is expected to finish or fail well before the ceiling.
+# Cost note (PRD 8.4): the job timeout is also the per-run macOS budget ceiling.
+# The source repository is public, so standard GitHub-hosted macOS minutes are
+# free; the ceiling that actually binds is the 180 minutes set on the job below,
+# and the chain that made 60 insufficient is the GPU addon's seven rings (two of
+# them full Mesa cross-builds).  Each ring now logs its own elapsed seconds, so
+# if the budget ever needs trimming again it is trimmed against a measurement.
 
 name: build-macos
 
