@@ -121,6 +121,31 @@ def test_only_the_named_path_is_tolerated(tmp_path):
     assert result.returncode != 0, f"an unnamed absent path was tolerated: {result.stdout!r}"
 
 
+def test_the_real_call_shape_is_skipped(tmp_path):
+    """The wrapper must match the way check-turnip-darwin-host.py actually calls it.
+
+    That call is ``subprocess.run([sys.executable, ROOT / 'scripts/check-....py',
+    '--output', Path(temporary) / 'control'], check=True, timeout=660)`` -- so the
+    absent file is a *Path object* at argv[1], with arguments after it.  A guard
+    that only understood strings at argv[0] would tolerate nothing at all, which
+    is the one failure this wrapper cannot afford: it would let the chain fail
+    while looking like it worked.
+    """
+    body = (
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        "target = Path(%r)\n"
+        "subprocess.run([sys.executable, target, '--output', Path('out') / 'control'],\n"
+        "               check=True, timeout=660)\n"
+        "print('after-absent')\n"
+    ) % str(ABSENT)
+    script = _upstream(tmp_path, "upstream_pathcall.py", body)
+    result = _run(script, str(ABSENT))
+    assert result.returncode == 0, result.stderr
+    assert "SKIPPED" in result.stdout, result.stdout
+    assert "after-absent" in result.stdout, result.stdout
+
+
 def test_the_wrapper_refuses_to_run_without_a_tolerated_path(tmp_path):
     """With nothing to tolerate there is no reason to interpose at all."""
     script = _upstream(tmp_path, "upstream_none.py", "print('ran')\n")
