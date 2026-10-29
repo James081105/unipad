@@ -1303,12 +1303,42 @@ jobs:
           # The addon blob, if whatever built it left one.  Read here rather
           # than in the build step so the producer and the consumer never have
           # to agree on a path: the chain's later links write it, this step
-          # forwards it, and build-macos.sh's --gpu-addon receives it.  Today
-          # nothing writes it -- the chain's links 2..6 are blocked upstream
-          # (docs/implementation-plan.md), so this output is absent and the
-          # payload step's existing "no GPU addon" line is what fires.
+          # forwards it, and build-macos.sh's --gpu-addon receives it.  The
+          # chain now runs in the step below, so this line is the fallback for
+          # a blob an earlier run left behind rather than the only source.
           if [ -f vendor/UniXNU/build/gpu-addon.ngpu ]; then
             echo "addon=vendor/UniXNU/build/gpu-addon.ngpu" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      # Rings 1..7 of the addon chain.  Sits here, immediately after the
+      # bootstraps and immediately before the build, for the reason the step
+      # above gives: the blob has to exist before build-macos.sh runs, because
+      # --gpu-addon is what puts it in the payload.
+      #
+      # Not fatal, for the same reason the bootstrap is not: a runner that
+      # cannot finish the chain still produces a kernel, a device tree and a
+      # Data volume, and the payload step names the missing addon in its own
+      # words.  What changed is that the chain now RUNS: rings 1..7 were
+      # unbuilt until this step, so `addon` above was structurally always
+      # absent.  The one upstream gap on the path (the absent
+      # check-quartzcore-turnip-cache-host.py) is skipped explicitly and
+      # loudly by scripts/macos/run-upstream-check.py, whose tests pin that it
+      # skips only that one call and still fails on everything else.
+      - name: Build the GPU addon chain
+        id: addon
+        if: always() && steps.mesa.outputs.available == 'true'
+        env:
+          ADDON_LOG_DIR: build-output
+        run: |
+          set -uo pipefail
+          mkdir -p build-output
+          if bash scripts/macos/build-gpu-addon.sh . ; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo "addon=vendor/UniXNU/build/gpu-addon.ngpu" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the GPU addon chain failed; its logs are in the build-logs artifact and the payload step will say no addon was supplied"
           fi
           exit 0
 
@@ -1344,7 +1374,7 @@ jobs:
           # as BUILD_PAYLOAD does.  Empty today, and an empty value has to reach
           # the script as "no --gpu-addon" -- which is what makes its payload
           # step say so in its own words instead of dying on a missing path.
-          UNIXNU_GPU_ADDON: ${{ steps.mesa.outputs.addon || '' }}
+          UNIXNU_GPU_ADDON: ${{ steps.addon.outputs.addon || steps.mesa.outputs.addon || '' }}
         run: |
           set -euo pipefail
           if [ ! -f scripts/macos/build-macos.sh ]; then
@@ -2047,7 +2077,7 @@ jobs:
           # as BUILD_PAYLOAD does.  Empty today, and an empty value has to reach
           # the script as "no --gpu-addon" -- which is what makes its payload
           # step say so in its own words instead of dying on a missing path.
-          UNIXNU_GPU_ADDON: ${{ steps.mesa.outputs.addon || '' }}
+          UNIXNU_GPU_ADDON: ${{ steps.addon.outputs.addon || steps.mesa.outputs.addon || '' }}
           # The passphrase the material-manifest stage encrypts the Data seed
           # with (`openssl enc -aes-256-gcm -pbkdf2 -salt -pass env:`).  It is a
           # secret, so it is never echoed and never written to disk by this
@@ -2184,6 +2214,8 @@ jobs:
             ipsw-work/chain.log
             ipsw-work/os-root.log
             build-output/bootstrap-mesa.log
+            build-output/build-gpu-addon.log
+            build-output/addon-*.log
           retention-days: 30
           if-no-files-found: warn
 
