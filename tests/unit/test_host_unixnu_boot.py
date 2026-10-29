@@ -298,12 +298,12 @@ def test_the_real_board_declares_the_payload_the_module_boots(
     assert real_spec["size_mib"] == 192, real_spec
     assert real_spec["dram_size"] == "0x180000000", real_spec
     assert real_spec["panic_screen"] is True, real_spec
-    # 25, not the 24 this asserted after the GPU addon was switched on.  The
+    # 26, not the 25 this asserted after the surface wait was raised.  The
     # count is the point of the line -- a board that silently loses an argument
     # boots a different machine -- so it moves with the board rather than being
     # loosened.  The arguments themselves are asserted by name below, because a
     # count alone cannot tell you WHICH argument changed.
-    assert len(real_spec["kernel_args"]) == 25, real_spec
+    assert len(real_spec["kernel_args"]) == 26, real_spec
     assert "sheng-gpu-addon=1" in real_spec["kernel_args"], real_spec
     # The kernel-side presenter.  This one is not the addon: NativeGOPPresenter::
     # start() is the only writer of native_gop_ready, and the object is only
@@ -311,6 +311,16 @@ def test_the_real_board_declares_the_payload_the_module_boots(
     # phase=4 and without it the presenter does not exist and gop_ready is 0 no
     # matter what the userspace half does.
     assert "sheng-fb-gpu=1" in real_spec["kernel_args"], real_spec
+    # The display probe's own surface wait.  The 120 s default let six of ten
+    # boots of one matched build reach the userland and then show no display at
+    # all -- surface_status 0 (the IOSurface kext loaded) with surface_found 0,
+    # i.e. waitForMatchingService() timed out.  Asserted by name AND by value:
+    # the name says the wait is configured rather than defaulted, and the value
+    # is the measured one that took the same build to stage 10 on both of the
+    # next two boots.
+    wait = [a for a in real_spec["kernel_args"]
+            if a.startswith("offline-legacy-surface-wait-ms=")]
+    assert wait == ["offline-legacy-surface-wait-ms=600000"], wait
 
 
 def test_the_memory_the_module_gives_the_machine_is_the_boards(
