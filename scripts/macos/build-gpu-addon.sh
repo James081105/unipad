@@ -164,6 +164,17 @@ command -v xcrun    >/dev/null 2>&1 || die "xcrun is absent; every ring that com
 command -v strip    >/dev/null 2>&1 || die "strip is absent; build-adreno-metal-plugin.py:47,62 strip the bundle executable and the Turnip library with it"
 command -v git      >/dev/null 2>&1 || die "git is absent; the pin checks in this script and in build-turnip-darwin.py:34 resolve through it"
 
+#: The bridge script, which is where the cargo toolchain pin is read from rather
+#: than spelled a second time here.  DEFINED BEFORE ITS FIRST USE, and that
+#: ordering is load-bearing: MEASURED on run 40928765061, the cargo check below
+#: read $BRIDGE thirty-eight lines above this definition, so under `set -u` the
+#: preflight died on an unbound variable the instant it reached it -- right after
+#: the Vulkan-header install, which is where the log simply stops.  A variable
+#: used before it is assigned is not a lint nit; it is a preflight that dies
+#: halfway through provisioning and leaves a log that ends mid-sentence.
+BRIDGE="$UP/scripts/build-native-metal-bridge.py"
+[[ -f "$BRIDGE" ]] || die "no $BRIDGE; the driver checkout is where this stage starts"
+
 # The Rust toolchain pin.  READ FROM THE BRIDGE SCRIPT rather than spelled here:
 # build-native-metal-bridge.py:82 invokes `cargo +1.98.0`, and a second copy of
 # that pin in this script is a second place for it to drift.  MEASURED on run
@@ -210,10 +221,6 @@ log "preflight: llvm-as is $LLVM_AS"
 # the missing bootstrap instead of a Rust path error.
 TRANSLATOR="$UP/.cache/gpu-reference/metal2vulkan"
 [[ -d "$TRANSLATOR/.git" ]] || die "no $TRANSLATOR; ring 0's bootstrap-metal2vulkan.sh has not run"
-#: The bridge script itself, which is where the cargo toolchain pin and the
-#: patch list are read from rather than spelled a second time here.
-BRIDGE="$UP/scripts/build-native-metal-bridge.py"
-[[ -f "$BRIDGE" ]] || die "no $BRIDGE; the driver checkout is where this stage starts"
 TRANSLATOR_HEAD="$(git -C "$TRANSLATOR" rev-parse HEAD 2>/dev/null | tr -d '\r')"
 TRANSLATOR_PIN="$("$PY" - "$UP/scripts/data/gpu-metal-vulkan-inputs.json" <<'PY' | tr -d '\r'
 import json, sys

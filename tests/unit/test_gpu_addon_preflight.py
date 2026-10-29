@@ -171,6 +171,98 @@ def test_the_preflight_provisions_the_shader_tools():
     )
 
 
+def _stub_bin(tmp_path: Path) -> Path:
+    """A directory of stubs that make every tool the preflight probes answer.
+
+    Why stubs at all: the refusal test above stops at the FIRST missing tool,
+    which on this host is ``glslc`` -- so it never reaches the cargo check, the
+    toolchain reader, or the translator pin.  That is exactly how the
+    use-before-definition bug on run 40928765061 survived a green suite: the
+    script died on ``$BRIDGE`` thirty-eight lines below its definition, at a
+    point no test had ever executed.
+
+    A guard that only ever runs as far as its host allows is a guard with a
+    host-shaped hole in it.  These stubs close the hole: with every tool
+    answering, the preflight runs to its end and the test can assert it reached
+    the rings rather than dying halfway through provisioning.
+    """
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    for name, body in {
+        # Each answers the question the preflight asks and nothing else, so a
+        # stub that stops matching shows up as a failure rather than as a pass.
+        "glslc": "#!/bin/sh\nexit 0\n",
+        "spirv-val": "#!/bin/sh\nexit 0\n",
+        "brew": "#!/bin/sh\nexit 0\n",
+        "codesign": "#!/bin/sh\nexit 0\n",
+        "strip": "#!/bin/sh\nexit 0\n",
+        "cargo": "#!/bin/sh\necho 'cargo 1.98.0 (stub)'\nexit 0\n",
+        "rustup": "#!/bin/sh\necho aarch64-apple-ios\nexit 0\n",
+        "llvm-as": "#!/bin/sh\nexit 0\n",
+        # xcrun is how the SDK, the compilers and the Vulkan-header proof are
+        # reached; a stub that succeeds is what "the toolchain is present" means
+        # to this preflight.
+        "xcrun": "#!/bin/sh\nexit 0\n",
+    }.items():
+        path = bindir / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    return bindir
+
+
+def test_the_preflight_runs_past_the_toolchain_check_when_every_tool_answers(tmp_path):
+    """Teeth for the coverage gap: the whole preflight, not just its first refusal.
+
+    Run 40928765061 died at ``$BRIDGE`` -- used thirty-eight lines above its own
+    definition -- and every preflight test stayed green, because on this host the
+    preflight never got past ``glslc``.  This test supplies stubs for every tool
+    so it does, and asserts the log reaches the toolchain line, which is the last
+    thing before the checks that need a real translator checkout.
+
+    The toolchain line is the right landmark: it sits immediately after the
+    ``$BRIDGE`` read, so a use-before-definition anywhere in the cargo block is
+    reached here and nowhere else.
+    """
+    if not (REPO / "vendor" / "UniXNU" / "scripts" / "build-native-metal-bridge.py").is_file():
+        pytest.skip("the pinned vendor checkout is absent; the preflight cannot run")
+    stubs = _stub_bin(tmp_path)
+    logs = tmp_path / "logs"
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stubs}{os.pathsep}{_shell_path()}"
+    env["ADDON_LOG_DIR"] = str(logs)
+    result = subprocess.run(
+        [_bash(), str(SCRIPT), REPO.as_posix()],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=600, cwd=str(tmp_path),
+    )
+    combined = result.stdout + result.stderr
+    log_text = logs / "build-gpu-addon.log"
+    written = log_text.read_text(encoding="utf-8", errors="replace") if log_text.is_file() else ""
+
+    # The bug this test exists for.  A use-before-definition is not a lint nit:
+    # under `set -u` it is a preflight that dies halfway through provisioning and
+    # leaves a log that stops mid-sentence, which is what run 40928765061's did.
+    assert "unbound variable" not in combined, (
+        f"the preflight died on an unbound variable; a variable is used before "
+        f"it is assigned. Output: {combined[-1500:]!r}"
+    )
+    assert "for toolchain 1.98.0" in written, (
+        f"the preflight stopped before the toolchain check; it got only as far "
+        f"as its host's missing tools, which is the hole run 40928765061 fell "
+        f"through. Output: {combined[-1500:]!r}"
+    )
+    assert "preflight: llvm-as is" in written, (
+        f"the preflight stopped before the llvm-as check. Output: {combined[-1500:]!r}"
+    )
+    # And no ring ran: reaching the rings means the preflight let something
+    # through that it should have refused.
+    assert not list(logs.glob("addon-*.log")), (
+        f"a ring ran; the preflight let the chain through: "
+        f"{[p.name for p in logs.glob('addon-*.log')]}"
+    )
+
+
 def test_the_rust_toolchain_pin_is_read_from_the_bridge_not_spelled_twice():
     """Teeth: the preflight queried the wrong toolchain and reported a false negative.
 

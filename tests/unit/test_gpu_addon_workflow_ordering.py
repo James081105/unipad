@@ -173,6 +173,19 @@ def test_a_failed_chain_still_reaches_the_runs_verdict():
     assert _index_of(steps, PRODUCER_ID) < steps.index(verdict[0]), (
         "the verdict step runs before the step that writes the output it reads"
     )
+    # And after every consumer, which is the part that actually bit: MEASURED on
+    # run 40928765061 the verdict step sat immediately after the producer, so
+    # when it failed, GitHub SKIPPED "Run macOS build" and the second pass with
+    # it.  A non-fatal step made fatal by a verdict placed in front of the thing
+    # it is meant to report on.  The verdict belongs at the END of the job, where
+    # the owner root chain's and the Data seed's already are.
+    verdict_at = steps.index(verdict[0])
+    for index, name in _consumers(steps):
+        assert index < verdict_at, (
+            f"the verdict step at {verdict_at} precedes {name!r} at {index}; a "
+            f"failed chain would skip the build, which is the exact trade the "
+            f"non-fatal design exists to avoid"
+        )
 
 
 def test_the_addon_logs_are_uploaded():
