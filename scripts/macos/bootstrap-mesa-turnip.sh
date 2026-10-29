@@ -4,16 +4,27 @@
 # build-turnip-darwin.py reads four things that nothing in this repository
 # produces, and it refuses rather than guessing at any of them:
 #
-#   .cache/mesa-work     a Mesa checkout whose HEAD equals
-#                        scripts/data/adreno-compiler-inputs.json's mesa.commit
-#   .cache/mesa-tools    a bison new enough for Mesa's parser (macOS ships 2.3;
-#                        the pin is 3.8.2, with a byte count to verify against)
-#   .cache/mesa-venv     meson, ninja and Mesa's python build deps
-#   glslangValidator     on PATH, for the Vulkan runtime build
+#   vendor/UniXNU/.cache/mesa-work     a Mesa checkout whose HEAD equals
+#                                      scripts/data/adreno-compiler-inputs.json's
+#                                      mesa.commit
+#   vendor/UniXNU/.cache/mesa-tools    a bison new enough for Mesa's parser
+#                                      (macOS ships 2.3; the pin is 3.8.2, with
+#                                      a sha256 to verify against)
+#   vendor/UniXNU/.cache/mesa-venv     meson, ninja and Mesa's python build deps
+#   glslangValidator                   on PATH, for the Vulkan runtime build
 #
 # All four are absent from a fresh macos-latest runner, so without this stage
 # the whole GPU-addon chain dies on its first line with a message about a
 # missing directory rather than about the missing stage.
+#
+# Every path here is under vendor/UniXNU, and that is not a stylistic choice:
+# build-turnip-darwin.py:17 is `ROOT = Path(__file__).resolve().parents[1]`, so
+# it reads its pin from vendor/UniXNU/scripts/data/ and its caches from
+# vendor/UniXNU/.cache/.  A bootstrap that put them anywhere else would satisfy
+# itself and starve the build it feeds.  It also keeps every byte this script
+# downloads inside vendor/, which .gitignore:39 already excludes -- a cache
+# under the repository root is stageable by a bare `git add -A`, and that is
+# how a 500 MB Mesa clone ends up in a commit.
 #
 # Deliberately NOT under `set -e`: a bootstrap that fails must say which of the
 # four it was, and `set -e` would abort on the first one.  Every command's
@@ -23,8 +34,11 @@
 
 set -uo pipefail
 
-ROOT="${1:?usage: bootstrap-mesa-turnip.sh REPO_ROOT}"
-PIN="$ROOT/scripts/data/adreno-compiler-inputs.json"
+REPO="${1:?usage: bootstrap-mesa-turnip.sh REPO_ROOT}"
+
+#: The driver checkout.  Its own scripts read the pin and the caches relative
+#: to themselves, so this is where the whole stage lives.
+UP="$REPO/vendor/UniXNU"
 
 # Resolved rather than assumed, for the reason build-macos.sh:194 gives: "the
 # interpreter is not called python3 on every host that runs this script".  A
@@ -33,18 +47,25 @@ if command -v python3 >/dev/null 2>&1; then PY='python3'
 elif command -v python  >/dev/null 2>&1; then PY='python'
 else PY=''; fi
 [[ -n "$PY" ]] || { echo "no python interpreter on PATH" >&2; exit 1; }
-SOURCE="$ROOT/.cache/mesa-work"
-TOOLS="$ROOT/.cache/mesa-tools"
-VENV="$ROOT/.cache/mesa-venv"
-LOG="${BOOTSTRAP_LOG:-$ROOT/.cache/bootstrap-mesa.log}"
+
+[[ -d "$UP/.git" ]] || { echo "no $UP; the driver checkout is where this stage starts" >&2; exit 1; }
+
+LOCK="$REPO/config/sources.lock.json"
+[[ -f "$LOCK" ]] || { echo "no $LOCK; the driver pin is where this stage starts" >&2; exit 1; }
+
+PIN="$UP/scripts/data/adreno-compiler-inputs.json"
+[[ -f "$PIN" ]] || { echo "no $PIN; the Mesa pin is where this stage starts" >&2; exit 1; }
+
+SOURCE="$UP/.cache/mesa-work"
+TOOLS="$UP/.cache/mesa-tools"
+VENV="$UP/.cache/mesa-venv"
+LOG="${BOOTSTRAP_LOG:-$UP/.cache/bootstrap-mesa.log}"
+
+mkdir -p "$UP/.cache" "$(dirname "$LOG")"
+: > "$LOG" || { echo "cannot write the log $LOG" >&2; exit 1; }
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
 die() { log "FAIL $*"; exit 1; }
-
-mkdir -p "$ROOT/.cache" "$LOG" 2>/dev/null || true
-: > "$LOG" 2>/dev/null || true
-
-[[ -f "$PIN" ]] || die "no $PIN; the Mesa pin is where this stage starts"
 
 # The pin is read with python rather than grep: it is JSON, and a grep for
 # '"commit"' would also match the linux and board entries' commit keys.
@@ -55,19 +76,38 @@ print(json.loads(open(sys.argv[1], encoding="utf-8").read())[sys.argv[2]][sys.ar
 PY
 }
 
+# The driver checkout must be the one the lock pins, and this is checked BEFORE
+# the pin inside it is trusted.  The Mesa pin is a file in that checkout, so a
+# stale checkout is a stale pin -- and a stale pin is indistinguishable from a
+# correct one until the commit it names moves, which is exactly the shape this
+# repository has been bitten by before (implementation-plan.md fact 122: a stale
+# copy that is byte-identical to the correct one for as long as the input does
+# not change).  Reading the lock rather than hardcoding a sha is the same rule
+# the workflow's acquisition step follows.
+driver_head="$(git -C "$UP" rev-parse HEAD 2>/dev/null)" || driver_head=""
+driver_pin="$("$PY" - "$LOCK" <<'PY'
+import json, sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["unixnu"]["commit"])
+PY
+)" || die "cannot read unixnu.commit from $LOCK"
+[[ "$driver_head" == "$driver_pin" ]] \
+    || die "the driver checkout is at ${driver_head:0:12}, the lock pins ${driver_pin:0:12}; a Mesa pin read from a stale checkout is not this build's pin"
+
 MESA_COMMIT="$(read_pin mesa commit)" || die "cannot read the Mesa commit from the pin"
 MESA_MIRROR="$(read_pin mesa mirror)" || die "cannot read the Mesa mirror from the pin"
+MESA_TREE="$(read_pin mesa tree)" || die "cannot read the Mesa tree from the pin"
 BISON_VERSION="$(read_pin bison version)" || die "cannot read the bison version from the pin"
 BISON_URL="$(read_pin bison url)" || die "cannot read the bison url from the pin"
-BISON_BYTES="$(read_pin bison bytes)" || die "cannot read the bison byte count from the pin"
+BISON_SHA256="$(read_pin bison sha256)" || die "cannot read the bison sha256 from the pin"
 
+log "driver ${driver_head:0:12} (the lock's pin)"
 log "mesa commit $MESA_COMMIT"
 log "mesa mirror $MESA_MIRROR"
-log "bison $BISON_VERSION ($BISON_BYTES bytes)"
+log "bison $BISON_VERSION ($BISON_SHA256)"
 
 # --- 1. the Mesa source ----------------------------------------------------
 # The mirror is preferred over repository: gitlab.freedesktop.org rate-limits
-# anonymous clones, and a runner that dies halfway through a 400 MB clone has
+# anonymous clones, and a runner that dies halfway through a 500 MB clone has
 # spent its minutes on nothing.  The mirror is Google's, which does not.
 if [[ -d "$SOURCE/.git" ]]; then
     head="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null)" || head=""
@@ -81,13 +121,14 @@ if [[ -d "$SOURCE/.git" ]]; then
             || die "cannot check out $MESA_COMMIT"
     fi
 else
-    log "cloning Mesa at $MESA_COMMIT (shallow)"
+    log "cloning Mesa at $MESA_COMMIT"
     rm -rf "$SOURCE"
+    # --branch with a sha needs the server to allow it; when it does not, fall
+    # back to a full clone and fetch the pin explicitly rather than accepting
+    # whatever the branch tip happens to be.
     git clone --depth 1 --branch "$MESA_COMMIT" "$MESA_MIRROR" "$SOURCE" 2>>"$LOG" \
         || git clone "$MESA_MIRROR" "$SOURCE" 2>>"$LOG" \
         || die "cannot clone Mesa from $MESA_MIRROR"
-    # A shallow clone of a branch lands on the tip, which is not the pin; a
-    # full clone needs the explicit checkout.  Either way the pin is what runs.
     if [[ "$(git -C "$SOURCE" rev-parse HEAD)" != "$MESA_COMMIT" ]]; then
         git -C "$SOURCE" fetch --depth 1 origin "$MESA_COMMIT" 2>>"$LOG" \
             || die "cannot fetch the pinned commit after cloning"
@@ -97,12 +138,67 @@ else
 fi
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$MESA_COMMIT" ]] \
     || die "the Mesa source is not at the pinned commit"
+# The commit alone says which change was made; the tree says what the source
+# actually is.  The pin records both, and checking only the first is how a
+# rewritten history with the same subject line gets in.
+[[ "$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')" == "$MESA_TREE" ]] \
+    || die "the Mesa source's tree is not the pinned tree; the commit id matches but its content does not"
 
-# --- 2. bison --------------------------------------------------------------
+# --- 2. the recorded patches ----------------------------------------------
+# build-turnip-darwin.py:35 calls validate_recorded_patches(), which does not
+# apply anything: it reverse-applies every recorded patch and requires the
+# result to equal HEAD.  So the source must arrive here with all nine already
+# applied, and with nothing else changed -- an unrecorded edit is a hard exit.
+# Applying them here, in the pin's order, is what makes that verifier pass.
+# The list is read once into a variable and fed through a here-document, rather
+# than through `done < <(... <<'PY')`: test_no_heredoc_inside_a_process_
+# substitution records run 40386064322, which died on exactly that construct
+# because macOS's bash 3.2 refuses to parse it and `bash -n` on a bash 5 host
+# accepts it happily.
+mesa_patches() {
+    "$PY" - "$PIN" <<'PY'
+import json, sys
+for name in json.loads(open(sys.argv[1], encoding="utf-8").read())["patches"]:
+    print(name)
+PY
+}
+PATCH_LIST="$(mesa_patches)" || die "cannot read the patch list from the pin"
+
+applied=0
+while IFS= read -r patch; do
+    [[ -n "$patch" ]] || continue
+    [[ -f "$UP/$patch" ]] || die "the pin names $patch and it is not in the driver checkout"
+    if git -C "$SOURCE" apply --reverse --check "$UP/$patch" 2>/dev/null; then
+        continue
+    fi
+    git -C "$SOURCE" apply "$UP/$patch" 2>>"$LOG" \
+        || die "cannot apply $patch onto Mesa $MESA_COMMIT"
+    applied=$((applied + 1))
+done <<PATCHES
+$PATCH_LIST
+PATCHES
+log "mesa patches: $applied applied, the rest were already in place"
+
+# Verified with the driver's own verifier rather than with a second
+# implementation of it.  This is the check build-turnip-darwin.py will run, so
+# passing it here means the build cannot be surprised by it three steps later.
+"$PY" - "$UP" "$SOURCE" "$PIN" <<'PY' 2>>"$LOG" || die "the recorded Mesa patches do not verify; see $LOG"
+import json, sys
+from pathlib import Path
+root, source, pin = (Path(a) for a in sys.argv[1:4])
+sys.path.insert(0, str(root / "scripts"))
+from mesa_patch_identity import validate_recorded_patches
+validate_recorded_patches(root, source, json.loads(pin.read_text()))
+print("the recorded patches reconstruct the pinned source")
+PY
+log "mesa patch state verified by the driver's own verifier"
+
+# --- 3. bison --------------------------------------------------------------
 # macOS ships bison 2.3, which cannot parse Mesa's grammar.  Built from source
 # into .cache/mesa-tools because there is no bottle new enough, and verified
-# against the pin's byte count before it is used -- a truncated tarball is a
-# build failure that looks like a Mesa bug.
+# against the pin's sha256 before it is used -- a truncated tarball is a build
+# failure that looks like a Mesa bug, and a byte count alone would not catch a
+# same-length corruption.
 BISON_PREFIX="$TOOLS"
 if [[ -x "$BISON_PREFIX/bin/bison" ]]; then
     have="$("$BISON_PREFIX/bin/bison" --version | head -1 | grep -o '[0-9.]*' | head -1)"
@@ -118,13 +214,20 @@ if [[ ! -x "$BISON_PREFIX/bin/bison" ]]; then
     # bison URL ends .tar.xz, and `tar -xzf` on an xz archive fails with a
     # message about the magic bytes rather than about the compression.
     ext="${BISON_URL##*.}"
-    tarball="$ROOT/.cache/bison-$BISON_VERSION.$ext"
+    tarball="$UP/.cache/bison-$BISON_VERSION.$ext"
     log "downloading bison $BISON_VERSION"
     curl -sSL -o "$tarball" "$BISON_URL" 2>>"$LOG" || die "cannot download bison"
-    got="$(wc -c < "$tarball" | tr -d ' ')"
-    [[ "$got" == "$BISON_BYTES" ]] \
-        || die "bison tarball is $got bytes, the pin says $BISON_BYTES"
-    build="$ROOT/.cache/bison-build"
+    # The digest of what was actually downloaded, not of what the URL claims.
+    # Resolved in this shell rather than inside a function called from a command
+    # substitution: `die` in a subshell exits the subshell, so a missing tool
+    # would surface as an empty digest and a message about the wrong thing.
+    if command -v shasum >/dev/null 2>&1; then SUM='shasum -a 256'
+    elif command -v sha256sum >/dev/null 2>&1; then SUM='sha256sum'
+    else die "no sha256 tool on PATH (shasum or sha256sum)"; fi
+    got="$($SUM "$tarball" | cut -d' ' -f1)"
+    [[ "$got" == "$BISON_SHA256" ]] \
+        || die "bison tarball is $got, the pin says $BISON_SHA256"
+    build="$UP/.cache/bison-build"
     rm -rf "$build"; mkdir -p "$build"
     # -x with no compression flag: both BSD tar (macOS) and GNU tar detect it,
     # so this does not need to know which one the runner has.
@@ -140,7 +243,7 @@ if [[ ! -x "$BISON_PREFIX/bin/bison" ]]; then
     log "bison $("$BISON_PREFIX/bin/bison" --version | head -1) installed"
 fi
 
-# --- 3. the python build environment ---------------------------------------
+# --- 4. the python build environment ---------------------------------------
 # meson and ninja are the two Mesa's build cannot do without; the rest are its
 # own declared requirements, read from its meson.build rather than guessed at
 # here so this stage does not need updating when Mesa adds a dependency.
@@ -155,7 +258,7 @@ fi
 "$VENV/bin/meson" --version >/dev/null 2>&1 || die "meson is not runnable"
 log "meson $("$VENV/bin/meson" --version)"
 
-# --- 4. glslang ------------------------------------------------------------
+# --- 5. glslang ------------------------------------------------------------
 # build-turnip-darwin.py checks for this by name and exits with a brew hint, so
 # it is installed here rather than left to the caller to interpret.
 if ! command -v glslangValidator >/dev/null 2>&1; then
@@ -164,5 +267,5 @@ if ! command -v glslangValidator >/dev/null 2>&1; then
 fi
 log "glslangValidator $(glslangValidator --version 2>&1 | head -1 | grep -o '[0-9.]*' | head -1)"
 
-log "PASS the Mesa source, bison, meson and glslang are all in place"
+log "PASS the Mesa source, its recorded patches, bison, meson and glslang are all in place"
 exit 0
