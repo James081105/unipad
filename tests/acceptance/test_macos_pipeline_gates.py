@@ -1232,3 +1232,42 @@ def test_set_is_alone_on_its_line() -> None:
         "reads as a positional argument rather than an assignment:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_every_macos_script_is_called_by_the_workflow() -> None:
+    """A script nothing invokes is a stage that looks done and never ran.
+
+    ``scripts/macos/bootstrap-mesa-turnip.sh`` was written before it was wired
+    in, and for one revision it was a file that passed ``bash -n``, satisfied
+    both shell guards, and was referenced by nothing.  That is the shape fact 96
+    recorded: a constraint expressed only in a comment is a constraint the next
+    edit forgets -- and here the comment was in the script, where nobody
+    building a workflow would look for it.
+
+    Enumerated rather than listed, so a script added later is covered without
+    anyone remembering to add it to a list.
+    """
+    # Every workflow, not just this one, so a script that a different workflow
+    # does invoke is not called an orphan here.
+    workflows = "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+    )
+    assert "build-macos.sh" in workflows, "the scan is not scanning the workflows"
+
+    # An explicit, named exception rather than a loosened rule.  prepare-image.sh
+    # is invoked by NO workflow -- this guard found that, it did not cause it --
+    # and wiring it in is a decision about what the pipeline is for, not a
+    # one-line fix to make a test green.  It is listed here so the guard still
+    # fails for the NEXT orphan, which is the only reason the guard exists.
+    KNOWN_ORPHANS = {"prepare-image.sh"}
+
+    scripts = sorted((ROOT / "scripts/macos").glob("*.sh"))
+    assert scripts, "no scripts/macos/*.sh found; the scan is not scanning"
+    for script in scripts:
+        if script.name in KNOWN_ORPHANS:
+            continue
+        assert script.name in workflows, (
+            f"{script.name} is not invoked by any workflow; it is a stage that "
+            f"will pass every check and never run"
+        )
