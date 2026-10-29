@@ -64,13 +64,29 @@ PIN="$UP/scripts/data/adreno-compiler-inputs.json"
 SOURCE="$UP/.cache/mesa-work"
 TOOLS="$UP/.cache/mesa-tools"
 VENV="$UP/.cache/mesa-venv"
+#: The log, resolved to an absolute path.  The workflow spells it relatively
+#: ("build-output/bootstrap-mesa.log"), and a relative path breaks the moment
+#: this script changes directory -- which it does, in the bison build's
+#: subshell.  MEASURED on run 40816437974: the bison build failed, and the
+#: failure's own output had gone to <build>/build-output/bootstrap-mesa.log,
+#: a file the cleanup step then deleted, so the uploaded log ended at
+#: "downloading bison 3.8.2 / FAIL cannot build bison 3.8.2" with nothing in
+#: between.  A stage whose failure reason is deleted by its own cleanup is a
+#: stage that cannot be diagnosed from its evidence.
 LOG="${BOOTSTRAP_LOG:-$UP/.cache/bootstrap-mesa.log}"
+case "$LOG" in
+    /*) ;;
+    *) LOG="$PWD/$LOG" ;;
+esac
 
 mkdir -p "$UP/.cache" "$(dirname "$LOG")"
 : > "$LOG" || { echo "cannot write the log $LOG" >&2; exit 1; }
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
-die() { log "FAIL $*"; exit 1; }
+# A refusal carries the log's own tail, so the reader does not have to go and
+# find the file to learn what happened.  Twelve lines is what the driver's own
+# build failure messages quote, and it is enough to name a configure error.
+die() { log "FAIL $*"; log "---- last 12 lines of $LOG ----"; tail -12 "$LOG" | tee -a "$LOG" >&2; exit 1; }
 
 # Every value read out of python is piped through `tr -d` with a CR class, and
 # that is load-bearing rather than tidiness.  Python translates a newline to
