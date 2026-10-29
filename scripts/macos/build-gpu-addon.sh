@@ -271,6 +271,21 @@ if ! "$PY" "$REPO/scripts/macos/apply-host-sim-divergences.py" "$UP" >>"$LOG" 2>
 fi
 grep -E "^(APPLIED|PRESENT|REFUSED|MISSING)" "$LOG" | tail -8 | tee -a "$LOG" >&2
 
+# Ring 2's LAST check links the HOST copy of the metal bridge:
+# check-priming-cache-host.py:41 reads build/native-metal-bridge/host/
+# libnative_metal_bridge.a and :46 compiles priming_cache_host.cpp against it.
+# Nothing in this chain built that -- ring 4 builds the iOS one -- so MEASURED on
+# run 40943937160 ring 2 got as far as five of the eight deferred-BO modes and
+# then died on exactly that compile.  A real Vulkan device had been created and a
+# real submission retired by then, so this is the last thing between here and a
+# complete ring 2, and it is a gap in THIS script rather than in the pinned tree.
+#
+# The host target needs nothing ring 4 does not: the bootstrap already assembled
+# the two AIR fixtures (it verifies the patch state with --manifest-only, which
+# stops just before cargo) and `aarch64-apple-darwin` is in the pinned
+# toolchain's installed targets.
+ring metal-bridge-host "$PY" "$BRIDGE" --target host
+
 ABSENT_QUARTZCORE="$UP/scripts/check-quartzcore-turnip-cache-host.py"
 ring turnip-host-check "$PY" "$REPO/scripts/macos/run-upstream-check.py" \
     "$UP/scripts/check-turnip-darwin-host.py" "$ABSENT_QUARTZCORE"

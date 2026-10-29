@@ -606,3 +606,17 @@ Undefined symbols for architecture arm64:
 ld: symbol(s) not found for architecture arm64
 ```
 **成因与上一处同形**：`NativeAdrenoUserClient.cpp:14` 声明 `extern "C" int proc_selfpid(void);`，`:237` 调用它；真内核上 XNU 提供这个符号，而主机仿真把驱动源码链成一个 dylib 时没有任何东西提供它。`host_iokit_shim.cpp` 自己的头注释写着「Never built for the tablet」——**又是仿真侧、又是平板看不到的文件**。**修法**：`getpid()`，忠实替身（那个符号在任何 UNIX 上就是这么答的，而且 `:237` 只是把它打包进一个诊断字）。**结构性决定**： divergence 从「内联在 build-gpu-addon.sh 里的一段 Python」改成独立的 `scripts/macos/apply-host-sim-divergences.py`，用一个表驱动——**第三处不该是第三份拷贝**。每条 divergence 记五件事：文件、锚点、替换、修的是什么、为什么这个值安全。fail-closed 与幂等都收在工具里（锚点不是恰好出现一次就拒绝；结果已在就跳过）。`build-gpu-addon.sh` 只负责调用它。**承重 3/3 杀死**（让常量与仿真分支的位相撞、去掉 fail-closed、去掉幂等守卫），green-first 通过，`vendor/` 一个字节未改。**状态划分**：代码——divergence 工具 + 六个测试 CODE COMPLETE、承重 3/3（PASS）；诊断——上一处修复被证实（编译错误消失、失败点前移到链接）、下一处缺口定位到 `proc_selfpid`（PASS）；**ring 2..7 仍未跑通过**（第五次派发待发）。**要诚实说明的一点**：这是同一个主机仿真里的第三处缺口。前两处各是一次派发才发现的，所以这里做了一个判断——**继续补，而不是绕过**。理由是主机仿真是这块 Turnip 上船前唯一的主机侧证据（它验的是 darwin KMD 后端能否编译、链接、并通过软件 SMMU/CP 驱动一个 Vulkan 实例），而每一处都小、都可理解、都在平板看不到的文件里。**但这是一个有上限的判断**：如果下一处不是同样形状（小、可理解、在仿真侧），就改成显式跳过 ring 2/3 与 ring 6 的 replay 调用并记录下来，因为那时候「把 pin 住的树改成能编」就已经变成「替上游重写它的测试夹具」了。
+**事实 151（run 40943937160：ring 2 第一次真正跑起来——建出了真的 Vulkan 设备、真的提交 retire 了，然后死在我自己链的缺口上）——这一跑是整条链目前最大的进展，而最后的失败点在我这里，不在上游。**三个 divergence 全部 `APPLIED`（fixture、shim 声明、shim 定义）。随后 ring 2 从 6 秒失败变成 15 秒失败，**而它在这 15 秒里做到了什么，日志写得很清楚**：
+```
+PASS: smoke shaders compiled and validated -> .../build/turnip-smoke/NativeTurnipShaders.h
+PASS: Turnip pipeline cache produce; uuid=061ad66f... bytes=3701 ... compile_us=996.1
+PASS: Turnip pipeline cache consume / uuid-miss / shader-miss
+device: Turnip Adreno (TM) 740 (vendor 0x5143 device 0x43050a01)
+memory types: 2, host visible+coherent type: 0
+device created, kernel objects live: 3, submissions: 0
+mapped 1 MiB through the kernel descriptor, mismatches: 0
+fill-buffer submission retired: kernel submissions 0 -> 1
+device destroyed, kernel objects live: 0
+PASS: deferred BO normal / busy / fence-error / free-error / lease-error
+```
+**也就是说：darwin KMD 后端真的编译、链接、并通过软件 SMMU/CP 驱动出了一个 Vulkan 设备、映射了内存、retire 了一次提交**——这正是这条链存在所要证明的那件事，而它现在被证明了。8 个 deferred-BO 模式里 5 个 PASS。**失败点在 `check-turnip-darwin-host.py:97`**，也就是缺席的 quartzcore 检查（:93）**之后**的那一个：`check-priming-cache-host.py`，它编译 `priming_cache_host.cpp` 时要链接 `build/native-metal-bridge/host/libnative_metal_bridge.a`（`check-priming-cache-host.py:41`）。**而我的链从来没建过 host 那份 bridge——ring 4 建的是 iOS 那份。**所以这不是上游的缺口，**是我这个脚本的排序缺口**，一行就能补：在 ring 2 之前加 `build-native-metal-bridge.py --target host`。host target 不需要任何 ring 4 不需要的东西——bootstrap 已经用 `--manifest-only`（它在 cargo 之前停）装配了两个 AIR fixture，而 `aarch64-apple-darwin` 就在钉住 toolchain 的已装 target 里（`rustup targets: aarch64-apple-darwin aarch64-apple-ios`）。**另一个关键事实**：`plugin_smoke` 与 `libhostiokit.dylib` 在 `:57-61` 就建好了，远在 `:97` 之前，**所以 ring 3 的前提已经满足**。**状态划分**：代码——host bridge ring 已补（PASS）；诊断——ring 2 的主机侧验证首次成立（真设备、真提交、5/8 模式），失败点定位到我自己的排序缺口（PASS）；**ring 2..7 仍未完整跑过**（第六次派发待发）。**这一轮也说明前一则记录里那个「有上限的判断」是对的**：第三处缺口（`proc_selfpid`）与第二处同形，补完之后链就自己往前走了一大步——所以继续补是对的；而现在这一处根本不是缺口，是我漏了一个 ring。
