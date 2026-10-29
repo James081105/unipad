@@ -569,3 +569,12 @@ bundle4（payload.json 无 sheng-fb-gpu）
 | 5 | 去掉 160 字节路径上限 | `test_a_path_the_kernel_would_reject…` | packer 返回 0 而测试要求非 0 |
 
 **这五次各自对应一个「不报错但给出错答案」的形状**，而这正是这个测试存在的理由：blob 是整条显示链上唯一一个免费可验的环节，其余都是几小时 macOS runner 时间。#1 和 #2 尤其是——count 与 padding 这两个字段错一位，内核 materialise 出来的就是另一回事，而 payload 侧的 `[:8] == b'NGPUADD2'` 检查照样过。**状态划分**：代码——对质 5/5 杀死（PASS）；`make-gpu-addon.py` 已还原到 pin 住的字节（PASS）。
+**事实 134（对质，续事实 133）——board 的 `kernel_args` 断言三次 mutation 三次被杀，其中第三次只有「按值断言」能杀。**同一个方法用在 `tests/unit/test_host_unixnu_boot.py::test_the_real_board_declares_the_payload_the_module_boots` 上，改的是 `vendor/UniXNU-qemu/board.toml`，每次还原后 `git status --porcelain` 确认干净：
+
+| # | 改了什么 | 计数断言 | 按名/按值断言 |
+|---|---|---|---|
+| A | 删掉 `sheng-fb-gpu=1` | 红（26→25） | 红 |
+| B | 删掉 `offline-legacy-surface-wait-ms=600000` | 红（26→25） | 红 |
+| C | 把等待值改回 `120000`（**计数仍是 26**） | **绿** | **红** |
+
+**C 是这三次里唯一有信息量的那次**：A 和 B 都会被计数断言抓到，而计数断言抓不住「参数还在、值变了」——那正是事实 132 修掉的那个缺陷（120 秒的默认值让十次启动里六次到用户态却没有显示）。**按值断言不是冗余，它是唯一能看见那次回归的断言**；如果当初只有计数，把 600000 改回 120000 会是一个全绿的提交。**状态划分**：代码——对质 3/3 杀死，其中 1 次只有按值断言能杀（PASS）；board.toml 已还原到 pin 住的字节（PASS）。
