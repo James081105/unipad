@@ -171,6 +171,85 @@ def test_the_preflight_provisions_the_shader_tools():
     )
 
 
+def test_the_rust_toolchain_pin_is_read_from_the_bridge_not_spelled_twice():
+    """Teeth: the preflight queried the wrong toolchain and reported a false negative.
+
+    MEASURED on run 40921780876.  This check asked
+    ``rustup target list --installed`` -- no ``+toolchain`` -- which answers for
+    rustup's DEFAULT toolchain, while the bridge builds with the pinned one.  On
+    that runner bootstrap-metal2vulkan.sh had just installed ``aarch64-apple-ios``
+    into the pinned toolchain (its own log reads
+    ``rustup targets: aarch64-apple-darwin aarch64-apple-ios``) and this line
+    still logged "aarch64-apple-ios is not in `rustup target list --installed`".
+    A negative answer from an instrument pointed at the wrong subject is worse
+    than no answer, because it is believed.
+
+    So the pin is read from the bridge script -- the same one it builds with --
+    and both the cargo check and the target check use it.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "rustup \"+$CARGO_TOOLCHAIN\" target list --installed" in script, (
+        "the target check no longer names the pinned toolchain; it would answer "
+        "for rustup's default, which on the measured runner was not the pinned "
+        "one, and report a target as missing while it was installed"
+    )
+    assert "cargo \"+$CARGO_TOOLCHAIN\" --version" in script, (
+        "the cargo check no longer uses the toolchain pin read from the bridge"
+    )
+    # The pin must be READ, not spelled: a second copy of `1.98.0` in this script
+    # is a second place for it to drift from build-native-metal-bridge.py:82.
+    #
+    # Proved by running the reader this script uses against the real bridge, so
+    # the assertion is about what the reader extracts rather than about how its
+    # source is spelled -- and by checking the pin is absent from the CODE, with
+    # the prose stripped first.  That second half is not decoration: this
+    # assertion's first two versions were both satisfied by another occurrence of
+    # the same string (a log line, then a comment), which is the third time in
+    # this file an assertion has been fooled by prose.
+    pin = _toolchain_pin()
+    code = _code_only(script)
+    assert f"+{pin}" not in code, (
+        f"the toolchain pin +{pin} is spelled in this script's code as well as "
+        f"read from the bridge; build-native-metal-bridge.py is the one place it "
+        f"should live"
+    )
+    assert 'cargo "+$CARGO_TOOLCHAIN" --version' in code, (
+        "the cargo check no longer uses the toolchain pin read from the bridge"
+    )
+    assert f"+{pin}" in _driver_file("scripts/build-native-metal-bridge.py"), (
+        f"the reader extracted {pin!r} but the bridge does not invoke "
+        f"cargo +{pin}; the reader is aimed at the wrong line"
+    )
+
+
+def _code_only(text: str) -> str:
+    """The script with its full-line comments removed.
+
+    Naive on purpose: it drops lines whose first non-blank character is ``#``,
+    which is where this script's prose lives.  A ``#`` inside a quoted string on
+    a code line would survive, and that is the right direction -- the point is to
+    check the pin is not spelled in CODE, not to parse shell.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _toolchain_pin() -> str:
+    """Run the reader this script uses, against the real bridge script."""
+    import re
+
+    bridge = DRIVER / "scripts" / "build-native-metal-bridge.py"
+    if not bridge.is_file():
+        pytest.skip(f"{bridge} is not present; the pinned vendor checkout is absent")
+    text = bridge.read_text(encoding="utf-8")
+    found = re.search(r"'cargo', '\+([0-9][0-9.]*)'", text)
+    if not found:
+        pytest.skip("the bridge no longer spells a cargo +<version> toolchain pin")
+    assert found.group(1), "the reader extracted an empty toolchain pin"
+    return found.group(1)
+
+
 def test_every_ring_reports_how_long_it_took():
     """The job's ``timeout-minutes`` is an estimate until a run produces numbers.
 

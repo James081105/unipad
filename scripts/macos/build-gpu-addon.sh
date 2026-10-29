@@ -164,13 +164,41 @@ command -v xcrun    >/dev/null 2>&1 || die "xcrun is absent; every ring that com
 command -v strip    >/dev/null 2>&1 || die "strip is absent; build-adreno-metal-plugin.py:47,62 strip the bundle executable and the Turnip library with it"
 command -v git      >/dev/null 2>&1 || die "git is absent; the pin checks in this script and in build-turnip-darwin.py:34 resolve through it"
 
-# The Rust toolchain pin is spelled in build-native-metal-bridge.py:82 as
-# `cargo +1.98.0`, so the check is the same invocation: if the pin is not
-# installed, cargo answers with its own message about the toolchain, which is
-# more use than anything this script could invent.
-cargo +1.98.0 --version >>"$LOG" 2>&1 || die "cargo +1.98.0 does not answer; rustup install the pinned toolchain (build-native-metal-bridge.py:82)"
-rustup target list --installed 2>/dev/null | grep -qx 'aarch64-apple-ios' \
-    || log "note: aarch64-apple-ios is not in `rustup target list --installed`; ring 4 will say so if it needs it"
+# The Rust toolchain pin.  READ FROM THE BRIDGE SCRIPT rather than spelled here:
+# build-native-metal-bridge.py:82 invokes `cargo +1.98.0`, and a second copy of
+# that pin in this script is a second place for it to drift.  MEASURED on run
+# 40921780876 why the reading matters: this check queried the DEFAULT toolchain's
+# installed targets while the bridge builds with the pinned one, so it logged
+# "aarch64-apple-ios is not in `rustup target list --installed`" on a runner where
+# bootstrap-metal2vulkan.sh had just installed it into the pinned toolchain -- its
+# own log says `rustup targets: aarch64-apple-darwin aarch64-apple-ios`.  A
+# negative answer from an instrument pointed at the wrong subject is worse than no
+# answer, because it is believed.
+CARGO_TOOLCHAIN="$("$PY" - "$BRIDGE" <<'PY' | tr -d '\r'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+found = re.search(r"'cargo', '\+([0-9][0-9.]*)'", text)
+if not found:
+    raise SystemExit('build-native-metal-bridge.py no longer spells a cargo +<version> toolchain pin')
+print(found.group(1))
+PY
+)" || die "cannot read the cargo toolchain pin from $BRIDGE"
+[[ -n "$CARGO_TOOLCHAIN" ]] || die "the cargo toolchain pin read from $BRIDGE is empty"
+
+# The same invocation the bridge uses, so a missing toolchain is answered by
+# cargo's own message rather than by anything this script could invent.
+cargo "+$CARGO_TOOLCHAIN" --version >>"$LOG" 2>&1 \
+    || die "cargo +$CARGO_TOOLCHAIN does not answer; rustup install the pinned toolchain ($BRIDGE)"
+log "cargo $(cargo "+$CARGO_TOOLCHAIN" --version 2>&1 | head -1)"
+
+# And the target, from the SAME toolchain.  `rustup target list --installed`
+# without a `+toolchain` answers for rustup's default, which on this runner is
+# not the pinned one -- that is exactly the mismatch measured above.
+if rustup "+$CARGO_TOOLCHAIN" target list --installed 2>/dev/null | grep -qx 'aarch64-apple-ios'; then
+    log "cargo target aarch64-apple-ios is installed for toolchain $CARGO_TOOLCHAIN"
+else
+    log "note: aarch64-apple-ios is NOT installed for toolchain $CARGO_TOOLCHAIN; ring 4 will say so if it needs it"
+fi
 
 LLVM_AS="$(command -v llvm-as || true)"
 [[ -z "$LLVM_AS" && -x /opt/homebrew/opt/llvm/bin/llvm-as ]] && LLVM_AS=/opt/homebrew/opt/llvm/bin/llvm-as
@@ -182,6 +210,10 @@ log "preflight: llvm-as is $LLVM_AS"
 # the missing bootstrap instead of a Rust path error.
 TRANSLATOR="$UP/.cache/gpu-reference/metal2vulkan"
 [[ -d "$TRANSLATOR/.git" ]] || die "no $TRANSLATOR; ring 0's bootstrap-metal2vulkan.sh has not run"
+#: The bridge script itself, which is where the cargo toolchain pin and the
+#: patch list are read from rather than spelled a second time here.
+BRIDGE="$UP/scripts/build-native-metal-bridge.py"
+[[ -f "$BRIDGE" ]] || die "no $BRIDGE; the driver checkout is where this stage starts"
 TRANSLATOR_HEAD="$(git -C "$TRANSLATOR" rev-parse HEAD 2>/dev/null | tr -d '\r')"
 TRANSLATOR_PIN="$("$PY" - "$UP/scripts/data/gpu-metal-vulkan-inputs.json" <<'PY' | tr -d '\r'
 import json, sys
