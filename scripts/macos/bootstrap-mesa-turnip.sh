@@ -37,8 +37,15 @@ set -uo pipefail
 REPO="${1:?usage: bootstrap-mesa-turnip.sh REPO_ROOT}"
 
 #: The driver checkout.  Its own scripts read the pin and the caches relative
-#: to themselves, so this is where the whole stage lives.
-UP="$REPO/vendor/UniXNU"
+#: to themselves, so this is where the whole stage lives.  RESOLVED TO AN
+#: ABSOLUTE PATH, and that is load-bearing: `git -C "$SOURCE" apply "$UP/$patch"`
+#: resolves the patch path against $SOURCE, not against this script's working
+#: directory, so a relative $UP makes every patch unfindable -- measured, as
+#: "can't open patch './vendor/UniXNU/patches/mesa/...'".  Every other path
+#: below is derived from this one, so making it absolute makes them all
+#: independent of where the script was invoked from.
+UP="$(cd "$REPO" 2>/dev/null && pwd)/vendor/UniXNU"
+[[ -d "$UP/.git" ]] || { echo "no $REPO/vendor/UniXNU; the driver checkout is where this stage starts" >&2; exit 1; }
 
 # Resolved rather than assumed, for the reason build-macos.sh:194 gives: "the
 # interpreter is not called python3 on every host that runs this script".  A
@@ -47,8 +54,6 @@ if command -v python3 >/dev/null 2>&1; then PY='python3'
 elif command -v python  >/dev/null 2>&1; then PY='python'
 else PY=''; fi
 [[ -n "$PY" ]] || { echo "no python interpreter on PATH" >&2; exit 1; }
-
-[[ -d "$UP/.git" ]] || { echo "no $UP; the driver checkout is where this stage starts" >&2; exit 1; }
 
 LOCK="$REPO/config/sources.lock.json"
 [[ -f "$LOCK" ]] || { echo "no $LOCK; the driver pin is where this stage starts" >&2; exit 1; }
@@ -67,10 +72,22 @@ mkdir -p "$UP/.cache" "$(dirname "$LOG")"
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
 die() { log "FAIL $*"; exit 1; }
 
-# The pin is read with python rather than grep: it is JSON, and a grep for
-# '"commit"' would also match the linux and board entries' commit keys.
+# Every value read out of python is piped through `tr -d` with a CR class, and
+# that is load-bearing rather than tidiness.  Python translates a newline to
+# os.linesep when stdout is a pipe, so on Windows the value arrives as text
+# followed by CR LF; command substitution strips the newline and keeps the
+# carriage return.  The result is a value that looks clean in a log line and
+# compares equal to itself, and is fatal the moment it is used as a path.
+#
+# That is exactly how this script's first real run died: `[[ -f "$UP/$patch" ]]`
+# refused a patch that was sitting right there, because the name carried a
+# trailing CR.  Worse, the two checks that compare one python value against
+# another -- the driver checkout against the lock, the Mesa tree against the
+# pin -- would both have PASSED with the CR present, because both sides carry
+# it.  A guard that cannot fail is worse than no guard, so the CR is stripped at
+# the point of capture rather than at the point of use.
 read_pin() {
-    "$PY" - "$PIN" "$1" "$2" <<'PY'
+    "$PY" - "$PIN" "$1" "$2" <<'PY' | tr -d '\r'
 import json, sys
 print(json.loads(open(sys.argv[1], encoding="utf-8").read())[sys.argv[2]][sys.argv[3]])
 PY
@@ -85,7 +102,7 @@ PY
 # not change).  Reading the lock rather than hardcoding a sha is the same rule
 # the workflow's acquisition step follows.
 driver_head="$(git -C "$UP" rev-parse HEAD 2>/dev/null)" || driver_head=""
-driver_pin="$("$PY" - "$LOCK" <<'PY'
+driver_pin="$("$PY" - "$LOCK" <<'PY' | tr -d '\r'
 import json, sys
 print(json.loads(open(sys.argv[1], encoding="utf-8").read())["unixnu"]["commit"])
 PY
@@ -107,34 +124,43 @@ log "bison $BISON_VERSION ($BISON_SHA256)"
 
 # --- 1. the Mesa source ----------------------------------------------------
 # The mirror is preferred over repository: gitlab.freedesktop.org rate-limits
-# anonymous clones, and a runner that dies halfway through a 500 MB clone has
+# anonymous clones, and a runner that dies halfway through a 500 MB fetch has
 # spent its minutes on nothing.  The mirror is Google's, which does not.
-if [[ -d "$SOURCE/.git" ]]; then
-    head="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null)" || head=""
-    if [[ "$head" == "$MESA_COMMIT" ]]; then
-        log "mesa source already at $MESA_COMMIT"
-    else
-        log "mesa source at ${head:0:12}, fetching $MESA_COMMIT"
-        git -C "$SOURCE" fetch --depth 1 origin "$MESA_COMMIT" 2>>"$LOG" \
-            || die "cannot fetch $MESA_COMMIT from the Mesa mirror"
-        git -C "$SOURCE" checkout --detach "$MESA_COMMIT" 2>>"$LOG" \
-            || die "cannot check out $MESA_COMMIT"
-    fi
-else
-    log "cloning Mesa at $MESA_COMMIT"
+#
+# The line endings are pinned BEFORE any file is written, and that ordering is
+# the whole reason this is `init` + `fetch` rather than `clone`.  `git clone -c
+# core.autocrlf=false` does not persist the setting, and a `clone` writes its
+# checkout before any later `git config` could take effect -- MEASURED on this
+# Windows host, whose global git sets autocrlf=true, where a `-c`-flagged clone
+# still produced CRLF on disk.  The consequence is not cosmetic: `git show
+# HEAD:<path>` returns LF, so the driver's own patch verifier refused the tree
+# with "Recorded Mesa patches do not reconstruct pinned source" -- after all nine
+# patches had applied cleanly.  The same difference would change
+# `git diff HEAD --binary`, which build-turnip-darwin.py hashes into its build
+# profile, so a Windows-produced tree and a macOS-produced one would get
+# different source ids and the builtin pack check ("not from this exact compiler
+# source/profile") would refuse a pack built from byte-identical source.
+GIT_LF='-c core.autocrlf=false -c core.eol=lf'
+if [[ ! -d "$SOURCE/.git" ]]; then
     rm -rf "$SOURCE"
-    # --branch with a sha needs the server to allow it; when it does not, fall
-    # back to a full clone and fetch the pin explicitly rather than accepting
-    # whatever the branch tip happens to be.
-    git clone --depth 1 --branch "$MESA_COMMIT" "$MESA_MIRROR" "$SOURCE" 2>>"$LOG" \
-        || git clone "$MESA_MIRROR" "$SOURCE" 2>>"$LOG" \
-        || die "cannot clone Mesa from $MESA_MIRROR"
-    if [[ "$(git -C "$SOURCE" rev-parse HEAD)" != "$MESA_COMMIT" ]]; then
-        git -C "$SOURCE" fetch --depth 1 origin "$MESA_COMMIT" 2>>"$LOG" \
-            || die "cannot fetch the pinned commit after cloning"
-        git -C "$SOURCE" checkout --detach "$MESA_COMMIT" 2>>"$LOG" \
-            || die "cannot check out the pinned commit after cloning"
-    fi
+    mkdir -p "$SOURCE"
+    git $GIT_LF init -q "$SOURCE" || die "cannot initialise $SOURCE"
+    git -C "$SOURCE" remote add origin "$MESA_MIRROR" 2>>"$LOG" \
+        || die "cannot add the Mesa mirror as a remote"
+fi
+git -C "$SOURCE" config core.autocrlf false
+git -C "$SOURCE" config core.eol lf
+head="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null)" || head=""
+if [[ "$head" == "$MESA_COMMIT" ]]; then
+    log "mesa source already at $MESA_COMMIT"
+else
+    # MEASURED: fetching by sha works on the googlesource mirror ("* branch
+    # <sha> -> FETCH_HEAD"), while `clone --branch <sha>` does not ("Remote
+    # branch <sha> not found in upstream origin").  So the fetch is the only
+    # mechanism here, and a shallow one keeps the runner's disk and minutes down.
+    log "mesa source at ${head:0:12}, fetching $MESA_COMMIT"
+    git -C "$SOURCE" fetch --depth 1 origin "$MESA_COMMIT" 2>>"$LOG"         || die "cannot fetch $MESA_COMMIT from the Mesa mirror"
+    git -C "$SOURCE" checkout --detach "$MESA_COMMIT" 2>>"$LOG"         || die "cannot check out $MESA_COMMIT"
 fi
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$MESA_COMMIT" ]] \
     || die "the Mesa source is not at the pinned commit"
@@ -150,13 +176,14 @@ fi
 # result to equal HEAD.  So the source must arrive here with all nine already
 # applied, and with nothing else changed -- an unrecorded edit is a hard exit.
 # Applying them here, in the pin's order, is what makes that verifier pass.
+#
 # The list is read once into a variable and fed through a here-document, rather
 # than through `done < <(... <<'PY')`: test_no_heredoc_inside_a_process_
 # substitution records run 40386064322, which died on exactly that construct
 # because macOS's bash 3.2 refuses to parse it and `bash -n` on a bash 5 host
 # accepts it happily.
 mesa_patches() {
-    "$PY" - "$PIN" <<'PY'
+    "$PY" - "$PIN" <<'PY' | tr -d '\r'
 import json, sys
 for name in json.loads(open(sys.argv[1], encoding="utf-8").read())["patches"]:
     print(name)
@@ -164,25 +191,52 @@ PY
 }
 PATCH_LIST="$(mesa_patches)" || die "cannot read the patch list from the pin"
 
+# The set is applied from a clean tree, every time.  Per-patch idempotence --
+# `apply --reverse --check` on each patch alone, skipping the ones that already
+# applied -- is NOT sound here, and was MEASURED failing: several recorded
+# patches touch the same file (src/freedreno/vulkan/tu_knl.cc is in three of
+# them), so reverse-checking one of them against a tree that also carries the
+# others fails even though the set is complete, and the run then dies with
+# "cannot apply offline-adreno-compiler-probe.patch" on a tree that already had
+# all nine.  Resetting costs one `git checkout` and makes the outcome a function
+# of the pin rather than of whatever the previous run left behind.
+git -C "$SOURCE" reset --hard --quiet HEAD 2>>"$LOG" \
+    || die "cannot reset the Mesa tree to the pinned commit"
+# The verifier refuses untracked files as "Unrecorded Mesa source changes", so
+# anything a previous run left behind has to go too.  Without -x, so files the
+# source's own .gitignore covers are kept -- those are not in `ls-files --others
+# --exclude-standard` and the verifier never sees them.
+git -C "$SOURCE" clean -fdq 2>>"$LOG" || true
+
 applied=0
 while IFS= read -r patch; do
     [[ -n "$patch" ]] || continue
     [[ -f "$UP/$patch" ]] || die "the pin names $patch and it is not in the driver checkout"
-    if git -C "$SOURCE" apply --reverse --check "$UP/$patch" 2>/dev/null; then
-        continue
-    fi
     git -C "$SOURCE" apply "$UP/$patch" 2>>"$LOG" \
         || die "cannot apply $patch onto Mesa $MESA_COMMIT"
     applied=$((applied + 1))
 done <<PATCHES
 $PATCH_LIST
 PATCHES
-log "mesa patches: $applied applied, the rest were already in place"
+log "mesa patches: $applied applied"
 
 # Verified with the driver's own verifier rather than with a second
 # implementation of it.  This is the check build-turnip-darwin.py will run, so
 # passing it here means the build cannot be surprised by it three steps later.
-"$PY" - "$UP" "$SOURCE" "$PIN" <<'PY' 2>>"$LOG" || die "the recorded Mesa patches do not verify; see $LOG"
+#
+# It runs with an isolated git environment (GIT_CONFIG_NOSYSTEM and a HOME with
+# no .gitconfig), and that is measured rather than defensive.  The verifier
+# builds a throwaway `git init` tree under .cache and reverse-applies the
+# patches there, so it inherits whatever the HOST's git config says -- and on a
+# Windows host whose global core.autocrlf is true, that tree comes back with
+# CRLF and every patched file fails its byte comparison against HEAD, after the
+# patches themselves applied cleanly.  Isolating the environment makes the
+# verdict a property of the tree rather than of the machine, which is the only
+# kind of verdict worth recording.
+NEUTRAL_HOME="$TOOLS/../git-neutral-home"
+mkdir -p "$NEUTRAL_HOME"
+GIT_CONFIG_NOSYSTEM=1 HOME="$NEUTRAL_HOME" "$PY" - "$UP" "$SOURCE" "$PIN" <<'PY' 2>>"$LOG" \
+    || die "the recorded Mesa patches do not verify; see $LOG"
 import json, sys
 from pathlib import Path
 root, source, pin = (Path(a) for a in sys.argv[1:4])
