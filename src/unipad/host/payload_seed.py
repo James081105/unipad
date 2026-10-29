@@ -1,24 +1,32 @@
-"""Read the Data seed out of a payload FAT32 image.
+"""Read a member out of a payload FAT32 image.
 
 Why this exists
 ---------------
-The payload build writes the seed into the payload volume at
-``EFI/UniXNU/Payloads/scratch-data.img`` (``vendor/UniXNU/scripts/unixnu/
-payload.py:157``) and records its digest as ``data_ramdisk_sha256`` in the
-``payload.json`` beside the image (``payload.py:188``).  On Windows the image is
-never attached as a drive -- the ESP the guest sees is a *staged directory*
-behind QEMU's ``fat:`` block driver (``unipad/host/qemu.py:444``) -- so the
-seed inside the image is invisible to the guest, and the staged directory is the
-only delivery channel.  A caller that stages a different seed therefore
-overwrites the build's own, and nothing on the host can see that it happened.
+The payload build packs the material the guest boots into the payload volume
+and records each piece's digest in the ``payload.json`` beside the image
+(``vendor/UniXNU/scripts/unixnu/payload.py:157,188``):
 
-Measured on 2026-10-30 with ``bundle7``: the image's own seed is
-``6fa3a34a…``, its volume UUID is ``974BCE86-A03D-40CF-A55A-B0F7F1A6734D``, and
-the kernel beside it in the same image carries that UUID.  The seed that was
-staged instead was ``784a8507…`` with volume UUID ``E3E8AE2D-…`` -- a different
-build entirely.  The consequence was ``native_owner_data_stage = 0`` /
-``status = 2`` (ENOENT): the owner Data volume never mounted, so the GPU addon
-mount's only call site was never entered.
+* ``EFI/UniXNU/Payloads/scratch-data.img`` -- the packed Data seed, whose digest
+  is ``data_ramdisk_sha256``;
+* ``EFI/UniXNU/Payloads/kernel.macho.gpuaddon`` -- the GPU addon blob, whose
+  digest is ``gpu_addon_sha256`` (``payload.py:145``, and the ADT placeholder
+  that makes it mandatory is written by ``make-qemu-adt.py:120``).
+
+On Windows the image is never attached as a drive -- the ESP the guest sees is a
+*staged directory* behind QEMU's ``fat:`` block driver
+(``unipad/host/qemu.py:444``) -- so everything inside the image is invisible to
+the guest, and the staged directory is the only delivery channel.  A caller that
+stages something else overwrites the build's own, and nothing on the host can see
+that it happened.
+
+Measured on 2026-10-30 with ``bundle7``: the image's own seed is ``6fa3a34a…``,
+its volume UUID is ``974BCE86-A03D-40CF-A55A-B0F7F1A6734D``, and the kernel
+beside it in the same image carries that UUID.  The seed that was staged instead
+was ``784a8507…`` with volume UUID ``E3E8AE2D-…`` -- a different build entirely.
+The consequence was ``native_owner_data_stage = 0`` / ``status = 2`` (ENOENT): the
+owner Data volume never mounted, so the GPU addon mount's only call site was
+never entered.  ``bundle8`` carries both pieces, and both digests below were
+re-read out of it and matched against its own ``payload.json``.
 
 So the bytes are already on disk, inside the public boot-inputs bundle, and the
 only thing missing is a reader.  This is that reader.  It is stdlib-only, like
@@ -30,7 +38,7 @@ It does not guess.  A volume that is not FAT32, a member that is not there, a
 cluster chain that loops or ends early, and a digest that does not match the
 declared one are each a refusal naming what was found -- because every one of
 them is a silent wrong-answer otherwise.  The digest check is the one that
-matters most: the caller passes ``payload.json``'s ``data_ramdisk_sha256`` and a
+matters most: the caller passes ``payload.json``'s digest for the member and a
 wrong extraction cannot pass.
 """
 
@@ -45,12 +53,18 @@ from typing import Optional
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host.paths import safe_location
 
-#: The member the payload build writes, relative to the volume root, spelled the
-#: way ``unixnu/payload.py:157`` spells it.  Matched case-insensitively and with
+#: The members the payload build writes, relative to the volume root, spelled the
+#: way ``unixnu/payload.py`` spells them.  Matched case-insensitively and with
 #: either separator, because FAT stores the name twice -- once as a long name and
 #: once as an 8.3 short name -- and which of the two a volume carries depends on
-#: the tool that formatted it.
+#: the tool that formatted it.  ``bundle8``'s volume carries both, so either
+#: spelling resolves.
 DATA_MEMBER = "EFI/UniXNU/Payloads/scratch-data.img"
+
+#: The GPU addon blob.  ``payload.py:145`` copies it beside the kernel and
+#: ``make-qemu-adt.py:120`` writes the ``GpuAddon`` placeholder that makes
+#: DarwinBoot refuse a boot carrying one without the other (``DarwinBoot.c:596``).
+GPU_ADDON_MEMBER = "EFI/UniXNU/Payloads/kernel.macho.gpuaddon"
 
 #: How the payload volume is laid out, measured on ``bundle7``'s ``payload.img``
 #: and written down here so a volume that differs is refused rather than
@@ -73,6 +87,11 @@ SHORT_NAME_BYTES = 11
 ATTR_OFFSET = 11
 ATTR_VOLUME_LABEL = 0x08
 ATTR_LONG_NAME = 0x0F
+#: FAT reserves the top two bits of the attributes byte, so a long-name fragment
+#: is recognised by its low six bits.
+ATTR_LONG_NAME_MASK = 0x3F
+#: A directory.
+ATTR_DIRECTORY = 0x10
 
 #: A deleted entry's first byte.  Skipped, not followed: the payload build
 #: deletes nothing, and a deleted member is not the build's seed.
@@ -92,8 +111,11 @@ END_OF_CHAIN = 0x0FFFFFF8
 BAD_CLUSTER = 0x0FFFFFF7
 
 #: The packed Data ramdisk's own ceiling (``packed_ramdisk.MAX_PACKED_BYTES``).
-#: A seed larger than this is not a seed this project produces, and reading one
-#: into memory would be the wrong answer to a corrupt directory entry.
+#: A seed larger than this is not a seed this project produces.  It is a
+#: *documentation* of what the seed is, not a bound the generic member reader
+#: applies: :func:`read_member` bounds a member by the volume's own size instead,
+#: which is derived rather than assumed and so cannot be wrong for a volume this
+#: module has not seen.
 MAX_SEED_BYTES = 256 * 1024 * 1024
 
 #: A directory deeper than this is a corrupt FAT, not a payload volume.  The
@@ -106,8 +128,8 @@ CHUNK = 1 << 20
 
 
 @dataclass(frozen=True)
-class PayloadSeed:
-    """The seed a payload image carries, and how it was found.
+class PayloadMember:
+    """A member a payload image carries, and how it was found.
 
     ``member`` is the path the reader matched, so a report can say which
     spelling the volume used -- the long name, the 8.3 short name, or both.
@@ -115,7 +137,7 @@ class PayloadSeed:
 
     #: The member's path inside the volume, as the volume spells it.
     member: str
-    #: The seed's bytes, exactly as the volume carries them.
+    #: The member's bytes, exactly as the volume carries them.
     data: bytes
     #: ``sha256`` of :attr:`data`.
     sha256: str
@@ -123,11 +145,6 @@ class PayloadSeed:
     size: int
     #: The first cluster of the chain that holds it.
     cluster: int
-
-    @property
-    def path(self) -> str:
-        """The member spelled the way the payload build spells it."""
-        return DATA_MEMBER
 
 
 def _refuse(code: ErrorCode, message: str, **details: object) -> UniPadError:
@@ -287,6 +304,19 @@ class _Fat32:
                 "the FAT's offset cannot be established",
                 reserved_sectors=self.reserved_sectors,
             )
+        # FAT32 always uses the 32-bit count; a 16-bit count is FAT12/16, which
+        # the check above has already refused.  Read anyway, because it is the
+        # field that says how large the volume claims to be and that is what
+        # bounds a member's declared size.
+        self.total_sectors = self.total_sectors_32 or self.total_sectors_16
+        if not self.total_sectors:
+            raise _refuse(
+                ErrorCode.CONFIG_INVALID,
+                f"{safe_location(self.image)} declares no sectors at all, so it "
+                "cannot hold a member",
+                total_sectors_16=self.total_sectors_16,
+                total_sectors_32=self.total_sectors_32,
+            )
 
         self.cluster_bytes = self.bytes_per_sector * self.sectors_per_cluster
         self.fat_offset = self.reserved_sectors * self.bytes_per_sector
@@ -428,7 +458,11 @@ class _Fat32:
                     fragments = {}
                     continue
                 attributes = entry[ATTR_OFFSET]
-                if attributes == ATTR_LONG_NAME:
+                # The low six bits, not all eight: FAT reserves the top two, and
+                # a formatter that sets them writes an entry that is still a
+                # long-name fragment.  Comparing the whole byte would treat it as
+                # a file whose name is the fragment's bytes.
+                if attributes & ATTR_LONG_NAME_MASK == ATTR_LONG_NAME:
                     ordinal, characters = _long_name_part(entry)
                     if ordinal >= 0:
                         fragments[ordinal] = characters
@@ -456,25 +490,27 @@ class _Fat32:
         self.close()
 
 
-def read_data_seed(
+def read_member(
     image: Path,
+    member: str,
     *,
     expected_sha256: Optional[str] = None,
-    member: str = DATA_MEMBER,
-) -> PayloadSeed:
-    """The Data seed a payload image carries, verified against its own record.
+) -> PayloadMember:
+    """A member a payload image carries, verified against its own record.
 
     Args:
         image: The payload FAT32 volume, read-only.  Never written to and never
             mounted.
-        expected_sha256: ``payload.json``'s ``data_ramdisk_sha256``, when the
+        member: Which member to read, relative to the volume root -- for example
+            :data:`DATA_MEMBER` or :data:`GPU_ADDON_MEMBER`.
+        expected_sha256: ``payload.json``'s digest *for that member*, when the
             caller has it.  Passing it is what turns a wrong extraction into a
-            refusal instead of a wrong seed on the ESP.
-        member: Which member to read.  Defaults to the payload build's own
-            spelling; a caller looking for another file may name it.
+            refusal instead of a wrong file on the ESP: the bytes are inside the
+            image and the image is never what the guest sees, so nothing else
+            would notice.
 
     Returns:
-        The seed, its digest, and the spelling the volume used.
+        The member, its digest, and the spelling the volume used.
 
     Raises:
         UniPadError: ``artifact_missing`` when the image or the member is not
@@ -489,6 +525,13 @@ def read_data_seed(
             ErrorCode.ARTIFACT_MISSING,
             "the payload image is not at the path given",
             image=safe_location(path),
+        )
+    if not member or not member.strip():
+        raise _refuse(
+            ErrorCode.CONFIG_INVALID,
+            "no member was named, so there is nothing to read out of the image",
+            image=safe_location(path),
+            member=member,
         )
 
     wanted = _normalize(member)
@@ -525,11 +568,10 @@ def read_data_seed(
                             or _normalize(short_name) in aliases):
                         found = (relative, first, size)
                         break
-                    if size == 0 and not (attributes & 0x10):
-                        # Not a directory and not a file with content: a
-                        # zero-length file cannot be the seed.
+                    if size == 0 and not (attributes & ATTR_DIRECTORY):
+                        # Not a directory and not a file with content.
                         continue
-                    if attributes & 0x10:
+                    if attributes & ATTR_DIRECTORY:
                         following.append((relative, first))
                 if found:
                     break
@@ -552,20 +594,25 @@ def read_data_seed(
         if size <= 0:
             raise _refuse(
                 ErrorCode.CONFIG_INVALID,
-                f"{relative} in the payload image is empty, so it is not a seed",
+                f"{relative} in the payload image is empty, so there is nothing "
+                "to read",
                 image=safe_location(path),
                 member=relative,
                 size=size,
             )
-        if size > MAX_SEED_BYTES:
+        # Bounded by the volume's own size rather than by a constant: it is
+        # derived from the BPB this reader has already validated, so it cannot be
+        # wrong for a volume shaped differently from the one measured here.
+        ceiling = volume.total_sectors * volume.bytes_per_sector
+        if size > ceiling:
             raise _refuse(
                 ErrorCode.CONFIG_INVALID,
-                f"{relative} in the payload image declares {size} bytes, over the "
-                f"{MAX_SEED_BYTES} a packed Data ramdisk can be",
+                f"{relative} in the payload image declares {size} bytes, more than "
+                f"the {ceiling}-byte volume that is supposed to hold it",
                 image=safe_location(path),
                 member=relative,
                 size=size,
-                ceiling=MAX_SEED_BYTES,
+                ceiling=ceiling,
             )
         data = volume.read_clusters(volume.chain(first), size)
 
@@ -573,7 +620,7 @@ def read_data_seed(
     if expected_sha256 and digest != expected_sha256.lower():
         raise _refuse(
             ErrorCode.VERIFICATION_FAILED,
-            f"the seed inside the payload image does not hash to the digest the "
+            f"{member} inside the payload image does not hash to the digest the "
             f"payload build recorded: {digest} against {expected_sha256.lower()}",
             image=safe_location(path),
             member=relative,
@@ -581,10 +628,37 @@ def read_data_seed(
             declared=expected_sha256.lower(),
             size=len(data),
         )
-    return PayloadSeed(
+    return PayloadMember(
         member=relative,
         data=data,
         sha256=digest,
         size=len(data),
         cluster=first,
     )
+
+
+def read_data_seed(
+    image: Path,
+    *,
+    expected_sha256: Optional[str] = None,
+    member: str = DATA_MEMBER,
+) -> PayloadMember:
+    """The Data seed a payload image carries, verified against its own record.
+
+    The seed-specific spelling of :func:`read_member`, kept because the seed is
+    the member the boot path needs and its digest has a name of its own
+    (``payload.json``'s ``data_ramdisk_sha256``).  It is a thin wrapper, not a
+    second implementation: one walk, one set of refusals, one digest check.
+
+    Args:
+        image: The payload FAT32 volume, read-only.  Never written to and never
+            mounted.
+        expected_sha256: ``payload.json``'s ``data_ramdisk_sha256``, when the
+            caller has it.
+        member: Which member to read.  Defaults to the payload build's own
+            spelling of the seed.
+
+    Returns:
+        The seed, its digest, and the spelling the volume used.
+    """
+    return read_member(image, member, expected_sha256=expected_sha256)

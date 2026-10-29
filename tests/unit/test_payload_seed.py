@@ -47,8 +47,14 @@ SEED_DISK = b"APSB" + b"\0" * 60 + bytes(range(0x97, 0x97)) + b"\x97\x4b\xce\x86
 SEED = pack(SEED_DISK)
 SEED_SHA256 = hashlib.sha256(SEED).hexdigest()
 
+#: A second member, so the tests exercise a reader that reads *members* and not
+#: only the seed.  The magic is the one ``unixnu/payload.py:118`` demands
+#: (``NGPUADD2``), and the blob is the shape ``make-gpu-addon.py`` packs.
+ADDON = b"NGPUADD2" + b"\x01\x00\x00\x00" + b"gpu addon blob" * 200
+ADDON_SHA256 = hashlib.sha256(ADDON).hexdigest()
+
 #: The clusters the fixture uses, in the order ``unixnu/payload.py:157`` writes
-#: them: three directories, then the seed.
+#: them: three directories, then the seed, then the addon.
 ROOT_CLUSTER = 2
 EFI_CLUSTER = 3
 UNIXNU_CLUSTER = 4
@@ -59,8 +65,12 @@ SEED_CLUSTER = 6
 #: seed the format check then rejects.
 SEED_CLUSTERS = (SEED_CLUSTER, SEED_CLUSTER + 1, SEED_CLUSTER + 2)
 LAST_CLUSTER = SEED_CLUSTER + 2
-#: The data region: eight clusters, one per directory plus the seed's three.
-DATA_CLUSTERS = 8
+#: The addon blob is 4,212 bytes, which is three more clusters.
+ADDON_CLUSTER = LAST_CLUSTER + 1
+ADDON_CLUSTERS = (ADDON_CLUSTER, ADDON_CLUSTER + 1, ADDON_CLUSTER + 2)
+LAST_CLUSTER = ADDON_CLUSTER + 2
+#: The data region: one cluster per directory plus the two members' six.
+DATA_CLUSTERS = LAST_CLUSTER - 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +163,8 @@ def _entry(name: str, cluster: int, size: int, *, long_name: bool = True,
 def _volume(directories: dict[int, list[bytes]], *, fat32: bool = True,
             root_entries: int = 0, fat_size_16: int = 0,
             seed_clusters: tuple[int, ...] = SEED_CLUSTERS,
-            seed_size: int = len(SEED)) -> bytes:
+            seed_size: int = len(SEED),
+            addon_size: int = len(ADDON)) -> bytes:
     """A FAT32 volume holding the payload build's own directory tree.
 
     Two FATs, and a data region of eight clusters: the root, ``EFI``,
@@ -177,9 +188,10 @@ def _volume(directories: dict[int, list[bytes]], *, fat32: bool = True,
     fat = bytearray(SECTORS_PER_FAT * BYTES_PER_SECTOR)
     struct.pack_into("<I", fat, 0, 0x0FFFFFF8)      # cluster 0: media + EOC
     struct.pack_into("<I", fat, 4, 0x0FFFFFFF)      # cluster 1: reserved
-    for index, cluster in enumerate(seed_clusters):
-        following = seed_clusters[index + 1] if index + 1 < len(seed_clusters) else 0x0FFFFFF8
-        struct.pack_into("<I", fat, cluster * 4, following)
+    for group in (seed_clusters, ADDON_CLUSTERS if addon_size else ()):
+        for index, cluster in enumerate(group):
+            following = group[index + 1] if index + 1 < len(group) else 0x0FFFFFF8
+            struct.pack_into("<I", fat, cluster * 4, following)
 
     data = bytearray(DATA_CLUSTERS * CLUSTER_BYTES)
     for cluster, entries in directories.items():
@@ -191,6 +203,9 @@ def _volume(directories: dict[int, list[bytes]], *, fat32: bool = True,
             at += len(entry)
     seed_at = (seed_clusters[0] - 2) * CLUSTER_BYTES
     data[seed_at:seed_at + seed_size] = SEED[:seed_size]
+    if addon_size:
+        addon_at = (ADDON_CLUSTER - 2) * CLUSTER_BYTES
+        data[addon_at:addon_at + addon_size] = ADDON[:addon_size]
 
     volume = bytearray(total_sectors * BYTES_PER_SECTOR)
     volume[0:BYTES_PER_SECTOR] = boot
@@ -202,15 +217,26 @@ def _volume(directories: dict[int, list[bytes]], *, fat32: bool = True,
     return bytes(volume)
 
 
-def _tree(*, long_name: bool = True, stem: str = "", seed_size: int = len(SEED)
-           ) -> dict[int, list[bytes]]:
-    """The payload build's own tree, one directory per cluster."""
+def _tree(*, long_name: bool = True, stem: str = "", seed_size: int = len(SEED),
+          addon: bool = True, addon_size: int = len(ADDON),
+          addon_stem: str = "") -> dict[int, list[bytes]]:
+    """The payload build's own tree, one directory per cluster.
+
+    ``addon`` puts a second member in ``Payloads`` beside the seed, which is what
+    makes the tests exercise a reader that reads *members* -- the GPU addon blob
+    is the second thing the payload build packs, and a reader that only ever
+    found the seed would pass every seed test and still not do the job.
+    """
+    payloads = [_entry("scratch-data.img", SEED_CLUSTER, seed_size,
+                       long_name=long_name, stem=stem)]
+    if addon:
+        payloads.append(_entry("kernel.macho.gpuaddon", ADDON_CLUSTER, addon_size,
+                               long_name=long_name, stem=addon_stem))
     return {
         ROOT_CLUSTER: [_entry("EFI", EFI_CLUSTER, 0, long_name=long_name, directory=True)],
         EFI_CLUSTER: [_entry("UniXNU", UNIXNU_CLUSTER, 0, long_name=long_name, directory=True)],
         UNIXNU_CLUSTER: [_entry("Payloads", PAYLOADS_CLUSTER, 0, long_name=long_name, directory=True)],
-        PAYLOADS_CLUSTER: [_entry("scratch-data.img", SEED_CLUSTER, seed_size,
-                                  long_name=long_name, stem=stem)],
+        PAYLOADS_CLUSTER: payloads,
     }
 
 
@@ -222,7 +248,7 @@ def _write(tmp_path: Path, volume: bytes, name: str = "payload.img") -> Path:
 
 #: What :func:`_tree` understands, so :func:`_payload_volume` can split its
 #: keyword arguments between the directory entries and the volume geometry.
-_TREE_KEYS = ("long_name", "stem", "seed_size")
+_TREE_KEYS = ("long_name", "stem", "seed_size", "addon", "addon_size", "addon_stem")
 
 
 def _payload_volume(tmp_path: Path, *, tree: dict | None = None, **kwargs) -> Path:
@@ -251,7 +277,7 @@ def test_it_reads_the_seed_the_volume_carries(tmp_path: Path) -> None:
     assert seed.sha256 == SEED_SHA256
     assert seed.size == len(SEED)
     assert seed.member.endswith("scratch-data.img"), seed.member
-    assert seed.path == ps.DATA_MEMBER
+    assert seed.cluster == SEED_CLUSTER, seed.cluster
 
 
 def test_it_reads_a_volume_that_spells_only_the_short_name(tmp_path: Path) -> None:
