@@ -16,6 +16,18 @@
 # the workflow runs first.  Every ring's output log lands in build-output/ so a
 # failure can be read from the artifact rather than re-run.
 #
+# Why the rings are sequential
+# ----------------------------
+# Ring 4 (the Rust bridge) needs nothing from the Mesa build -- its inputs are
+# the pinned translator source and cargo -- so it could run alongside rings 1..3
+# and save perhaps a fifth of the wall clock.  It does not, deliberately.  Two
+# heavy builds sharing a three-core runner is not a 2x win, and the failure mode
+# of a background job whose log interleaves is a run that fails for a reason
+# nothing in the artifact explains.  The job budget is 180 minutes and the chain
+# is estimated well inside it; every ring now logs its own elapsed seconds, so if
+# that estimate turns out to be wrong the numbers will say which ring to
+# parallelise and it can be done against a measurement rather than a hunch.
+#
 # What this script does NOT do, stated because each is a real gap and not an
 # oversight:
 #   * the wallpaper overlay (make-wallpaper-overlay.py) -- needs the mounted IPSW
