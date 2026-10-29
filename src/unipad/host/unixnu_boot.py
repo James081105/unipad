@@ -67,6 +67,7 @@ __all__ = [
     "boot_until_mounted",
     "build_argv",
     "guest_stopped_progressing",
+    "kernel_args_divergence",
     "kernel_args_line",
     "pe_subsystem",
     "read_board_payload",
@@ -478,6 +479,58 @@ def kernel_args_line(spec: Mapping[str, Any], extra: Sequence[str] = ()) -> str:
             bytes=len(line),
         )
     return line
+
+
+def kernel_args_divergence(staged: str, delivered: str) -> dict[str, Any]:
+    """Where two kernel command lines disagree, argument by argument.
+
+    Why this exists
+    ---------------
+    A boot is only evidence about the command line it actually booted, and this
+    module can produce two different ones for the same bundle.
+    :func:`stage_esp` writes ``unixnu.toml`` from ``board.toml`` when
+    :attr:`BootInputs.payload_toml` is ``None`` and copies the caller's file
+    verbatim when it is set -- so "the payload's line" and "the board's line" are
+    two different inputs, chosen by one keyword, and nothing in the run output
+    says which was chosen.  Measured on 2026-10-29 against the delivered
+    ``local-private/boot32`` bundle: the board's line carries
+    ``offline-legacy-surface-wait-ms=600000``, ``sheng-fb-gpu=1`` and
+    ``sheng-gpu-addon=1`` that the delivered payload's ``kernel_args`` does not.
+    That is not cosmetic -- ``offline-legacy-surface-wait-ms`` sets how long the
+    display probe waits for ``IOCoreSurfaceRoot``, and the display path is what
+    increments ``native_legacy_transfer_calls``, which is the gate
+    ``native_hid_input_requested()`` checks before it will let a Home press
+    through.  A run measured with the wrong one of the two answers a different
+    question, and the two runs look identical from the outside.
+
+    So the comparison is a function rather than a habit: a caller that is about
+    to spend a boot prints this, and a divergence is a name rather than a shrug.
+
+    Args:
+        staged: The line the guest will be handed.
+        delivered: The line the payload under test delivered.
+
+    Returns:
+        ``{"equal": bool, "only_staged": [...], "only_delivered": [...],
+        "changed": [...]}``.  ``changed`` spells ``"NAME=1 -> NAME=2"`` for a name
+        both lines carry with different values, because that is the failure that
+        reads as "the guest ignored my argument" and a set difference would
+        report it as one removal plus one addition -- or miss it entirely if the
+        two lines happened to have the same length.
+    """
+    def as_map(line: str) -> dict[str, str]:
+        return {item.split("=", 1)[0]: item for item in line.split() if item}
+
+    left, right = as_map(staged), as_map(delivered)
+    only_staged = sorted(set(left) - set(right))
+    only_delivered = sorted(set(right) - set(left))
+    changed = sorted(name for name in set(left) & set(right) if left[name] != right[name])
+    return {
+        "equal": not (only_staged or only_delivered or changed),
+        "only_staged": [left[name] for name in only_staged],
+        "only_delivered": [right[name] for name in only_delivered],
+        "changed": [f"{left[name]} -> {right[name]}" for name in changed],
+    }
 
 
 def tree_ramdisk_placeholder(devicetree: Path) -> Optional[str]:
