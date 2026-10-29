@@ -298,7 +298,13 @@ def test_the_real_board_declares_the_payload_the_module_boots(
     assert real_spec["size_mib"] == 192, real_spec
     assert real_spec["dram_size"] == "0x180000000", real_spec
     assert real_spec["panic_screen"] is True, real_spec
-    assert len(real_spec["kernel_args"]) == 23, real_spec
+    # 24, not the 23 this asserted before the GPU addon was switched on.  The
+    # count is the point of the line -- a board that silently loses an argument
+    # boots a different machine -- so it moves with the board rather than being
+    # loosened.  The argument itself is asserted by name below, because a count
+    # alone cannot tell you WHICH argument changed.
+    assert len(real_spec["kernel_args"]) == 24, real_spec
+    assert "sheng-gpu-addon=1" in real_spec["kernel_args"], real_spec
 
 
 def test_the_memory_the_module_gives_the_machine_is_the_boards(

@@ -180,7 +180,7 @@ payload_invocation() {
 """
 
 
-def _run_region(trust: str = "", ramdisk: str = "") -> tuple[int, str]:
+def _run_region(trust: str = "", ramdisk: str = "", addon: str = "") -> tuple[int, str]:
     """Execute the argv-building region and return ``(status, output)``.
 
     A real ``bash``, because the region is shell: the empty-array expansions
@@ -204,7 +204,8 @@ def _run_region(trust: str = "", ramdisk: str = "") -> tuple[int, str]:
     )
     environment = dict(os.environ)
     environment.update(
-        {"UEFI_DIR": "", "TRUST_CACHE_PATH": trust, "DATA_RAMDISK_PATH": ramdisk}
+        {"UEFI_DIR": "", "TRUST_CACHE_PATH": trust, "DATA_RAMDISK_PATH": ramdisk,
+         "GPU_ADDON_PATH": addon}
     )
     result = subprocess.run(
         [_bash(), "-s"],
@@ -228,6 +229,7 @@ def test_the_stage_forwards_both_of_the_chains_outputs() -> None:
     status, output = _run_region(
         trust="/tree/build/original-static-system-trust/original-static-system.bundle",
         ramdisk="/device/.cache/firmware/owner-data/owner-data-1g.dbr",
+        addon="/tree/build/adreno-metal-plugin/gpu-addon.ngpu",
     )
     assert status == 0, output
     arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG ")]
@@ -244,6 +246,12 @@ def test_the_stage_forwards_both_of_the_chains_outputs() -> None:
     )
     assert "--data-ramdisk" in arguments, arguments
     assert "/device/.cache/firmware/owner-data/owner-data-1g.dbr" in arguments, arguments
+    # The addon travels with them but is not one of them: it is forwarded with its
+    # own value, and it does not take part in the chain's ordering assertion
+    # below, because folding it into root_count would make that sentence about
+    # something else.
+    assert "--gpu-addon" in arguments, arguments
+    assert "/tree/build/adreno-metal-plugin/gpu-addon.ngpu" in arguments, arguments
     # ...and in the chain's own order, so the argv.log reads like the command
     # build-os-root.py:174 prints.
     assert arguments.index("--trust-cache") < arguments.index("--data-ramdisk"), arguments
@@ -267,7 +275,13 @@ def test_a_pass_with_no_chain_sends_neither_and_says_so() -> None:
     arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG ")]
     assert "--trust-cache" not in arguments, arguments
     assert "--data-ramdisk" not in arguments, arguments
+    assert "--gpu-addon" not in arguments, arguments
     assert "AMFI will refuse launchd" in output, output
+    # The addon's absence is logged for the same reason the chain's is: a silent
+    # absence on the first pass and a silent absence on the second are the same
+    # bytes, and only the second is the defect.  Its consequence is different and
+    # is said in its own words rather than folded into the chain's sentence.
+    assert "no GPU addon" in output, output
 
 
 def _region_code(region: str) -> str:

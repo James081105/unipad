@@ -467,6 +467,12 @@ Options:
                            payload' as --data-ramdisk.  Same ordering as
                            --trust-cache: the chain makes it, so only a pass
                            that ran after the chain can have one.
+  --gpu-addon <file>       The NGPUADD2 blob scripts/make-gpu-addon.py packs,
+                           forwarded to 'unixnu build payload' as --gpu-addon.
+                           Not part of the owner root chain: without it the
+                           kernel creates no /private/var/ngpu, the addon
+                           mount fails its first lookup with ENOENT, and
+                           native_gop_ready stays 0.
   --unique-chip-id <hex>   The platform seed the device tree carries.  It is
                            not stored in any repository (board.toml
                            [payload.adt] unique_chip_id = "required").  Without
@@ -558,6 +564,10 @@ DEVICETREE_PATH=''
 #: are for is not optional at all -- see the note above step_build_payload.
 TRUST_CACHE_PATH=''
 DATA_RAMDISK_PATH=''
+# Declared like its two siblings: this script runs under `set -u`, and an
+# undeclared variable is fatal there rather than empty.  Fact 101 recorded a
+# build dying on exactly that for a different name.
+GPU_ADDON_PATH=''
 #: Set when this script diverges from the pinned device repository to get the
 #: build past a defect in it.  Recorded in build-report.json, because a build
 #: that quietly patches its own inputs is a build nobody can reproduce.
@@ -606,6 +616,8 @@ while (( $# > 0 )); do
         --trust-cache=*)  TRUST_CACHE_PATH="${1#*=}"; shift ;;
         --data-ramdisk)   DATA_RAMDISK_PATH="${2:-}"; shift 2 ;;
         --data-ramdisk=*) DATA_RAMDISK_PATH="${1#*=}"; shift ;;
+        --gpu-addon)      GPU_ADDON_PATH="${2:-}"; shift 2 ;;
+        --gpu-addon=*)    GPU_ADDON_PATH="${1#*=}"; shift ;;
         --kernelcache=*)  KERNELCACHE_PATH="${1#*=}"; shift ;;
         --dtb)            DTB_PATH="${2:-}"; shift 2 ;;
         --dtb=*)          DTB_PATH="${1#*=}"; shift ;;
@@ -3137,6 +3149,20 @@ step_build_payload() {
     if [[ -n "$DATA_RAMDISK_PATH" ]]; then
         root_args+=(--data-ramdisk "$DATA_RAMDISK_PATH")
         root_count=$((root_count + 1))
+    fi
+    # The GPU addon is NOT part of the owner root chain, so it is deliberately
+    # outside root_count: it is a separate axis, and folding it in would make
+    # "the trust cache and the Data ramdisk are both supplied" a sentence about
+    # something else.  Its absence is recorded for the same reason the trust
+    # cache's is -- measured, not inferred: without the blob the kernel has
+    # nothing to materialise /private/var/ngpu from, native_gpu_addon_mount
+    # fails its first vnode_lookup with ENOENT (stage 1 / status 2), and
+    # native_gop_ready stays 0 no matter what else is right.
+    if [[ -n "$GPU_ADDON_PATH" ]]; then
+        root_args+=(--gpu-addon "$GPU_ADDON_PATH")
+        log "payload: the GPU addon is supplied; the kernel will materialise /private/var/ngpu before it mounts"
+    else
+        log "payload: no GPU addon; the kernel will create no /private/var/ngpu and the addon mount will fail its first lookup with ENOENT"
     fi
     if (( root_count == 2 )); then
         log "payload: the owner root chain's trust cache and Data ramdisk are both supplied; this ESP can start a userland"
