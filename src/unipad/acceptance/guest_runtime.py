@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -43,6 +44,7 @@ from unipad.acceptance.e2e import (
     release_verdict,
 )
 from unipad.errors import ErrorCode, UniPadError
+from unipad.host import payload_seed
 from unipad.host import unixnu_boot as ub
 from unipad.host.guestobserve import (
     GuestMemory,
@@ -701,6 +703,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--unixnu", type=Path, default=None)
     parser.add_argument("--trust-cache", type=Path, default=None)
     parser.add_argument("--data-ramdisk", type=Path, default=None)
+    parser.add_argument("--payload-report", type=Path, default=None,
+                        help="the payload build's payload.json; the staged Data ramdisk "
+                             "must hash to its data_ramdisk_sha256 or the run is refused")
+    parser.add_argument("--payload-image", type=Path, default=None,
+                        help="the payload FAT32 image to read the Data seed out of when "
+                             "--data-ramdisk is not given (unipad.host.payload_seed)")
+    parser.add_argument("--gpu-addon", type=Path, default=None,
+                        help="the GPU addon blob to stage beside the kernel; required "
+                             "whenever the device tree carries a GpuAddon placeholder, "
+                             "because DarwinBoot refuses the boot otherwise and prints "
+                             "nothing before refusing")
     parser.add_argument("--payload-toml", type=Path, default=None)
     parser.add_argument("--ramfb-driver", type=Path, default=None)
     parser.add_argument("--root-image", type=Path, default=None)
@@ -735,6 +748,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             unixnu=args.unixnu,
             firmware=args.firmware,
             payload_toml=args.payload_toml,
+            payload_report=args.payload_report,
+            gpu_addon=args.gpu_addon,
             ramfb_driver=args.ramfb_driver,
             root_image=args.root_image,
             systemos_image=args.systemos_image,
@@ -752,11 +767,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "darwinboot", "unixnu"):
             if getattr(args, required) is None:
                 parser.error(f"without --manifest, --{required} is required")
+        # The seed the run stages: ``--data-ramdisk`` names one directly, and
+        # ``--payload-image`` names the volume the payload build wrote the seed
+        # into.  On Windows that volume is never attached as a drive, so without
+        # the second route the only seed available is one borrowed from another
+        # build -- measured 2026-10-30 as native_owner_data_stage stuck at 0.
+        seed_dir = None
+        data_ramdisk = args.data_ramdisk
+        if data_ramdisk is None and args.payload_image is not None:
+            seed = payload_seed.read_data_seed(
+                args.payload_image,
+                expected_sha256=ub._declared_seed_digest(args.payload_report),
+            )
+            seed_dir = tempfile.TemporaryDirectory(prefix="unipad-seed-")
+            data_ramdisk = Path(seed_dir.name) / ub.DATA_RAMDISK_NAME
+            data_ramdisk.write_bytes(seed.data)
+            print(f"data seed: {seed.member} from {args.payload_image} "
+                  f"({seed.size} bytes, sha256 {seed.sha256})")
         inputs = ub.BootInputs(
             firmware=args.firmware, kernel=args.kernel, devicetree=args.devicetree,
             darwinboot=args.darwinboot, unixnu=args.unixnu,
             payload_toml=args.payload_toml, trust_cache=args.trust_cache,
-            data_ramdisk=args.data_ramdisk, ramfb_driver=args.ramfb_driver,
+            data_ramdisk=data_ramdisk, payload_report=args.payload_report,
+            gpu_addon=args.gpu_addon,
+            ramfb_driver=args.ramfb_driver,
         )
         runtime = RealGuestRuntime(
             inputs=inputs, qemu=args.qemu, device_dir=args.device,
@@ -819,6 +853,35 @@ def runtime_from_manifest(
             )
         return manifest_dir / str(entry["path"])
 
+    def verify_member(role: str) -> Path:
+        """The role's file, checked against the digest the manifest declares.
+
+        The manifest's ``sha256`` is the delivery's own record of what it
+        shipped, and it sits in the same entry as the ``path`` -- so reading one
+        and not the other is what let a boot run on material the manifest never
+        described.  A role the manifest declares without a digest is passed
+        through unchecked rather than refused: not every delivery carries one,
+        and a refusal there would make the check a way to fail rather than a way
+        to be sure.
+        """
+        path = member(role)
+        declared = artifacts.get(role, {}).get("sha256")
+        if not declared:
+            return path
+        actual = sha256_file(path)
+        if actual != str(declared).lower():
+            raise UniPadError(
+                ErrorCode.VERIFICATION_FAILED,
+                f"the {role} member does not hash to the digest the material "
+                f"manifest declares: {actual} against {str(declared).lower()}",
+                manifest=str(manifest_dir),
+                role=role,
+                member=str(path),
+                actual=actual,
+                declared=str(declared).lower(),
+            )
+        return path
+
     def raw_volume(role: str) -> Optional[Path]:
         compressed = member(role)
         raw = compressed.with_suffix(".raw")
@@ -835,13 +898,15 @@ def runtime_from_manifest(
 
     inputs = ub.BootInputs(
         firmware=kwargs.pop("firmware"),
-        kernel=member("kernel"),
-        devicetree=member("devicetree"),
+        kernel=verify_member("kernel"),
+        devicetree=verify_member("devicetree"),
         darwinboot=Path(darwinboot),
         unixnu=Path(unixnu),
         payload_toml=kwargs.pop("payload_toml", None),
-        trust_cache=member("trust_cache") if "trust_cache" in artifacts else None,
-        data_ramdisk=member("data_seed") if "data_seed" in artifacts else None,
+        trust_cache=verify_member("trust_cache") if "trust_cache" in artifacts else None,
+        data_ramdisk=verify_member("data_seed") if "data_seed" in artifacts else None,
+        payload_report=kwargs.pop("payload_report", None),
+        gpu_addon=verify_member("gpu_addon") if "gpu_addon" in artifacts else None,
         ramfb_driver=kwargs.pop("ramfb_driver", None),
     )
     return RealGuestRuntime(

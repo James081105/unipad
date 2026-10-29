@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import dataclasses
 import getpass
+import hashlib
+import json
 import socket
 import struct
 import tomllib
@@ -99,6 +101,8 @@ def _synthetic_tree(
     ramdisk: Optional[bytes] = None,
     ramdisk_key: str = "PackedRAMDisk",
     both: bool = False,
+    addon: Optional[bytes] = None,
+    addon_key: str = "GpuAddon",
 ) -> bytes:
     """A parseable tree whose ``/chosen/memory-map`` is the interesting part.
 
@@ -106,12 +110,21 @@ def _synthetic_tree(
     two properties at once, which is the state ``AdtNode`` refuses.  Everything
     else is the minimum a parse needs: names on the three nodes, and a
     ``TrustCache`` so the tree is shaped like the real one.
+
+    ``addon`` writes the GPU addon placeholder, which is a fourth property
+    beside the ramdisk and the trust cache.  ``AdtNode`` resolves every one of
+    them *by name* (``DarwinBoot.c:225-243``), so a fourth property is legal --
+    which is why the real tree grew from three to four without anything
+    complaining, and why the missing file it names was invisible until the
+    firmware refused the boot.
     """
     memory_map = [("name", b"memory-map\0"), ("TrustCache", bytes(16))]
     if both:
         memory_map += [("PackedRAMDisk", bytes(16)), ("RAMDisk", bytes(16))]
     elif ramdisk is not None:
         memory_map.append((ramdisk_key, ramdisk))
+    if addon is not None:
+        memory_map.append((addon_key, addon))
     return _serialize_adt(
         _adt_node("", [("name", b"root\0")], [
             _adt_node("chosen", [("name", b"chosen\0")], [
@@ -119,6 +132,25 @@ def _synthetic_tree(
             ]),
         ])
     )
+
+
+def _synthetic_addon(*, size: int = 4096, magic: bytes = b"NGPUADD2",
+                     declared: Optional[int] = None) -> bytes:
+    """A blob satisfying the header ``DarwinBoot.c:593-595`` checks.
+
+    ``make-gpu-addon.py`` writes an eight-byte magic, then a u64 at offset 16
+    recording the total length, and the firmware repeats all three checks.  A
+    real blob is Apple-independent build output but it is 12 MB and belongs to a
+    particular build, so what the tests need is the *contract*: magic, a size of
+    at least 24, and a self-describing length.
+    """
+    blob = bytearray(max(size, 24))
+    blob[:8] = magic
+    struct.pack_into("<Q", blob, 16, size if declared is None else declared)
+    # Truncated back to the requested size, so a caller asking for a 16-byte
+    # blob gets exactly the too-short blob the firmware would refuse -- and not
+    # a 24-byte one whose length field then disagrees for a different reason.
+    return bytes(blob[:size]) if size < 24 else bytes(blob)
 
 
 def _synthetic_seed(*, logical: int = 1 << 30, extents=((0, 4096),)) -> bytes:
@@ -3002,6 +3034,188 @@ def test_a_data_ramdisk_without_the_trees_placeholder_is_refused(
     assert error.details["tree_placeholder"] is None, error.details
 
 
+# ---------------------------------------------------------------------------
+# the GPU addon: the third half of the same hand-off
+# ---------------------------------------------------------------------------
+def test_the_esp_carries_the_gpu_addon_beside_the_kernel(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """Staged at the one name the firmware builds by concatenation.
+
+    ``DarwinBoot.c:587-589`` copies ``Request->KernelPath`` and appends
+    ``.gpuaddon``, so the name is a lookup exactly like the trust cache's -- and
+    it is also what the payload build writes (``unixnu/payload.py:145``).  Two
+    spellings would stage a file nothing opens.
+    """
+    addon = tmp_path / "gpu-addon.ngpu"
+    addon.write_bytes(_synthetic_addon())
+    tree = tmp_path / "with-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(16)))
+
+    esp = tmp_path / "esp"
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, gpu_addon=addon), esp, real_spec
+    )
+    staged = esp / "EFI/UniXNU/Payloads" / Path(ub.GPU_ADDON_NAME).name
+    assert staged.is_file(), "the addon was validated but not staged"
+    assert staged.read_bytes() == addon.read_bytes()
+    assert written[ub.GPU_ADDON_NAME] == addon.stat().st_size
+    # The name is the one the firmware derives, not one this module prefers.
+    assert ub.GPU_ADDON_NAME == "EFI/UniXNU/Payloads/" + "kernel.macho" + ".gpuaddon"
+
+
+def test_a_tree_placeholder_without_the_addon_blob_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """THE MEASURED DEFECT, and the reason this field exists.
+
+    ``DarwinBoot.c:596-598`` refuses with ``EFI_COMPROMISED_DATA`` when the tree
+    carries a ``GpuAddon`` placeholder and ``ReadFile`` finds no
+    ``kernel.macho.gpuaddon`` -- and it refuses *before* the hand-off banner, so
+    the serial log names compromised data and not a missing file.
+
+    Measured on 2026-10-30 with bundle8, the first build that carried the blob:
+    the boot never reached the kernel at all, and the log ends
+    ``DARWINBOOT: boot refused: Compromised Data; firmware retained``.  The
+    blob was in the bundle the whole time (``payload.img`` carries
+    ``KERNEL~1.GPU`` at 12,131,336 bytes); only the staging path was absent, so
+    ``BootInputs`` had no field to carry it with.
+    """
+    tree = tmp_path / "with-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(16)))
+    error = _refused(
+        ub.stage_esp, replace(inputs, devicetree=tree), tmp_path / "esp", real_spec
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "accepts both or neither" in error.message, error
+    assert error.details["addon"] is False, error.details
+    assert error.details["tree_placeholder"] is True, error.details
+
+
+def test_an_addon_blob_without_the_trees_placeholder_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The other branch of the same exclusive-or.
+
+    A staged blob with no placeholder is the mirror image: the firmware would
+    patch nothing and the kernel would have no window to find it in.
+    """
+    addon = tmp_path / "gpu-addon.ngpu"
+    addon.write_bytes(_synthetic_addon())
+    error = _refused(
+        ub.stage_esp, replace(inputs, gpu_addon=addon), tmp_path / "esp", real_spec
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "accepts both or neither" in error.message, error
+    assert error.details["addon"] is True, error.details
+    assert error.details["tree_placeholder"] is False, error.details
+
+
+def test_both_addon_halves_together_are_accepted(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The state that actually boots, so the guard is not a guard against everything."""
+    addon = tmp_path / "gpu-addon.ngpu"
+    addon.write_bytes(_synthetic_addon())
+    tree = tmp_path / "with-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(16)))
+
+    esp = tmp_path / "esp"
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, gpu_addon=addon), esp, real_spec
+    )
+    assert ub.GPU_ADDON_NAME in written, written
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"magic": b"NGPUADD1"}, "NGPUADD2"),
+        ({"size": 16}, "at least 24"),
+        ({"declared": 9999}, "disagrees with itself"),
+    ],
+)
+def test_an_addon_whose_header_darwinboot_rejects_is_refused_here_instead(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path,
+    kwargs: dict[str, Any], expected: str,
+) -> None:
+    """The firmware's three header checks, applied a second earlier.
+
+    ``DarwinBoot.c:593-595`` refuses a staged addon unless the magic is
+    ``NGPUADD2``, the size is at least 24, and the u64 at offset 16 equals the
+    file's own length.  Its message for a failure is ``EFI_COMPROMISED_DATA``,
+    which names a corrupted device tree -- so the same three checks run here,
+    where the message can name the file.
+    """
+    addon = tmp_path / "gpu-addon.ngpu"
+    addon.write_bytes(_synthetic_addon(**kwargs))
+    tree = tmp_path / "with-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(16)))
+
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, gpu_addon=addon),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert expected in error.message, error
+    assert not (tmp_path / "esp" / "EFI/UniXNU/Payloads" / Path(ub.GPU_ADDON_NAME).name).exists(), (
+        "a blob the firmware would refuse was staged anyway"
+    )
+
+
+def test_a_nonzero_addon_placeholder_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The placeholder has to be zeroed, exactly as the ramdisk's does.
+
+    DarwinBoot patches the 16 bytes with the blob's address and size, and treats
+    a nonzero value as compromised data (``DarwinBoot.c:563`` for the ramdisk,
+    and the same reasoning at :593 for the addon).  A tree carrying a nonzero
+    ``GpuAddon`` is therefore a tree this module refuses rather than boots.
+    """
+    tree = tmp_path / "nonzero-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(range(16))))
+    error = _refused(
+        ub.stage_esp, replace(inputs, devicetree=tree), tmp_path / "esp", real_spec
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "not zeroed" in error.message, error
+
+
+def test_an_addon_placeholder_of_the_wrong_length_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """``AdtNode`` requires exactly 16 bytes and refuses the tree otherwise."""
+    tree = tmp_path / "short-addon.adt"
+    tree.write_bytes(_synthetic_tree(addon=bytes(8)))
+    error = _refused(
+        ub.stage_esp, replace(inputs, devicetree=tree), tmp_path / "esp", real_spec
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "exactly 16" in error.message, error
+
+
+def test_the_addon_is_recorded_in_the_boot_report(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """``to_dict`` carries it, so a report says which blob a run used.
+
+    The ramdisk and the trust cache are both recorded for this reason: the
+    question "did this boot carry an addon" decides whether the GPU addon mount
+    can be entered at all, and a report that cannot answer it is not
+    diagnosable.
+    """
+    addon = tmp_path / "gpu-addon.ngpu"
+    addon.write_bytes(_synthetic_addon())
+    record = replace(inputs, gpu_addon=addon).to_dict()
+    assert record["gpu_addon"] == ub.safe_location(addon), record
+    assert "gpu_addon" not in inputs.to_dict(), (
+        "a boot with no addon must not claim one"
+    )
+
+
 def test_a_tree_placeholder_without_a_data_ramdisk_is_refused(
     inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -4617,3 +4831,191 @@ def test_the_probe_reports_a_port_it_cannot_even_construct_a_client_for(
     # this line exists to prevent being "fixed" into.
     assert "config_invalid" in entry["reason"], entry["reason"]
     assert "qmp port" in entry["reason"], entry["reason"]
+
+
+# ---------------------------------------------------------------------------
+# the Data seed against the payload build's own record
+# ---------------------------------------------------------------------------
+
+def _payload_report(tmp_path: Path, digest: object) -> Path:
+    """A ``payload.json`` carrying ``data_ramdisk_sha256``."""
+    report = tmp_path / "payload.json"
+    report.write_text(json.dumps({"data_ramdisk_sha256": digest}), encoding="utf-8")
+    return report
+
+
+def test_a_seed_that_is_not_the_payload_builds_own_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The defect this closes, in one test.
+
+    On Windows the payload image is never attached as a drive -- the ESP is a
+    staged directory behind QEMU's ``fat:`` block driver -- so the seed inside
+    the image is invisible to the guest and this directory is the only delivery
+    channel.  A seed staged from another build replaces the image's own with
+    nothing to notice.  Measured on 2026-10-30 with ``bundle7``: the image
+    carried ``6fa3a34a…`` whose volume UUID ``974BCE86-…`` is the one its own
+    kernel was built for, and what was staged was ``784a8507…`` with
+    ``E3E8AE2D-…``.  The guest logged ``native_owner_data_stage = 0`` /
+    ``status = 2`` (ENOENT), so the owner Data volume never mounted and the GPU
+    addon mount's only call site was never entered.
+    """
+    seed = tmp_path / "borrowed.dbr"
+    blob = _synthetic_seed()
+    seed.write_bytes(blob)
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    report = _payload_report(tmp_path, "0" * 64)
+
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed, payload_report=report),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "not the one the payload build put in the image" in error.message, error
+    # Both digests, because the question an operator has is "which of these do I
+    # have" and a message naming one of them does not answer it.
+    assert error.details["staged"] == hashlib.sha256(blob).hexdigest(), error.details
+    assert error.details["declared"] == "0" * 64, error.details
+    # And what it costs, in the message rather than only in a code.
+    assert "owner Data volume will not mount" in error.message, error
+    assert "GPU addon mount" in error.message, error
+
+
+def test_a_seed_that_matches_the_payload_builds_record_is_staged(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The green control: the matched pair stages, and says it was checked.
+
+    Without this the refusal above could pass for the wrong reason -- a guard
+    that refuses everything is not a guard.
+    """
+    seed = tmp_path / "matched.dbr"
+    blob = _synthetic_seed()
+    seed.write_bytes(blob)
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    report = _payload_report(tmp_path, hashlib.sha256(blob).hexdigest())
+
+    esp = tmp_path / "esp"
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, data_ramdisk=seed, payload_report=report),
+        esp, real_spec,
+    )
+    staged = esp / "EFI/UniXNU/Payloads" / ub.DATA_RAMDISK_NAME
+    assert staged.read_bytes() == blob
+    # The record says the check ran, the way the trust cache's key does: a later
+    # mismatch cannot have slipped through a run whose report says otherwise.
+    assert written["_data_seed_declared"] == hashlib.sha256(blob).hexdigest(), written
+    assert written["_data_seed_sha256"] == hashlib.sha256(blob).hexdigest(), written
+
+
+def test_a_seed_with_no_payload_report_is_staged_unchecked(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """The check is additive: a caller with no report gets the old behaviour.
+
+    Every existing caller passes no ``payload_report``, and a field that
+    silently turned their boots into refusals would be a different defect.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, data_ramdisk=seed), tmp_path / "esp", real_spec
+    )
+    assert (tmp_path / "esp" / "EFI/UniXNU/Payloads" / ub.DATA_RAMDISK_NAME).is_file()
+    assert "_data_seed_declared" not in written, written
+
+
+def test_a_payload_built_without_a_seed_declares_no_digest(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """``null`` is not a disagreement.
+
+    ``unixnu/payload.py:188`` writes ``data_ramdisk_sha256: null`` for a payload
+    built without a seed.  A boot that adds one to such a payload is doing
+    something the build did not, and there is nothing to compare against -- so
+    refusing would make the check a way to fail rather than a way to be sure.
+    """
+    seed = tmp_path / "added.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    report = _payload_report(tmp_path, None)
+
+    written = ub.stage_esp(
+        replace(inputs, devicetree=tree, data_ramdisk=seed, payload_report=report),
+        tmp_path / "esp", real_spec,
+    )
+    assert "_data_seed_declared" not in written, written
+    assert (tmp_path / "esp" / "EFI/UniXNU/Payloads" / ub.DATA_RAMDISK_NAME).is_file()
+
+
+def test_a_payload_report_that_does_not_parse_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """A malformed report refuses rather than skipping the check.
+
+    Silently skipping a check because a file is unreadable is how the check
+    stops running without anyone noticing -- which is the shape this whole
+    change exists to remove.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    report = tmp_path / "payload.json"
+    report.write_text("{ not json", encoding="utf-8")
+
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed, payload_report=report),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "does not parse" in error.message, error
+
+
+def test_a_declared_digest_that_is_not_a_sha256_is_refused(
+    inputs: BootInputs, real_spec: dict[str, Any], tmp_path: Path
+) -> None:
+    """A truncated digest would refuse every seed forever.
+
+    Comparing against a value that cannot be a digest reads as a broken reader
+    rather than a broken argument, so it is named as what it is.
+    """
+    seed = tmp_path / "owner-data-1g.dbr"
+    seed.write_bytes(_synthetic_seed())
+    tree = tmp_path / "with-placeholder.adt"
+    tree.write_bytes(_synthetic_tree(ramdisk=bytes(16)))
+    report = _payload_report(tmp_path, "6fa3a34a")
+
+    error = _refused(
+        ub.stage_esp,
+        replace(inputs, devicetree=tree, data_ramdisk=seed, payload_report=report),
+        tmp_path / "esp",
+        real_spec,
+    )
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "not a sha256" in error.message, error
+
+
+def test_the_payload_report_is_an_input_like_any_other(
+    inputs: BootInputs, tmp_path: Path
+) -> None:
+    """The report is named by ``missing()`` and carried by ``to_dict()``.
+
+    A field that is checked when present but never reported absent is a field
+    whose absence is invisible -- and the absence is what turns the check off.
+    """
+    absent = replace(inputs, payload_report=tmp_path / "absent.json")
+    assert "payload_report=absent.json" in absent.missing(), absent.missing()
+    assert inputs.to_dict().get("payload_report") is None
+    with_report = replace(inputs, payload_report=Path("payload.json"))
+    assert with_report.to_dict()["payload_report"] == "payload.json"

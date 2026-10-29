@@ -17,6 +17,8 @@ Modules:
 - :mod:`unipad.host.httpsvc`   -- self-controlled HTTPS package service (PRD 3.2 P1)
 - :mod:`unipad.host.packed_ramdisk` -- the packed Data ramdisk format, as both the
   bootloader and the kernel driver parse it
+- :mod:`unipad.host.payload_seed` -- read the Data seed out of a payload FAT32
+  image, verified against the digest the payload build recorded
 - :mod:`unipad.host.apfs_checksum` -- APFS's object checksum, measured from the
   containers this project boots rather than transcribed
 

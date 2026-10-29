@@ -9,6 +9,7 @@ guessed ``False`` would be manufacturing a pass.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -796,3 +797,90 @@ def test_the_runtime_hands_the_probe_two_paths_too(
     assert "memory" in scratch.name, (
         f"the raw-memory scratch no longer says what it holds: {scratch.name}"
     )
+
+
+# ---------------------------------------------------------------------------
+# the manifest's own digests
+# ---------------------------------------------------------------------------
+
+def _manifest_dir(tmp_path: Path, *, seed_digest: object = None) -> Path:
+    """A delivery directory whose ``data_seed`` entry carries ``sha256``."""
+    manifest_dir = tmp_path / "delivery"
+    manifest_dir.mkdir()
+    for name in ("kernel.macho", "kernel.macho.adt", "original-static-system.bundle",
+                 "owner-data-1g.dbr", "044-76040-038.dmg", "044-76034-038.dmg"):
+        (manifest_dir / name).write_bytes(b"\0" * 8)
+    (manifest_dir / "044-76040-038.raw").write_bytes(b"\0" * 8)
+    (manifest_dir / "044-76034-038.raw").write_bytes(b"\0" * 8)
+    entry: dict[str, object] = {"path": "owner-data-1g.dbr"}
+    if seed_digest is not None:
+        entry["sha256"] = seed_digest
+    (manifest_dir / "material-manifest.json").write_text(json.dumps({
+        "artifacts": {
+            "kernel": {"path": "kernel.macho"},
+            "devicetree": {"path": "kernel.macho.adt"},
+            "trust_cache": {"path": "original-static-system.bundle"},
+            "data_seed": entry,
+            "os_root_image": {"path": "044-76040-038.dmg"},
+            "systemos_image": {"path": "044-76034-038.dmg"},
+        }
+    }), encoding="utf-8")
+    for name in ("fw.bin", "DarwinBoot.efi", "UniXNU.efi"):
+        (tmp_path / name).write_bytes(b"\0" * 8)
+    return manifest_dir
+
+
+def _delivered_runtime(tmp_path: Path, manifest_dir: Path):
+    from unipad.acceptance import guest_runtime as gr
+    return gr.runtime_from_manifest(
+        manifest_dir,
+        device_dir=tmp_path / "device",
+        qemu=tmp_path / "qemu.exe",
+        darwinboot=tmp_path / "DarwinBoot.efi",
+        unixnu=tmp_path / "UniXNU.efi",
+        firmware=tmp_path / "fw.bin",
+        workdir=tmp_path / "run",
+    )
+
+
+def test_the_manifest_declared_seed_digest_is_checked(tmp_path: Path) -> None:
+    """The delivery's own record of what it shipped, read and not ignored.
+
+    ``runtime_from_manifest`` reads each role's ``path`` out of the manifest and
+    then boots whatever is at it -- so a directory whose seed had been replaced
+    produced a boot the manifest never described.  The ``sha256`` sits in the
+    same entry as the ``path``; reading one and not the other is the gap.
+    """
+    manifest_dir = _manifest_dir(tmp_path, seed_digest="0" * 64)
+    with pytest.raises(UniPadError) as caught:
+        _delivered_runtime(tmp_path, manifest_dir)
+    assert caught.value.code is ErrorCode.VERIFICATION_FAILED, caught.value
+    assert "data_seed" in str(caught.value.details.get("role")), caught.value.details
+    assert caught.value.details["declared"] == "0" * 64, caught.value.details
+
+
+def test_the_manifest_declared_seed_digest_that_matches_is_accepted(tmp_path: Path) -> None:
+    """The green control: a delivery that describes itself honestly is booted."""
+    manifest_dir = _manifest_dir(tmp_path)
+    digest = hashlib.sha256((manifest_dir / "owner-data-1g.dbr").read_bytes()).hexdigest()
+    (manifest_dir / "material-manifest.json").write_text(json.dumps({
+        "artifacts": {
+            "kernel": {"path": "kernel.macho"},
+            "devicetree": {"path": "kernel.macho.adt"},
+            "trust_cache": {"path": "original-static-system.bundle"},
+            "data_seed": {"path": "owner-data-1g.dbr", "sha256": digest},
+            "os_root_image": {"path": "044-76040-038.dmg"},
+            "systemos_image": {"path": "044-76034-038.dmg"},
+        }
+    }), encoding="utf-8")
+    assert _delivered_runtime(tmp_path, manifest_dir).inputs.data_ramdisk == manifest_dir / "owner-data-1g.dbr"
+
+
+def test_a_role_the_manifest_declares_without_a_digest_is_passed_through(tmp_path: Path) -> None:
+    """Not every delivery carries one, and a refusal there would be a different bug.
+
+    The check is "when the manifest declares a digest, honour it" -- not "refuse
+    a manifest that omits one".
+    """
+    runtime = _delivered_runtime(tmp_path, _manifest_dir(tmp_path))
+    assert runtime.inputs.data_ramdisk is not None

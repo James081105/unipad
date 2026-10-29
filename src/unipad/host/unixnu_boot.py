@@ -43,6 +43,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass, field, replace
@@ -50,8 +51,9 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from unipad.errors import ErrorCode, UniPadError
-from unipad.host import adt, packed_ramdisk
+from unipad.host import adt, packed_ramdisk, payload_seed
 from unipad.host.adt import read_board_adt
+from unipad.host.images import sha256_file
 from unipad.host.paths import safe_location, scrub_account
 
 __all__ = [
@@ -263,6 +265,59 @@ class BootInputs:
     #: is refused with ``EFI_UNSUPPORTED``.  :func:`stage_esp` checks the pair
     #: instead of trusting the caller to have got both halves right.
     data_ramdisk: Optional[Path] = None
+    #: The payload build's own ``payload.json`` -- the record that says which
+    #: seed the build put in the image.
+    #:
+    #: Why one path rather than a digest field: that file already carries
+    #: ``data_ramdisk_sha256``, ``adt_sha256``, ``trust_cache_sha256``,
+    #: ``gpu_addon_sha256`` and ``kernel_args`` (``unixnu/payload.py:185-190``),
+    #: so one field buys every one of those bindings and the next one costs
+    #: nothing.  It is small, it is JSON, and it is already in every delivered
+    #: boot-inputs bundle.
+    #:
+    #: What it is *for*: on Windows the payload image is never attached as a
+    #: drive -- the ESP is a staged directory behind QEMU's ``fat:`` block
+    #: driver -- so the seed inside the image is invisible to the guest and this
+    #: directory is the only delivery channel.  A seed staged from anywhere else
+    #: overwrites the build's own, and until this field existed nothing on the
+    #: host could see that it had happened.  Measured on 2026-10-30 with
+    #: ``bundle7``: the image carried ``6fa3a34a…`` (volume UUID ``974BCE86-…``,
+    #: the one its own kernel was built for) and the staged seed was
+    #: ``784a8507…`` (volume UUID ``E3E8AE2D-…``, a different build).  The guest
+    #: logged ``native_owner_data_stage = 0`` / ``status = 2`` (ENOENT) -- the
+    #: owner Data volume never mounted, so the GPU addon mount's only call site
+    #: was never entered.  :func:`stage_esp` refuses that combination now.
+    payload_report: Optional[Path] = None
+    #: The GPU addon blob, staged as ``EFI/UniXNU/Payloads/kernel.macho.gpuaddon``
+    #: beside the kernel.
+    #:
+    #: This is the third half of the same hand-off :attr:`data_ramdisk` and
+    #: :attr:`trust_cache` are, and it is missing for the same reason they once
+    #: were: nothing in this module could supply it, so the check that depends on
+    #: it could never be exercised.  Unlike those, this one is not optional in
+    #: principle.  ``AdtNode`` (``DarwinBoot.c:239-243``) accepts a
+    #: ``GpuAddon`` property inside ``/chosen/memory-map`` and resolves it by
+    #: name, exactly as it does ``PackedRAMDisk`` and ``TrustCache``; and the
+    #: consumer (``DarwinBoot.c:588-598``) refuses with ``EFI_COMPROMISED_DATA``
+    #: when the tree carries the placeholder but ``ReadFile`` finds no
+    #: ``kernel.macho.gpuaddon`` beside the kernel -- the exact mirror of the
+    #: ramdisk pair.  A payload built with an addon therefore *cannot* boot
+    #: without one staged, and the host had no field to stage it with.
+    #:
+    #: Measured on 2026-10-30 with ``bundle8``, the first build that carried the
+    #: blob: the boot never reached the kernel at all.  The serial log ends
+    #: ``DARWINBOOT: boot refused: Compromised Data; firmware retained``, and the
+    #: cause is visible in the two device trees -- bundle7's
+    #: ``/chosen/memory-map`` has 3 properties, bundle8's has 4, and the added
+    #: one is named ``GpuAddon``.  The blob itself was in the bundle the whole
+    #: time: ``payload.img`` carries ``EFI/UNIXNU/PAYLOADS/KERNEL~1.GPU`` at
+    #: 12,131,336 bytes and ``payload.json`` records its digest.  Only the
+    #: staging path was absent.
+    #:
+    #: Validated here against the header ``DarwinBoot.c:593-595`` checks, so a
+    #: truncated or foreign blob costs a second on the host rather than a boot
+    #: that refuses with a message about compromised data.
+    gpu_addon: Optional[Path] = None
     #: ``QemuRamfb.efi``, staged as ``EFI/UniXNU/Payloads/QemuRamfb.efi``.
     #:
     #: This field exists because of a check that could never pass.
@@ -296,6 +351,10 @@ class BootInputs:
             absent.append(f"trust_cache={safe_location(Path(self.trust_cache))}")
         if self.data_ramdisk is not None and not Path(self.data_ramdisk).is_file():
             absent.append(f"data_ramdisk={safe_location(Path(self.data_ramdisk))}")
+        if self.payload_report is not None and not Path(self.payload_report).is_file():
+            absent.append(f"payload_report={safe_location(Path(self.payload_report))}")
+        if self.gpu_addon is not None and not Path(self.gpu_addon).is_file():
+            absent.append(f"gpu_addon={safe_location(Path(self.gpu_addon))}")
         if self.ramfb_driver is not None and not Path(self.ramfb_driver).is_file():
             absent.append(f"ramfb_driver={safe_location(Path(self.ramfb_driver))}")
         return absent
@@ -309,6 +368,10 @@ class BootInputs:
             record["trust_cache"] = safe_location(Path(self.trust_cache))
         if self.data_ramdisk is not None:
             record["data_ramdisk"] = safe_location(Path(self.data_ramdisk))
+        if self.payload_report is not None:
+            record["payload_report"] = safe_location(Path(self.payload_report))
+        if self.gpu_addon is not None:
+            record["gpu_addon"] = safe_location(Path(self.gpu_addon))
         if self.ramfb_driver is not None:
             record["ramfb_driver"] = safe_location(Path(self.ramfb_driver))
         return record
@@ -703,6 +766,19 @@ DATA_RAMDISK_NAME = "scratch-data.img"
 #: stage a file nothing opens.
 TRUSTCACHE_NAME = "EFI/UniXNU/Payloads/kernel.macho.trustcache"
 
+#: The name the GPU addon blob is staged under, beside the kernel.  A lookup,
+#: not a label: ``DarwinBoot.c:587-589`` builds the path by concatenating
+#: ``.gpuaddon`` onto ``Request->KernelPath``, so it opens exactly this and a
+#: second spelling stages a file nothing reads.  It is also what the payload
+#: build writes (``unixnu/payload.py:145``: ``payloads / 'kernel.macho.gpuaddon'``),
+#: so the host and the runner agree without either restating the other.
+GPU_ADDON_NAME = "EFI/UniXNU/Payloads/kernel.macho.gpuaddon"
+
+#: The magic ``make-gpu-addon.py`` writes and ``DarwinBoot.c:595`` compares the
+#: first eight bytes against.  ``unixnu/payload.py:113`` applies the same guard
+#: on the runner, so a blob that fails it never reaches a payload image either.
+GPU_ADDON_MAGIC = b"NGPUADD2"
+
 #: The name the frame-buffer driver is staged under, and the path
 #: :func:`build_argv` tests for before emitting ``ramfb_size``.  It has to be
 #: exactly this because it is also a *lookup*: ``run-qemu.py:105-116`` runs it
@@ -717,6 +793,66 @@ RAMFB_NAME = "EFI/UniXNU/Payloads/QemuRamfb.efi"
 #: enough -- and a config that spells it some other way is a config to read,
 #: not to guess at.
 _INITRD_LINE = re.compile(r'^\s*initrd\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _declared_seed_digest(payload_report: Optional[Path]) -> Optional[str]:
+    """The seed digest the payload build recorded, or ``None`` when it said none.
+
+    ``unixnu/payload.py:188`` writes ``data_ramdisk_sha256`` as ``None`` for a
+    payload built without a seed, and the field is simply absent from a report
+    written by anything else.  Both mean "this build declared no seed", which is
+    not a disagreement -- a boot that adds a seed to such a payload is doing
+    something the build did not, and there is nothing to compare against.
+
+    A report that does not parse, or that is not a JSON object, is a refusal
+    rather than a ``None``: silently skipping the check because a file is
+    malformed is how the check stops running without anyone noticing.
+    """
+    if payload_report is None:
+        return None
+    path = Path(payload_report)
+    if not path.is_file():
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MISSING,
+            "the payload build's report is not at the path given",
+            payload_report=safe_location(path),
+        )
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as failure:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the payload build's report does not parse: {failure}",
+            payload_report=safe_location(path),
+        ) from failure
+    if not isinstance(report, dict):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the payload build's report is not a JSON object",
+            payload_report=safe_location(path),
+        )
+    declared = report.get("data_ramdisk_sha256")
+    if declared is None:
+        return None
+    if not isinstance(declared, str) or len(declared) != 64:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the payload build's report carries a data_ramdisk_sha256 that is "
+            f"not a sha256: {declared!r}",
+            payload_report=safe_location(path),
+            declared=declared,
+        )
+    try:
+        int(declared, 16)
+    except ValueError as failure:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the payload build's report carries a data_ramdisk_sha256 that is "
+            f"not hexadecimal: {declared!r}",
+            payload_report=safe_location(path),
+            declared=declared,
+        ) from failure
+    return declared.lower()
 
 
 def _check_ramdisk_pair(
@@ -771,6 +907,150 @@ def _check_ramdisk_pair(
         )
 
 
+def _validate_gpu_addon(addon: Path) -> int:
+    """Check the addon blob against the header DarwinBoot checks, return its size.
+
+    ``DarwinBoot.c:593-595`` refuses a staged addon with
+    ``EFI_COMPROMISED_DATA`` unless all three of these hold::
+
+        (AddonSize < 24) ||
+        (CompareMem (Addon, "NGPUADD2", 8) != 0) ||
+        (U64 ((UINT8 *)Addon + 16) != AddonSize)
+
+    The u64 at offset 16 is ``make-gpu-addon.py``'s own record of the total
+    length, so it is a self-check the writer performs and the reader repeats.
+    ``unixnu/payload.py:113`` applies the same magic on the runner, which means
+    a blob failing it never reaches a payload image either -- but a caller can
+    still hand this module one, and the firmware's message for it names a
+    corrupted device tree rather than a wrong file.
+    """
+    path = Path(addon)
+    blob = path.read_bytes()
+    if len(blob) < 24:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the GPU addon is {len(blob)} bytes; DarwinBoot requires at least "
+            "24 and refuses the tree otherwise",
+            gpu_addon=safe_location(path),
+            bytes=len(blob),
+        )
+    if blob[:8] != GPU_ADDON_MAGIC:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the GPU addon does not start with {GPU_ADDON_MAGIC.decode()}: "
+            f"{blob[:8]!r}. It was not made by scripts/make-gpu-addon.py",
+            gpu_addon=safe_location(path),
+            magic=blob[:8].hex(),
+        )
+    declared = int.from_bytes(blob[16:24], "little")
+    if declared != len(blob):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"the GPU addon's own header says {declared} bytes but the file is "
+            f"{len(blob)}; DarwinBoot refuses a blob whose length disagrees "
+            "with itself",
+            gpu_addon=safe_location(path),
+            declared=declared,
+            actual=len(blob),
+        )
+    return len(blob)
+
+
+def _check_addon_pair(inputs: "BootInputs", written: Mapping[str, Any]) -> None:
+    """Refuse a boot whose addon halves do not agree.
+
+    The same exclusive-or the ramdisk has (``DarwinBoot.c:588-598``)::
+
+        if (Addon != NULL) {
+          if ((AddonOffset == MAX_UINTN) || ... ) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+        } else if (AddonOffset != MAX_UINTN) {
+          Status = EFI_COMPROMISED_DATA;
+          goto Fail;
+        }
+
+    Both directions are a boot that never reaches the kernel, and the firmware
+    prints nothing before refusing -- which is how this one was found.  Measured
+    on 2026-10-30 with ``bundle8``, the first build that carried the blob: the
+    serial log ends ``DARWINBOOT: boot refused: Compromised Data; firmware
+    retained``, because the tree gained a ``GpuAddon`` placeholder (its
+    ``/chosen/memory-map`` went from 3 properties to 4) and this module had no
+    field to stage the file it names.  The blob was in the bundle the whole time.
+    """
+    staged = GPU_ADDON_NAME in written
+    placeholder = _tree_addon_placeholder(inputs.devicetree)
+    if staged != (placeholder is not None):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the GPU addon blob and the device tree disagree: the tree carries "
+            f"a GpuAddon placeholder={placeholder is not None} and the ESP "
+            f"carries the blob={staged}. DarwinBoot accepts both or neither, "
+            "and refuses the boot with EFI_COMPROMISED_DATA before the kernel "
+            "starts",
+            addon=staged,
+            tree_placeholder=placeholder is not None,
+            tree=safe_location(Path(inputs.devicetree)),
+        )
+
+
+def _tree_addon_placeholder(devicetree: Path) -> Optional[str]:
+    """Whether ``/chosen/memory-map`` carries a zeroed 16-byte ``GpuAddon``.
+
+    The addon's counterpart to :func:`tree_ramdisk_placeholder`.  ``AdtNode``
+    (``DarwinBoot.c:239-243``) resolves the property *by name*, so a fourth
+    property beside ``PackedRAMDisk`` and ``TrustCache`` is legal -- what is not
+    legal is a placeholder with no blob, or a blob with no placeholder, and
+    neither is visible until the firmware refuses.
+    """
+    tree = Path(devicetree)
+    if not tree.is_file():
+        raise UniPadError(
+            ErrorCode.ARTIFACT_MISSING,
+            "the device tree is not at the path given",
+            tree=safe_location(tree),
+        )
+    blob = tree.read_bytes()
+    try:
+        root, end = adt.parse_adt(blob)
+    except Exception as exc:  # a tree that does not parse is a config error
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the device tree does not parse as an Apple device tree",
+            tree=safe_location(tree),
+            reason=type(exc).__name__,
+        ) from exc
+    if end != len(blob):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the device tree has trailing bytes after the root node",
+            tree=safe_location(tree),
+            bytes=len(blob) - end,
+        )
+    chosen = adt.find_node(root, "chosen")
+    memory_map = adt.find_node(chosen, "memory-map") if chosen else None
+    if memory_map is None:
+        return None
+    value = adt.node_property(memory_map, "GpuAddon")
+    if value is None:
+        return None
+    if len(value) != 16:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            f"/chosen/memory-map/GpuAddon is {len(value)} bytes; AdtNode "
+            "requires exactly 16 and refuses the tree otherwise",
+            tree=safe_location(tree),
+            property="GpuAddon",
+        )
+    if value != bytes(16):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "/chosen/memory-map/GpuAddon is not zeroed; DarwinBoot treats a "
+            "nonzero placeholder as compromised data",
+            tree=safe_location(tree),
+            property="GpuAddon",
+        )
+    return "GpuAddon"
+
+
 def _check_ramfb_pair(inputs: "BootInputs", config: str) -> None:
     """Refuse a boot that stages the frame-buffer driver nothing will load.
 
@@ -814,6 +1094,7 @@ def _check_ramfb_pair(inputs: "BootInputs", config: str) -> None:
 _OPTIONAL_STAGED = {
     "trust_cache": TRUSTCACHE_NAME,
     "data_ramdisk": f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}",
+    "gpu_addon": GPU_ADDON_NAME,
     "ramfb_driver": RAMFB_NAME,
 }
 
@@ -937,8 +1218,38 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
     # them would reject costs a second here rather than a boot.  The name is
     # fixed because unixnu.toml's initrd is a path, not a lookup: whatever is
     # staged has to be spelled exactly by the config.
+    #
+    # Then, when the payload build's own record is in hand, the seed is checked
+    # against it.  That is the whole defect this closes: the staged directory is
+    # the only channel to the guest, so a seed from another build replaces the
+    # image's own silently, and the symptom -- ``native_owner_data_stage`` stuck
+    # at 0 with ``status = 2`` -- names a kernel problem and not a wrong file.
     if inputs.data_ramdisk is not None:
         packed_ramdisk.validate_file(inputs.data_ramdisk)
+        declared = _declared_seed_digest(inputs.payload_report)
+        if declared is not None:
+            staged = sha256_file(inputs.data_ramdisk)
+            if staged != declared:
+                raise UniPadError(
+                    ErrorCode.CONFIG_INVALID,
+                    "the Data ramdisk staged here is not the one the payload "
+                    f"build put in the image: {staged} against {declared}. "
+                    "The owner Data volume will not mount, so the GPU addon "
+                    "mount is never entered -- use the seed from the same "
+                    "build, or read it out of the payload image with "
+                    "unipad.host.payload_seed.read_data_seed",
+                    staged=staged,
+                    declared=declared,
+                    data_ramdisk=safe_location(Path(inputs.data_ramdisk)),
+                    payload_report=None if inputs.payload_report is None
+                    else safe_location(Path(inputs.payload_report)),
+                )
+            # Recorded rather than silent, the way the trust cache is: the key's
+            # presence is the answer to "was this seed checked against the
+            # build's own record", which is the question that decides whether a
+            # later mismatch could have slipped through.
+            written["_data_seed_declared"] = declared
+            written["_data_seed_sha256"] = staged
         target = esp / "EFI/UniXNU/Payloads" / DATA_RAMDISK_NAME
         shutil.copyfile(inputs.data_ramdisk, target)
         written[f"EFI/UniXNU/Payloads/{DATA_RAMDISK_NAME}"] = target.stat().st_size
@@ -955,6 +1266,19 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
         shutil.copyfile(inputs.ramfb_driver, target)
         written[RAMFB_NAME] = target.stat().st_size
 
+    # The GPU addon blob.  Validated against the header DarwinBoot checks
+    # (``DarwinBoot.c:593-595``): the eight-byte magic, a size of at least 24,
+    # and the u64 at offset 16 equal to the file's own size -- which is
+    # ``make-gpu-addon.py``'s record of how many bytes follow the header.  A
+    # blob that fails any of the three would be refused by the firmware with
+    # ``EFI_COMPROMISED_DATA``, which names a corrupted tree and not a wrong
+    # file, so it is caught here instead.
+    if inputs.gpu_addon is not None:
+        _validate_gpu_addon(inputs.gpu_addon)
+        target = esp / "EFI/UniXNU/Payloads" / Path(GPU_ADDON_NAME).name
+        shutil.copyfile(inputs.gpu_addon, target)
+        written[GPU_ADDON_NAME] = target.stat().st_size
+
     initrd = f"Payloads/{DATA_RAMDISK_NAME}" if inputs.data_ramdisk is not None else None
     if inputs.payload_toml is not None:
         config = Path(inputs.payload_toml).read_text(encoding="utf-8")
@@ -968,6 +1292,7 @@ def stage_esp(inputs: BootInputs, esp: Path, spec: Mapping[str, Any]) -> dict[st
             '[payload] loader must be "driver"',
         )
     _check_ramdisk_pair(inputs, config, written)
+    _check_addon_pair(inputs, written)
     _check_ramfb_pair(inputs, config)
     (esp / "EFI/UniXNU/unixnu.toml").write_text(config, encoding="utf-8")
     written["EFI/UniXNU/unixnu.toml"] = len(config.encode("utf-8"))
@@ -1560,6 +1885,7 @@ def boot(
         darwinboot=Path(inputs.darwinboot).resolve(),
         unixnu=Path(inputs.unixnu).resolve(),
         payload_toml=None if inputs.payload_toml is None else Path(inputs.payload_toml).resolve(),
+        payload_report=None if inputs.payload_report is None else Path(inputs.payload_report).resolve(),
     )
     # ...and the resolution kept every optional input.  Checked here rather than
     # only against the staged ESP because this is where a hand-written list would
@@ -2315,6 +2641,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="the packed Data ramdisk (.dbr) to stage beside the kernel; "
                              "the device tree must also carry the PackedRAMDisk "
                              "placeholder, which unipad.host.adt --data-ramdisk writes")
+    parser.add_argument("--payload-report", type=Path, default=None,
+                        help="the payload build's payload.json; when given, the staged "
+                             "Data ramdisk must hash to its data_ramdisk_sha256, and a "
+                             "mismatch is refused rather than booted (measured 2026-10-30: "
+                             "a borrowed seed leaves native_owner_data_stage at 0 and the "
+                             "GPU addon mount is never entered)")
+    parser.add_argument("--payload-image", type=Path, default=None,
+                        help="the payload FAT32 image to read the Data seed out of when "
+                             "--data-ramdisk is not given; the seed is verified against "
+                             "--payload-report's data_ramdisk_sha256 on the way out "
+                             "(unipad.host.payload_seed)")
+    parser.add_argument("--gpu-addon", type=Path, default=None,
+                        help="the GPU addon blob (gpu-addon.ngpu) to stage beside the "
+                             "kernel. Required whenever the device tree carries a "
+                             "GpuAddon placeholder: DarwinBoot.c:588-598 refuses the boot "
+                             "with EFI_COMPROMISED_DATA when it has one and not the other, "
+                             "and prints nothing before refusing")
     parser.add_argument("--ramfb-driver", type=Path, default=None,
                         help="QemuRamfb.efi to stage at EFI/UniXNU/Payloads; without it "
                              "nothing applies SCREEN, build_argv emits no ramfb-size "
@@ -2354,6 +2697,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              "single-boot behaviour")
     args = parser.parse_args(argv)
 
+    # The seed the run stages.  ``--data-ramdisk`` names one directly; without
+    # it, ``--payload-image`` names the volume the payload build wrote the seed
+    # into, and the seed is read out of that and verified against
+    # ``--payload-report``'s digest on the way.  Reading it out is what makes
+    # the staged ESP the build's own: on Windows the image is never attached as
+    # a drive, so without this the image's seed is invisible and the only seed
+    # available is one borrowed from another build -- which is exactly the
+    # mismatch measured on 2026-10-30 (``native_owner_data_stage`` stuck at 0,
+    # ``status = 2`` ENOENT, GPU addon mount never entered).
+    seed_dir: Optional[tempfile.TemporaryDirectory] = None
+    data_ramdisk = args.data_ramdisk
+    if data_ramdisk is None and args.payload_image is not None:
+        declared = _declared_seed_digest(args.payload_report)
+        seed = payload_seed.read_data_seed(args.payload_image, expected_sha256=declared)
+        seed_dir = tempfile.TemporaryDirectory(prefix="unipad-seed-")
+        data_ramdisk = Path(seed_dir.name) / DATA_RAMDISK_NAME
+        data_ramdisk.write_bytes(seed.data)
+        print(f"data seed: {seed.member} from {args.payload_image} "
+              f"({seed.size} bytes, sha256 {seed.sha256})")
+
     inputs = BootInputs(
         firmware=args.firmware,
         kernel=args.kernel,
@@ -2362,7 +2725,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         unixnu=args.unixnu,
         payload_toml=args.payload_toml,
         trust_cache=args.trust_cache,
-        data_ramdisk=args.data_ramdisk,
+        data_ramdisk=data_ramdisk,
+        payload_report=args.payload_report,
+        gpu_addon=args.gpu_addon,
         ramfb_driver=args.ramfb_driver,
     )
     if args.kernel_arg:
@@ -2370,21 +2735,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # not inside a run that has already started QEMU.
         kernel_args_line(read_board_payload(args.device), args.kernel_arg)
 
-    runner = boot_until_mounted if args.attempts > 1 else boot
-    report = runner(
-        inputs,
-        args.workdir,
-        qemu=args.qemu,
-        device_dir=args.device,
-        seconds=args.seconds,
-        every=args.every,
-        qmp_port=args.qmp_port,
-        serial_port=args.serial_port,
-        display=args.display,
-        root_image=args.root_image,
-        systemos_image=args.systemos_image,
-        **({"attempts": args.attempts} if args.attempts > 1 else {}),
-    )
+    try:
+        runner = boot_until_mounted if args.attempts > 1 else boot
+        report = runner(
+            inputs,
+            args.workdir,
+            qemu=args.qemu,
+            device_dir=args.device,
+            seconds=args.seconds,
+            every=args.every,
+            qmp_port=args.qmp_port,
+            serial_port=args.serial_port,
+            display=args.display,
+            root_image=args.root_image,
+            systemos_image=args.systemos_image,
+            **({"attempts": args.attempts} if args.attempts > 1 else {}),
+        )
+    finally:
+        # The extracted seed is a copy, not the build's own file, so it does not
+        # outlive the run it was staged for.
+        if seed_dir is not None:
+            seed_dir.cleanup()
     print(f"qemu exit {report.exit_code}; qmp ready: {report.reached_qmp}; serial {report.serial_bytes} bytes")
     # The guest's own answer, and the only line in this output that describes
     # something the guest did rather than something the host did.  A run whose
