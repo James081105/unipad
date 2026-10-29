@@ -1398,6 +1398,35 @@ jobs:
           fi
           exit 0
 
+      # The chain's outcome in the run's verdict, for the same reason the owner
+      # root chain has one below.
+      #
+      # MEASURED on run 40921780876, the first run that reached these rings: the
+      # chain failed at ring 1 (the build virtualenv lacked Mesa's python
+      # modules) and this step reported `success` anyway, because it ends in
+      # `exit 0` -- which is deliberate, a runner that cannot cross-compile the
+      # plugin still owes a kernel and a Data volume.  But `success` on a step
+      # whose own log says `FAIL turnip-host` is a green light over a red one:
+      # the failure was recorded in `built=false` and in an annotation, and
+      # nothing read either.  A reader of the run summary saw the addon chain
+      # pass, which is the one thing it did not do.
+      #
+      # So the step stays non-fatal and the verdict does not.  `built=false` is
+      # now consumed by something, and the run's conclusion says the addon is
+      # missing even though the kernel, the device tree and the Data volume were
+      # all produced.  That is the honest split: the artifacts are real, the
+      # addon is not, and a run that says so is worth more than a green one.
+      - name: The GPU addon chain's outcome is part of the run's verdict
+        if: always() && steps.addon.outputs.built == 'false'
+        run: |
+          set -uo pipefail
+          echo "::error::the GPU addon chain did not produce a blob; the payload carries no --gpu-addon and the guest's addon mount will fail ENOENT"
+          echo "The chain's own log and each ring's log are in the build-logs artifact:"
+          echo "  build-output/build-gpu-addon.log   the ring sequence and each ring's elapsed seconds"
+          echo "  build-output/addon-<ring>.log      the failing ring's own output"
+          echo "Every ring reports how long it took, so this says which ring to look at, not just that one failed."
+          exit 1
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:

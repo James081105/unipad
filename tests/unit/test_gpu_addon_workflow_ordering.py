@@ -134,6 +134,47 @@ def test_the_addon_step_runs_the_script_that_builds_the_chain():
     )
 
 
+def test_a_failed_chain_still_reaches_the_runs_verdict():
+    """Teeth: `success` on a step whose own log says FAIL is a green light over a red one.
+
+    MEASURED on run 40921780876, the first run that reached the rings: ring 1
+    failed and the step reported ``success`` anyway, because it ends in
+    ``exit 0`` -- which is deliberate, since a runner that cannot cross-compile
+    the plugin still owes a kernel and a Data volume.  But nothing consumed the
+    ``built=false`` output, so the run summary said the addon chain passed.  This
+    is the assertion that would have caught it.
+    """
+    job = _build_job()
+    steps = _steps(job)
+    producer = steps[_index_of(steps, PRODUCER_ID)]
+    run = str(producer.get("run", ""))
+    assert 'echo "built=false"' in run, (
+        "the addon step no longer records a failure in a step output; the "
+        "verdict step below would have nothing to read"
+    )
+    verdict = [
+        step for step in steps
+        if "GPU addon chain's outcome is part of the run's verdict" in str(step.get("name", ""))
+    ]
+    assert verdict, (
+        "no verdict step consumes the addon chain's outcome; a failed chain "
+        "reports `success` and the run's conclusion says nothing about it"
+    )
+    condition = str(verdict[0].get("if", ""))
+    assert "built" in condition and "false" in condition, (
+        f"the verdict step's condition is {condition!r}; it must fire on the "
+        f"producer's recorded failure"
+    )
+    assert "exit 1" in str(verdict[0].get("run", "")), (
+        "the verdict step does not fail the run; a failed chain would still "
+        "conclude green"
+    )
+    # And it must come after the producer, or the output it reads is not set yet.
+    assert _index_of(steps, PRODUCER_ID) < steps.index(verdict[0]), (
+        "the verdict step runs before the step that writes the output it reads"
+    )
+
+
 def test_the_addon_logs_are_uploaded():
     """A chain whose logs are not in the artifact cannot be diagnosed after the runner dies."""
     job = _build_job()

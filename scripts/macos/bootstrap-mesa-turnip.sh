@@ -260,9 +260,28 @@ if [[ ! -x "$BISON_PREFIX/bin/bison" ]]; then
 fi
 
 # --- 4. the python build environment ---------------------------------------
-# meson and ninja are the two Mesa's build cannot do without; the rest are its
-# own declared requirements, read from its meson.build rather than guessed at
-# here so this stage does not need updating when Mesa adds a dependency.
+# meson and ninja are the two Mesa's build cannot do without; the rest are Mesa's
+# own declared requirements.
+#
+# MEASURED on run 40921780876, which is the first run that ever got this far: the
+# venv carried meson and ninja and nothing else, so ring 1 died seven seconds in
+# with
+#     vendor/UniXNU/.cache/mesa-work/meson.build:1141:2: ERROR: Problem
+#     encountered: One of Python (3.x) packaging or distutils module is required.
+# The comment this step used to carry promised that the dependency list came from
+# Mesa's own build file and would therefore need no updating.  It did not: the code
+# installed meson and ninja and nothing else, so the promise was an intention.  A
+# comment describing a guard that does not exist is worse than no comment, because
+# it stops the next reader from looking -- which is exactly how this survived a
+# bootstrap that had already been verified on a runner.
+#
+# So the requirement is now met rather than described: the three modules Mesa's
+# meson.build probes for are installed and then IMPORTED to prove it.  The module
+# names and the meson.build lines that require them are in the table below, so a
+# reader can check the claim against the source in one jump.  If Mesa adds a
+# fourth, its configure fails and the failure names the module -- which is the
+# same outcome as today, one ring later.
+MESA_PYTHON_MODULES='mako:mako packaging:packaging yaml:PyYAML'
 if [[ ! -x "$VENV/bin/meson" ]]; then
     log "creating the build virtualenv"
     "$PY" -m venv "$VENV" 2>>"$LOG" || die "cannot create $VENV"
@@ -274,6 +293,34 @@ fi
 "$VENV/bin/meson" --version >/dev/null 2>&1 || die "meson is not runnable"
 log "meson $("$VENV/bin/meson" --version)"
 
+# Installed unconditionally rather than inside the venv-creation branch: a venv
+# left by an earlier revision of this script has meson and ninja and is missing
+# these, which is exactly the state run 40921780876 found.
+for pair in $MESA_PYTHON_MODULES; do
+    module="${pair%%:*}"
+    package="${pair#*:}"
+    if "$VENV/bin/python" -c "import $module" >/dev/null 2>&1; then
+        log "python module $module is present"
+        continue
+    fi
+    log "installing $package (Mesa's meson.build imports $module)"
+    "$VENV/bin/pip" install --quiet "$package" 2>>"$LOG" \
+        || die "cannot install $package, which provides the $module module Mesa's meson.build requires"
+    "$VENV/bin/python" -c "import $module" >/dev/null 2>&1 \
+        || die "$package is installed but 'import $module' still fails"
+done
+# Mesa also requires mako >= 0.8.0 (meson.build:1118-1119), and a version that
+# imports is not a version that satisfies.  The instrument answers a question it
+# can only answer by being right, so the answer is trusted.
+"$VENV/bin/python" - <<'PY' 2>>"$LOG" || die "the venv's mako is older than the 0.8.0 Mesa's meson.build:1118 requires"
+import sys
+import mako
+parts = (mako.__version__.split(".") + ["0", "0"])[:3]
+if tuple(int(p) for p in parts if p.isdigit()) < (0, 8, 0):
+    sys.exit(f"mako {mako.__version__} is older than 0.8.0")
+PY
+log "mako $("$VENV/bin/python" -c 'import mako; print(mako.__version__)') (Mesa requires >= 0.8.0)"
+
 # --- 5. glslang ------------------------------------------------------------
 # build-turnip-darwin.py checks for this by name and exits with a brew hint, so
 # it is installed here rather than left to the caller to interpret.
@@ -283,5 +330,5 @@ if ! command -v glslangValidator >/dev/null 2>&1; then
 fi
 log "glslangValidator $(glslangValidator --version 2>&1 | head -1 | grep -o '[0-9.]*' | head -1)"
 
-log "PASS the Mesa source, its recorded patches, bison, meson and glslang are all in place"
+log "PASS the Mesa source, its recorded patches, bison, meson, Mesa's python modules and glslang are all in place"
 exit 0
