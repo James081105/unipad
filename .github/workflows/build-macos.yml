@@ -82,7 +82,19 @@ jobs:
     # assume macos-latest keeps the same architecture; do not assume HVF nesting
     # exists on an arm64 runner.
     runs-on: macos-latest
-    timeout-minutes: 60
+    # 60 minutes held the kernel, the device tree, the payload and the Data
+    # volume.  It does not hold the GPU addon chain, which the step below added:
+    # seven rings, of which two are full Mesa cross-builds (host and iOS), one is
+    # a cargo release build of the metal2vulkan bridge, and one compiles and
+    # signs the plugin bundle.  Measured cost is not known yet -- every ring now
+    # logs its own elapsed seconds into build-output/build-gpu-addon.log, so the
+    # first run that reaches them replaces this estimate with a number.
+    #
+    # 180 is an estimate, not a measurement, and it is written as one.  A chain
+    # that overruns the job budget fails at the job boundary, which names no
+    # ring; a job that is sized generously and logs each ring can be corrected
+    # from its own evidence.
+    timeout-minutes: 180
     steps:
       # This repository declares NO submodules: there is no .gitmodules and
       # `git submodule status` is empty, so `submodules: recursive` fetches

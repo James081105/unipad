@@ -72,16 +72,25 @@ die() { log "FAIL $*"; log "---- last 25 lines of $LOG ----"; tail -25 "$LOG" | 
 # shared log, so the artifact carries both the per-ring detail and the sequence.
 # `|| die` rather than `set -e`: the failure message has to name the ring, and a
 # bare `set -e` exit would leave the reader with a nonzero status and no sentence.
+#
+# Each ring reports how long it took.  That is not decoration: the workflow's
+# `timeout-minutes` is an estimate until a run has produced these numbers, and a
+# chain that silently overruns a job budget fails at the job boundary with no
+# indication of which ring was still going.
 ring() {
     local name="$1"; shift
     local file="$LOGDIR/addon-$name.log"
+    local started ended status=0
+    started="$(date +%s)"
     log "=== ring: $name ==="
     log "+ $*"
-    if "$@" >"$file" 2>&1; then
-        log "PASS $name (its log: $file)"
+    "$@" >"$file" 2>&1 || status=$?
+    ended="$(date +%s)"
+    if [ "$status" -eq 0 ]; then
+        log "PASS $name in $((ended - started))s (its log: $file)"
         return 0
     fi
-    log "FAIL $name (exit $?); its log: $file"
+    log "FAIL $name after $((ended - started))s (exit $status); its log: $file"
     tail -25 "$file" | tee -a "$LOG" >&2
     die "$name failed"
 }

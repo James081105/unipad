@@ -153,7 +153,29 @@ def test_the_preflight_provisions_the_shader_tools():
     )
 
 
-def test_the_preflight_names_the_vulkan_header_gap():
+def test_every_ring_reports_how_long_it_took():
+    """The job's ``timeout-minutes`` is an estimate until a run produces numbers.
+
+    ``build-macos.yml`` sizes the build job in minutes, and a chain that
+    overruns it fails at the job boundary -- which names no ring.  The way out
+    is for each ring to say how long it took, so the first run that reaches them
+    replaces the estimate with a measurement.  Asserted on the source because
+    the timing itself only exists on a macOS runner.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'log "PASS $name in $((ended - started))s' in script, (
+        "the ring helper no longer logs how long a ring took; the job's "
+        "timeout-minutes could not be corrected from a run's own evidence"
+    )
+    assert 'started="$(date +%s)"' in script and 'ended="$(date +%s)"' in script, (
+        "the ring helper no longer brackets each ring with timestamps"
+    )
+    # The failure line must carry the duration too: a ring that ran for fifty
+    # minutes and then failed is a different problem from one that failed in
+    # five seconds, and the log is where that distinction is read.
+    assert 'log "FAIL $name after $((ended - started))s' in script, (
+        "a failed ring no longer reports how long it ran before failing"
+    )
     """The one gap that was found by reading the include rather than by running.
 
     Recorded as a source assertion because it cannot be executed here: the
