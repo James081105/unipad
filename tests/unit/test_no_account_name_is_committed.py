@@ -1,4 +1,4 @@
-"""No committed file may spell the host account name.
+"""No file in the repository may spell the host account name.
 
 Why this exists
 ---------------
@@ -10,7 +10,7 @@ explaining that a path is unsafe to relay, which then relays the unsafe spelling
 as its own example.  Two of the three were already on ``origin/main``.
 
 A rule enforced by review alone is a rule that gets reviewed once.  This is the
-same rule enforced by the suite, over every tracked file, and it checks BOTH
+same rule enforced by the suite, over every file in or entering the repo, and it checks BOTH
 spellings Windows uses: the account name itself, and the 8.3 short name
 (``USERNA~1``) that Windows substitutes when the profile path contains a space
 or a non-ASCII character.  The second is the one that actually leaked, because
@@ -41,9 +41,10 @@ def _spellings() -> set[str]:
 
     The 8.3 form is derived rather than read from the filesystem: Windows builds
     it from the first six characters that are valid in a short name, upper-cased,
-    with a numeric tail.  ``ZhuanZ（无密码）`` therefore becomes ``ZHUANZ~1`` --
-    the full-width parentheses and the space are dropped, which is why the
-    spelling shares nothing with the name it came from.
+    with a numeric tail.  A six-character ASCII account name therefore becomes
+    ``USERNA~1``; a longer one whose tail is non-ASCII keeps only its usable
+    prefix, which is why the short spelling can share no substring at all with
+    the name it came from.
     """
     name = account_name()
     if not name or len(name) < MIN_NAME_LENGTH:
@@ -55,33 +56,47 @@ def _spellings() -> set[str]:
     return spellings
 
 
-def _tracked_files() -> list[Path]:
-    """Every file git tracks, which is exactly the set that gets published.
+def _scanned_files() -> list[Path]:
+    """Every file that is, or is about to become, part of the repository.
 
-    ``git ls-files`` rather than a walk, so the gitignored trees -- ``vendor/``
-    and ``local-private/`` -- are excluded by the same rule that keeps them out
-    of a commit.
+    Two ``git ls-files`` calls, not one.  The first lists what is tracked.  The
+    second (``--others --exclude-standard``) lists what is untracked but not
+    ignored -- which is exactly the set a ``git add -A`` would take.
+
+    The second call is not redundancy, and the reason is measured on this very
+    guard: its first version scanned tracked files only, so when the guard's own
+    new test file was written carrying the account name, the guard ran GREEN,
+    because the file had not been committed yet.  A guard that only sees what is
+    already published cannot catch the thing you are about to publish, which is
+    the only moment it is useful.
+
+    Both exclude the gitignored trees -- ``vendor/`` and ``local-private/`` --
+    by the same rule that keeps them out of a commit.
     """
-    result = subprocess.run(
-        ["git", "ls-files", "-z"],
-        cwd=str(REPO),
-        capture_output=True,
-        timeout=300,
-        check=False,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"git ls-files failed in {REPO}: {result.stderr[:200]!r}")
-    names = [n for n in result.stdout.decode("utf-8", "replace").split("\0") if n]
-    return [REPO / n for n in names]
+    seen: set[Path] = set()
+    for extra in (["-z"], ["-z", "--others", "--exclude-standard"]):
+        result = subprocess.run(
+            ["git", "ls-files", *extra],
+            cwd=str(REPO),
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"git ls-files {extra} failed in {REPO}: {result.stderr[:200]!r}")
+        for name in result.stdout.decode("utf-8", "replace").split("\0"):
+            if name:
+                seen.add(REPO / name)
+    return sorted(seen)
 
 
 @pytest.mark.skipif(not _spellings(), reason="the host account name cannot be determined")
-def test_no_tracked_file_spells_the_host_account():
-    """Every tracked file is scanned; a hit names the file and the line."""
+def test_no_file_spells_the_host_account():
+    """Every file in, or about to enter, the repository; a hit names file and line."""
     spellings = _spellings()
     offenders: list[str] = []
 
-    for path in _tracked_files():
+    for path in _scanned_files():
         try:
             raw = path.read_bytes()
         except OSError:
@@ -98,8 +113,8 @@ def test_no_tracked_file_spells_the_host_account():
                     offenders.append(f"{path.relative_to(REPO).as_posix()}:{number}: {shown}")
 
     assert not offenders, (
-        "these committed files spell the host account name (or its 8.3 short "
-        "form). PRD 9.2: the account name must never appear in a committed "
+        "these files spell the host account name (or its 8.3 short "
+        "form). PRD 9.2: the account name must never appear in a committed or about-to-be-committed "
         "file, including in a sentence explaining why something must not be "
         "printed -- genericise the example instead. "
         + "; ".join(offenders[:10])
