@@ -30,6 +30,26 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "macos" / "build-gpu-addon.sh"
+DRIVER = REPO / "vendor" / "UniXNU"
+
+
+def _driver_file(relative: str) -> str:
+    """Read a file out of the pinned driver checkout, or skip naming the path.
+
+    ``tests/unit`` runs on a clean checkout where ``vendor/`` is empty, so every
+    read through it needs an existence check beside it -- that is what
+    ``test_clean_checkout_selfsufficiency.py`` enforces, and the same shape
+    ``tests/integration/test_gpu_addon_blob.py``'s ``_packer()`` uses.  A skip
+    that names the missing path is the honest outcome; a FileNotFoundError about
+    a checkout that was never prepared is not.
+    """
+    path = DRIVER / relative
+    if not path.is_file():
+        pytest.skip(
+            f"{path} is not present: this stage needs the pinned vendor "
+            "checkout from config/sources.lock.json"
+        )
+    return path.read_text(encoding="utf-8")
 
 # The messages the preflight is allowed to die with.  Each names the tool and
 # the ring that needs it.  A message outside this set means the script got past
@@ -144,9 +164,7 @@ def test_the_preflight_provisions_the_shader_tools():
         "the preflight no longer asks glslc and spirv-val to answer; a tool "
         "that is on PATH but does not run is the same failure as an absent one"
     )
-    generators = (
-        REPO / "vendor" / "UniXNU" / "scripts" / "gen-turnip-smoke-shaders.py"
-    ).read_text(encoding="utf-8")
+    generators = _driver_file("scripts/gen-turnip-smoke-shaders.py")
     assert "'glslc'" in generators and "'spirv-val'" in generators, (
         "gen-turnip-smoke-shaders.py no longer calls glslc and spirv-val by "
         "name; the preflight is provisioning tools nothing uses"
@@ -182,13 +200,12 @@ def test_every_ring_reports_how_long_it_took():
     include and the `-I` flag are the evidence, and a future edit that drops the
     Vulkan-header check would otherwise look harmless.
     """
-    sim = REPO / "vendor" / "UniXNU" / "drivers" / "NativeAdreno" / "tests" / "hostsim"
-    smoke = (sim / "vulkan_smoke.c").read_text(encoding="utf-8")
+    smoke = _driver_file("drivers/NativeAdreno/tests/hostsim/vulkan_smoke.c")
     assert "#include <vulkan/vulkan.h>" in smoke, (
         "vulkan_smoke.c no longer includes <vulkan/vulkan.h>; the preflight's "
         "vulkan-headers check may now be unnecessary"
     )
-    check = (REPO / "vendor" / "UniXNU" / "scripts" / "check-turnip-darwin-host.py").read_text(encoding="utf-8")
+    check = _driver_file("scripts/check-turnip-darwin-host.py")
     assert "'/opt/homebrew/include'" in check, (
         "check-turnip-darwin-host.py no longer compiles against "
         "/opt/homebrew/include; the preflight's header proof is aimed at the "
