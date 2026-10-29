@@ -668,14 +668,30 @@ if (( BUILD_PAYLOAD == 0 )) && [[ -n "$PAYLOAD_FROM_ENV" ]]; then
     esac
 fi
 
-# An unrecognised value is a refusal rather than a silent empty, for the same
-# reason BUILD_PAYLOAD's is: a typo in the variable's name would otherwise read
-# as "no addon supplied", which is a sentence the payload step already knows how
-# to say on purpose.
+# A value that is not a path is a refusal rather than a silent acceptance.
+#
+# The first version of this ended its accept list with `?*`, which matches every
+# non-empty string, so the `*)` branch that called `die` could never run -- a
+# guard that cannot fail, which is worse than no guard because it reads as one.
+# Measured, not reasoned: tests/acceptance/test_gpu_addon_env_spelling.py drives
+# a flag-shaped value through this region and failed with "a flag-shaped value
+# was accepted as a path; the guard never fired" until the pattern was fixed.
+#
+# What is refused is narrow and deliberate.  A leading `-` is the one shape that
+# cannot be a path on any command line this script builds, and it is the
+# realistic mistake: `UNIXNU_GPU_ADDON=--gpu-addon` puts the flag in the variable
+# instead of its value, and the file-existence loop below would then refuse it
+# with "--gpu-addon is not a file: --gpu-addon", which names the wrong thing.
+# Everything else -- absolute, relative, bare filename -- is a path and is
+# accepted here; whether it EXISTS is the existence loop's question, not this
+# one's, and a build that refused a not-yet-downloaded blob at the argument
+# stage would be refusing a state the rest of the script is built to tolerate.
 if [[ -z "$GPU_ADDON_PATH" && -n "$GPU_ADDON_FROM_ENV" ]]; then
     case "$GPU_ADDON_FROM_ENV" in
-        /*|./*|../*|?*) GPU_ADDON_PATH="$GPU_ADDON_FROM_ENV" ;;
-        *) die 'config_invalid'             "UNIXNU_GPU_ADDON must be a path (got '$GPU_ADDON_FROM_ENV')."             "{\"gpu_addon\":\"$(json_escape "$GPU_ADDON_FROM_ENV")\"}" "$EXIT_USAGE" ;;
+        -*) die 'config_invalid' \
+            "UNIXNU_GPU_ADDON must be a path, not a flag (got '$GPU_ADDON_FROM_ENV')." \
+            "{\"gpu_addon\":\"$(json_escape "$GPU_ADDON_FROM_ENV")\"}" "$EXIT_USAGE" ;;
+        *) GPU_ADDON_PATH="$GPU_ADDON_FROM_ENV" ;;
     esac
 fi
 
