@@ -2183,6 +2183,7 @@ jobs:
             ipsw-work/ipsw.log
             ipsw-work/chain.log
             ipsw-work/os-root.log
+            build-output/bootstrap-mesa.log
           retention-days: 30
           if-no-files-found: warn
 
