@@ -371,6 +371,7 @@ def adt_command(
     seed: Optional[str] = None,
     data_ramdisk: bool = False,
     trust_cache: bool = False,
+    gpu_addon: bool = False,
 ) -> list[str]:
     """Build the ``make-qemu-adt.py`` argv for ``board``.
 
@@ -409,6 +410,12 @@ def adt_command(
         command.append("--packed-data-ramdisk" if board.packed_data_ramdisk else "--data-ramdisk")
     if trust_cache:
         command.append("--trust-cache")
+    # Mirrors payload.py:161.  Kept in step with it rather than added late:
+    # this function's docstring promises the two are the same mapping, and a
+    # flag the driver emits that this one drops is a divergence that only shows
+    # up when a build boots without the addon.
+    if gpu_addon:
+        command.append("--gpu-addon")
     for switch in ADT_SWITCHES:
         if getattr(board, switch, False):
             command.append("--" + switch.replace("_", "-"))

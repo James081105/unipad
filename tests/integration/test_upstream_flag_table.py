@@ -89,6 +89,34 @@ def test_the_ramdisk_and_trust_cache_flags_are_the_tools_own(tool_source: str) -
         assert flag in tool_source, flag
 
 
+def test_the_gpu_addon_flag_is_the_tools_own(tool_source: str) -> None:
+    """``--gpu-addon`` exists in the tool's parser, and it publishes the node.
+
+    The driver already sends this flag: unixnu/scripts/unixnu/payload.py:161
+    appends it to the make-qemu-adt.py command line whenever the payload was
+    given a blob.  The device repository did not implement it, so a build
+    carrying one would have died on argparse's "unrecognized arguments" rather
+    than on anything meaningful -- which is the failure mode where the message
+    names the wrong cause.
+
+    The node it must publish is asserted too, because a flag that parses and
+    then puts nothing would be worse than the missing flag: the loader
+    (DarwinBoot.c:235-237) looks for GpuAddon by name and demands exactly 16
+    zero bytes, and NativeRamBlock.cpp:434 reads back the range the loader
+    fills.  Without the entry the kernel creates no /private/var/ngpu and the
+    addon mount fails its first vnode_lookup with ENOENT -- measured as
+    native_gpu_addon_stage 1 / status 2.
+    """
+    assert "--gpu-addon" in tool_source, "the driver sends --gpu-addon; the tool must parse it"
+    assert "GpuAddon" in tool_source, (
+        "the tool must publish /chosen/memory-map/GpuAddon, or the loader has "
+        "nowhere to put the blob"
+    )
+    # The placeholder contract, not just the name: 16 zero bytes, exactly as
+    # PackedRAMDisk two lines above it.
+    assert "bytes(16)" in tool_source, tool_source
+
+
 def test_the_pinned_device_repository_is_the_one_the_lock_names() -> None:
     """The checkout on disk is the pin, not a later upstream revision.
 

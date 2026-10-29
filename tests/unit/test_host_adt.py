@@ -870,6 +870,25 @@ def test_the_ramdisk_and_trust_cache_switches_reach_the_command(tmp_path: Path) 
         assert flag in command, (flag, command)
 
 
+def test_the_gpu_addon_switch_reaches_the_command(tmp_path: Path) -> None:
+    """Asking for the GPU addon puts it on the command line.
+
+    The pure half of the pair; the vendor half (that the tool's own parser
+    spells ``--gpu-addon`` and publishes the node) lives in
+    ``tests/integration/`` for the reason the ramdisk test's docstring gives.
+
+    ``adt_command`` already had a ``gpu_addon`` parameter -- the driver's
+    payload.py forwards the switch -- but nothing asserted it survived to argv,
+    and a switch that is parsed and then dropped is invisible until a build
+    boots without the addon.
+    """
+    board = _synthetic_board(tmp_path)
+    command = adt.adt_command(
+        board, tmp_path / "kernel.macho.adt", seed=SEED_HEX, gpu_addon=True
+    )
+    assert "--gpu-addon" in command, command
+
+
 #: A seed whose first byte is below 0x10, which is what makes the comparison
 #: defect below visible: ``f"{value:x}"`` renders it without the leading zero
 #: while the seed's own spelling keeps it.
