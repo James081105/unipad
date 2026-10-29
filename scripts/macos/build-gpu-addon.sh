@@ -11,10 +11,16 @@
 # the display at all: frame_count=0, copy_bytes_sum=0, transfer_calls=0,
 # gpu_gpu_offers=0 across every boot so far.  The blob is the missing client.
 #
-# The chain has eight rings and this script is rings 1..7; ring 0 is
+# The chain has nine rings and this script is rings 1..8; ring 0 is
 # scripts/macos/bootstrap-mesa-turnip.sh (plus bootstrap-metal2vulkan.sh), which
 # the workflow runs first.  Every ring's output log lands in build-output/ so a
 # failure can be read from the artifact rather than re-run.
+#
+# The ninth is metal-bridge-host, added after run 40943937160: ring 2's own last
+# check links the HOST copy of the metal bridge, and the chain had been building
+# only the iOS one.  The count is written down because "rings 1..7" in this
+# comment was already wrong once -- a comment describing a structure that has
+# moved is the same defect as one describing a guard that does not exist.
 #
 # Why the rings are sequential
 # ----------------------------
