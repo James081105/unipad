@@ -568,6 +568,13 @@ DATA_RAMDISK_PATH=''
 # undeclared variable is fatal there rather than empty.  Fact 101 recorded a
 # build dying on exactly that for a different name.
 GPU_ADDON_PATH=''
+#: The environment spelling of --gpu-addon, captured BEFORE the variable is
+#: initialised for the reason PAYLOAD_FROM_ENV gives: an exported
+#: UNIXNU_GPU_ADDON must not be overwritten by the default, and the flag wins
+#: when both are present.  The workflow sets it from the bootstrap step's
+#: output, so the producer of the blob and this script never have to agree on
+#: how it arrives.
+GPU_ADDON_FROM_ENV="${UNIXNU_GPU_ADDON:-}"
 #: Set when this script diverges from the pinned device repository to get the
 #: build past a defect in it.  Recorded in build-report.json, because a build
 #: that quietly patches its own inputs is a build nobody can reproduce.
@@ -661,6 +668,17 @@ if (( BUILD_PAYLOAD == 0 )) && [[ -n "$PAYLOAD_FROM_ENV" ]]; then
     esac
 fi
 
+# An unrecognised value is a refusal rather than a silent empty, for the same
+# reason BUILD_PAYLOAD's is: a typo in the variable's name would otherwise read
+# as "no addon supplied", which is a sentence the payload step already knows how
+# to say on purpose.
+if [[ -z "$GPU_ADDON_PATH" && -n "$GPU_ADDON_FROM_ENV" ]]; then
+    case "$GPU_ADDON_FROM_ENV" in
+        /*|./*|../*|?*) GPU_ADDON_PATH="$GPU_ADDON_FROM_ENV" ;;
+        *) die 'config_invalid'             "UNIXNU_GPU_ADDON must be a path (got '$GPU_ADDON_FROM_ENV')."             "{\"gpu_addon\":\"$(json_escape "$GPU_ADDON_FROM_ENV")\"}" "$EXIT_USAGE" ;;
+    esac
+fi
+
 if [[ -z "$STAGE" ]]; then
     die 'config_invalid' '--stage is required.' '{}' "$EXIT_USAGE"
 fi
@@ -698,7 +716,7 @@ fi
 # A declared file input that is not a file is a usage error, refused here rather
 # than discovered by the driver halfway through a build.
 for pair in 'kernelcache:'"$KERNELCACHE_PATH" 'ipsw:'"$IPSW_PATH" 'dtb:'"$DTB_PATH" 'fd:'"$FD_PATH_IN" \
-            'trust-cache:'"$TRUST_CACHE_PATH" 'data-ramdisk:'"$DATA_RAMDISK_PATH"; do
+            'trust-cache:'"$TRUST_CACHE_PATH" 'data-ramdisk:'"$DATA_RAMDISK_PATH"             'gpu-addon:'"$GPU_ADDON_PATH"; do
     label="${pair%%:*}"
     value="${pair#*:}"
     if [[ -n "$value" && ! -f "$value" ]]; then

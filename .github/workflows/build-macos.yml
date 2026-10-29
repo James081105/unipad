@@ -1269,6 +1269,49 @@ jobs:
           fi
           lld-link --version
 
+      # The Mesa source and the tools build-turnip-darwin.py needs.  Without it
+      # the GPU-addon chain dies on its first line with a message about a
+      # missing .cache directory rather than about the missing stage -- which is
+      # the shape where the failure names the wrong cause.
+      #
+      # The position is the whole point.  The payload step that would consume
+      # the addon runs INSIDE build-macos.sh, in the step immediately below, so
+      # a chain that ran after it could never hand anything over: the blob has
+      # to exist before the build starts, not after it.  An earlier revision of
+      # this step sat after the build and its comment claimed it ran before it,
+      # which was false on the very run that comment described.
+      #
+      # Failure here is NOT fatal to the build: it is recorded as a step output
+      # and the payload step says, in its own words, that no addon was supplied.
+      # A runner that cannot cross-compile Mesa still produces a kernel, a
+      # device tree and a Data volume, and refusing all of that because the
+      # plugin is missing would trade a known limitation for an unknown one.
+      - name: Bootstrap the Mesa source and Turnip tools
+        id: mesa
+        if: always()
+        env:
+          BOOTSTRAP_LOG: build-output/bootstrap-mesa.log
+        run: |
+          set -uo pipefail
+          mkdir -p build-output
+          if bash scripts/macos/bootstrap-mesa-turnip.sh . ; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the Mesa bootstrap failed; the GPU addon will not be built and the payload step will say so"
+          fi
+          # The addon blob, if whatever built it left one.  Read here rather
+          # than in the build step so the producer and the consumer never have
+          # to agree on a path: the chain's later links write it, this step
+          # forwards it, and build-macos.sh's --gpu-addon receives it.  Today
+          # nothing writes it -- the chain's links 2..6 are blocked upstream
+          # (docs/implementation-plan.md), so this output is absent and the
+          # payload step's existing "no GPU addon" line is what fires.
+          if [ -f vendor/UniXNU/build/gpu-addon.ngpu ]; then
+            echo "addon=vendor/UniXNU/build/gpu-addon.ngpu" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
       - name: Run macOS build (scripts/macos/build-macos.sh)
         id: build
         env:
@@ -1295,6 +1338,13 @@ jobs:
           # input set is the point of the run: a kernel with nothing to start it
           # is not a deliverable (PRD 8.1).
           BUILD_PAYLOAD: '1'
+          # The GPU addon blob, when the chain above produced one.  The
+          # environment spelling of --gpu-addon; build-macos.sh reads it when
+          # the flag is absent and the flag wins when both are present, exactly
+          # as BUILD_PAYLOAD does.  Empty today, and an empty value has to reach
+          # the script as "no --gpu-addon" -- which is what makes its payload
+          # step say so in its own words instead of dying on a missing path.
+          UNIXNU_GPU_ADDON: ${{ steps.mesa.outputs.addon || '' }}
         run: |
           set -euo pipefail
           if [ ! -f scripts/macos/build-macos.sh ]; then
@@ -1991,6 +2041,13 @@ jobs:
           DEVICETREE_PATH: ipsw-work/devicetree
           KERNELCACHE_PATH: ipsw-work/kernelcache.macho
           BUILD_PAYLOAD: '1'
+          # The GPU addon blob, when the chain above produced one.  The
+          # environment spelling of --gpu-addon; build-macos.sh reads it when
+          # the flag is absent and the flag wins when both are present, exactly
+          # as BUILD_PAYLOAD does.  Empty today, and an empty value has to reach
+          # the script as "no --gpu-addon" -- which is what makes its payload
+          # step say so in its own words instead of dying on a missing path.
+          UNIXNU_GPU_ADDON: ${{ steps.mesa.outputs.addon || '' }}
           # The passphrase the material-manifest stage encrypts the Data seed
           # with (`openssl enc -aes-256-gcm -pbkdf2 -salt -pass env:`).  It is a
           # secret, so it is never echoed and never written to disk by this
