@@ -248,6 +248,60 @@ ring turnip-host  "$PY" "$UP/scripts/build-turnip-darwin.py" --target host
 # buys is ring 3: the script writes build/turnip-darwin-host/plugin_smoke at
 # line 57-61, BEFORE the failing line, and gen-turnip-replay.py:23 skips the
 # whole check when that binary exists.
+# Ring 2 compiles the real driver sources against the host simulation's stub
+# IOKit headers (drivers/NativeAdreno/tests/XnuMemoryFixture.h, which every
+# IOKit/*.h under build/turnip-darwin-host/host-include funnels into).  MEASURED
+# on run 40932083150: that fixture declares a hand-picked subset of the IOKit
+# vocabulary and is missing two declarations NativeAdrenoMemory.cpp:167,170 uses,
+# so the ring died on its fifth compile unit with
+#     NativeAdrenoMemory.cpp:167:70: error: unknown type name 'IODirection'
+#     NativeAdrenoMemory.cpp:170:90: error: use of undeclared identifier 'kIOMemoryPersistent'
+#
+# That is upstream bit-rot in a TEST FIXTURE, not in the shipped driver: on a
+# real build `NativeAdrenoMemory.h:4` includes <IOKit/IOTypes.h>, which provides
+# both.  The fixture's own values are already non-canonical (it declares
+# kIODirectionOut=2 where IOKit says 1), so it aims for internal consistency, not
+# for IOKit fidelity.
+#
+# The fix is applied HERE, as a recorded divergence, rather than being edited
+# into the pinned checkout: the acquisition step resets vendor/UniXNU to its pin
+# on every run, so an in-tree edit would vanish and the next run would fail
+# identically with nothing in our repository saying why.  It is two declarations
+# in a file the tablet never sees, and the value chosen for kIOMemoryPersistent
+# is inert by construction -- the fixture's withAddressRange tests only
+# kIOMemoryMapperNone (0x800) and kIOMemoryPhysicallyContiguous (0x10), and
+# 0x40000 shares no bit with either.
+FIXTURE="$UP/drivers/NativeAdreno/tests/XnuMemoryFixture.h"
+if [[ -f "$FIXTURE" ]] && ! grep -q "kIOMemoryPersistent" "$FIXTURE"; then
+    log "DIVERGENCE applying the host-simulation fixture's two missing IOKit declarations"
+    "$PY" - "$FIXTURE" <<'PY' || die "cannot apply the host-simulation fixture fix to $FIXTURE"
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+anchor = "constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10;"
+if anchor not in text:
+    raise SystemExit(
+        "XnuMemoryFixture.h no longer carries the constant line this fix extends; "
+        "the upstream fixture changed and the fix must be re-derived"
+    )
+if "IODirection" in text.split(anchor)[0].split("constexpr")[-1]:
+    raise SystemExit("the fixture already declares IODirection")
+replacement = (
+    "using IODirection=unsigned;\n"
+    "constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,"
+    "kIOMemoryPhysicallyContiguous=0x10,kIOMemoryPersistent=0x40000;"
+)
+path.write_text(text.replace(anchor, replacement, 1), encoding="utf-8")
+print("applied")
+PY
+    grep -q "using IODirection=unsigned" "$FIXTURE" || die "the fixture fix did not take"
+    grep -q "kIOMemoryPersistent=0x40000" "$FIXTURE" || die "the fixture fix did not take"
+    log "DIVERGENCE applied: IODirection and kIOMemoryPersistent are now declared in the host simulation's fixture"
+    log "DIVERGENCE this is a two-declaration change to a test fixture the tablet never sees; it is recorded here because a build that quietly patches its own inputs is a build nobody can reproduce"
+fi
+
 ABSENT_QUARTZCORE="$UP/scripts/check-quartzcore-turnip-cache-host.py"
 ring turnip-host-check "$PY" "$REPO/scripts/macos/run-upstream-check.py" \
     "$UP/scripts/check-turnip-darwin-host.py" "$ABSENT_QUARTZCORE"
