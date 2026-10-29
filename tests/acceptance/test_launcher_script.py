@@ -327,14 +327,21 @@ def test_logs_follow_and_plain_read_agree_on_the_tail_size(ascii_scratch):
     plain_lines = [line for line in plain.stdout.splitlines() if line.strip()]
 
     # -Follow on a log that already exists: Get-Content -Wait -Tail N prints the
-    # tail immediately and then blocks, so it has to be run with a timeout and
-    # the exit code is not meaningful.
-    followed = _run_launcher_with_timeout(
+    # tail immediately and then blocks, so it is stopped by its own silence
+    # rather than by a deadline -- see _follow_launcher for why a deadline here
+    # measured the host's PowerShell startup instead of the launcher's contract.
+    followed_out, followed_err, spoke = _follow_launcher(
         ["-Action", "logs", "-Run", "exp-agree", "-Follow",
-         "-RunsRoot", str(ascii_scratch / "runs")],
-        timeout=12,
+         "-RunsRoot", str(ascii_scratch / "runs")]
     )
-    followed_lines = [line for line in followed.splitlines() if line.strip()]
+    # Teeth for the failure mode the neighbouring test pins from the other side:
+    # a follow that says nothing at all must not be mistaken for a follow that
+    # tailed zero lines.  Both are wrong, but only one is a slow host.
+    assert spoke, (
+        "the follow printed nothing within the hard cap; that is a defect, not "
+        f"a slow host. stderr: {followed_err!r}"
+    )
+    followed_lines = [line for line in followed_out.splitlines() if line.strip()]
     assert plain_lines == followed_lines, (
         f"plain read showed {len(plain_lines)} lines, -Follow showed "
         f"{len(followed_lines)}; the two must agree"
@@ -450,12 +457,36 @@ def test_unexpected_error_code_and_exit_code_agree(ascii_scratch):
     )
 
 
-def _run_launcher_with_timeout(args: list[str], *, timeout: float) -> str:
-    """Run the launcher, kill it after ``timeout`` and return what it printed.
+def _follow_launcher(
+    args: list[str], *, quiet_after: float = 3.0, hard_cap: float = 180.0
+) -> tuple[str, str, bool]:
+    """Run a launcher verb that never returns, and collect what it printed.
 
-    ``-Follow`` never returns on its own once the log exists (that is the point
-    of ``tail -f``), so its output has to be collected under a deadline.
+    ``-Follow`` blocks forever once the log exists -- that is the whole point
+    of ``tail -f`` -- so the only way to see its output is to stop it.  A
+    wall-clock deadline is the wrong way to choose that moment here, and the
+    reason is measured, not guessed: on this host bare
+    ``powershell.exe -NoProfile`` takes 6.7 s to start, the launcher's own
+    "can this interpreter ``import unipad``" probe adds ~2.5 s, so the first
+    byte of the tail does not appear until ~10 s.  The 12 s deadline this
+    helper used to carry therefore left under 3 s of margin, and on any loaded
+    host it killed the launcher *before* it printed -- the follow then
+    reported zero lines while the plain read reported 100, and the test failed
+    with "plain read showed 100 lines, -Follow showed 0".  That is a failure of
+    the harness, not of the launcher: the deadline was a magic constant set
+    below the measured cost of the thing under test.
+
+    So the stop condition is the output itself.  Wait until the launcher has
+    said something and then gone quiet, which is precisely the moment a
+    ``-Tail`` dump is finished.  ``hard_cap`` is the only wall-clock bound and
+    exists purely as a backstop: a launcher that prints *nothing* inside it is
+    broken, and the caller asserts on that instead of comparing it to the
+    plain read's tail.
+
+    Returns ``(stdout, stderr, spoke)``; ``spoke`` is False only when the hard
+    cap expired with no output at all.
     """
+    import queue
     import threading
 
     proc = subprocess.Popen(
@@ -467,24 +498,62 @@ def _run_launcher_with_timeout(args: list[str], *, timeout: float) -> str:
         encoding="utf-8",
         errors="replace",
     )
-    box: dict[str, str] = {}
+    out_lines: "queue.Queue[str | None]" = queue.Queue()
+    stderr_box: dict[str, str] = {}
+
+    def _pump(pipe):
+        try:
+            for line in pipe:
+                out_lines.put(line)
+        finally:
+            out_lines.put(None)          # EOF, so the loop below can stop early
 
     def _drain(pipe, key):
-        box[key] = pipe.read()
+        stderr_box[key] = pipe.read()
 
-    threads = [
-        threading.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True),
-        threading.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
+    stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)
+    stdout_thread = threading.Thread(target=_pump, args=(proc.stdout,), daemon=True)
+    stderr_thread.start()
+    stdout_thread.start()
+
+    chunks: list[str] = []
+    spoke = False
+    deadline = time.monotonic() + hard_cap
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = out_lines.get(timeout=min(quiet_after, remaining))
+            except queue.Empty:
+                # No line within the quiet window.  Having already spoken, that
+                # is the end of the tail; not having spoken, it is only the
+                # launcher still starting up, so keep waiting for the hard cap.
+                if spoke:
+                    break
+                continue
+            if item is None:
+                break                       # EOF: the launcher exited by itself
+            spoke = True
+            chunks.append(item)
+    finally:
         proc.kill()
-    for thread in threads:
-        thread.join(timeout=5)
-    return box.get("out", "")
+        stderr_thread.join(timeout=5)
+        stdout_thread.join(timeout=5)
+        # Anything already buffered belongs to the tail we just stopped; take it
+        # without waiting, so a slow final flush cannot truncate the comparison.
+        while True:
+            try:
+                item = out_lines.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            spoke = True
+            chunks.append(item)
+
+    return "".join(chunks), stderr_box.get("err", ""), spoke
 
 
 def test_logs_without_run_selects_the_latest_experiment(ascii_scratch):
