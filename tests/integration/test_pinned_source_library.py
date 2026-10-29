@@ -47,9 +47,10 @@ rather than of the code.  It is recorded in docs/implementation-plan.md as an
 extraction, and can only be re-verified by a runner.
 
 Every path this file creates is ASCII.  That is not tidiness: this host's
-``TEMP`` is reachable both as ``C:\\Users\\ZHUANZ~1\\...`` and as
-``C:\\Users\\ZhuanZ（无密码）\\...``, and the long spelling is what a
-non-ASCII-aware native tool sees when the ANSI code page is not UTF-8.  The
+``TEMP`` sits under a user directory whose long spelling is non-ASCII, and the
+long spelling is what a native tool sees when the ANSI code page is not UTF-8
+-- ``tempfile.gettempdir()`` answers with the 8.3 spelling, which is ASCII, so
+the distinction stays invisible until something reads the long form.  The
 temporary root is asserted ASCII rather than assumed, so a host where it is
 not fails naming the path instead of failing somewhere inside git.
 """
@@ -270,9 +271,9 @@ def _force_rmtree(path: Path) -> None:
 def fixture() -> Path:
     """The fixture repository, in an ASCII temporary root of our own choosing.
 
-    Not pytest's ``tmp_path``: on this host that is
-    ``.../pytest-of-ZhuanZ（无密码）/...``, and the long spelling of the user
-    directory is what a native tool sees under a non-UTF-8 ANSI code page.
+    Not pytest's ``tmp_path``: on this host that sits under a user directory
+    whose long spelling is non-ASCII, and that long spelling is what a native
+    tool sees under a non-UTF-8 ANSI code page.
     ``tempfile.gettempdir()`` answers with the 8.3 spelling here, which is
     ASCII, and the assertion below is what makes that a checked fact rather
     than a lucky one.

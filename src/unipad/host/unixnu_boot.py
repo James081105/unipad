@@ -1900,8 +1900,8 @@ def _safe_reason(reason: str, *roots: Optional[Path]) -> str:
     list of spellings rather than one ``replace``.
 
     Two separate things make the directory unsafe to print, and both are live on
-    this host.  The profile directory contains a space, so Windows renders the
-    account as its 8.3 short name (``ZHUANZ~1``) -- a spelling
+    this host.  The profile directory contains a space, so Windows also renders
+    the account as its 8.3 short name (``USERNA~1``) -- a spelling
     :func:`unipad.host.paths.scrub_account` cannot match, because it is not the
     account name.  And the run directory itself is under a path a report has no
     business naming.
