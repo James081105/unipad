@@ -55,6 +55,12 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 SHARED = REPO / "scripts" / "shared"
 PATCH_DIR = REPO / "vendor" / "UniXNU" / "patches"
+#: The second patch directory the build applies, and the one this test's first
+#: revision missed.  ``build-xnu-4k-baseline.sh:44`` walks
+#: ``patches/xnu/*.patch`` AND ``kits/NativePrelink/patches/*.patch``; walking
+#: only the first is the same shape of blind spot as a checker that reports a
+#: problem in patches nobody touched -- coverage that looks total and is not.
+PRELINK_DIR = REPO / "vendor" / "UniXNU" / "kits" / "NativePrelink" / "patches"
 
 #: (patch name, hunk line) for every unreachable hunk start in the pinned tree,
 #: measured 2026-10-30.  A change to this set is a test failure, in either
@@ -81,6 +87,8 @@ def _patches() -> list[Path]:
     if not PATCH_DIR.is_dir():
         pytest.skip(f"{PATCH_DIR} is not present; the pinned vendor tree is not acquired")
     found = sorted(PATCH_DIR.rglob("*.patch"))
+    if PRELINK_DIR.is_dir():
+        found += sorted(PRELINK_DIR.glob("*.patch"))
     assert found, f"no .patch file anywhere under {PATCH_DIR}"
     return found
 
@@ -90,6 +98,36 @@ def _run(script: str, *args: str) -> subprocess.CompletedProcess:
         [sys.executable, str(SHARED / script), *args],
         cwd=str(REPO), capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=300,
+    )
+
+
+def test_the_native_prelink_patches_are_in_the_set_at_all():
+    """Coverage that looks total and is not.
+
+    This test's first revision walked ``patches/xnu/*.patch`` and called that
+    every patch.  ``build-xnu-4k-baseline.sh:44`` walks that AND
+    ``kits/NativePrelink/patches/*.patch``, so two patches were unchecked --
+    and they are the two that do not apply to a Windows checkout, because the
+    submodule carries no ``.gitattributes`` and ``core.autocrlf=true`` rewrites
+    them to CRLF while ``refer/xnu``'s sources stay LF.
+
+    That is the same shape as the defect this file exists for: a check that
+    reports a problem in patches nobody touched is bad, but a check that never
+    looks at two of them is worse, because it looks like complete coverage.  The
+    count is asserted so that adding a third patch directory without adding it
+    here fails rather than silently narrowing.
+    """
+    patches = _patches()
+    names = {p.name for p in patches}
+    assert "xnu-10063.141.1-sparse-index.patch" in names, (
+        "the NativePrelink patches are not being walked; the count below would "
+        "still pass with them missing"
+    )
+    assert "xnu-10063.141.1-security-init.patch" in names
+    assert len(patches) >= 55, (
+        f"only {len(patches)} patches are walked; the pinned tree carries 53 in "
+        "patches/xnu and 2 in kits/NativePrelink/patches, and the build applies "
+        "all of them"
     )
 
 
