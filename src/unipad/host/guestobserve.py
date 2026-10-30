@@ -50,7 +50,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host.paths import safe_location, scrub_account
@@ -492,6 +492,74 @@ class Process:
 
 
 @dataclass(frozen=True)
+class Counter:
+    """One kernel global read as an unsigned little-endian integer.
+
+    ``reason`` is what separates a *negative* from a *failure*, and the two are
+    not the same fact.  A counter the kernel's symbol table does not carry is a
+    legitimate answer -- ``native_gpu_gpu_transfers`` is measured absent in the
+    delivered build, and "this kernel has no such counter" is exactly what a run
+    needs to be told.  A counter that *is* in the table but could not be read is
+    a broken instrument, and that is a refusal, not a ``None``.
+    """
+
+    name: str
+    size: int
+    value: Optional[int]
+    reason: Optional[str] = None
+
+
+#: ``--counters`` takes ``name[:size]`` pairs separated by commas.  The default
+#: width is four because every ``native_*`` counter in the delivered kernel is a
+#: ``volatile uint32_t``; a caller that wants a pointer or a 64-bit counter says
+#: so rather than having the width guessed.
+DEFAULT_COUNTER_SIZE = 4
+
+
+def parse_counter_spec(text: str) -> dict[str, int]:
+    """``"a,b:8"`` into ``{"a": 4, "b": 8}``, refusing what it cannot honour.
+
+    Refused rather than ignored: a silently dropped counter is a reading that
+    looks complete and is not, which is the failure this module exists to
+    prevent.  A width is also bounded, because ``value()`` would otherwise be
+    asked for a span that crosses into whatever follows the global.
+    """
+    if not text.strip():
+        return {}
+    wanted: dict[str, int] = {}
+    for item in text.split(","):
+        name, _, width = item.strip().partition(":")
+        if not name:
+            raise _refuse(
+                ErrorCode.CONFIG_INVALID,
+                "every counter needs a name: the spec is name[:size] pairs "
+                "separated by commas",
+                item=item.strip(),
+            )
+        size = DEFAULT_COUNTER_SIZE
+        if width:
+            try:
+                size = int(width, 0)
+            except ValueError as exc:
+                raise _refuse(
+                    ErrorCode.CONFIG_INVALID,
+                    "a counter's width is a byte count, not free text",
+                    item=item.strip(),
+                    width=width,
+                ) from exc
+            if not 1 <= size <= 8:
+                raise _refuse(
+                    ErrorCode.CONFIG_INVALID,
+                    "a counter's width is between 1 and 8 bytes; anything "
+                    "wider is not a scalar this probe can read",
+                    item=item.strip(),
+                    width=size,
+                )
+        wanted[name] = size
+    return wanted
+
+
+@dataclass(frozen=True)
 class Sample:
     """One stamped observation of the guest.
 
@@ -513,6 +581,9 @@ class Sample:
     kernel_log_sha256: str
     memory_reads: int
     memory_bytes: int
+    #: Empty when the caller asked for no counters, which is every caller that
+    #: predates them -- so the field defaults rather than breaking them.
+    counters: tuple[Counter, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -540,6 +611,18 @@ class Sample:
                 "sha256": self.kernel_log_sha256,
             },
             "memory": {"reads": self.memory_reads, "bytes": self.memory_bytes},
+            # Sorted, and each entry self-describing its width, because a
+            # counter whose width is not on the record cannot be compared with
+            # one from a different run.
+            "counters": [
+                {
+                    "name": counter.name,
+                    "size": counter.size,
+                    "value": counter.value,
+                    "reason": counter.reason,
+                }
+                for counter in sorted(self.counters, key=lambda c: c.name)
+            ],
         }
 
 
@@ -674,6 +757,39 @@ class GuestObserver:
         """A kernel global, as an unsigned little-endian integer."""
         return int.from_bytes(self.read(self.image.require_symbol(name), size), "little")
 
+    def counters(self, wanted: Mapping[str, int]) -> tuple[Counter, ...]:
+        """Read named kernel globals, keeping "absent" and "unreadable" apart.
+
+        ``wanted`` maps a symbol name to the byte width to read.  A symbol the
+        image does not define comes back as ``Counter(value=None)`` with the
+        reason, because that is a measured fact about the build and a run that
+        needs it must be able to see it.  A symbol the image *does* define is
+        read, and a failure there propagates: the observer is broken and saying
+        so beats returning a plausible ``None``.
+
+        Read after :meth:`processes` and :meth:`kernel_log` in :meth:`sample`,
+        and deliberately through the same page cache -- so a counter costs no
+        extra guest read when its page was already fetched for the process walk,
+        and one observation is one QMP session rather than two racing.
+        """
+        readings: list[Counter] = []
+        for name, size in wanted.items():
+            address = self.image.symbol(name)
+            if address is None:
+                readings.append(
+                    Counter(
+                        name=name,
+                        size=size,
+                        value=None,
+                        reason="not in this kernel's symbol table",
+                    )
+                )
+                continue
+            readings.append(
+                Counter(name=name, size=size, value=self.value(name, size))
+            )
+        return tuple(readings)
+
     # -- what the guest is doing -----------------------------------------
     def _proc_fields(self, address: int) -> tuple[int, int, str, int]:
         """One ``struct proc``'s pid, state, name and next pointer.
@@ -794,12 +910,20 @@ class GuestObserver:
         self._tables.clear()
         self._root = None
 
-    def sample(self, *, taken_at: str = "", log_path: Optional[Path] = None) -> Sample:
+    def sample(
+        self,
+        *,
+        taken_at: str = "",
+        log_path: Optional[Path] = None,
+        counters: Optional[Mapping[str, int]] = None,
+    ) -> Sample:
         """One stamped observation, optionally writing the kernel log out.
 
         ``taken_at`` defaults to now, so a caller that does not care still gets a
         stamped sample.  A sample with no timestamp cannot be compared with any
         other, which is the one thing the stamp exists to prevent.
+
+        ``counters`` maps symbol names to widths; see :meth:`counters`.
         """
         from datetime import datetime, timezone
 
@@ -808,6 +932,7 @@ class GuestObserver:
         self.reset()
         rows = self.processes()
         log = self.kernel_log()
+        readings = self.counters(counters or {})
         if log_path is not None:
             try:
                 destination = Path(log_path)
@@ -832,6 +957,7 @@ class GuestObserver:
             kernel_log_sha256=hashlib.sha256(log).hexdigest(),
             memory_reads=self.memory.reads,
             memory_bytes=self.memory.bytes_read,
+            counters=readings,
         )
 
 
@@ -843,7 +969,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ``python -m unipad.host.guestobserve --qmp-port 4444 --kernel KERNEL
     [--serial serial.log] [--expected-sha256 HEX] [--run-id ID] [--log FILE]
-    [--json]``
+    [--counters name[:size],...]``
 
     Exactly one JSON object goes to stdout -- on the success path *and* on the
     refusal path, because ``tests/acceptance/test_m0_ai_interface_smoke.py``
@@ -880,6 +1006,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="where pmemsave writes; defaults to a temporary file")
     parser.add_argument("--max-processes", type=int, default=1024,
                         help="refuse if the process list does not end within this many rows")
+    parser.add_argument("--counters", default="",
+                        help="kernel globals to read alongside the process list: "
+                             "name[:size] pairs separated by commas, width in "
+                             "bytes, default 4. A symbol the kernel does not "
+                             "define is reported with its reason rather than "
+                             "silently dropped")
     args = parser.parse_args(argv)
 
     import json
@@ -916,6 +1048,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Declared before the try so every exit path can clean up after itself.
     owned: list[Path] = []
     try:
+        # Parsed before anything is opened, for the same reason ``--kernel`` is
+        # verified first: a malformed ``--counters`` is the caller's typo and
+        # must cost no guest reads.
+        wanted_counters = parse_counter_spec(args.counters)
         image = KernelImage(args.kernel, expected_sha256=args.expected_sha256)
 
         if args.serial is not None:
@@ -967,7 +1103,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 run_id=args.run_id,
                 max_processes=args.max_processes,
             )
-            sample = observer.sample(log_path=args.log)
+            sample = observer.sample(
+                log_path=args.log,
+                counters=wanted_counters,
+            )
         finally:
             client.close()
 

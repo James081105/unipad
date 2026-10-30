@@ -913,3 +913,251 @@ def test_a_malformed_image_does_not_escape_as_a_traceback(tmp_path: Path) -> Non
         go.KernelImage(path, expected_sha256=_digest(path))
     assert refused.value.code == ErrorCode.CONFIG_INVALID
     assert "load-command" in refused.value.message
+
+
+# ---------------------------------------------------------------------------
+# named kernel globals, read alongside the process list
+# ---------------------------------------------------------------------------
+#: A counter the fixture's image defines, and the page it lands on.  The planted
+#: tables map virtual page *i* to physical page *i*, so a counter at ``0x9000``
+#: is written at physical ``0x9000`` -- which is why these are page-aligned and
+#: inside the 16 pages ``_plant_tables`` maps.
+PA_COUNTER = 0x9000
+PA_COUNTER_WIDE = 0xA000
+
+#: The six ``QemuMetalPublish.cpp`` counters plus the gate that decides whether
+#: any of them can move.  All seven are ``volatile uint32_t`` in the source, and
+#: all seven sit within 32 bytes of each other in the delivered kernel -- which
+#: is why they are read as one block rather than seven separate probes.
+QMETAL_COUNTERS = (
+    "native_shared_window_stage",
+    "native_qemu_metal_stage",
+    "native_qemu_metal_status",
+    "native_qemu_metal_opens",
+    "native_qemu_metal_refusals",
+    "native_qemu_metal_grants",
+    "native_qemu_metal_owners",
+)
+
+
+def _counter_image(extra: Optional[dict[str, int]] = None) -> StubImage:
+    symbols = dict(STUB_VA)
+    symbols.update(extra or {})
+    return StubImage(symbols)
+
+
+#: Where the delivered kernel has been seen on this host, most specific first.
+#: Not a search: ``local-private`` holds tens of gigabytes of images, and a walk
+#: that hashed all of them would turn a unit test into a disk benchmark.  A
+#: delivery that lands somewhere new gets one line here.
+DELIVERED_KERNEL_CANDIDATES = (
+    "local-private/tmp/bundle9/payload-esp/EFI/UniXNU/Payloads/kernel.macho",
+    "local-private/firmware/owner-data-delivery/kernel.macho",
+    "local-private/boot-inputs/unixnu-out/qemu/kernel/kernel.macho",
+)
+
+#: The digest of the kernel the 2026-10-30 shared-window run booted, recorded in
+#: ``measure-display.json`` as both ``kernel_sha256`` and
+#: ``payload_kernel_sha256``.  A candidate whose digest differs is a different
+#: kernel and must not stand in for this one.
+DELIVERED_KERNEL_SHA256 = (
+    "e345d1e15d1c10a6f5382f99f96a9bbf1d6531f4967bc66206c1e39bb74ac77b"
+)
+
+
+def _delivered_kernel() -> Optional[go.KernelImage]:
+    """The delivered kernel, by digest, or ``None`` when it is not here.
+
+    ``KernelImage`` verifies the digest it is given, so a candidate that is
+    present but different raises -- which is caught and treated as "not the
+    image", because a *different* kernel is not this kernel.
+    """
+    import hashlib
+
+    for relative in DELIVERED_KERNEL_CANDIDATES:
+        path = Path(__file__).resolve().parents[2] / relative
+        if not path.is_file():
+            continue
+        try:
+            return go.KernelImage(path, expected_sha256=DELIVERED_KERNEL_SHA256)
+        except UniPadError:
+            continue
+    return None
+
+
+def test_a_counter_the_kernel_has_is_read_at_the_width_it_asked_for(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """Four bytes by default, because every ``native_*`` counter is a uint32.
+
+    The width is on the record and not assumed: ``native_qemu_metal_stage`` is
+    four bytes wide in ``QemuMetalPublish.cpp:14``, and a probe that read eight
+    would fold the next counter into this one and report a number that is not
+    any counter's value.
+    """
+    guest.write(PA_COUNTER, struct.pack("<I", 4))
+    guest.write(PA_COUNTER + 4, struct.pack("<I", 0))
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+    observer = _observer(
+        guest, tmp_path, image=_counter_image({"native_qemu_metal_stage": PA_COUNTER})
+    )
+    readings = {c.name: c for c in observer.counters({"native_qemu_metal_stage": 4})}
+    assert readings["native_qemu_metal_stage"].value == 4
+    assert readings["native_qemu_metal_stage"].size == 4
+    assert readings["native_qemu_metal_stage"].reason is None
+
+
+def test_an_eight_byte_counter_is_read_as_eight_bytes(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """A pointer or a 64-bit total is asked for explicitly.
+
+    ``native_legacy_copy_bytes_sum`` is a byte total that a 4 GiB window can
+    push past 2^32, so the caller says ``:8`` rather than having the probe
+    truncate it and report a number that wraps.
+    """
+    guest.write(PA_COUNTER_WIDE, struct.pack("<Q", 0x1_0000_0000))
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+    observer = _observer(
+        guest, tmp_path,
+        image=_counter_image({"wide_total": PA_COUNTER_WIDE}),
+    )
+    readings = {c.name: c for c in observer.counters({"wide_total": 8})}
+    assert readings["wide_total"].value == 0x1_0000_0000
+    assert readings["wide_total"].size == 8
+
+
+def test_a_counter_the_kernel_does_not_have_is_a_negative_not_a_failure(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """``native_gpu_gpu_transfers`` is measured absent from the delivered build.
+
+    So "this kernel has no such symbol" has to be *reportable*.  A probe that
+    raised instead would make one absent counter fail the whole observation,
+    and a probe that silently dropped it would return a counter set that looks
+    complete -- which is how a run ends up believing it measured something it
+    never read.
+    """
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+    observer = _observer(guest, tmp_path)
+    readings = observer.counters({"native_gpu_gpu_transfers": 4})
+    assert len(readings) == 1
+    assert readings[0].value is None
+    assert readings[0].reason
+    assert "symbol table" in readings[0].reason
+
+
+def test_a_counter_that_is_defined_but_cannot_be_read_is_a_refusal(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """A symbol the image has, on a page the guest has not mapped.
+
+    This is the case that separates the two answer classes, and it is the one a
+    broken instrument reaches for: catching the read failure and reporting
+    ``value=None`` would make an unreadable counter indistinguishable from a
+    counter the kernel does not have -- and the run would then file a measured
+    absence it never measured.  ``counters()`` lets it propagate instead, and
+    this test is what makes that a contract rather than an intention.  It was
+    written because a teeth mutant that wrapped exactly this read in
+    ``except Exception: value=None`` survived every other test in the file.
+    """
+    unmapped = 0x100_0000
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+    observer = _observer(
+        guest, tmp_path,
+        image=_counter_image({"native_qemu_metal_stage": unmapped}),
+    )
+    with pytest.raises(UniPadError) as refused:
+        observer.counters({"native_qemu_metal_stage": 4})
+    assert refused.value.code == ErrorCode.EVIDENCE_INCOMPLETE
+    assert "not mapped" in str(refused.value)
+
+
+def test_the_default_width_is_four() -> None:
+    """``--counters a,b:8`` gives ``a`` four bytes and ``b`` eight."""
+    assert go.parse_counter_spec("a,b:8") == {"a": 4, "b": 8}
+    assert go.parse_counter_spec("") == {}
+    assert go.parse_counter_spec("   ") == {}
+
+
+def test_the_spec_refuses_what_it_cannot_honour() -> None:
+    """A dropped or malformed counter is a refusal, never a silent omission.
+
+    ``":8"`` names nothing, ``"a:x"`` is not a width, and ``"a:9"`` is wider
+    than a scalar this probe reads.  Each of those would otherwise produce a
+    counter set that looks complete and is not.
+    """
+    for spec in (":8", "a:x", "a:9", "a:0", ",a"):
+        with pytest.raises(UniPadError) as refused:
+            go.parse_counter_spec(spec)
+        assert refused.value.code == ErrorCode.CONFIG_INVALID, spec
+
+
+def test_counters_ride_along_with_the_process_list_in_one_observation(
+    guest: FakeGuest, tmp_path: Path
+) -> None:
+    """One sample, one QMP session, both halves.
+
+    QEMU serves one QMP client at a time, so reading the counters in a second
+    session would race the process walk -- and the race would be intermittent,
+    which is the kind of failure that gets attributed to the guest.  Both come
+    out of the same :meth:`sample` call.
+    """
+    guest.write(PA_COUNTER, struct.pack("<I", 3))
+    _plant_tables(guest)
+    _plant_empty_kernel(guest)
+    guest.write(PA_ALLPROC, struct.pack("<Q", PA_PROC_A))
+    _plant_process(guest, PA_PROC_A, 1, "launchd", 0)
+    observer = _observer(
+        guest, tmp_path,
+        image=_counter_image({"native_qemu_metal_stage": PA_COUNTER}),
+    )
+    sample = observer.sample(
+        taken_at="2026-10-30T00:00:00+00:00",
+        counters={"native_qemu_metal_stage": 4},
+    )
+    document = sample.to_dict()
+    assert [p.name for p in sample.processes] == ["launchd"]
+    assert document["counters"] == [
+        {"name": "native_qemu_metal_stage", "size": 4, "value": 3, "reason": None}
+    ]
+    # A sample taken before this option existed still serialises, with an empty
+    # counter set rather than a missing key -- so an old caller's document does
+    # not change shape under it.
+    assert observer.sample(taken_at="2026-10-30T00:00:01+00:00").to_dict()[
+        "counters"
+    ] == []
+
+
+def test_the_real_kernel_carries_every_qemu_metal_counter() -> None:
+    """The counters the display chain turns on are in the image that booted.
+
+    This is the instrument check, and it runs *before* a negative is believed.
+    ``QemuMetalPublish.cpp:27`` gates the whole accelerator on
+    ``native_shared_window_stage >= 4``, so a run that reports
+    ``native_qemu_metal_stage == 0`` means nothing unless the seven symbols
+    resolve in the kernel it booted.  Measured on this host, they do -- and the
+    gate in particular sits four bytes before the ``native_qemu_metal_*``
+    block, which is how the two are known to be one structure.
+
+    The image is *found by digest*, not by path: ``local-private`` is not
+    committed and its layout is whatever the last delivery left behind, so a
+    test that named one path would either skip forever or -- worse -- open a
+    different kernel and pass.  ``KernelImage`` refuses an image whose digest
+    is not the one passed, so a match here is a match.
+    """
+    image = _delivered_kernel()
+    if image is None:
+        pytest.skip("the delivered kernel is not on this host")
+    addresses = {name: image.symbol(name) for name in QMETAL_COUNTERS}
+    missing = sorted(name for name, address in addresses.items() if address is None)
+    assert not missing, f"the kernel does not define: {missing}"
+    gate = addresses["native_shared_window_stage"]
+    assert gate == addresses["native_qemu_metal_stage"] - 4, (
+        "the gate no longer sits immediately before the QemuMetal counter "
+        "block, so the two are not the same structure any more"
+    )
