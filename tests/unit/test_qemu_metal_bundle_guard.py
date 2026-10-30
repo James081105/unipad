@@ -249,6 +249,30 @@ def test_the_metal_artifacts_reach_the_boot_inputs_bundle() -> None:
 # --- 5. the self-check: the hand-copied table matches the files -------------
 
 
+def test_the_metal_steps_log_is_in_the_build_logs_artifact() -> None:
+    """The failure message points at the log, so the log has to be uploadable.
+
+    Measured on run 41099656091: the step wrote ``build-output/qemu-metal.log``
+    with ``tee`` and its failure message said "its log is in
+    build-output/qemu-metal.log and in the build-logs artifact".  It was in the
+    first place and **not** in the second -- the upload step names its paths
+    explicitly, and this one was not among them.  So the one message that could
+    have explained the failure pointed at a file a reader could not open.
+
+    Named explicitly rather than matched by a glob, because a glob wide enough
+    to catch it would also change what every other run publishes.
+    """
+    upload = next(
+        str(s.get("with") or "")
+        for s in _steps()
+        if "Upload the build logs" in str(s.get("name") or "")
+    )
+    assert "build-output/qemu-metal.log" in upload, (
+        "the QemuMetal step's log is not in the build-logs artifact, so its own "
+        "failure message points at a file nobody can read"
+    )
+
+
 def test_the_hand_copied_dependencies_are_the_ones_the_files_describe() -> None:
     """Every id and path this module names is read back out of the workflow.
 

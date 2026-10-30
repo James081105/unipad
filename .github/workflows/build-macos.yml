@@ -2375,6 +2375,14 @@ jobs:
             build-output/bootstrap-metal2vulkan.log
             build-output/build-gpu-addon.log
             build-output/addon-*.log
+            # The QemuMetal step's own log.  It is named explicitly rather than
+            # matched by `build-output/*.log`, because that step's failure message
+            # says "its log is in build-output/qemu-metal.log and in the
+            # build-logs artifact" -- and MEASURED on run 41099656091 it was in
+            # the first place and NOT in the second, so the message pointed at a
+            # file a reader could not open.  A pointer to a file that is not
+            # there is worse than no pointer.
+            build-output/qemu-metal.log
           retention-days: 30
           if-no-files-found: warn
 
