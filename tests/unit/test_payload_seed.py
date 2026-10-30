@@ -22,6 +22,7 @@ Apple-derived build output and does not belong in the repository (PRD 12).
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 from pathlib import Path
 
@@ -30,6 +31,8 @@ import pytest
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host import payload_seed as ps
 from unipad.host.packed_ramdisk import pack
+
+REPO = Path(__file__).resolve().parents[2]
 
 #: The geometry of ``bundle7``'s payload volume, measured rather than assumed.
 BYTES_PER_SECTOR = 512
@@ -302,6 +305,13 @@ def test_the_declared_digest_is_the_free_check(tmp_path: Path) -> None:
     assert ps.read_data_seed(image, expected_sha256=SEED_SHA256).sha256 == SEED_SHA256
     # Upper case, because a digest may be spelled either way and neither is wrong.
     assert ps.read_data_seed(image, expected_sha256=SEED_SHA256.upper()).sha256 == SEED_SHA256
+    # And through the wrapper a wrong digest is still a refusal.  The wrapper is
+    # one line, but a line that dropped the argument would disable the check for
+    # every caller that uses the seed spelling -- which is the boot path.
+    error = _refused(ps.read_data_seed, image, expected_sha256="0" * 64)
+    assert error.code is ErrorCode.VERIFICATION_FAILED, error
+    assert error.details["extracted"] == SEED_SHA256, error.details
+    assert error.details["declared"] == "0" * 64, error.details
 
 
 # ---------------------------------------------------------------------------
@@ -469,3 +479,171 @@ def _refused(call, *args, **kwargs) -> UniPadError:
     with pytest.raises(UniPadError) as caught:
         call(*args, **kwargs)
     return caught.value
+
+
+# ---------------------------------------------------------------------------
+# members, not only the seed
+# ---------------------------------------------------------------------------
+
+def test_it_reads_a_member_that_is_not_the_seed(tmp_path: Path) -> None:
+    """The GPU addon blob, which is the second thing the payload build packs.
+
+    ``unixnu/payload.py:145`` copies it beside the kernel and records its digest
+    as ``gpu_addon_sha256``.  A reader that only ever found the seed would pass
+    every seed test above and still not do the job this module exists for.
+    """
+    image = _payload_volume(tmp_path)
+    addon = ps.read_member(image, ps.GPU_ADDON_MEMBER, expected_sha256=ADDON_SHA256)
+    assert addon.data == ADDON, "the addon read is not the addon the volume carries"
+    assert addon.sha256 == ADDON_SHA256
+    assert addon.size == len(ADDON)
+    assert addon.cluster == ADDON_CLUSTER, addon.cluster
+    # The magic the payload build itself demands (payload.py:118).
+    assert addon.data[:8] == b"NGPUADD2"
+
+
+def test_both_members_are_read_from_one_volume(tmp_path: Path) -> None:
+    """One walk, two members, neither confused with the other.
+
+    Every fixture above now carries both, so a reader that matched the first
+    file in ``Payloads`` rather than the one named would fail here rather than
+    passing a suite that happened to test the seed first.
+    """
+    image = _payload_volume(tmp_path)
+    seed = ps.read_member(image, ps.DATA_MEMBER)
+    addon = ps.read_member(image, ps.GPU_ADDON_MEMBER)
+    assert seed.data == SEED and addon.data == ADDON
+    assert seed.sha256 != addon.sha256
+    assert seed.cluster != addon.cluster
+    assert seed.member.endswith("scratch-data.img"), seed.member
+    assert addon.member.endswith("kernel.macho.gpuaddon"), addon.member
+
+
+def test_read_data_seed_is_the_seed_spelling_of_read_member(tmp_path: Path) -> None:
+    """The wrapper is a wrapper, not a second implementation.
+
+    Two walks that could disagree are two chances to be wrong about the seed, so
+    the seed-specific entry point has to return exactly what the general one
+    returns for the same member.
+    """
+    image = _payload_volume(tmp_path)
+    direct = ps.read_member(image, ps.DATA_MEMBER, expected_sha256=SEED_SHA256)
+    wrapped = ps.read_data_seed(image, expected_sha256=SEED_SHA256)
+    assert wrapped == direct, (wrapped, direct)
+
+
+def test_a_members_own_digest_is_what_is_checked(tmp_path: Path) -> None:
+    """The seed's digest does not excuse the addon, and the other way round.
+
+    ``payload.json`` carries one digest per member, so the check has to be
+    against the digest for the member asked for -- a reader that checked every
+    member against ``data_ramdisk_sha256`` would refuse the addon on a volume
+    that is entirely correct.
+    """
+    image = _payload_volume(tmp_path)
+    error = _refused(ps.read_member, image, ps.GPU_ADDON_MEMBER,
+                     expected_sha256=SEED_SHA256)
+    assert error.code is ErrorCode.VERIFICATION_FAILED, error
+    assert error.details["extracted"] == ADDON_SHA256, error.details
+    assert error.details["declared"] == SEED_SHA256, error.details
+
+
+def test_a_member_that_declares_more_than_the_volume_holds_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Bounded by the volume's own size, which is derived and cannot be wrong.
+
+    The bound used to be the packed-ramdisk ceiling, which is the wrong constant
+    for a member that is not a seed.  The volume's declared sector count is read
+    from the BPB this reader has already validated, so it holds for a volume
+    shaped differently from the one measured.
+
+    The declared size is written into the entry directly rather than by asking
+    the fixture to place a blob that big: a slice assignment longer than the data
+    region would resize the region, and the test would be corrupting its own
+    fixture instead of the member's size field.
+    """
+    total_sectors = (RESERVED_SECTORS + FAT_COUNT * SECTORS_PER_FAT
+                     + DATA_CLUSTERS * SECTORS_PER_CLUSTER)
+    ceiling = total_sectors * BYTES_PER_SECTOR
+    tree = _tree(addon=False)
+    tree[PAYLOADS_CLUSTER].append(
+        _entry("kernel.macho.gpuaddon", ADDON_CLUSTER, ceiling + CLUSTER_BYTES)
+    )
+    image = _payload_volume(tmp_path, tree=tree, addon=False)
+
+    error = _refused(ps.read_member, image, ps.GPU_ADDON_MEMBER)
+    assert error.code is ErrorCode.CONFIG_INVALID, error
+    assert "more than" in error.message, error
+    assert error.details["ceiling"] == ceiling, error.details
+    assert error.details["size"] == ceiling + CLUSTER_BYTES, error.details
+
+
+def test_no_member_named_is_refused(tmp_path: Path) -> None:
+    """An empty name is a caller error, not a volume that lacks a member.
+
+    Reporting it as an absent member would send an operator looking for a file
+    that was never asked for.
+    """
+    image = _payload_volume(tmp_path)
+    for name in ("", "   "):
+        error = _refused(ps.read_member, image, name)
+        assert error.code is ErrorCode.CONFIG_INVALID, error
+        assert "no member was named" in error.message, error
+
+
+def test_the_addon_is_read_from_a_volume_that_spells_only_short_names(
+    tmp_path: Path,
+) -> None:
+    """The second member through the 8.3 spelling too.
+
+    ``mtools`` writes both names, but a volume formatted with short names only
+    carries ``KERNEL~1.GPU`` -- and a reader that decoded the long name only
+    would find the seed on such a volume and miss the addon.
+    """
+    image = _payload_volume(tmp_path, long_name=False, stem="SCRATC~1",
+                            addon_stem="KERNEL~1")
+    addon = ps.read_member(image, ps.GPU_ADDON_MEMBER, expected_sha256=ADDON_SHA256)
+    assert addon.data == ADDON
+    assert ps.read_data_seed(image, expected_sha256=SEED_SHA256).data == SEED
+
+
+# ---------------------------------------------------------------------------
+# the real bundle, when it is there
+# ---------------------------------------------------------------------------
+
+def _bundles() -> list[Path]:
+    """The delivered boot-inputs bundles that carry a payload image.
+
+    ``local-private`` is never committed and never required: a host without it
+    skips the real-image tests rather than failing them, and a host with it gets
+    the one check no fixture can give -- the reader against the volume a real
+    runner produced.
+    """
+    root = REPO / "local-private" / "tmp"
+    if not root.is_dir():
+        return []
+    return [candidate for candidate in sorted(root.glob("bundle*"))
+            if (candidate / "payload.img").is_file()
+            and (candidate / "payload.json").is_file()]
+
+
+@pytest.mark.parametrize("bundle", _bundles(), ids=lambda path: path.name)
+def test_it_reads_the_real_bundles_members(bundle: Path) -> None:
+    """Both members, each against the digest the build itself recorded.
+
+    This is the test that makes the fixtures worth anything: a FAT32 volume
+    written by hand can agree with a reader that is wrong about the real one, so
+    the reader is checked against the bytes a real runner produced.  ``bundle8``
+    carries both members -- the seed at 1,499,280 bytes and the addon blob at
+    12,131,336 -- and ``payload.json`` beside the image declares both digests.
+    """
+    report = json.loads((bundle / "payload.json").read_text(encoding="utf-8"))
+    for member, key in ((ps.DATA_MEMBER, "data_ramdisk_sha256"),
+                        (ps.GPU_ADDON_MEMBER, "gpu_addon_sha256")):
+        declared = report.get(key)
+        if not declared:
+            continue
+        got = ps.read_member(bundle / "payload.img", member, expected_sha256=declared)
+        assert got.sha256 == declared, (member, got.sha256, declared)
+        assert got.data, member

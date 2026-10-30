@@ -54,6 +54,7 @@ from unipad.host.guestobserve import (
     load_addresses_from_serial,
 )
 from unipad.host.input import QmpInputSink
+from unipad.host.payload_seed import GPU_ADDON_MEMBER
 from unipad.host.qmp import QmpClient
 from unipad.ipa.package import open_ipa, sha256_file
 from unipad.ipa.precheck import VERDICT_REJECT, run_precheck
@@ -814,6 +815,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0 if verdict == "PASS" else 1
 
 
+def _addon_from_image(payload_image: Optional[Path]) -> Optional[Path]:
+    """The GPU addon blob read out of a payload image, or ``None``.
+
+    The manifest path has no ``gpu_addon`` member because the runner packs the
+    blob into the payload image, so the only way the acceptance path can supply
+    one is to read it back out.  The caller names the image; when it does not,
+    this returns ``None`` and ``stage_esp``'s pair check decides whether that is
+    legal -- which is the right division, because whether a tree needs a blob is
+    a property of the tree and not of this function.
+
+    A missing image is refused by :func:`payload_seed.read_member` with
+    ``artifact_missing``, not here.  An earlier revision checked ``is_file()``
+    first and said the same thing in different words; the teeth check killed
+    nothing by removing it, which is how the duplication was found.  One
+    spelling of "the image is not there" is the point.
+    """
+    if payload_image is None:
+        return None
+    member = payload_seed.read_member(Path(payload_image), GPU_ADDON_MEMBER)
+    target = Path(tempfile.mkdtemp(prefix="unipad-addon-")) / Path(GPU_ADDON_MEMBER).name
+    target.write_bytes(member.data)
+    return target
+
+
 def runtime_from_manifest(
     manifest_dir: Path,
     *,
@@ -906,7 +931,14 @@ def runtime_from_manifest(
         trust_cache=verify_member("trust_cache") if "trust_cache" in artifacts else None,
         data_ramdisk=verify_member("data_seed") if "data_seed" in artifacts else None,
         payload_report=kwargs.pop("payload_report", None),
-        gpu_addon=verify_member("gpu_addon") if "gpu_addon" in artifacts else None,
+        # The GPU addon is NOT a manifest member: the runner packs it into the
+        # payload image rather than the private delivery, so nothing here names
+        # it.  A device tree built with --gpu-addon carries the GpuAddon
+        # placeholder anyway, and BootInputs.stage_esp now refuses a tree with
+        # the placeholder and no blob -- correctly, because that is the state
+        # DarwinBoot.c:596-598 refuses before the kernel starts.  So it is read
+        # out of the payload image when the caller names one.
+        gpu_addon=_addon_from_image(kwargs.pop("payload_image", None)),
         ramfb_driver=kwargs.pop("ramfb_driver", None),
     )
     return RealGuestRuntime(

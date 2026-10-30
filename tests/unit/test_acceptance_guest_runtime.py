@@ -884,3 +884,81 @@ def test_a_role_the_manifest_declares_without_a_digest_is_passed_through(tmp_pat
     """
     runtime = _delivered_runtime(tmp_path, _manifest_dir(tmp_path))
     assert runtime.inputs.data_ramdisk is not None
+
+
+# ---------------------------------------------------------------------------
+# the GPU addon, which the manifest does not name
+# ---------------------------------------------------------------------------
+
+def test_the_manifest_path_reads_the_addon_out_of_the_payload_image(tmp_path: Path) -> None:
+    """The blob is a payload member, not a delivery member -- so it is read out.
+
+    ``unixnu/payload.py:145`` packs the addon into the payload image and the
+    private delivery carries the seed, the kernelcache and the trust bundle.  A
+    device tree built with ``--gpu-addon`` carries the ``GpuAddon`` placeholder
+    regardless, and ``stage_esp`` refuses a tree with the placeholder and no
+    blob -- correctly, because that is the state ``DarwinBoot.c:596-598``
+    refuses before the kernel starts.  MEASURED on 2026-10-30 with bundle8:
+    the boot never reached the kernel and the serial log ended
+    ``DARWINBOOT: boot refused: Compromised Data; firmware retained``.
+
+    So the manifest path has to be able to supply one, and the only place it
+    exists is inside the payload image.
+    """
+    from unipad.acceptance import guest_runtime as gr
+    from tests.unit.test_payload_seed import ADDON, _payload_volume
+
+    manifest_dir = _manifest_dir(tmp_path)
+    image_dir = tmp_path / "image"
+    image_dir.mkdir()
+    image = _payload_volume(image_dir)
+    runtime = gr.runtime_from_manifest(
+        manifest_dir,
+        device_dir=tmp_path / "device",
+        qemu=tmp_path / "qemu.exe",
+        darwinboot=tmp_path / "DarwinBoot.efi",
+        unixnu=tmp_path / "UniXNU.efi",
+        firmware=tmp_path / "fw.bin",
+        payload_image=image,
+        workdir=tmp_path / "run",
+    )
+    addon = runtime.inputs.gpu_addon
+    assert addon is not None, "the manifest path could not supply the GPU addon"
+    assert addon.read_bytes() == ADDON, "the addon staged is not the volume's own"
+
+
+def test_without_a_payload_image_the_manifest_path_supplies_no_addon(tmp_path: Path) -> None:
+    """``None``, not a guess: whether a tree needs a blob is the tree's business.
+
+    :func:`stage_esp`'s pair check is what decides, and it decides from the
+    device tree.  A function here that invented a blob would make that check
+    unable to fire.
+    """
+    runtime = _delivered_runtime(tmp_path, _manifest_dir(tmp_path))
+    assert runtime.inputs.gpu_addon is None
+
+
+def test_a_payload_image_that_is_not_there_is_refused(tmp_path: Path) -> None:
+    """Naming an image that does not exist is a caller error, not a silent skip.
+
+    The refusal is :func:`payload_seed.read_member`'s, with
+    ``artifact_missing``.  An earlier revision of ``_addon_from_image`` checked
+    ``is_file()`` itself and said the same thing in different words; the teeth
+    check killed nothing by deleting it, which is how the duplication was found.
+    """
+    from unipad.acceptance import guest_runtime as gr
+    from unipad.errors import ErrorCode
+
+    manifest_dir = _manifest_dir(tmp_path)
+    with pytest.raises(UniPadError) as caught:
+        gr.runtime_from_manifest(
+            manifest_dir,
+            device_dir=tmp_path / "device",
+            qemu=tmp_path / "qemu.exe",
+            darwinboot=tmp_path / "DarwinBoot.efi",
+            unixnu=tmp_path / "UniXNU.efi",
+            firmware=tmp_path / "fw.bin",
+            payload_image=tmp_path / "absent" / "payload.img",
+            workdir=tmp_path / "run",
+        )
+    assert caught.value.code is ErrorCode.ARTIFACT_MISSING, caught.value
