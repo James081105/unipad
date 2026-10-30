@@ -26,9 +26,26 @@ So the check lives here.  Two levels, because they catch different things:
 
 Both are skipped when the pinned vendor checkout is absent, which is the normal
 state on a host that has not acquired it.
+
+What is NOT skipped, and why
+---------------------------
+The pinned tree carries four hunks whose new-side start is unreachable -- the
+two sides of the header disagree about where the hunk is.  ``git apply``
+tolerates that by searching for the context, which is why those four patches
+still build.  They are recorded here by name rather than ignored, and the test
+fails if the set changes: a *new* unreachable hunk is the defect this check
+exists for, and a silently tolerated one is how the next runner cycle gets
+spent.
+
+Correcting those four is deliberately not done here.  Fixing one shifts the
+next -- they are a systematic offset, not four independent typos -- so the fix
+is a cascade through three unrelated patches in a pinned tree, which is exactly
+the scope creep that breaks a build that works.  That is a change to propose on
+its own, with its own runner cycle, not one to fold into an unrelated fix.
 """
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +55,26 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 SHARED = REPO / "scripts" / "shared"
 PATCH_DIR = REPO / "vendor" / "UniXNU" / "patches"
+
+#: (patch name, hunk line) for every unreachable hunk start in the pinned tree,
+#: measured 2026-10-30.  A change to this set is a test failure, in either
+#: direction: a new entry is the defect, and a removed one means somebody
+#: corrected a patch without recording that it had been wrong.
+KNOWN_UNREACHABLE = {
+    ("offline-component-load-probes.patch", 92),
+    ("offline-owner-systemos-mount.patch", 270),
+    ("zzz-boot-progress.patch", 223),
+    ("zzz-boot-progress.patch", 264),
+}
+
+
+def _load_checker():
+    spec = importlib.util.spec_from_file_location(
+        "check_patch_hunks", SHARED / "check_patch_hunks.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _patches() -> list[Path]:
@@ -56,15 +93,48 @@ def _run(script: str, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_every_hunks_declared_counts_match_what_it_carries():
-    """The cheap check, and the one that catches a header left behind by an edit."""
+def test_no_hunks_counts_disagree_with_its_header():
+    """The cheap check, and the one that catches a header left behind by an edit.
+
+    This is the defect that cost run 40971549320: an edit grew a comment by
+    thirteen lines and the hunk header kept counting 321.
+    """
     patches = _patches()
-    proc = _run("check_patch_hunks.py", *[str(p) for p in patches])
-    assert proc.returncode == 0, (
-        f"{len(patches)} patches checked and these are malformed:\n"
-        f"{proc.stdout}{proc.stderr}"
+    checker = _load_checker()
+    counts = []
+    for patch in patches:
+        for problem in checker.check(patch):
+            if "declares" in problem:
+                counts.append(problem)
+    assert not counts, (
+        f"{len(counts)} hunk(s) whose declared counts disagree with what they "
+        f"carry:\n" + "\n".join(counts)
     )
-    assert "every hunk's counts match its header" in proc.stdout, proc.stdout
+
+
+def test_the_unreachable_hunk_starts_are_exactly_the_known_set():
+    """A new unreachable start fails; a corrected one fails too, and should not.
+
+    See the module docstring for why the four are recorded rather than fixed.
+    """
+    patches = _patches()
+    checker = _load_checker()
+    found = set()
+    for patch in patches:
+        for problem in checker.check(patch):
+            if "unreachable" not in problem:
+                continue
+            line = int(problem.split("hunk at line ")[1].split(" ")[0])
+            found.add((patch.name, line))
+    assert found == KNOWN_UNREACHABLE, (
+        "the set of unreachable hunk starts changed. A new entry means a patch "
+        "was edited without moving the following hunks' new-side starts -- which "
+        "is what failed run 40981242194 at build-xnu-4k-baseline.sh:44. A "
+        "removed entry means a patch was corrected; record that it had been "
+        "wrong by removing it here deliberately.\n"
+        f"  now      : {sorted(found)}\n"
+        f"  recorded : {sorted(KNOWN_UNREACHABLE)}"
+    )
 
 
 def test_every_patch_applies_to_its_own_minus_side():
