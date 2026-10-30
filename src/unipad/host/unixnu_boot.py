@@ -84,6 +84,18 @@ __all__ = [
 #: from board.toml through :mod:`unipad.host.adt`.
 MEMORY_MIB = 6144
 
+#: Where the shared window starts in guest physical memory: the end of QEMU
+#: ``virt``'s own RAM.  ``run-qemu.py:27`` spells the same sum
+#: (``SHARED_WINDOW = 0x40000000 + (MEMORY_MIB << 20)``) and its ``--shared-window``
+#: help text names the resulting address, 0x1c0000000 for the 6 GiB this module
+#: gives the machine.
+#:
+#: It is a base, not a size: the window is ``memory_mib`` bytes wide and this is
+#: where it begins.  Keeping the addition in :func:`build_argv` rather than
+#: baking the address in here means a board with a different ``dram_size`` gets
+#: the right base instead of a window that silently overlaps the guest's RAM.
+SHARED_WINDOW_BASE = 0x40000000
+
 #: The frame-buffer geometry.  1376x1024, not the iPad's 1366x1024: every row of
 #: the picture has to be a multiple of 64 bytes or it lands 2-3 bytes off, and
 #: 1376 is the nearest such width (``run-qemu.py:41-45``).  ``QemuRamfb.efi``
@@ -409,6 +421,16 @@ class BootReport:
     #: ``offline owner SystemOS mount failed: 80`` -- so "the kernel started" is
     #: true of both machines and only this field separates them.
     systemos_image: Optional[str] = None
+    #: The shared window this run gave the guest, in MiB, or ``None`` for none.
+    #: The same argument as :attr:`root_image` one link further out: with no
+    #: window ``native_shared_window_stage`` stays 0 (SharedWindow.cpp:123
+    #: returns when the fw_cfg item is absent), and
+    #: ``native_qemu_metal_stage`` therefore never leaves 0 either
+    #: (QemuMetalPublish.cpp:27 gates on ``native_shared_window_stage >= 4``) --
+    #: so the Metal device is never published and nothing presents.  Measured
+    #: 2026-10-30: six ``native_qemu_metal_*`` counters all zero, and every
+    #: screendump byte-identical to a run with no addon files written at all.
+    shared_window_mib: Optional[int] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     #: Whether the guest's own kernel log reported the Data volume mounted.  This
@@ -1422,6 +1444,9 @@ def build_argv(
     *,
     qmp_port: int = DEFAULT_QMP_PORT,
     memory_mib: int = MEMORY_MIB,
+    shared_window_mib: int = 0,
+    shared_window_cache: str = "wb",
+    metal_clients: Optional[str] = None,
     display: str = "none",
     ramfb_size: Optional[str] = None,
     root_image: Optional[Path] = None,
@@ -1545,6 +1570,19 @@ def build_argv(
             "qmp_port must be a TCP port in 1..65535",
             qmp_port=repr(qmp_port),
         )
+    if shared_window_mib < 0:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "shared_window_mib cannot be negative",
+            shared_window_mib=repr(shared_window_mib),
+        )
+    if shared_window_cache not in ("wb", "device"):
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "shared_window_cache must be 'wb' or 'device'; SharedWindow.cpp "
+            "refuses anything else and leaves native_shared_window_stage at 1",
+            shared_window_cache=repr(shared_window_cache),
+        )
     firmware = Path(inputs.firmware).resolve()
     code_size = firmware.stat().st_size if firmware.is_file() else 0
     if code_size <= 0:
@@ -1603,7 +1641,29 @@ def build_argv(
         "-cpu", "cortex-a710",
         "-machine", "virt,virtualization=off,secure=off,gic-version=3",
         "-smp", "1",
-        "-m", str(int(memory_mib)),
+        # The guest's RAM, and the shared window's second node when there is one.
+        #
+        # ``memory_mib`` alone is what every run before 2026-10-30 got, and it is
+        # what the device tree declares (board.toml:92 ``dram_size`` =
+        # ``0x180000000``, "the 6 GiB scripts/run-qemu.py gives the machine").
+        # ``shared_window_mib`` adds a SECOND node after it rather than enlarging
+        # the first, and the split is the whole point rather than a detail:
+        #
+        # * SharedWindow.cpp:133 requires the window to be memory the kernel does
+        #   NOT manage -- ``pmap_valid_address(base)`` must be false.  The kernel
+        #   only knows the 6 GiB the device tree declares, so the window has to
+        #   start after it, and ``-m`` has to grow by exactly the window's size
+        #   or QEMU has no guest-physical range to put the second node in.
+        # * run-qemu.py:171-173 records what happens when the whole guest is one
+        #   shared node instead: "Sharing all of the guest's memory instead
+        #   stopped the userland at launchd, spinning."
+        #
+        # The window's base is upstream's formula verbatim (run-qemu.py:27,
+        # ``SHARED_WINDOW = 0x40000000 + (MEMORY_MIB << 20)``), which for 6 GiB
+        # is 0x1c0000000 -- the address the flag's own help text names.  It is
+        # derived from ``memory_mib`` rather than hard-coded so a board with a
+        # different DRAM size gets the right base instead of a silent overlap.
+        "-m", str(int(memory_mib) + int(shared_window_mib)),
         "-no-reboot",
         # The ESP as a read-only FAT volume behind virtio-blk: the only disk
         # form UniXNU boots.  PCI, because EDK II enumerates the virtual PCI bus
@@ -1701,6 +1761,48 @@ def build_argv(
         "-name", "unipad-unixnu",
     ] + (
         ["-fw_cfg", f"name=opt/org.unixnu/ramfb-size,string={ramfb_size}"] if ramfb_size else []
+    ) + (
+        # The shared window, upstream's own spelling (run-qemu.py:168-181) with
+        # one change forced by Windows: the file is ``shared.bin`` in the run
+        # directory rather than a path QEMU creates and deletes, because this
+        # module already seeds ``vars.fd`` itself for the same reason -- a file
+        # the child is expected to create is a file whose absence is a QEMU exit
+        # 1 with a path that looks right.
+        #
+        # ``share=on`` is what makes the second node visible outside the guest.
+        # Without it the window is ordinary guest RAM and nothing on the host can
+        # map it, which is the state every run before this had.
+        #
+        # Position: last, after the fw_cfg items and before the SystemOS pair,
+        # matching where run-qemu.py appends its own memory options.
+        [
+            "-object", f"memory-backend-ram,id=ram0,size={int(memory_mib)}M",
+            "-object",
+            f"memory-backend-file,id=ram1,size={int(shared_window_mib)}M,"
+            f"mem-path={qpath(Path(workdir) / 'shared.bin')},share=on",
+            "-numa", "node,nodeid=0,cpus=0,memdev=ram0",
+            "-numa", "node,nodeid=1,memdev=ram1",
+            # SharedWindow.cpp:123 reads exactly this item and returns with the
+            # stage still 0 when it is absent -- which is the measured state of
+            # every run on this host, and the reason
+            # native_qemu_metal_stage never left 0 either
+            # (QemuMetalPublish.cpp:27 gates on native_shared_window_stage >= 4).
+            "-fw_cfg",
+            f"name=opt/org.unixnu/shared-window,string="
+            f"{SHARED_WINDOW_BASE + (int(memory_mib) << 20):x}:"
+            f"{int(shared_window_mib) << 20:x}:{shared_window_cache}",
+        ]
+        + (
+            # QemuMetalPublish.cpp:57-70 publishes a grant for each name in this
+            # item.  Upstream's default is ``iconservicesagent``, and its help
+            # text says why: "Core Image without Metal crashes the icon service,
+            # and Settings waits on it."  The render server does not go here --
+            # QemuMetalPublish.cpp:50 hard-codes ``backboardd`` as
+            # ``NativeSandboxGrantProcess`` on the accelerator itself.
+            ["-fw_cfg", f"name=opt/org.unixnu/metal-clients,string={metal_clients}"]
+            if metal_clients else []
+        )
+        if shared_window_mib else []
     ) + systemos_argv
 
 
@@ -1814,6 +1916,9 @@ def boot(
     display: str = "none",
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
+    shared_window_mib: int = 0,
+    shared_window_cache: str = "wb",
+    metal_clients: Optional[str] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
 
@@ -1950,9 +2055,25 @@ def boot(
         with vars_path.open("wb") as handle:
             handle.truncate(code_size)
 
+    # The shared window's backing file, seeded here for the same reason vars.fd
+    # is: QEMU's ``memory-backend-file`` is the one object whose missing file is
+    # an exit 1 with a path that looks right, and a run that never started is
+    # indistinguishable from a boot that failed except by reading QEMU's stderr.
+    # run-qemu.py lets QEMU create and delete it; this module does not, because
+    # the file is evidence of what size the window actually was.
+    window_path = work / "shared.bin"
+    if shared_window_mib:
+        wanted = int(shared_window_mib) << 20
+        if not window_path.is_file() or window_path.stat().st_size != wanted:
+            with window_path.open("wb") as handle:
+                handle.truncate(wanted)
+
     command = build_argv(
         qemu, inputs, esp, work, qmp_port=qmp_port, serial_port=serial_port,
         memory_mib=memory_mib, display=display,
+        shared_window_mib=shared_window_mib,
+        shared_window_cache=shared_window_cache,
+        metal_clients=metal_clients,
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
         ramfb_size=SCREEN if (esp / RAMFB_NAME).is_file() else None,
@@ -1972,6 +2093,10 @@ def boot(
         systemos_image=(
             safe_location(systemos_image.resolve()) if systemos_image is not None else None
         ),
+        # Named here for the same reason root_image is: a run that reached the
+        # kernel, mounted its Data volume and presented nothing is otherwise
+        # indistinguishable from one that never had a window to present into.
+        shared_window_mib=int(shared_window_mib) if shared_window_mib else None,
     )
 
     stdout_path = work / "qemu-stdout.log"

@@ -5019,3 +5019,153 @@ def test_the_payload_report_is_an_input_like_any_other(
     assert inputs.to_dict().get("payload_report") is None
     with_report = replace(inputs, payload_report=Path("payload.json"))
     assert with_report.to_dict()["payload_report"] == "payload.json"
+
+
+# ---------------------------------------------------------------------------
+# the shared window
+# ---------------------------------------------------------------------------
+def test_no_window_by_default_keeps_the_machine_it_always_was(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """Zero is the default and zero must mean *nothing changes*.
+
+    Every run recorded before 2026-10-30 had one memory node, and a parameter
+    that silently adds a second one turns every one of those runs into a
+    different machine without saying so.  Asserted as an exact token list rather
+    than "no shared-window item", because the failure mode is an extra ``-object``
+    or ``-numa`` that nothing asked for.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none")
+    assert _values(argv, "-m") == [str(ub.MEMORY_MIB)], argv
+    assert _values(argv, "-object") == [], argv
+    assert _values(argv, "-numa") == [], argv
+    assert not any("shared-window" in token for token in argv), argv
+
+
+def test_the_window_is_a_second_memory_node_not_a_bigger_first_one(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The split is the point, and both halves of it are asserted.
+
+    ``SharedWindow.cpp:133`` refuses a window that is memory the kernel manages
+    (``pmap_valid_address(base)`` must be false), so the window has to start
+    *after* the DRAM the device tree declares.  ``run-qemu.py:171-173`` records
+    the other half: "Sharing all of the guest's memory instead stopped the
+    userland at launchd, spinning."  One node of 8 GiB therefore fails for a
+    different reason than two nodes of 6 + 2, and only the second one works.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                         shared_window_mib=2048)
+    # -m grows by exactly the window: QEMU needs a guest-physical range to put
+    # the second node in, and the guest's own view of RAM does not change.
+    assert _values(argv, "-m") == [str(ub.MEMORY_MIB + 2048)], argv
+    backends = _values(argv, "-object")
+    assert f"memory-backend-ram,id=ram0,size={ub.MEMORY_MIB}M" in backends, backends
+    window = next((b for b in backends if b.startswith("memory-backend-file,id=ram1")), "")
+    assert window, backends
+    assert f"size={2048}M" in window, window
+    # share=on is what makes the window visible outside the guest at all.
+    assert ",share=on" in window, window
+    nodes = _values(argv, "-numa")
+    assert nodes == ["node,nodeid=0,cpus=0,memdev=ram0", "node,nodeid=1,memdev=ram1"], nodes
+
+
+def test_the_windows_fw_cfg_address_is_upstreams_formula_not_a_constant(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """``BASE:SIZE:MODE``, with BASE derived rather than written down.
+
+    ``run-qemu.py:27`` spells it ``0x40000000 + (MEMORY_MIB << 20)``, which for
+    the 6 GiB this module gives the machine is 0x1c0000000 -- the address the
+    flag's own help text names.  Hard-coding that address passes this test for
+    the current board and silently overlaps the guest's RAM for any other one,
+    so the assertion is on the arithmetic: a different ``memory_mib`` must move
+    the base by exactly that much.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                         shared_window_mib=2048)
+    item = _values(argv, "-fw_cfg")
+    window = next((v for v in item if "shared-window" in v), "")
+    assert window, item
+    expected = (f"name=opt/org.unixnu/shared-window,string="
+                f"{ub.SHARED_WINDOW_BASE + (ub.MEMORY_MIB << 20):x}:{2048 << 20:x}:wb")
+    assert window == expected, (window, expected)
+    # And the mode really is honoured, because SharedWindow.cpp:131 refuses
+    # anything that is not wb or device and leaves the stage at 1.
+    device = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                           shared_window_mib=2048, shared_window_cache="device")
+    assert _values(device, "-fw_cfg")[-1].endswith(":device"), _values(device, "-fw_cfg")
+    # And the base really tracks ``memory_mib`` rather than being this board's
+    # address written down.  Without this the assertion above is satisfied by
+    # ``0x1c0000000`` as a literal, which is correct here and an overlap with the
+    # guest's own RAM on any board whose dram_size differs.
+    other = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                          memory_mib=4096, shared_window_mib=1024)
+    moved = next(v for v in _values(other, "-fw_cfg") if "shared-window" in v)
+    assert moved == (f"name=opt/org.unixnu/shared-window,string="
+                     f"{ub.SHARED_WINDOW_BASE + (4096 << 20):x}:{1024 << 20:x}:wb"), moved
+
+
+def test_the_metal_clients_item_rides_with_the_window(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The grants are a separate item, and they need the window to mean anything.
+
+    ``QemuMetalPublish.cpp:57-70`` reads ``opt/org.unixnu/metal-clients`` and
+    publishes a grant per name -- but only after it has published the
+    accelerator, which it will not do without a window.  So emitting the clients
+    without a window would be a claim the guest cannot act on.  The render server
+    is deliberately NOT in this list: :50 hard-codes ``backboardd`` as
+    ``NativeSandboxGrantProcess`` on the accelerator itself.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                         shared_window_mib=2048,
+                         metal_clients="iconservicesagent")
+    item = _values(argv, "-fw_cfg")
+    assert "name=opt/org.unixnu/metal-clients,string=iconservicesagent" in item, item
+    # ...and without a window, nothing.
+    alone = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                          metal_clients="iconservicesagent")
+    assert not any("metal-clients" in token for token in alone), alone
+
+
+def test_a_cache_mode_the_probe_refuses_is_refused_here(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """``wb`` or ``device``, and anything else is a refusal rather than a run.
+
+    ``SharedWindow.cpp:130-131`` accepts exactly those two and returns with
+    ``native_shared_window_stage`` still 1 on anything else.  Letting it through
+    would produce a boot that looks configured and is not, which is the same
+    shape as the ``--ramfb-driver`` gap.
+    """
+    work = tmp_path / "run"
+    with pytest.raises(UniPadError) as caught:
+        ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                      shared_window_mib=2048, shared_window_cache="writeback")
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "wb" in caught.value.message, caught.value
+
+
+def test_the_report_says_whether_the_run_had_a_window(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """A field nothing reports absent is a field whose absence is invisible.
+
+    ``native_shared_window_stage`` staying 0 makes the Metal device unpublished,
+    which makes nothing present -- and a run that reached the kernel, mounted its
+    Data volume and drew nothing is otherwise indistinguishable from one that
+    never had a window.  Both directions asserted, because the obvious
+    implementation (always an int) passes the first and fails the second.
+    """
+    work = tmp_path / "run"
+    argv = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                         shared_window_mib=2048)
+    report = ub.BootReport(ok=True, command=argv, shared_window_mib=2048)
+    assert report.shared_window_mib == 2048
+    plain = ub.BootReport(ok=True, command=argv)
+    assert plain.shared_window_mib is None, plain
