@@ -2102,6 +2102,75 @@ jobs:
             exit 1
           fi
 
+      # THE USERSPACE HALF OF THE METAL DEVICE.  Everything above this line builds
+      # the kernel half: QemuMetalPublish.cpp and QemuMetalAccelerator.cpp are in
+      # the display archive and they really do publish an accelerator (measured
+      # 2026-10-31: native_qemu_metal_stage 0->4, grants 0->1, and one refused
+      # open with backboardd running).  What nothing built was the other half:
+      # the QemuMetal.bundle that Metal.framework's _getMetalPluginClassForService
+      # reads MetalPluginName to find, and the owner trust cache that carries its
+      # CDHash.  Measured consequence: kOpenType (0x514d) is used nowhere in this
+      # repository but QemuMetalPlugin.mm:81, which is inside that bundle -- so no
+      # guest process could ever open the device with the type openClient()
+      # accepts, and native_qemu_metal_opens stays 0 no matter how long the
+      # observation window is.  This step is that missing half.
+      #
+      # WHY IT FAILS THE JOB INSTEAD OF WARNING.  The GPU addon chain above warns
+      # and continues, and that was right for it.  This one is different: a
+      # warning is exactly what let the gap survive, because the boot then
+      # succeeded, the accelerator was published, every counter looked plausible,
+      # and the only thing missing was invisible in all of them.  A step whose
+      # absence is indistinguishable from success must not be allowed to be
+      # absent quietly.
+      #
+      # Run from the tree, not from the device repository: the script derives
+      # ROOT from __file__, and it reads the trust bundle the root chain just
+      # wrote at <tree>/build/original-static-system-trust/ and the Data seed at
+      # <tree>/.cache/firmware/owner-data/ (a symlink tree.py:assemble makes at
+      # the device repository's, so every tree shares one seed).
+      - name: Build the QemuMetal userspace plugin (build-qemu-metal.py guest)
+        id: qemu_metal
+        if: steps.os_root.outputs.os_root_status == 'pass'
+        env:
+          OUT_ROOT: build-output/unixnu-out
+        run: |
+          set -euo pipefail
+          tree="$(ls -d "$OUT_ROOT"/*/tree 2>/dev/null | head -n 1 || true)"
+          if [ -z "$tree" ]; then
+            echo "::error::no assembled build tree under $OUT_ROOT; build-qemu-metal.py guest cannot run (it reads ROOT from __file__)"
+            exit 1
+          fi
+          log="build-output/qemu-metal.log"
+          mkdir -p build-output
+          if ! ( cd "$tree" && python3 scripts/build-qemu-metal.py guest ) 2>&1 | tee "$log"; then
+            echo "::error::build-qemu-metal.py guest failed; its log is in $log and in the build-logs artifact"
+            exit 1
+          fi
+          metal="$tree/build/qemu-metal"
+          # Every output named, because a glob that expands to nothing and a step
+          # that silently produced nothing are the same failure.  The bundle is a
+          # directory, so its executable and its Info.plist are checked by name.
+          for wanted in \
+            "$metal/QemuMetal.bundle/QemuMetal" \
+            "$metal/QemuMetal.bundle/Info.plist" \
+            "$metal/owner-trust.bundle" \
+            "$metal/owner-data-1g-metal.dbr" \
+            "$metal/trust.json"; do
+            if [ ! -f "$wanted" ]; then
+              echo "::error::build-qemu-metal.py guest produced no $wanted; the Metal device cannot be opened and the seed cannot carry the plugin"
+              exit 1
+            fi
+            echo "metal: $(basename "$wanted") $(wc -c <"$wanted" | tr -d ' ') bytes"
+          done
+          # The CDHash the trust cache is built around, echoed so a reader of the
+          # job summary can match it against the bundle without unpacking either.
+          cdhash="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['cdhash'])" "$metal/trust.json")"
+          echo "metal: QemuMetal.bundle CDHash $cdhash"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          echo "bundle=$metal/QemuMetal.bundle" >> "$GITHUB_OUTPUT"
+          echo "trust=$metal/owner-trust.bundle" >> "$GITHUB_OUTPUT"
+          echo "seed=$metal/owner-data-1g-metal.dbr" >> "$GITHUB_OUTPUT"
+
       # The second invocation the chain's own comment asks for.  Same command,
       # same inputs, same stage: the plan is a pure function of the stage, so the
       # only thing that has changed is what is on disk -- and that is exactly what
@@ -2207,8 +2276,41 @@ jobs:
           # the same failure, so the absence is said out loud.
           declare -a root_args=()
           root_tree="$(ls -d build-output/unixnu-out/*/tree 2>/dev/null | head -n 1 || true)"
+          # The Metal half, when the step above produced it.  Two different files
+          # for two different reasons, and neither is optional once it exists:
+          #
+          #   trust  -- the original bundle's two modules PLUS an owner module
+          #             carrying QemuMetal.bundle's CDHash.  Without the owner
+          #             module AMFI refuses the bundle, so shipping the bundle
+          #             against the original trust cache is shipping something
+          #             that cannot load.
+          #   seed   -- a copy of the 1 GiB Data seed with the bundle already at
+          #             /private/var/ngpu/addons/QemuMetal.bundle, which is where
+          #             the kernel's addon mount (sheng-gpu-addon=1) publishes it,
+          #             and with the render server's framebuffer preferences set
+          #             to no deep framebuffer and no compression -- it reads
+          #             those before the plugin runs.
+          #
+          # Preferred, not added: the metal seed IS the seed (same container, one
+          # bundle directory and four plists more), so passing both would stage
+          # two ramdisks into one ESP and the last one would win by accident.
+          # The defaults first, then the Metal half over them.  The order is
+          # load-bearing in the boring way: with `set -u`, assigning only inside
+          # the `if` below would leave the variable unset on every run where the
+          # Metal step did not produce it, and the step would die on
+          # "trust_cache: unbound variable" -- which reads like a workflow bug
+          # rather than like a missing plugin.
           trust_cache="$root_tree/build/original-static-system-trust/original-static-system.bundle"
           data_ramdisk="vendor/UniXNU-qemu/.cache/firmware/owner-data/owner-data-1g.dbr"
+          metal="$root_tree/build/qemu-metal"
+          if [ -f "$metal/owner-trust.bundle" ]; then
+            trust_cache="$metal/owner-trust.bundle"
+            echo "build: using the QemuMetal owner trust cache (it carries the bundle's CDHash; AMFI would refuse the bundle against the original one)"
+          fi
+          if [ -f "$metal/owner-data-1g-metal.dbr" ]; then
+            data_ramdisk="$metal/owner-data-1g-metal.dbr"
+            echo "build: using the QemuMetal Data seed (it carries the bundle in the addon mount and the render server's framebuffer preferences)"
+          fi
           if [ -f "$trust_cache" ]; then
             root_args+=(--trust-cache "$trust_cache")
             echo "build: the owner root chain's trust cache is at $trust_cache ($(wc -c <"$trust_cache" | tr -d ' ') bytes)"
@@ -2823,6 +2925,17 @@ jobs:
               ("unixnu-out/*/logs/payload-adt.log", "logs/payload-adt.log"),
               ("unixnu-out/*/logs/payload-patch.log", "logs/payload-patch.log"),
               ("build-bootloader.subsystem.log", "logs/build-bootloader.subsystem.log"),
+              # The Metal half, when the step above produced it.  Three single
+              # files, deliberately not the bundle directory: the bundle already
+              # travels inside the QemuMetal Data seed, and a directory in this
+              # tuple would be counted by `stat().st_size` as one entry rather
+              # than as its files, which is the kind of accounting that looks
+              # complete and is not.  What is added here is what a verifier needs
+              # to check the trust cache without unpacking the seed: the CDHash
+              # the cache was built around, and the cache itself.
+              ("unixnu-out/*/tree/build/qemu-metal/owner-trust.bundle", "owner-trust.bundle"),
+              ("unixnu-out/*/tree/build/qemu-metal/trust.json", "metal-cdhash.json"),
+              ("qemu-metal.log", "logs/qemu-metal.log"),
           )
           for pattern, name in PAYLOAD_SET:
               matches = sorted(out.glob(pattern))
