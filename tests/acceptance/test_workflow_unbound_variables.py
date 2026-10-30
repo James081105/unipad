@@ -141,6 +141,122 @@ def _unbound(path: Path | None = None) -> dict[str, set[str]]:
     return unbound
 
 
+def _base_indent(source: str) -> int:
+    """The indentation of the script's outermost statements."""
+    indents = [
+        len(line) - len(line.lstrip(" "))
+        for line in source.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    return min(indents) if indents else 0
+
+
+def _conditionally_bound(path: Path | None = None) -> dict[str, set[str]]:
+    """``{step name: variables it expands at the top level but only binds inside a block}``.
+
+    The check above asks "is this name assigned anywhere".  This one asks the
+    question that actually matters under ``set -u``: is it assigned on a path
+    that always runs?  A name whose every assignment sits inside an ``if`` --
+    while the name is expanded at the script's own indentation, outside any
+    block -- dies the moment that branch is not taken.
+
+    Measured, not theorised: the QemuMetal step first assigned ``trust_cache``
+    only inside ``if [ -f "$metal/owner-trust.bundle" ]`` and expanded it at the
+    top level, so every run without the Metal half stopped with
+    ``trust_cache: unbound variable``.  The guard above passed it, because the
+    assignment *is* there -- its own docstring says it does not execute
+    anything, and it does not model conditionals either.
+
+    Only the top-level case is reported.  A name assigned and expanded inside
+    the same block is fine, and reporting it would make this check noisy enough
+    to be ignored -- which is how a guard stops guarding.
+    """
+    found: dict[str, set[str]] = {}
+    for name, source, _bound in _steps(path):
+        base = _base_indent(source)
+        top_level_assignments: set[str] = set()
+        nested_assignments: set[str] = set()
+        for line in source.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            matches = ASSIGNMENT.findall(line)
+            if not matches:
+                continue
+            target = (
+                top_level_assignments
+                if (len(line) - len(line.lstrip(" "))) <= base
+                else nested_assignments
+            )
+            target.update(matches)
+        # A name is safe if it is assigned at the top level, or only ever
+        # assigned and expanded inside the same block -- the latter is detected
+        # by the expansion being deeper than the base indent too.
+        expanded_at_top: set[str] = set()
+        for line in source.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if (len(line) - len(line.lstrip(" "))) > base:
+                continue
+            expanded_at_top.update(EXPANSION.findall(line))
+        risky = {
+            variable
+            for variable in expanded_at_top
+            if variable in nested_assignments
+            and variable not in top_level_assignments
+            and variable not in ALWAYS_PRESENT
+            and not variable.startswith(GITHUB_PREFIXES)
+        }
+        if risky:
+            found[name] = risky
+    return found
+
+
+def test_no_step_binds_a_top_level_variable_only_inside_a_block() -> None:
+    """The conditional half of the guard, against the workflow as committed.
+
+    ``test_every_variable_a_step_expands_is_bound`` cannot see this: it finds
+    the assignment inside the ``if`` and is satisfied.  This is the check that
+    would have stopped the QemuMetal step's ``trust_cache`` before a runner
+    minute was spent.
+    """
+    conditional = _conditionally_bound()
+    assert not conditional, (
+        "these steps expand a variable at the top level but only assign it "
+        "inside a block, so `set -u` stops them on every run that does not take "
+        "that branch (measured with trust_cache in the QemuMetal step):\n"
+        + "\n".join(
+            f"  {step}: {sorted(names)}" for step, names in sorted(conditional.items())
+        )
+    )
+
+
+def test_the_conditional_half_has_teeth(tmp_path: Path) -> None:
+    """A binding moved inside an ``if`` is reported.
+
+    The same discipline as the guard above: a check nobody has seen go red is
+    not a check.  The mutation is the exact one that reached ``main`` -- the
+    default assignment deleted, the override left inside the branch.
+    """
+    source = WORKFLOW.read_text(encoding="utf-8")
+    default = (
+        '          trust_cache="$root_tree/build/original-static-system-trust/'
+        'original-static-system.bundle"\n'
+    )
+    assert default in source, (
+        "the anchor is gone; the QemuMetal step no longer assigns trust_cache "
+        "unconditionally, so this mutation no longer describes it"
+    )
+    broken = source.replace(default, "", 1)
+    assert broken != source
+    mutated = tmp_path / "build-macos.yml"
+    mutated.write_text(broken, encoding="utf-8")
+    conditional = _conditionally_bound(mutated)
+    assert conditional, "the conditional check did not report the moved binding"
+    assert any(
+        "trust_cache" in names for names in conditional.values()
+    ), conditional
+
+
 def test_every_variable_a_step_expands_is_bound() -> None:
     """The guard itself, against the workflow as committed."""
     unbound = _unbound()
