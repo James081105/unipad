@@ -107,11 +107,23 @@ PAYLOAD_SET: tuple[tuple[str, str], ...] = (
     ("unixnu-out/*/tree/build/qemu-metal/owner-trust.bundle", "owner-trust.bundle"),
     ("unixnu-out/*/tree/build/qemu-metal/trust.json", "metal-cdhash.json"),
     ("qemu-metal.log", "logs/qemu-metal.log"),
+    # The bundle's own executable and plist, so two runs' bundles can be diffed
+    # byte-for-byte.  Three runs produced three different CDHashes from the same
+    # sources, flags and toolchain, and the remaining candidates for that cannot
+    # be separated by reasoning -- a diff names the first differing offset, and
+    # that offset says which region is moving.
+    ("unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/QemuMetal",
+     "QemuMetal.bundle/QemuMetal"),
+    ("unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/Info.plist",
+     "QemuMetal.bundle/Info.plist"),
 )
 
-#: The Metal half's three entries, split back out so the arithmetic below can
-#: say why a count moved instead of carrying a new magic number.
-METAL_ENTRIES = PAYLOAD_SET[-3:]
+#: The Metal half's five entries, split back out so the arithmetic below can say
+#: why a count moved instead of carrying a new magic number.  Five, not three:
+#: the bundle's own executable and plist were added so two runs' bundles can be
+#: diffed byte-for-byte, which is the only way to find where the build stops
+#: being reproducible.
+METAL_ENTRIES = PAYLOAD_SET[-5:]
 
 #: The bundle names of the Metal half.
 METAL_NAMES = tuple(name for _pattern, name in METAL_ENTRIES)
@@ -162,6 +174,8 @@ BUILD_OUTPUT: dict[str, bytes] = {
     f"unixnu-out/{PIN}/tree/build/qemu-metal/owner-trust.bundle": b"the owner trust cache",
     f"unixnu-out/{PIN}/tree/build/qemu-metal/trust.json": b'{"cdhash": "0" * 40}',
     "qemu-metal.log": b"bundle QemuMetal.bundle CDHash 0\n",
+    f"unixnu-out/{PIN}/tree/build/qemu-metal/QemuMetal.bundle/QemuMetal": b"the plugin",
+    f"unixnu-out/{PIN}/tree/build/qemu-metal/QemuMetal.bundle/Info.plist": b"<plist/>",
 }
 
 
@@ -454,6 +468,8 @@ def test_the_bundle_carries_every_boot_input(collected: Result) -> None:
             "owner-trust.bundle",
             "metal-cdhash.json",
             "logs/qemu-metal.log",
+            "QemuMetal.bundle/QemuMetal",
+            "QemuMetal.bundle/Info.plist",
         ]
     ), collected.files()
     assert f"boot inputs: {KEPT_FILES} file(s)" in collected.stdout, collected.stdout
@@ -643,6 +659,8 @@ def test_the_metal_half_is_recorded_absent_when_it_was_not_built(tmp_path: Path)
             f"unixnu-out/{PIN}/tree/build/qemu-metal/owner-trust.bundle",
             f"unixnu-out/{PIN}/tree/build/qemu-metal/trust.json",
             "qemu-metal.log",
+            f"unixnu-out/{PIN}/tree/build/qemu-metal/QemuMetal.bundle/QemuMetal",
+            f"unixnu-out/{PIN}/tree/build/qemu-metal/QemuMetal.bundle/Info.plist",
         ]
     )
     result = run_block(tmp_path, output=output)

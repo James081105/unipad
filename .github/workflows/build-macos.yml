@@ -2933,7 +2933,7 @@ jobs:
               ("unixnu-out/*/logs/payload-adt.log", "logs/payload-adt.log"),
               ("unixnu-out/*/logs/payload-patch.log", "logs/payload-patch.log"),
               ("build-bootloader.subsystem.log", "logs/build-bootloader.subsystem.log"),
-              # The Metal half, when the step above produced it.  Three single
+              # The Metal half, when the step above produced it.  Five single
               # files, deliberately not the bundle directory: the bundle already
               # travels inside the QemuMetal Data seed, and a directory in this
               # tuple would be counted by `stat().st_size` as one entry rather
@@ -2944,6 +2944,21 @@ jobs:
               ("unixnu-out/*/tree/build/qemu-metal/owner-trust.bundle", "owner-trust.bundle"),
               ("unixnu-out/*/tree/build/qemu-metal/trust.json", "metal-cdhash.json"),
               ("qemu-metal.log", "logs/qemu-metal.log"),
+              # The bundle's own executable and plist, so TWO runs' bundles can be
+              # diffed.  Measured 2026-10-31: the same sources, flags and toolchain
+              # produced three different CDHashes (a1fce7f8..., then 68518f18...,
+              # then 6080ce8f... with -Wl,-no_uuid), so LC_UUID is refuted as the
+              # cause and the remaining candidates cannot be separated by
+              # reasoning about them.  A byte diff names the first differing
+              # offset, and that offset says which region is moving: inside the
+              # Mach-O header points at a link-time field, inside __text points at
+              # something the compiler is doing.  Until this line existed the
+              # bundle was only ever inside the packed Data seed, so nobody could
+              # diff two of them.
+              ("unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/QemuMetal",
+               "QemuMetal.bundle/QemuMetal"),
+              ("unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/Info.plist",
+               "QemuMetal.bundle/Info.plist"),
           )
           for pattern, name in PAYLOAD_SET:
               matches = sorted(out.glob(pattern))

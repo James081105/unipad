@@ -273,6 +273,36 @@ def test_the_metal_steps_log_is_in_the_build_logs_artifact() -> None:
     )
 
 
+def test_the_bundle_itself_is_in_the_artifact_so_two_runs_can_be_diffed() -> None:
+    """The bundle's executable and plist, so a byte diff is possible.
+
+    Measured 2026-10-31: the same sources, flags and toolchain produced three
+    different CDHashes -- a1fce7f8..., 68518f18..., 6080ce8f... (the last with
+    ``-Wl,-no_uuid``, which refutes LC_UUID as the cause).  The remaining
+    candidates cannot be separated by reasoning about them, and until the
+    bundle was in the artifact nobody could diff two of them, because it only
+    ever travelled inside the packed Data seed.
+
+    A diff names the first differing offset, and that offset is the answer's
+    shape: inside the Mach-O header points at a link-time field, inside
+    ``__text`` points at something the compiler is doing.
+    """
+    body = _body("collect_inputs") if any(
+        s.get("id") == "collect_inputs" for s in _steps()
+    ) else next(
+        str(s.get("run") or "") for s in _steps()
+        if "Collect the boot inputs" in str(s.get("name") or "")
+    )
+    for fragment in (
+        "unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/QemuMetal",
+        "unixnu-out/*/tree/build/qemu-metal/QemuMetal.bundle/Info.plist",
+    ):
+        assert fragment in body, (
+            f"the boot-inputs bundle does not carry {fragment}; two runs' "
+            "bundles could not be diffed"
+        )
+
+
 def test_the_hand_copied_dependencies_are_the_ones_the_files_describe() -> None:
     """Every id and path this module names is read back out of the workflow.
 
