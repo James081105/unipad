@@ -48,6 +48,7 @@ import hashlib
 import json
 import socket
 import struct
+import subprocess
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -250,6 +251,25 @@ def real_spec() -> dict[str, Any]:
 def real_line(real_spec: dict[str, Any]) -> str:
     """The board's kernel command line, spelled the way the module spells it."""
     return ub.kernel_args_line(real_spec)
+
+
+class _AnswersObjectHelp:
+    """A ``subprocess.run`` that answers ``-object help`` and nothing else.
+
+    The probe's whole question is "what does this binary register", so the test
+    answers it rather than launching something.  A different command is an
+    assertion failure, not a silent empty answer: a probe that quietly accepts
+    any command is a probe that would pass against a QEMU which never ran.
+    """
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+
+    def run(self, argv: list[str], **_kwargs: Any) -> Any:
+        assert "-object" in argv and "help" in argv, argv
+        return subprocess.CompletedProcess(argv, self.returncode,
+                                           stdout=self.stdout, stderr="")
 
 
 def _refused(call, *args: Any, **kwargs: Any) -> UniPadError:
@@ -5169,3 +5189,157 @@ def test_the_report_says_whether_the_run_had_a_window(
     assert report.shared_window_mib == 2048
     plain = ub.BootReport(ok=True, command=argv)
     assert plain.shared_window_mib is None, plain
+
+
+# -- which backend, and asking QEMU before believing it ----------------------
+def test_the_file_backend_is_the_default_and_the_only_one_that_shares(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """``file`` is upstream's; ``ram`` is the diagnostic for a QEMU without it.
+
+    Measured 2026-10-30 on this host's pinned QEMU 11.1.0: ``-object help``
+    prints ``memory-backend-ram`` and nothing else, so ``memory-backend-file``
+    is an *invalid object type*, QEMU exits 1, and the run leaves a
+    correctly-sized ``shared.bin`` beside a 0-byte ``serial.log`` with the
+    whole reason on stderr.  The fallback keeps the guest's second memory node
+    at the same address, which is what the guest-side stages need, and gives up
+    only the sharing -- so the two argv must differ in exactly that one object.
+    """
+    work = tmp_path / "run"
+    shared = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                           shared_window_mib=2048)
+    diagnostic = ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                               shared_window_mib=2048, shared_window_backend="ram")
+    joined_shared = " ".join(shared)
+    joined_ram = " ".join(diagnostic)
+    assert "memory-backend-file,id=ram1,size=2048M" in joined_shared, joined_shared
+    assert "share=on" in joined_shared, joined_shared
+    assert "memory-backend-ram,id=ram1,size=2048M" in joined_ram, joined_ram
+    assert "share=on" not in joined_ram, joined_ram
+    # Everything else about the machine is the same, or the comparison the
+    # fallback exists to make would be a comparison of two different machines.
+    assert shared[:shared.index("-object")] == diagnostic[:diagnostic.index("-object")]
+    assert (shared[shared.index("-numa"):] == diagnostic[diagnostic.index("-numa"):])
+
+
+def test_a_backend_nobody_defined_is_refused_not_ignored(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """A typo must not silently become the diagnostic.
+
+    ``shared_window_backend="filee"`` would otherwise fall through to the
+    ``else`` branch and emit the un-shared node, which is a run that claims a
+    window nothing outside the guest can see -- the exact state the field
+    exists to distinguish.
+    """
+    work = tmp_path / "run"
+    with pytest.raises(UniPadError) as caught:
+        ub.build_argv(qemu, inputs, tmp_path / "esp", work, display="none",
+                      shared_window_mib=2048, shared_window_backend="filee")
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    assert "ram" in caught.value.message and "file" in caught.value.message, caught.value
+
+
+def test_the_probe_asks_the_binary_rather_than_trusting_the_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registered object types are a property of the build, not the version.
+
+    A version string cannot answer this: QEMU 11.1.0 for w64 registers
+    ``memory-backend-ram`` alone, while another 11.1.0 registers
+    ``memory-backend-file`` too.  The answer is read from the binary rather
+    than assumed, so this test answers the probe the way this host's QEMU does
+    and asserts the parse -- including that the header line, which is not an
+    identifier, is not mistaken for a type.
+    """
+    monkeypatch.setattr(
+        ub.subprocess, "run",
+        _AnswersObjectHelp(
+            "List of user creatable objects:\n"
+            "  authz-list\n"
+            "  memory-backend-ram\n"
+            "  rng-egd\n"
+        ).run,
+    )
+    found = ub.qemu_object_types(tmp_path / "qemu-system-aarch64.exe")
+    assert found == {"authz-list", "memory-backend-ram", "rng-egd"}, found
+    assert "memory-backend-file" not in found
+    assert "List of user creatable objects:" not in found
+
+
+def test_a_nonzero_object_help_answers_with_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A QEMU that refuses the question has not said yes.
+
+    The only caller acts on the absence of a name, and a name that was never
+    in a failed answer must not be treated as absent for the right reason.
+    """
+    monkeypatch.setattr(ub.subprocess, "run", _AnswersObjectHelp("", returncode=1).run)
+    assert ub.qemu_object_types(tmp_path / "qemu-system-aarch64.exe") == set()
+
+
+def test_a_binary_that_cannot_be_asked_answers_with_nothing(
+    tmp_path: Path,
+) -> None:
+    """An empty set, not an exception and not a guess.
+
+    The caller's question is "can I use this type", and the conservative answer
+    to a question that could not be asked is no.  Raising here would turn a
+    missing QEMU into a crash inside :func:`boot` instead of the named refusal
+    that a caller can act on.
+    """
+    missing = tmp_path / "no-such-qemu"
+    assert ub.qemu_object_types(missing) == set()
+
+
+def test_a_window_this_qemu_cannot_build_is_refused_before_anything_starts(
+    inputs: BootInputs, tmp_path: Path, qemu: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight that would have saved four minutes of polling a corpse.
+
+    The 2026-10-30 run wrote a 2 GiB ``shared.bin``, produced a 0-byte serial
+    log, and spent 240 seconds reporting ``native_legacy_stage=None`` while
+    QEMU had already exited.  ``boot()`` did record ``QEMU_LAUNCH_FAILED`` and
+    the stderr tail; the caller ignored both.  Refusing here means the run
+    never begins, and the message names the remedy.
+    """
+    work = tmp_path / "run"
+    monkeypatch.setattr(ub, "qemu_object_types", lambda _qemu, timeout=30.0: {"memory-backend-ram"})
+    with pytest.raises(UniPadError) as caught:
+        ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path),
+                seconds=5, shared_window_mib=2048)
+    assert caught.value.code is ErrorCode.CONFIG_INVALID, caught.value
+    message = caught.value.message
+    assert "memory-backend-file" in message, message
+    assert "shared_window_backend='ram'" in message, message
+    # Nothing was started, so nothing was staged and no backing file exists.
+    assert not (work / "shared.bin").exists(), "a refused run must not leave a window"
+
+
+def test_the_diagnostic_backend_skips_the_preflight_and_seeds_no_file(
+    inputs: BootInputs, tmp_path: Path, qemu: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ram`` is the answer to a QEMU without the file backend, so it must not
+    be refused by the probe that exists for the file backend.
+
+    And it must not leave a 2 GiB artefact behind.  This goes through
+    :func:`boot` rather than :func:`build_argv`, because the seeding lives in
+    ``boot`` -- asserting it on ``build_argv`` alone is how the first version of
+    this test passed against a mutant that seeded the file anyway.
+    """
+    work = tmp_path / "run"
+    monkeypatch.setattr(ub, "qemu_object_types", lambda _qemu, timeout=30.0: set())
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    seen: list[Any] = []
+    # ``_watch`` hands its report back, which is the report ``boot`` writes:
+    # capturing it here asserts on the run's own record rather than on a file
+    # some other test also writes.
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: (seen.append(a[1]), a[1])[1])
+    ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path),
+            seconds=0, shared_window_mib=2048, shared_window_backend="ram")
+    assert not (work / "shared.bin").exists(), "a ram window left a file nothing reads"
+    # And the run still says which machine it was, because a report that
+    # records the size but not the backend reads the same as its opposite.
+    assert seen and seen[0].shared_window_backend == "ram", seen[0]

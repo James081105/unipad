@@ -96,6 +96,30 @@ MEMORY_MIB = 6144
 #: the right base instead of a window that silently overlaps the guest's RAM.
 SHARED_WINDOW_BASE = 0x40000000
 
+#: How the window's second memory node is backed.  ``"file"`` is upstream's
+#: spelling and the default: ``memory-backend-file`` with ``mem-path`` and
+#: ``share=on``, which is what lets a process outside the guest map the same
+#: pages the guest writes into.  ``"ram"`` is a diagnostic for a host whose
+#: QEMU does not register ``memory-backend-file`` at all.
+#:
+#: The pinned w64 QEMU 11.1.0 on this host registers exactly one hostmem
+#: backend -- ``-object help`` prints ``memory-backend-ram`` and nothing else
+#: -- so ``memory-backend-file`` is an *invalid object type* there and QEMU
+#: exits 1 with that one line.  Measured 2026-10-30: the run wrote a
+#: 2147483648-byte ``shared.bin``, produced a 0-byte ``serial.log``, and the
+#: whole failure was on stderr.  ``"ram"`` gives the guest the same unmanaged
+#: physical memory at the same address, which is everything the guest-side
+#: stages need, and is read through QMP ``pmemsave`` like every other
+#: counter -- but nothing outside the guest can map it, so it is not the
+#: recipe for a Metal device whose work runs on the host's GPU.
+SHARED_WINDOW_BACKENDS = ("file", "ram")
+
+#: A QOM type name as ``-object help`` prints it.  Deliberately not
+#: ``str.isidentifier``: the hostmem backends are hyphenated, so an identifier
+#: test would reject every one of them and make :func:`qemu_object_types`
+#: answer "no" to a question the binary answered "yes" to.
+_QOM_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
+
 #: The frame-buffer geometry.  1376x1024, not the iPad's 1366x1024: every row of
 #: the picture has to be a multiple of 64 bytes or it lands 2-3 bytes off, and
 #: 1376 is the nearest such width (``run-qemu.py:41-45``).  ``QemuRamfb.efi``
@@ -431,6 +455,11 @@ class BootReport:
     #: 2026-10-30: six ``native_qemu_metal_*`` counters all zero, and every
     #: screendump byte-identical to a run with no addon files written at all.
     shared_window_mib: Optional[int] = None
+    #: How that window was backed: ``"file"`` (upstream, shared with the host)
+    #: or ``"ram"`` (diagnostic, visible to the guest only).  A report that
+    #: records the size but not the backend lets two different machines read
+    #: as the same one, which is the failure this field exists to prevent.
+    shared_window_backend: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     #: Whether the guest's own kernel log reported the Data volume mounted.  This
@@ -1342,6 +1371,42 @@ def qpath(path: Path | str) -> str:
     return Path(path).resolve().as_posix()
 
 
+def qemu_object_types(qemu: Path, timeout: float = 30.0) -> set[str]:
+    """The object types *this* QEMU binary registers, by asking it.
+
+    ``qemu-system-aarch64 -object help`` prints one type per line and exits 0.
+    The set is not knowable from the version string: QEMU 11.1.0 built for
+    w64 registers ``memory-backend-ram`` and not ``memory-backend-file``,
+    while a build with the hostmem backends compiled in registers both.  A
+    run that assumed the wrong set produced a 0-byte serial log and put the
+    whole reason on stderr (2026-10-30).
+
+    An unreadable or timed-out binary returns an empty set rather than
+    raising: the caller's question is "can I use this type", and an empty set
+    answers it conservatively.  A caller that needs to tell "QEMU said no"
+    apart from "QEMU could not be asked" should run the same command itself,
+    because that difference matters for a diagnosis and not for the decision.
+    """
+    try:
+        proc = subprocess.run([str(qemu), "-object", "help"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    out = set()
+    for line in proc.stdout.splitlines():
+        name = line.strip()
+        # A QOM type name, not ``str.isidentifier()``: every hostmem backend is
+        # hyphenated (``memory-backend-ram``, ``rng-egd``) and an identifier
+        # test rejects all of them, which would make this probe answer "no" to
+        # a question the binary answered "yes" to.
+        if _QOM_TYPE.fullmatch(name):
+            out.add(name)
+    return out
+
+
 def _serial_argv(port: Optional[int], log: Path) -> list[str]:
     """The UART's argv: a file by default, a TCP chardev when a port is given.
 
@@ -1446,6 +1511,7 @@ def build_argv(
     memory_mib: int = MEMORY_MIB,
     shared_window_mib: int = 0,
     shared_window_cache: str = "wb",
+    shared_window_backend: str = "file",
     metal_clients: Optional[str] = None,
     display: str = "none",
     ramfb_size: Optional[str] = None,
@@ -1582,6 +1648,15 @@ def build_argv(
             "shared_window_cache must be 'wb' or 'device'; SharedWindow.cpp "
             "refuses anything else and leaves native_shared_window_stage at 1",
             shared_window_cache=repr(shared_window_cache),
+        )
+    if shared_window_backend not in SHARED_WINDOW_BACKENDS:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "shared_window_backend must be one of "
+            f"{SHARED_WINDOW_BACKENDS}; 'file' is upstream's and shares the "
+            "window with the host, 'ram' is the diagnostic for a QEMU that "
+            "does not register memory-backend-file",
+            shared_window_backend=repr(shared_window_backend),
         )
     firmware = Path(inputs.firmware).resolve()
     code_size = firmware.stat().st_size if firmware.is_file() else 0
@@ -1777,9 +1852,16 @@ def build_argv(
         # matching where run-qemu.py appends its own memory options.
         [
             "-object", f"memory-backend-ram,id=ram0,size={int(memory_mib)}M",
+            # ``share=on`` is what makes the second node visible outside the
+            # guest.  Without it the window is ordinary guest RAM and nothing on
+            # the host can map it, which is the state every run before this had.
+            # ``"ram"`` drops both the path and the sharing, which is the whole
+            # difference between the two backends: see SHARED_WINDOW_BACKENDS.
             "-object",
-            f"memory-backend-file,id=ram1,size={int(shared_window_mib)}M,"
-            f"mem-path={qpath(Path(workdir) / 'shared.bin')},share=on",
+            (f"memory-backend-file,id=ram1,size={int(shared_window_mib)}M,"
+             f"mem-path={qpath(Path(workdir) / 'shared.bin')},share=on"
+             if shared_window_backend == "file" else
+             f"memory-backend-ram,id=ram1,size={int(shared_window_mib)}M"),
             "-numa", "node,nodeid=0,cpus=0,memdev=ram0",
             "-numa", "node,nodeid=1,memdev=ram1",
             # SharedWindow.cpp:123 reads exactly this item and returns with the
@@ -1918,6 +2000,7 @@ def boot(
     systemos_image: Optional[Path] = None,
     shared_window_mib: int = 0,
     shared_window_cache: str = "wb",
+    shared_window_backend: str = "file",
     metal_clients: Optional[str] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
@@ -2055,14 +2138,42 @@ def boot(
         with vars_path.open("wb") as handle:
             handle.truncate(code_size)
 
+    # The preflight that would have saved the 2026-10-30 run.  A QEMU that does
+    # not register ``memory-backend-file`` exits 1 with that one line, writes a
+    # correctly-sized ``shared.bin`` and a 0-byte ``serial.log``, and leaves the
+    # whole reason on stderr -- which cost a four-minute poll of a dead process
+    # before anyone read it.  Asking the binary first turns that into an
+    # immediate, named refusal.
+    #
+    # It is here rather than in :func:`build_argv` because asking runs a
+    # subprocess: ``build_argv`` is a pure function of its arguments, and every
+    # test that spells an argv is a test that must not need a QEMU.
+    if shared_window_mib and shared_window_backend == "file":
+        available = qemu_object_types(qemu)
+        if "memory-backend-file" not in available:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "this QEMU does not register 'memory-backend-file', so it "
+                "cannot give the guest a shared window: it exits 1 with "
+                "'invalid object type' after creating the backing file. "
+                "Ask it with `-object help`. Pass shared_window_backend='ram' "
+                "for the diagnostic second memory node, which the guest can "
+                "still find but nothing outside the guest can map",
+                qemu=str(safe_location(qemu)),
+                registered_object_types=sorted(available),
+            )
+
     # The shared window's backing file, seeded here for the same reason vars.fd
     # is: QEMU's ``memory-backend-file`` is the one object whose missing file is
     # an exit 1 with a path that looks right, and a run that never started is
     # indistinguishable from a boot that failed except by reading QEMU's stderr.
     # run-qemu.py lets QEMU create and delete it; this module does not, because
-    # the file is evidence of what size the window actually was.
+    # the file is evidence of what size the window actually was.  Only the file
+    # backend has one -- seeding a file for the ``ram`` backend would leave a
+    # 2 GiB artefact in the run directory that nothing read, which is the kind
+    # of evidence that gets mistaken for a window that existed.
     window_path = work / "shared.bin"
-    if shared_window_mib:
+    if shared_window_mib and shared_window_backend == "file":
         wanted = int(shared_window_mib) << 20
         if not window_path.is_file() or window_path.stat().st_size != wanted:
             with window_path.open("wb") as handle:
@@ -2073,6 +2184,7 @@ def boot(
         memory_mib=memory_mib, display=display,
         shared_window_mib=shared_window_mib,
         shared_window_cache=shared_window_cache,
+        shared_window_backend=shared_window_backend,
         metal_clients=metal_clients,
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
@@ -2097,6 +2209,7 @@ def boot(
         # kernel, mounted its Data volume and presented nothing is otherwise
         # indistinguishable from one that never had a window to present into.
         shared_window_mib=int(shared_window_mib) if shared_window_mib else None,
+        shared_window_backend=shared_window_backend if shared_window_mib else None,
     )
 
     stdout_path = work / "qemu-stdout.log"
