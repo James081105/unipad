@@ -50,6 +50,7 @@ caller plugged in, so this module stays testable without a boot.
 from __future__ import annotations
 
 import ctypes
+import sys
 from ctypes import wintypes
 from typing import Any, Optional, Protocol
 
@@ -140,10 +141,26 @@ IDC_ARROW = 32512
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 768
 
+#: Whether this process can create a window at all.  A Windows surface is
+#: Windows-only by nature, but this MODULE must import everywhere:
+#: ``unipad.host.__init__`` pulls it in, and the macOS runner executes that
+#: import in the pin cross-check.  MEASURED: declaring ``ctypes.WINFUNCTYPE``
+#: at module level made run 41238555718 die at
+#:   AttributeError: module 'ctypes' has no attribute 'WINFUNCTYPE'
+#: before it reached a single build step -- a module-level platform assumption
+#: took the whole package down.  The house pattern (``unipad.host.httpsvc``)
+#: reaches ``ctypes.windll`` lazily inside a function for the same reason.
+_WINDOWS = sys.platform == "win32"
+
 #: The window procedure signature, declared once so both the structure field
-#: and the callback use the same one.
-_WNDPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT,
-                              wintypes.WPARAM, wintypes.LPARAM)
+#: and the callback use the same one.  Off Windows it is a placeholder: the
+#: structure still has to be definable, and :class:`SurfaceWindow` refuses to
+#: construct before anything would use it.
+if _WINDOWS:
+    _WNDPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT,
+                                  wintypes.WPARAM, wintypes.LPARAM)
+else:  # pragma: no cover - exercised only off Windows
+    _WNDPROC = ctypes.c_void_p
 
 
 class WNDCLASSEXW(ctypes.Structure):
@@ -227,86 +244,91 @@ class FrameSource(Protocol):
 
 # --- the GDI entry points, with the signatures ctypes will not guess ---
 
-_USER32 = ctypes.windll.user32
-_GDI32 = ctypes.windll.gdi32
-_KERNEL32 = ctypes.windll.kernel32
+if not _WINDOWS:  # pragma: no cover - exercised only off Windows
+    # Nothing below may touch ctypes.windll: it does not exist off
+    # Windows, and reaching it at import time is what broke the runner.
+    _USER32 = _GDI32 = _KERNEL32 = None
+else:
+    _USER32 = ctypes.windll.user32
+    _GDI32 = ctypes.windll.gdi32
+    _KERNEL32 = ctypes.windll.kernel32
 
-_USER32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
-_USER32.RegisterClassExW.restype = wintypes.ATOM
-_USER32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
-_USER32.UnregisterClassW.restype = wintypes.BOOL
-_USER32.CreateWindowExW.argtypes = [
-    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-    wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
-    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
-_USER32.CreateWindowExW.restype = wintypes.HWND
-_USER32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
-                                   wintypes.WPARAM, wintypes.LPARAM]
-_USER32.DefWindowProcW.restype = wintypes.LPARAM
-_USER32.DestroyWindow.argtypes = [wintypes.HWND]
-_USER32.DestroyWindow.restype = wintypes.BOOL
-_USER32.ShowWindow.argtypes = [wintypes.HWND, wintypes.INT]
-_USER32.ShowWindow.restype = wintypes.BOOL
-_USER32.UpdateWindow.argtypes = [wintypes.HWND]
-_USER32.UpdateWindow.restype = wintypes.BOOL
-_USER32.AdjustWindowRectEx.argtypes = [ctypes.POINTER(wintypes.RECT),
-                                       wintypes.DWORD, wintypes.BOOL,
-                                       wintypes.DWORD]
-_USER32.AdjustWindowRectEx.restype = wintypes.BOOL
-_USER32.GetDC.argtypes = [wintypes.HWND]
-_USER32.GetDC.restype = wintypes.HDC
-_USER32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
-_USER32.ReleaseDC.restype = wintypes.INT
-_USER32.GetSysColorBrush.argtypes = [wintypes.INT]
-_USER32.GetSysColorBrush.restype = wintypes.HBRUSH
-_USER32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
-_USER32.LoadIconW.restype = wintypes.HICON
-_USER32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
-_USER32.LoadCursorW.restype = wintypes.HANDLE
-_USER32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND,
-                                 wintypes.UINT, wintypes.UINT, wintypes.UINT]
-_USER32.PeekMessageW.restype = wintypes.BOOL
-_USER32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
-_USER32.TranslateMessage.restype = wintypes.BOOL
-_USER32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
-_USER32.DispatchMessageW.restype = wintypes.LPARAM
-_USER32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-_USER32.GetGuiResources.restype = wintypes.DWORD
-_USER32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.INT,
-                                  wintypes.INT, wintypes.INT, wintypes.INT,
-                                  wintypes.UINT]
-_USER32.SetWindowPos.restype = wintypes.BOOL
-_USER32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-_USER32.GetClientRect.restype = wintypes.BOOL
-_USER32.IsWindow.argtypes = [wintypes.HWND]
-_USER32.IsWindow.restype = wintypes.BOOL
-_USER32.PostQuitMessage.argtypes = [wintypes.INT]
-_USER32.PostQuitMessage.restype = None
+    _USER32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+    _USER32.RegisterClassExW.restype = wintypes.ATOM
+    _USER32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    _USER32.UnregisterClassW.restype = wintypes.BOOL
+    _USER32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    _USER32.CreateWindowExW.restype = wintypes.HWND
+    _USER32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                       wintypes.WPARAM, wintypes.LPARAM]
+    _USER32.DefWindowProcW.restype = wintypes.LPARAM
+    _USER32.DestroyWindow.argtypes = [wintypes.HWND]
+    _USER32.DestroyWindow.restype = wintypes.BOOL
+    _USER32.ShowWindow.argtypes = [wintypes.HWND, wintypes.INT]
+    _USER32.ShowWindow.restype = wintypes.BOOL
+    _USER32.UpdateWindow.argtypes = [wintypes.HWND]
+    _USER32.UpdateWindow.restype = wintypes.BOOL
+    _USER32.AdjustWindowRectEx.argtypes = [ctypes.POINTER(wintypes.RECT),
+                                           wintypes.DWORD, wintypes.BOOL,
+                                           wintypes.DWORD]
+    _USER32.AdjustWindowRectEx.restype = wintypes.BOOL
+    _USER32.GetDC.argtypes = [wintypes.HWND]
+    _USER32.GetDC.restype = wintypes.HDC
+    _USER32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    _USER32.ReleaseDC.restype = wintypes.INT
+    _USER32.GetSysColorBrush.argtypes = [wintypes.INT]
+    _USER32.GetSysColorBrush.restype = wintypes.HBRUSH
+    _USER32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    _USER32.LoadIconW.restype = wintypes.HICON
+    _USER32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    _USER32.LoadCursorW.restype = wintypes.HANDLE
+    _USER32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND,
+                                     wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    _USER32.PeekMessageW.restype = wintypes.BOOL
+    _USER32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+    _USER32.TranslateMessage.restype = wintypes.BOOL
+    _USER32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+    _USER32.DispatchMessageW.restype = wintypes.LPARAM
+    _USER32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _USER32.GetGuiResources.restype = wintypes.DWORD
+    _USER32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.INT,
+                                      wintypes.INT, wintypes.INT, wintypes.INT,
+                                      wintypes.UINT]
+    _USER32.SetWindowPos.restype = wintypes.BOOL
+    _USER32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _USER32.GetClientRect.restype = wintypes.BOOL
+    _USER32.IsWindow.argtypes = [wintypes.HWND]
+    _USER32.IsWindow.restype = wintypes.BOOL
+    _USER32.PostQuitMessage.argtypes = [wintypes.INT]
+    _USER32.PostQuitMessage.restype = None
 
-_GDI32.CreateCompatibleDC.argtypes = [wintypes.HDC]
-_GDI32.CreateCompatibleDC.restype = wintypes.HDC
-_GDI32.CreateDIBSection.argtypes = [
-    wintypes.HDC, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
-    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
-_GDI32.CreateDIBSection.restype = wintypes.HBITMAP
-_GDI32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
-_GDI32.SelectObject.restype = wintypes.HGDIOBJ
-_GDI32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
-_GDI32.DeleteObject.restype = wintypes.BOOL
-_GDI32.DeleteDC.argtypes = [wintypes.HDC]
-_GDI32.DeleteDC.restype = wintypes.BOOL
-_GDI32.StretchDIBits.argtypes = [
-    wintypes.HDC, wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
-    wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
-    ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT, wintypes.DWORD]
-_GDI32.GetPixel.argtypes = [wintypes.HDC, wintypes.INT, wintypes.INT]
-_GDI32.GetPixel.restype = wintypes.DWORD
-_GDI32.StretchDIBits.restype = wintypes.INT
+    _GDI32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    _GDI32.CreateCompatibleDC.restype = wintypes.HDC
+    _GDI32.CreateDIBSection.argtypes = [
+        wintypes.HDC, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+        ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+    _GDI32.CreateDIBSection.restype = wintypes.HBITMAP
+    _GDI32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    _GDI32.SelectObject.restype = wintypes.HGDIOBJ
+    _GDI32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    _GDI32.DeleteObject.restype = wintypes.BOOL
+    _GDI32.DeleteDC.argtypes = [wintypes.HDC]
+    _GDI32.DeleteDC.restype = wintypes.BOOL
+    _GDI32.StretchDIBits.argtypes = [
+        wintypes.HDC, wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
+        wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
+        ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT, wintypes.DWORD]
+    _GDI32.GetPixel.argtypes = [wintypes.HDC, wintypes.INT, wintypes.INT]
+    _GDI32.GetPixel.restype = wintypes.DWORD
+    _GDI32.StretchDIBits.restype = wintypes.INT
 
-_KERNEL32.GetCurrentProcess.argtypes = []
-_KERNEL32.GetCurrentProcess.restype = wintypes.HANDLE
-_KERNEL32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-_KERNEL32.GetModuleHandleW.restype = wintypes.HMODULE
+    _KERNEL32.GetCurrentProcess.argtypes = []
+    _KERNEL32.GetCurrentProcess.restype = wintypes.HANDLE
+    _KERNEL32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _KERNEL32.GetModuleHandleW.restype = wintypes.HMODULE
 
 
 def _header_for(width: int, height: int) -> BITMAPINFO:
@@ -454,6 +476,17 @@ class SurfaceWindow:
 
     def __init__(self, title: str = "UniPad", *, width: int = DEFAULT_WIDTH,
                  height: int = DEFAULT_HEIGHT) -> None:
+        if not _WINDOWS:
+            # Refused here rather than at import, so the module stays importable
+            # everywhere and the pure helpers stay usable everywhere.  A caller
+            # that reaches this off Windows gets a named refusal instead of an
+            # AttributeError from inside ctypes.
+            raise UniPadError(
+                ErrorCode.RENDER_FAILED,
+                "a Windows surface needs Windows; this host is "
+                f"{sys.platform}",
+                platform=sys.platform,
+            )
         if width <= 0 or height <= 0:
             raise UniPadError(
                 ErrorCode.RENDER_FAILED,

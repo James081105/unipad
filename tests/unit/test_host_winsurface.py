@@ -485,3 +485,84 @@ def test_a_bad_dimension_is_refused_before_any_window_is_made() -> None:
     with pytest.raises(UniPadError) as caught:
         SurfaceWindow("unipad-bad", width=0, height=10)
     assert caught.value.code == ErrorCode.RENDER_FAILED
+
+
+def test_the_module_imports_off_windows() -> None:
+    """``unipad.host.winsurface`` must import on every platform.
+
+    ``unipad.host.__init__`` pulls this module in, and the macOS runner executes
+    that import in the pin cross-check.  MEASURED: declaring
+    ``ctypes.WINFUNCTYPE`` at module level made run 41238555718 die with
+    ``AttributeError: module 'ctypes' has no attribute 'WINFUNCTYPE'`` before it
+    reached a single build step -- a module-level platform assumption took the
+    whole package down, and the failure had nothing to do with what the run was
+    for.
+
+    The first version of this test only re-imported a module that had already
+    imported successfully *on Windows*, so it could not have caught that
+    regression -- it passed before the fix and after it alike.  A guard test that
+    cannot go red where the defect lives is worse than no test.  So this one
+    reloads the module with the platform faked, which is the only way to make the
+    assertion bite on the host where the suite actually runs.
+
+    ``os.name`` is flipped as well as ``sys.platform``, because
+    ``unipad.host.httpsvc`` guards ``ctypes.windll`` behind ``os.name == 'nt'``
+    -- but only ``winsurface`` is reloaded, and every module it imports is
+    already in ``sys.modules``, so nothing re-executes CPython's ``shutil`` and
+    its ``import posix``.
+
+    ``ctypes.WINFUNCTYPE`` and ``ctypes.windll`` are *deleted* for the reload,
+    not just unreferenced.  That is the part that makes the test bite: the defect
+    was fatal only because macOS lacks those attributes, and on Windows they
+    exist, so a reload without deleting them passes with the defect present.
+    MEASURED: with the platform faked but the attributes intact, a reintroduced
+    module-level ``ctypes.WINFUNCTYPE`` left this test green.
+    """
+    import ctypes
+    import importlib
+    import os
+
+    import shutil  # noqa: F401  # pre-import: flipping os.name must not ask for posix
+
+    module = importlib.import_module("unipad.host.winsurface")
+    real_platform, real_os_name = sys.platform, os.name
+    removed = {name: getattr(ctypes, name)
+               for name in ("WINFUNCTYPE", "windll", "oledll")
+               if hasattr(ctypes, name)}
+    try:
+        sys.platform = "darwin"
+        os.name = "posix"
+        for name in removed:
+            delattr(ctypes, name)
+        reloaded = importlib.reload(module)
+        assert reloaded._WINDOWS is False, "the platform guard did not take"
+        assert reloaded._USER32 is None and reloaded._GDI32 is None
+        # The pure conversion is platform-independent and must stay so.
+        width, height, rows = reloaded.ppm_to_bgr(
+            reloaded.solid_frame(3, 2, (1, 2, 3)))
+        assert (width, height) == (3, 2)
+        assert rows[:3] == bytes((3, 2, 1))
+        # And a caller reaching for a window gets a named refusal, not an
+        # AttributeError out of ctypes.
+        with pytest.raises(UniPadError) as caught:
+            reloaded.SurfaceWindow("unipad-not-windows")
+        assert caught.value.code == ErrorCode.RENDER_FAILED
+        assert "windows" in str(caught.value).lower()
+    finally:
+        sys.platform = real_platform
+        os.name = real_os_name
+        for name, value in removed.items():
+            setattr(ctypes, name, value)
+        importlib.reload(module)
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="this host can create a window, so the refusal is unreachable")
+def test_a_surface_refuses_to_construct_off_windows() -> None:
+    """Off Windows the refusal is named, not an AttributeError from ctypes."""
+    from unipad.host.winsurface import SurfaceWindow
+
+    with pytest.raises(UniPadError) as caught:
+        SurfaceWindow("unipad-not-windows")
+    assert caught.value.code == ErrorCode.RENDER_FAILED
+    assert "windows" in str(caught.value).lower()
