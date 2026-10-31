@@ -41,11 +41,11 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import urllib.error
 import urllib.request
 import zipfile
-from io import BytesIO
 from pathlib import Path
 
 #: The member of the artifact that carries the record, relative to the artifact
@@ -65,6 +65,26 @@ EXPECTED_SOURCE_BASENAME = "IOPlatformExpert.c"
 
 class RecordError(Exception):
     """A refusal to trust or use the record.  Never coerced into a success."""
+
+
+def parse_record(raw: bytes) -> dict:
+    """The record's JSON, normalized the way ``build-arm-driver.py:27`` normalizes it.
+
+    XNU's ``-MJ`` writes one JSON object per compile and appends a comma separator
+    when the same output file is written again, so the file on disk ends ``},``.
+    ``build-arm-driver.py`` handles that with ``.strip().rstrip(',')``; a plain
+    ``json.loads`` here raises "Extra data" -- measured on run 41218257835, where
+    the builder parsed the file successfully and this script refused it.  A second
+    parser of the same bytes is a divergence, so the same normalization is used.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RecordError(f"the record is not UTF-8: {error}") from None
+    try:
+        return json.loads(text.strip().rstrip(","))
+    except ValueError as error:
+        raise RecordError(f"the record is not JSON even after the trailing comma is removed: {error}") from None
 
 
 def api(url: str, token: str, *, stream: bool = False):
@@ -112,6 +132,47 @@ def resolve_artifact(repo: str, run_id: str, prefix: str, token: str) -> dict:
     return matches[0]
 
 
+def download_with_curl(url: str, token: str) -> Path:
+    """The artifact zip, fetched by curl into a private temporary file.
+
+    The whole archive is fetched even though one 9 KB member is wanted: the GitHub
+    API offers no partial download of an artifact, and the artifact is ~1.1 GB.  It
+    is written to a temporary file and LEFT THERE, returned as a path, because
+    reading 1.1 GB into a Python bytes object on a runner that also holds a build
+    tree is how a job dies of the OOM killer with a message about something else.
+    The caller deletes it.
+    """
+    import subprocess
+    import tempfile
+
+    curl = shutil.which("curl")
+    if not curl:
+        raise RecordError("curl is not on PATH; the artifact download needs it")
+    with tempfile.NamedTemporaryFile(prefix="unipad-artifact-", suffix=".zip", delete=False) as handle:
+        temporary = Path(handle.name)
+    command = [
+        curl,
+        "--silent",
+        "--show-error",
+        "--location",
+        "--fail-with-body",
+        "--retry", "3",
+        "--retry-delay", "2",
+        "--max-time", "900",
+        "-H", f"Authorization: Bearer {token}",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "X-GitHub-Api-Version: 2022-11-28",
+        "-o", str(temporary),
+        url,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()[:500]
+        temporary.unlink(missing_ok=True)
+        raise RecordError(f"curl exited {result.returncode} downloading the artifact: {detail}")
+    return temporary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="owner/name")
@@ -126,7 +187,21 @@ def main() -> int:
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         raise SystemExit("GITHUB_TOKEN is not set: the artifact API needs it")
+    # The zip is ~1.1 GB of fetched material on a runner that also holds a build
+    # tree.  It is handed back through a holder so that this finally -- which runs
+    # on success, on refusal and on an unexpected exception alike -- can delete it.
+    # An earlier revision kept it in a local of the function that raised, so the
+    # file survived every failure path.
+    holder: dict = {}
+    try:
+        return obtain(args, token, holder)
+    finally:
+        fetched = holder.get("payload")
+        if fetched is not None:
+            fetched.unlink(missing_ok=True)
 
+
+def obtain(args, token: str, holder: dict) -> int:
     try:
         artifact = resolve_artifact(args.repo, args.run_id, args.artifact_prefix, token)
         artifact_id = artifact.get("id")
@@ -136,11 +211,19 @@ def main() -> int:
             raise RecordError(f"artifact {artifact_id} carries no archive_download_url")
 
         print(f"artifact: {artifact.get('name')} id={artifact_id} {size} bytes", flush=True)
-        with api(download, token, stream=True) as response:
-            payload = BytesIO(response.read())
-        print(f"downloaded {len(payload.getvalue())} bytes", flush=True)
+        # curl, not urllib, and the reason is a measurement rather than a
+        # preference.  The artifact API answers with a 302 to a blob URL carrying a
+        # SAS token.  urllib follows the redirect WITH the Authorization header
+        # still attached, and Azure Blob Storage rejects a request that carries
+        # both a SAS token and an Authorization header -- "Server failed to
+        # authenticate the request", HTTP 401.  Measured on run 41218257835: the
+        # listing succeeded and the download did not, 0.5 s apart.  curl drops
+        # custom headers on a cross-host redirect unless --location-trusted is
+        # given, which is exactly the behaviour wanted here.
+        holder["payload"] = download_with_curl(download, token)
+        print(f"downloaded {holder['payload'].stat().st_size} bytes", flush=True)
 
-        with zipfile.ZipFile(payload) as archive:
+        with zipfile.ZipFile(holder["payload"]) as archive:
             names = archive.namelist()
             if args.member not in names:
                 # A near-miss is worth naming: the member list is the only way to
@@ -197,9 +280,9 @@ def main() -> int:
         return 1
 
     try:
-        record = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
-        print(f"::error::the record is not JSON: {error.__class__.__name__}")
+        record = parse_record(raw)
+    except RecordError as error:
+        print(f"::error::{error}")
         return 1
 
     arguments = record.get("arguments")

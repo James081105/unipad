@@ -72,6 +72,13 @@ NOT_CLAIMED = (
 #: The four outcomes.  A verdict outside this set is a bug in this script.
 OUTCOMES = ("compiled", "invoked-but-failed", "not-invoked", "unmeasured")
 
+#: What a translation unit looks like on a clang command line.  Used to find the
+#: source in the command the builder wrote, because "the argument that is not a
+#: flag" is not a test: a clang command has hundreds of those.
+SOURCE_SUFFIXES = (
+    ".cpp", ".cc", ".cxx", ".c++", ".C", ".c", ".m", ".mm", ".s", ".S",
+)
+
 
 def sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
@@ -194,6 +201,14 @@ def read_compile_command(tree: Path, component: str) -> dict:
 
     ``build-arm-driver.py`` writes ``build/<out>/compile-command.json`` before it
     runs clang, so this is the command as executed rather than as reconstructed.
+
+    The source is identified by its EXTENSION, not by "the first argument that is
+    not a flag".  The first revision of this used the latter and read
+    ``-I .../.cache/xnu-work/osfmk`` as the source, which made a correct build
+    report that it had compiled the wrong translation unit -- measured on run
+    41218257835, where the archive carried 59 NativeVirtioConsole symbols and the
+    linked kernel carried the same 59.  A clang command has hundreds of non-flag
+    arguments (every ``-D`` define is one), so "not a flag" is not a test.
     """
     out_names = {
         "NativeVirtioConsole": "native-virtio-console",
@@ -211,26 +226,25 @@ def read_compile_command(tree: Path, component: str) -> dict:
         return {"present": False, "reason": f"compile-command.json does not parse: {error.__class__.__name__}"}
     if not isinstance(command, list) or not command:
         return {"present": False, "reason": "compile-command.json is not a non-empty list"}
-    # The source is the one argument that is not a flag and not the output.  The
-    # builder puts ``-o <destination>`` in there, so the destination has to be
-    # skipped or it would be read as the source.
-    source = None
-    skip_next = False
-    for value in command:
-        if skip_next:
-            skip_next = False
-            continue
-        if value == "-o":
-            skip_next = True
-            continue
-        if value.startswith("-"):
-            continue
-        source = value
+    sources = [
+        value
+        for value in command
+        if isinstance(value, str) and value.lower().endswith(SOURCE_SUFFIXES)
+    ]
+    if not sources:
+        return {
+            "present": True,
+            "path": path.as_posix(),
+            "source": None,
+            "source_basename": None,
+            "reason": "no argument of the command ends in a source extension",
+        }
     return {
         "present": True,
         "path": path.as_posix(),
-        "source": source,
-        "source_basename": Path(source).name if source else None,
+        "source": sources[0],
+        "source_basename": Path(sources[0]).name,
+        "source_candidates": sources,
     }
 
 
@@ -435,18 +449,37 @@ def main() -> int:
         and command.get("source")
         and command["source"].replace("\\", "/").endswith(expected_source)
     )
-    if command.get("present") and not source_is_the_driver:
-        problems.append(
-            "the compile command's source is "
-            f"{command.get('source')!r}, not .../{expected_source}: the builder ran "
-            "against the wrong translation unit"
-        )
 
+    # Two independent checks that the right translation unit was compiled, and
+    # they are NOT weighted equally.  The symbols are the ground truth: an object
+    # carrying the driver's own class symbols is that driver, whatever the command
+    # line says.  The source path is supporting evidence that explains it.
+    #
+    # The first revision made the source path the gate and reported
+    # `invoked-but-failed` on a build whose archive and whose linked kernel both
+    # carried 59 NativeVirtioConsole symbols (run 41218257835), because it had read
+    # an `-I` argument as the source.  A detector that fails a correct build is
+    # worse than no detector, so the symbol check is what decides.
     symbols = object_symbols(tree, component, component)
-    if symbols.get("checked") and symbols.get("matches", 0) == 0:
-        problems.append(
-            f"the object carries no symbol containing {component}; the archive is not this driver"
-        )
+    object_is_the_driver = bool(symbols.get("checked") and symbols.get("matches", 0) > 0)
+
+    if not object_is_the_driver:
+        if symbols.get("checked"):
+            problems.append(
+                f"the object carries no symbol containing {component}; the archive is not this driver"
+            )
+        elif command.get("present") and not source_is_the_driver:
+            # nm was unavailable, so the source path is all there is.  Say which
+            # signal was used rather than presenting one as the other.
+            problems.append(
+                "nm was unavailable, and the compile command's source is "
+                f"{command.get('source')!r}, not .../{expected_source}"
+            )
+        elif command.get("present") and command.get("source") is None:
+            problems.append(
+                "nm was unavailable and the compile command names no source file; "
+                "there is no evidence about which translation unit was compiled"
+            )
 
     # ---- 5. did it land in the kernel? --------------------------------
     flags = config_flags(args.config)
@@ -560,6 +593,7 @@ def main() -> int:
         "archive": archive_facts,
         "compile_command": command,
         "source_is_the_driver": source_is_the_driver,
+        "object_is_the_driver": object_is_the_driver,
         "object_symbols": symbols,
         "config_flags": flags,
         "linked": linked,
@@ -593,6 +627,7 @@ def main() -> int:
             f"sha256 `{archive_facts['sha256']}`"
         )
     lines.append(f"- **source_is_the_driver**: `{source_is_the_driver}`")
+    lines.append(f"- **object_is_the_driver**: `{object_is_the_driver}` (the archive's own symbols; this is the check that decides)")
     lines.append(f"- **linked**: `{linked}` -- {linked_reason}")
     if flags.get("present"):
         lines.append(
@@ -602,6 +637,14 @@ def main() -> int:
         )
     if per_builder_log:
         lines.append(f"- **per-builder log**: `{per_builder_log.as_posix()}`")
+    if link_facts.get("checked") and link_facts.get("mentions") == 0 and linked == "yes":
+        # Not a problem, and worth saying so: the link log does not name the
+        # archive on its command line, so "the linker was told about it" is not
+        # measurable from the log.  The symbol check is what measures it.
+        lines.append(
+            "- **link log**: does not name the archive; the evidence for `linked` is "
+            "the kernel's own symbols, not the linker's command line"
+        )
     if preflight:
         lines.append(
             "- **preconditions**: "

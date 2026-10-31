@@ -513,7 +513,12 @@ jobs:
             echo "builder_ran=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          mapfile -t parts < "$argv_file"
+          # `mapfile` is a bash 4 builtin and GitHub's macOS runners run /bin/bash,
+          # which is 3.2: the first dispatch died with "mapfile: command not found"
+          # (run 41218257835) and the step exited 127 before the builder was ever
+          # given a chance.  A while-read loop is the portable spelling.
+          parts=()
+          while IFS= read -r line; do parts+=("$line"); done < "$argv_file"
           log="$REPORT_DIR/${component}-builder.log"
           echo "+ (cd $tree && python3 ${parts[*]})"
           started=$(date -u +%s)
@@ -1101,6 +1106,18 @@ jobs:
           set -uo pipefail
           tree="$OUT_ROOT/$BOARD/tree"
           member="build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
+          # The fact is written FIRST, from the file's existence, and only then is
+          # the provenance read.  The first dispatch wrote it inside the branch,
+          # after a json.loads that raised, so the step exited 1 having recorded
+          # nothing -- and the verdict then read the empty output as "the run could
+          # not set the build up" on a run whose bootstrap pass had in fact produced
+          # the record and whose archive had built and linked (run 41218257835).
+          if [ -f "$tree/$member" ]; then
+            echo "record=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "record=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::no compile record was produced; the XNU bootstrap pass did not reach iokit"
+          fi
           if [ -f "$tree/$member" ]; then
             python3 - "$tree/$member" "$REPORT_DIR/compile-record-provenance.json" <<'PY'
           import hashlib
@@ -1110,7 +1127,11 @@ jobs:
 
           source, destination = Path(sys.argv[1]), Path(sys.argv[2])
           raw = source.read_bytes()
-          record = json.loads(raw.decode("utf-8"))
+          # The same normalization build-arm-driver.py:27 applies: XNU's -MJ leaves a
+          # trailing comma separator, so a plain json.loads raises "Extra data".
+          # Measured on run 41218257835 -- the builder parsed this file and this
+          # step refused it.
+          record = json.loads(raw.decode("utf-8").strip().rstrip(","))
           provenance = {
               "origin": "compiled by this run's own XNU bootstrap pass",
               "detail": (
@@ -1123,15 +1144,16 @@ jobs:
               "size_bytes": len(raw),
               "cwd_the_builder_uses": record.get("directory"),
               "cwd_exists_here": Path(str(record.get("directory"))).is_dir(),
+              "source_the_record_names": next(
+                  (value for value in (record.get("arguments") or [])
+                   if isinstance(value, str) and value.endswith("IOPlatformExpert.c")),
+                  None,
+              ),
           }
           destination.parent.mkdir(parents=True, exist_ok=True)
           destination.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           print(f"record: produced by this run, sha256 {provenance['sha256']}")
           PY
-            echo "record=ok" >> "$GITHUB_OUTPUT"
-          else
-            echo "record=failed" >> "$GITHUB_OUTPUT"
-            echo "::error::no compile record was produced; the XNU bootstrap pass did not reach iokit"
           fi
           exit 0
 
