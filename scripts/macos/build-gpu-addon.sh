@@ -86,6 +86,86 @@ case "$LOG" in /*|[A-Za-z]:/*) ;; *) LOG="$PWD/$LOG" ;; esac
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
 die() { log "FAIL $*"; log "---- last 25 lines of $LOG ----"; tail -25 "$LOG" | tee -a "$LOG" >&2; exit 1; }
 
+# One record per ring, written to $SUMMARY at the end.  The log already says
+# everything in it; what the log cannot do is be READ by the next step, and the
+# next step is where the loss was.
+#
+# The defect this exists for: ``ring_best_effort`` returns 0 when a ring goes
+# DEGRADED, by design -- the artifact exists and the chain must continue on it.
+# So this script exits 0, and the workflow's ``if bash build-gpu-addon.sh .``
+# therefore set ``built=true`` and moved on.  A run in which an assertion was
+# given up was indistinguishable from a clean one in everything a reader looks
+# at: exit status, GITHUB_OUTPUT, and the artifact itself.  The log said
+# DEGRADED; nothing consumed it.
+#
+# So the state is written where a consumer can reach it, and the consumer is
+# required to surface it separately.  Derived from the rings that ran rather
+# than hand-listed, so a ring added next month is recorded without anyone
+# remembering to.
+RINGS=()
+SUMMARY="$LOGDIR/addon-summary.json"
+
+ring_record() {
+    # ring_record NAME STATUS SECONDS [ARTIFACT] [DETAIL]
+    local name="$1" status="$2" seconds="$3" artifact="${4:-}" detail="${5:-}"
+    RINGS+=("$name|$status|$seconds|$artifact|$detail")
+}
+
+# ring_summary -- write $SUMMARY from the accumulated records.
+#
+# A JSON document rather than more log lines, for the same reason
+# build-macos.sh writes build-report.json: the log is for a human reading a
+# failure, and this is for the step that has to decide what to report.  Both are
+# needed and they are not the same artifact.
+ring_summary() {
+    local first=1 entry name status seconds artifact detail
+    local j_name j_status j_artifact j_detail
+    {
+        printf '{\n  "rings": ['
+        for entry in ${RINGS[@]+"${RINGS[@]}"}; do
+            IFS='|' read -r name status seconds artifact detail <<<"$entry"
+            (( first )) || printf ','
+            first=0
+            printf '\n    {"name":"%s","status":"%s","seconds":%s,"artifact":"%s","detail":"%s"}' \
+                "$(json_escape "$name")" "$(json_escape "$status")" "$seconds" \
+                "$(json_escape "$artifact")" "$(json_escape "$detail")"
+        done
+        printf '\n  ],\n'
+        printf '  "degraded": ['
+        first=1
+        for entry in ${RINGS[@]+"${RINGS[@]}"}; do
+            IFS='|' read -r name status seconds artifact detail <<<"$entry"
+            [[ "$status" == degraded ]] || continue
+            (( first )) || printf ','
+            first=0
+            printf '"%s"' "$(json_escape "$name")"
+        done
+        printf '],\n'
+        printf '  "failed": ['
+        first=1
+        for entry in ${RINGS[@]+"${RINGS[@]}"}; do
+            IFS='|' read -r name status seconds artifact detail <<<"$entry"
+            [[ "$status" == failed ]] || continue
+            (( first )) || printf ','
+            first=0
+            printf '"%s"' "$(json_escape "$name")"
+        done
+        printf ']\n}\n'
+    } >"$SUMMARY"
+    log "ring summary written to $SUMMARY"
+}
+
+# json_escape STRING -- STRING as a JSON string body, without the quotes.
+#
+# Ring names and artifacts are ASCII paths, but the DETAIL field carries the
+# failing assertion's text, which is upstream's and not guaranteed to be.  A
+# quote or a backslash in it would otherwise produce a summary nobody can parse
+# -- and a summary that fails to parse is read as "no degraded rings", which is
+# the exact failure this whole mechanism exists to prevent.
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\n\r'
+}
+
 # Run one ring whose failure is survivable, because the ring's OUTPUTS are what
 # the next ring needs and the failure is in an assertion AFTER them.
 #
@@ -115,17 +195,26 @@ ring_best_effort() {
     ended="$(date +%s)"
     if [[ "$status" -eq 0 ]]; then
         log "PASS $name in $((ended - started))s (its log: $file)"
+        ring_record "$name" pass "$((ended - started))" "$artifact" ""
         return 0
     fi
     if [[ ! -f "$artifact" ]]; then
         log "FAIL $name after $((ended - started))s (exit $status) and $artifact was not produced; its log: $file"
         tail -25 "$file" | tee -a "$LOG" >&2
+        ring_record "$name" failed "$((ended - started))" "$artifact" "exit $status before producing it"
+        ring_summary
         die "$name failed before producing $artifact"
     fi
+    # DEGRADED, and it is recorded as its own status rather than folded into
+    # pass.  The chain continues on $artifact -- that is what this function is
+    # for -- but "an assertion was given up" has to stay visible to the step
+    # that decides what to report, and the exit status cannot carry it.
     log "DEGRADED $name after $((ended - started))s (exit $status): it failed an assertion AFTER producing $artifact"
     log "DEGRADED the chain continues on $artifact; what is given up is that assertion and everything after it"
     log "DEGRADED the ring's own log is $file -- the failing assertion is in its tail"
-    grep -E "upstream check failed|FAIL|SKIPPED" "$file" | tail -6 | tee -a "$LOG" >&2 || true
+    local detail
+    detail="$(grep -E "upstream check failed|FAIL|SKIPPED" "$file" | tail -3 | tr '\n' ';' | cut -c1-160)"
+    ring_record "$name" degraded "$((ended - started))" "$artifact" "$detail"
     return 0
 }
 
@@ -149,10 +238,13 @@ ring() {
     ended="$(date +%s)"
     if [ "$status" -eq 0 ]; then
         log "PASS $name in $((ended - started))s (its log: $file)"
+        ring_record "$name" pass "$((ended - started))" "" ""
         return 0
     fi
     log "FAIL $name after $((ended - started))s (exit $status); its log: $file"
     tail -25 "$file" | tee -a "$LOG" >&2
+    ring_record "$name" failed "$((ended - started))" "" "exit $status"
+    ring_summary
     die "$name failed"
 }
 
@@ -373,3 +465,17 @@ ADDON="$REPO/$OUTPUT"
 [[ -f "$ADDON" ]] || die "the chain reported success but $ADDON is not there"
 log "PASS the GPU addon chain produced $ADDON ($(wc -c <"$ADDON" | tr -d ' ') bytes)"
 log "note what this blob does NOT carry: no --wallpaper overlay and no --prime-list (see the header)"
+
+# The summary, written whether or not anything degraded, so its absence is
+# itself a signal rather than a silent "nothing to report".
+ring_summary
+
+# A degraded ring does not change the exit status -- the artifact exists and the
+# chain must continue on it -- but it is stated once more here, at the end, in
+# the same words the summary uses.  A reader who got here from a green workflow
+# run should not have to open a JSON file to learn an assertion was given up.
+if grep -q '"degraded": \[[^]]' "$SUMMARY" 2>/dev/null; then
+    log "DEGRADED SUMMARY: this chain produced $OUTPUT with at least one ring degraded;"
+    log "DEGRADED SUMMARY: the rings named in $SUMMARY's \"degraded\" array gave up an assertion each;"
+    log "DEGRADED SUMMARY: the artifact is usable and the assertion is not -- do not read this as a clean build."
+fi

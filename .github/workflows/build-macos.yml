@@ -1396,6 +1396,80 @@ jobs:
             echo "built=false" >> "$GITHUB_OUTPUT"
             echo "::warning::the GPU addon chain failed; its logs are in the build-logs artifact and the payload step will say no addon was supplied"
           fi
+          # A DEGRADED ring is not a failure and must not become one: the
+          # artifact exists and the chain continued on it, which is the whole
+          # point of ring_best_effort.  It is also not a clean build, and until
+          # this block existed that is exactly what it was reported as -- the
+          # script exits 0, so `built=true` above was set either way, and
+          # nothing a reader looks at (exit status, GITHUB_OUTPUT, the artifact)
+          # could tell the two apart.  The log said DEGRADED; nothing consumed
+          # it.
+          #
+          # So the state is read out of the machine-readable summary and
+          # surfaced as its OWN output.  Derived from the file rather than from
+          # a grep of the log, because a ring added next month is recorded
+          # without anyone remembering to add it here.
+          #
+          # Three distinct values, and the difference between two of them is
+          # one word that has to stay load-bearing: "none" means the summary was
+          # read and nothing degraded, "unreadable" means it was not read at all.
+          # Collapsing those would put the defect back -- an absent output would
+          # read as "nothing degraded", which is what a crashed reader would
+          # produce.  So the writer is the Python and only the Python, and it
+          # writes one of the three on every path including its own failure.
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def emit(value):
+              Path(sys.argv[1]).write_text(
+                  Path(sys.argv[1]).read_text(encoding="utf-8") + f"addon_degraded={value}\n",
+                  encoding="utf-8")
+
+          try:
+              summary = Path("build-output/addon-summary.json")
+              if not summary.is_file():
+                  # The chain died before writing it.  That is a real signal and
+                  # is reported as one, not swallowed.
+                  print("::warning::no addon-summary.json; the GPU addon ring state "
+                        "is unknown, not clean")
+                  emit("unreadable")
+                  raise SystemExit(0)
+              try:
+                  document = json.loads(summary.read_text(encoding="utf-8"))
+              except ValueError as error:
+                  print(f"::warning::addon-summary.json does not parse ({error}); "
+                        "the GPU addon ring state is unknown, not clean")
+                  emit("unreadable")
+                  raise SystemExit(0)
+              degraded = document.get("degraded") or []
+              failed = document.get("failed") or []
+              # Comma-joined, because a step output is one string and the
+              # consumer has to be able to name every ring rather than count them.
+              emit(",".join(degraded) if degraded else "none")
+              for name in degraded:
+                  print(f"::warning::the GPU addon ring {name!r} is DEGRADED: it "
+                        "produced its artifact and then failed an assertion, so "
+                        "that assertion was given up. The blob is usable and the "
+                        "check is not -- see build-output/addon-summary.json and "
+                        f"build-output/addon-{name}.log.")
+              for name in failed:
+                  print(f"::warning::the GPU addon ring {name!r} FAILED before "
+                        "producing its artifact.")
+              if degraded:
+                  print(f"::warning::{len(degraded)} degraded GPU addon ring(s): "
+                        + ", ".join(degraded)
+                        + ". This is NOT a clean build; do not read built=true as one.")
+          except SystemExit:
+              raise
+          except Exception as error:  # noqa: BLE001
+              # Any other failure of THIS reader is "unknown", never "none": a
+              # reader that cannot say must not be allowed to say "clean".
+              print(f"::warning::the addon-summary reader failed ({error!r}); the "
+                    "GPU addon ring state is unknown, not clean")
+              emit("unreadable")
+          PY
           exit 0
 
       - name: Run macOS build (scripts/macos/build-macos.sh)
@@ -3262,6 +3336,7 @@ jobs:
           DEVICE_COMMIT: ${{ steps.sources.outputs.device_commit || inputs.device_commit }}
           REQUESTED_UNIXNU_COMMIT: ${{ inputs.unixnu_commit }}
           REQUESTED_DEVICE_COMMIT: ${{ inputs.device_commit }}
+          ADDON_DEGRADED: ${{ steps.addon.outputs.addon_degraded }}
         run: |
           python3 - <<'PY'
           """Write the GitHub step summary from build/staging-report.json (evidence, PRD 9.2)."""
@@ -3279,6 +3354,40 @@ jobs:
               f"- device repo: {os.environ.get('DEVICE_COMMIT', '')}",
               f"- artifact: `{os.environ.get('ARTIFACT_NAME', '')}` (retention 30 days)",
           ]
+          # A degraded GPU addon ring gets its own line, before anything that
+          # could read as a verdict.  It is neither a pass nor a failure -- the
+          # artifact was produced and an assertion after it was given up -- so
+          # it must not be folded into either.  An empty value means nothing
+          # degraded; "unreadable" means the ring state is unknown, which is a
+          # different thing and is not allowed to look like "none".
+          degraded = (os.environ.get("ADDON_DEGRADED") or "").strip()
+          if degraded == "unreadable":
+              lines.append(
+                  "- GPU addon rings: **UNKNOWN** -- no readable addon-summary.json, "
+                  "so the ring state cannot be reported. Do not read this as clean."
+              )
+          elif degraded == "none":
+              # The positive spelling, not an empty string.  An absent output
+              # means the addon step never ran, and claiming its rings were
+              # clean would be the defect this whole block exists to prevent.
+              lines.append("- GPU addon rings: none degraded")
+          elif degraded:
+              rings = [name for name in degraded.split(",") if name]
+              lines.append(
+                  f"- GPU addon rings: **{len(rings)} DEGRADED** ({', '.join(rings)}) -- "
+                  "each produced its artifact and then failed an assertion, so that "
+                  "assertion was given up. The blob is usable and the check is not. "
+                  "This run is NOT a clean build."
+              )
+          else:
+              # Absent, or present but empty.  The first is "the addon step
+              # never ran"; the second is "it ran and said nothing".  Neither is
+              # "nothing degraded", and reporting either as that is how the
+              # defect got in.
+              lines.append(
+                  "- GPU addon rings: **NOT REPORTED** -- the addon step emitted no "
+                  "ring state. Do not read this as clean."
+              )
           # When the dispatch form asked for something other than the lock, say
           # so: the build used the lock, and a silent difference between the two
           # is the divergence this whole step exists to surface.
