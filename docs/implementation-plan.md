@@ -789,3 +789,22 @@ for (size_t i = sizeof("/private/var/ngpu/") - 1; parent[i]; ++i) {
 **这一轮同时把一个 instrument 从不可用修到可用的过程全部记下来，因为每一步都是「读起来像答案的失败」**：(1) 解析器找一个输出里不存在的 `hostmem backends:` 标题，于是对一个列了一个后端的二进制报「零个后端」——与事实 195 同族，我去假设了一个格式而不是读它；(2) `& $exe ... 2>&1` 在 PS 5.1 上把原生 stderr 包成 ErrorRecord，配 `$ErrorActionPreference='Stop'` 直接抛异常，于是**第一个探测——它的全部意义就是记录 QEMU 的拒绝——把整次测量变成 `unmeasured`**；(3) `-S` 让 QEMU 永不退出，`Start-Process -Wait` 永远阻塞；(4) `-PassThru` 的 Process 对象 `ExitCode` 对一个退出 0 的进程读出来是空的，判定于是变成「exited (blank)」；(5) QMP 那一问先写成 `TcpListener` 等 QEMU 连过来，而 `server=on` 正好相反；又用 `AcceptTcpClientAsync().GetAwaiter().GetResult(TimeSpan)`，.NET Framework 4.x 没有这个重载。**两个都产出零个命令名，而零个命令名读起来正是「这个构建没有 PhyMemMode」**——所以那一问最终交给 `scripts/ci/qemu-qmp-commands.py`，因为 PowerShell 版在 `ReadLine()` 上超时而 Python 版立刻读到 greeting。**一台从来没有产出过已知答案的仪器不是仪器**，所以整件事先在 pinned 11.1.0 上验证（答案已知：事实 189），四项全复现之后才敢信它对 2026.8.11 的判定。
 
 | R9r | **「换个新 QEMU 就有 memory-backend-file」被 runner 否掉；宿主根本写不进客人内存；Windows 渲染链宿主侧只剩 virtio 通道一条路**（2026-10-31，run 41212163686，提交见本轮事实 197；用户 item 2/3）：2026.8.11（206,615,928 字节，runner 6 秒下完，本机 16 流 8 尝试全废）实测 32 个 object type、hostmem 只有 `memory-backend-ram`、`memory-backend-file`/`-memfd` 均 `invalid object type` 退出 1、**反向对照被接受**、QMP 238 条无 `PhyMemMode`。成因是 Windows 移植的 `CONFIG_POSIX` 构建配置而非版本，**任何官方 w64 构建都不会有**。同一轮量到 QMP 无任何写客人物理内存的命令。**结论：Metal 线须改走 `_agent_argv()` 的 virtio-serial 通道（唯一宿主→客人可写通道），须客人侧实现**。仪器五处缺陷全部记录并修复，先在 pinned 构建上复现已知答案（事实 189）再采信新判定 | ✅ runner 验证 PASS（present/absent/unmeasured 三态分明，仅 unmeasured 失败）；本机验证 PASS（pinned 11.1.0 复现事实 189）；**L3/L4/L5 仍未满足，且「等新 QEMU」不再是可推进选项**；virtio 通道承载 Metal 协议需要客人侧实现，UNVERIFIED |
+
+---
+
+**事实 198（帧缓冲被实测为「静态且对输入无反应」，而这次它是一个带正向对照的否定——所以它可以被相信；同时记账一台仪器如何连续五次把「我没测到」报成「答案是 no」**）：事实 191 把 L5 记成 PARTIAL 并特意留白：帧缓冲 3,897,803/5,636,096 字节非零，但 sha256 35 分钟恒定、`transfer_calls=0`、`frame_count=0`，**所以那些字节从未被证明是客人画的**。`local-private/tmp/real-pixel-change.py` 现在把这件事测完了，用的是 `InteractionProbe`——它此前只在 `tests/unit/test_host_interact.py` 里对着 fake 跑过，**从来没有对真客人跑过一次**。
+
+**四步全部落成数**（run：客人 46 秒自报，ring 27,001 字节，1376x1024）：
+
+1. **正向对照 PASS**——把真帧的一个字节翻转，differ 报 `changed_bytes=1`、`identical=False`。**这一条是后面一切的前提**：没有它，「屏幕没动」是仪器的陈述而不是客人的。
+2. **对照（无输入）**——两次抓帧 **4,227,072 字节里 0 字节变化**，逐字节相同。
+3. **两次点击**——(688,512) 与 (400,300)，QMP 的 move/press/release 全部返回 `{}`（事件被接受），**两次都是 0 字节变化**。
+4. **判定 `no_change`**，不是 `indistinguishable`：对照本身是 0，所以这不是「客人自己也在动」，是「什么都没动」。
+
+**所以 L5 的验收状态从 PARTIAL 变成一个带对照的否定**：帧缓冲是静态的，两次宿主输入没有产生任何像素变化。这不满足用户 item 2 的「以实际像素变化验收」。**它也没有区分三种成因**——客人没绑上 HID 设备、客人不在重绘、点击落在空处——而 `processes` 这一项本次读到 0 个进程（观察器自身失败，被 `except` 吞掉），所以连「SpringBoard 是否在跑」都没能成为判据。**这是一个真实的否定，不是一个完整的解释。**
+
+**这台仪器连续五次把「我没测到」报成「答案是 no」，每一次都换一个原因，而每一次的错误信息都读起来像一个结论**：(1) 等 `Serial keyboard started` 出现在 `serial.log` 里——**常量自己的注释就说这不可能**（"every prior run's serial.log stops at the DarwinBoot handoff"），300 秒后报「客人从未自报」；(2) 从 argv 里找 `-kernel`——这个 boot 走 edk2 pflash，内核是 ESP 上的 payload，于是「argv 没有 -kernel」；(3) `token.startswith("if=none,id=esp")`——drive spec 是 `-drive` **后面**那个 token，于是拼出 `-device\EFI\...` 这种路径；(4) `finally` 里用 `Path.replace()` 把 C: 的 serial.log 移到 F:，跨盘抛 WinError 17，**而它位于失败测量的 finally 里，于是连续两次把唯一能解释失败的日志销毁**；(5) `ub` 在 `main()` 里局部导入而 `_guest_ring` 在模块作用域引用它，`NameError` 被一个裸 `except Exception` 吞掉 **180 次、跨越 900 秒**，报「ring 始终 0 字节」。
+
+**第 5 条是这一族的教科书形状，而抓住它的过程值得记**：一次独立诊断（`local-private/tmp/why-ring-not-ready.py`，同样的 argv、同样的探针）**15 秒就 READY**。所以「ring 始终 0 字节」从来不是客人的陈述，是仪器的。修法不是猜，是让仪器把探针自己的 `reason` 打印出来——`_guest_log_probe` 本来就返回 `{"ready": False, "reason": ...}` 而不是抛异常（设计如此，为的是慢启动不被中止），而我的仪器把它扔了。**一个把自己的诊断信息扔掉的仪器，和一个没有诊断信息的仪器，在报告上完全一样。**
+
+| R9s | **帧缓冲实测静态且对两次点击无反应；这是一个带正向对照的否定，所以可信；但它不区分三种成因，L5 验收未满足**（2026-11-01，事实 198；用户 item 2 的 L5）：`real-pixel-change.py` 第一次把 `InteractionProbe` 对真客人跑起来。正向对照（翻转一字节）报 `changed_bytes=1`——differ 能测出变化；对照（无输入）4,227,072 字节 0 变化；两次点击 QMP 全部接受、0 字节变化；判定 `no_change`。**仪器自身五处缺陷全部记录并修复**，其中 `ub` 的 `NameError` 被裸 `except` 吞掉 180 次/900 秒，报「ring 始终 0 字节」，而独立诊断证明同一探针 15 秒就 READY。**未满足**：item 2 要的「实际像素变化」；也未区分「无 HID 设备」/「客人不重绘」/「点击落空」，且 `processes` 读到 0 个进程（观察器失败被吞），连 SpringBoard 是否在跑都没能成为判据 | ✅ 已测量且带正向对照（**`no_change`，一个可信的否定**）；**L5 验收仍未满足**；三种成因未区分；GPU 完成记录（QM_OPEN→命令执行→completion）仍 UNMET，且事实 197 已证明宿主侧无传输 |
