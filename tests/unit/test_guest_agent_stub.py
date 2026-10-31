@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from typing import Any
 
 import pytest
@@ -99,6 +100,42 @@ def _client(transport: Any, *, attempts: int = 2) -> GuestClient:
 
 def _session(stub: GuestAgentStub, **kwargs: Any) -> AgentSession:
     return AgentSession("127.0.0.1", stub.port, timeout_s=TIMEOUT_S, **kwargs)
+
+
+def _wait_until(predicate: Any, *, deadline_s: float = 5.0) -> bool:
+    """Poll ``predicate`` until it holds or the deadline passes.
+
+    Used where the thing being waited for is the *stub's own log* rather than a
+    reply.  A fixed sleep would pass on a busy machine where the discard has not
+    happened yet, and a fixed timeout would fail on one where it has; polling
+    the guest's record of what it did is the version that means the same thing
+    on a loaded box and an idle one.
+    """
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _not_ready_verdict(verdict: dict[str, Any], stub: GuestAgentStub) -> str:
+    """Why a guest that is not ready produced a reply, in one line.
+
+    A not-ready stub accepting the TCP connection and saying nothing is the
+    measured state of this host (``silent``).  If a reply arrives anyway, the
+    verdict, the stub's own logs and its readiness flag are the only things
+    that can say which of the three happened: the stub answered, a *previous*
+    stub's leftover thread answered on a reused port, or the reply belongs to
+    an exchange this test did not start.
+    """
+    return (
+        f"a guest that is not ready answered: state={verdict.get('state')!r} "
+        f"detail={verdict.get('detail')!r} reply={verdict.get('reply')!r} "
+        f"stub.ready={stub.ready!r} port={stub.port} "
+        f"answered={stub.answered!r} discarded={stub.discarded!r} "
+        f"connections_served={stub.connections_served}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -301,12 +338,16 @@ def test_a_guest_that_is_not_ready_yet_answers_on_the_same_connection() -> None:
     with start_agent_stub() as stub:  # not ready
         with _session(stub) as session:
             early = session.status()
-            assert early["reachable"] is False
+            assert early["reachable"] is False, _not_ready_verdict(early, stub)
             assert early["state"] == STATE_SILENT
             assert early["detail"] == "no_reply_in_budget"
             # The socket survived the timeout: this is the whole point.
             assert session.transport.connected is True
             assert session.state == STATE_SILENT
+            # And the premature request reached THIS stub, which dropped it.
+            # Asserted on the stub's own log rather than on the clock, so a
+            # reply that arrived from anywhere else cannot read as a pass.
+            assert _wait_until(lambda: len(stub.discarded) == 1), _not_ready_verdict(early, stub)
 
             stub.make_ready()
             late = session.status()
@@ -330,10 +371,20 @@ def test_a_guest_that_never_becomes_ready_yields_service_unavailable() -> None:
     """
     with start_agent_stub() as stub:  # never ready
         with _session(stub) as session:
-            with pytest.raises(UniPadError) as excinfo:
+            try:
                 _client(session.transport, attempts=2).install_package(PACKAGE_BYTES, META)
-
-            error = excinfo.value
+            except UniPadError as exc:
+                error = exc
+            else:
+                pytest.fail(
+                    _not_ready_verdict(
+                        {"state": session.state, "detail": "", "reply": None}, stub
+                    )
+                )
+            # Both attempts reached the guest and neither was answered.
+            assert _wait_until(lambda: len(stub.discarded) == 2), _not_ready_verdict(
+                {"state": session.state, "detail": "", "reply": None}, stub
+            )
             assert error.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
             assert error.details["detail"] == "timeout"
             assert error.details["request_type"] == "install.request"
@@ -378,8 +429,11 @@ def test_answering_a_stale_request_consumes_the_next_questions_slot() -> None:
         with _session(stub) as session:
             client = _client(session.transport, attempts=1)
             early = session.status()
-            assert early["reachable"] is False
+            assert early["reachable"] is False, _not_ready_verdict(early, stub)
             assert early["state"] == STATE_SILENT
+            # Nothing was discarded: under this policy the request is queued,
+            # which is exactly the difference being tested.
+            assert stub.discarded == []
 
             stub.make_ready()
             with pytest.raises(UniPadError) as excinfo:

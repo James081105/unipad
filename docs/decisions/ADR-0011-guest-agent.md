@@ -62,7 +62,7 @@
 - **三种放置方式一个都没选**，所以「代理怎么进去」这个问题原样留给 M10。这不是疏漏：选它需要现场证据（launchd 是否从 Data 卷读作业、镜像构建管线能否容纳一个常驻进程），而这两样本机都没有。
 - **决定 4 的四个步骤全部是推断，除「SpringBoard 存在」这一条存在性证据。** 真实客体上的容器建立、注册、图标放置、信任记录都可能与本协议的字段形状不符；届时按 ADR-0003 的程序再立一份独立决策记录修订，**不得**在功能提交里顺手改。
 - `GuestAgentStub` 与 `FakeGuestService` 有两个模型（ADR-0003 阶段词表 vs PRD §10 断点词表），需要各自保持与词表同步；已用 `test_a_failure_may_be_injected_at_every_stage_in_the_vocabulary` 与 `test_the_stub_never_reports_a_code_outside_the_taxonomy` 分别钉住。
-- 本 ADR 记录了两个**宿主侧的既有缺陷**（见下一节），都不由本 ADR 修复，因为它们不在属主范围内。
+- 本 ADR 记录了一个**宿主侧的既有缺陷**（见 Status 一节），它已被该文件属主修复；本 ADR 只提供证据与记录，不改别人的文件。
 
 **不做的事**
 
@@ -74,9 +74,11 @@
 
 ## Status
 
-proposed (code stage)。代码阶段交付：`src/unipad/guest/agent_stub.py`（`GuestAgentStub` 与 `start_agent_stub`，含就绪门、`STALE_DISCARD` / `STALE_ANSWER` 两种迟到请求政策、按 ADR-0003 阶段注入故障、一次连接保真）、`tests/unit/test_guest_agent_stub.py`（28 项，全绿，三次重复无 flake）、变异检查 `local-private/tmp/mutate-agent-stub.py`（**12/12 全部被捕获**，含基线红则中止、锚点缺失记为 ANCHOR ERROR、CAUGHT 必须解析出失败测试 id 三条自律规则；恢复后按字节校验目标文件未被改动）。
+proposed (code stage)。代码阶段交付：`src/unipad/guest/agent_stub.py`（`GuestAgentStub` 与 `start_agent_stub`，含就绪门、`STALE_DISCARD` / `STALE_ANSWER` 两种迟到请求政策、按 ADR-0003 阶段注入故障、一次连接保真）、`tests/unit/test_guest_agent_stub.py`（28 项，全绿）、变异检查 `local-private/tmp/mutate-agent-stub.py`（**12/12 全部被捕获**，含基线红则中止、锚点缺失记为 ANCHOR ERROR、CAUGHT 必须解析出失败测试 id 三条自律规则；恢复后按字节校验目标文件未被改动）。
 
 变异检查第一轮有 1 个变异存活（M5：信任检查被跳过却无人发现——没有任何测试驱动过「策略拒绝」这条路径），修复方式是补 `test_a_package_the_trust_policy_refuses_is_never_installed`，而不是宣称该守卫已被覆盖。第一轮另有 2 个变异（M9/M10）因 `_weaken` 的锚点带上了 `if` 而产生 SyntaxError，被自律规则正确判为 INCONCLUSIVE 而非击杀——**那正是「退出码非零但没有失败测试行」的假阳性形态**，锚点修好后两个都变红。
+
+**一次未被复现的就绪门 flake，以及因此加的不变量。** 在 5 文件组合的一次运行里，三个就绪测试同时报「未就绪的客人却答了」（`reachable` 为 True / `DID NOT RAISE`），此后同组合连跑 19 次（含加诊断信息后的 14 次）全部通过，未能复现。**没有把它当成不存在**：三个测试现在各带一个不依赖时钟的判定式——断言那条过早的请求**确实到达了这个 stub 并被它丢弃**（`stub.discarded`），而不是只断言「预算内没有回复」。这样做的理由是：超时类测试只有一个方向是安全的（机器慢 → 仍然没有回复 → 仍然通过），而「回复从别处到达」是它防不住的方向，也正是那次 flake 的形状；把判定式挪到客人自己的记录上，一次跨会话串扰会变成一条自带诊断的红测，而不是一个时红时绿的谜。诊断信息（`_not_ready_verdict`）会同时打印 `stub.ready`、`stub.answered`、`stub.discarded`、端口与连接数，足以一次分清「本 stub 答了」「上一个 stub 的残留线程答了」「回复属于本测试没有发起的交换」。**根因未定，标记为未解释；不得写成已修复。**
 
 **四环的诚实状态（与 ADR-0010 的表并列，不覆盖它）：**
 

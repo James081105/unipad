@@ -365,21 +365,42 @@ def test_a_timeout_leaves_the_connection_usable_for_the_next_request():
     timeout, the chardev's single connection would be gone and the retry would
     fail with ``refused``, which is a *different* failure and would be reported
     as one.
+
+    **This test used to pass for the wrong reason, and the way it did is the
+    point.**  ``Listener._handle`` sleeps ``delay_s`` for *every* line it reads,
+    so the first request's reply only exists after one delay and the second
+    request's after two.  With a 0.4 s budget and a 0.8 s delay, the second call
+    was receiving the FIRST request's late reply -- and the assertion was only
+    ``reply["type"] == MSG_STATUS_RESPONSE``, which a stale reply satisfies
+    perfectly.  ``AgentChannelTransport.request`` reads exactly one line and does
+    not check its ``id``; only ``GuestClient._validate_reply`` correlates.  So
+    the test claimed "the second request succeeded on the same connection" while
+    actually measuring "a reply arrived".
+
+    The fix is to assert the thing the test says it measures: the reply's ``id``
+    must be the SECOND request's.  ``BecomesReady`` is used rather than
+    ``Listener`` because it delays only until a deadline, so both requests get
+    their own reply at a predictable time.
     """
-    listener = Listener(echo=True, delay_s=0.8)
+    guest = BecomesReady(silent_for_s=0.9)
     try:
-        transport = AgentChannelTransport("127.0.0.1", listener.port, timeout_s=0.4)
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=0.4)
         with pytest.raises(TimeoutError):
-            transport.request({"type": "status_request", "id": "a", "payload": {}})
+            transport.request({"type": "status.request", "id": "a", "payload": {}})
         assert transport.state == STATE_SILENT
         assert transport.connected is True
-        # The slow reply has landed by now; the second request must succeed on
-        # the SAME connection.
-        reply = transport.request({"type": "status_request", "id": "b", "payload": {}})
+
+        time.sleep(1.0)  # the guest starts answering
+        reply = transport.request({"type": "status.request", "id": "b", "payload": {}})
         assert reply["type"] == MSG_STATUS_RESPONSE
+        # The correlation, which is what makes this the second request's answer
+        # rather than the first one's late arrival.
+        assert reply["id"] == "b", (
+            f"the reply belongs to another exchange (id={reply['id']!r}); "
+            "a stale reply is not a successful retry")
         assert transport.state == STATE_ANSWERED
     finally:
-        listener.close()
+        guest.close()
 
 
 def test_a_peer_that_hangs_up_mid_exchange_reports_the_channel():
