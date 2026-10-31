@@ -1183,6 +1183,54 @@ jobs:
           PY
           echo "config=$PWD/$OUT_ROOT/$BOARD/.config" >> "$GITHUB_OUTPUT"
 
+      # The same text fact the negative control asserts, so this job's `invoked`
+      # claim rests on it too rather than on the driver's log line alone.  The log
+      # line is the stronger evidence -- it is the driver's own output -- but a
+      # report that says `listed: unknown` next to `invoked: driver-board-toml` is a
+      # claim with half its backing missing, and the first dispatch of this field
+      # read exactly that way.  No build, no toolchain: tomllib over board.toml.
+      - name: 'Assert what board.toml''s archives list says (no build)'
+        id: listed
+        run: |
+          set -uo pipefail
+          console="${{ inputs.console_component }}"
+          python3 - "$VENDOR_DIR/UniXNU-qemu/board.toml" "$console" \
+            "$REPORT_DIR/archives-listing.json" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import shlex
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          board, console, destination = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+          data = tomllib.loads(board.read_text(encoding="utf-8"))
+          entries = (data.get("kernel") or {}).get("archives") or []
+          listed = any(console in shlex.split(entry)[1:] for entry in entries)
+          listing = {
+              "schema_version": 1,
+              "check": "board-archives-listing",
+              "board": board.as_posix(),
+              "entry_count": len(entries),
+              "entries": entries,
+              "console_component": console,
+              "console_listed": listed,
+          }
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_text(json.dumps(listing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"console_listed={'true' if listed else 'false'}")
+          print(
+              f"console_verdict={'listed' if listed else 'not-listed'}: board.toml's "
+              f"[kernel] archives list {'carries' if listed else 'carries no'} entry "
+              f"naming {console} ({len(entries)} entries in total)"
+          )
+          if not listed:
+              print(
+                  "::error::the console component is NOT in board.toml's archives list, "
+                  "so this job's `invoked` claim would have nothing behind it"
+              )
+          PY
+          exit 0
+
       # The measurement.  `unixnu build kernel` runs kernel.build() -- which runs
       # the bootstrap pass for the compile records, then board.toml's archive
       # builders, then the real pass and the link -- and then kernel.prelink().
@@ -1317,6 +1365,7 @@ jobs:
             --link-log "$logs/kernel.log" \
             --record-provenance "$REPORT_DIR/compile-record-provenance.json" \
             --invoked-directly false \
+            --listed "${{ steps.listed.outputs.console_listed }}" \
             --preflight "$preflight" \
             --elapsed-seconds "$ELAPSED" \
             --report "$REPORT_DIR/console-report.json" \
@@ -1422,6 +1471,7 @@ jobs:
           for name in (
               "console-report.json",
               "console-summary.md",
+              "archives-listing.json",
               "compile-record-provenance.json",
               "config-divergence.json",
               "kernel-driver.log",
