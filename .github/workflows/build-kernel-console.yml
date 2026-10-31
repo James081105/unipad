@@ -72,7 +72,7 @@ on:
           - NativeAdreno
           - NativeOfflineGPU
       run_kernel_link:
-        description: 'Also run console-in-kernel: the driver''s own kernel step, which needs a full XNU build (hours of free macOS minutes). Set false to measure only the archive.'
+        description: 'Also run console-in-kernel: the driver''s own kernel step, which links the kernel and is the only thing that can show the archive landed in it. Set false to measure only the archive.'
         required: true
         default: 'true'
         type: choice
@@ -80,7 +80,7 @@ on:
           - 'true'
           - 'false'
       record_run_id:
-        description: 'Run whose build artifact carries the XNU compile record the archive builder reads. Used only by console-archive, which does not build XNU itself; console-in-kernel produces its own.'
+        description: 'Run whose build artifact carries the XNU compile record. A FALLBACK only: console-archive builds XNU itself and uses this only if that pass leaves no record, because a record from another run carries another run''s generated-header layout.'
         required: false
         default: '41139423523'
         type: string
@@ -110,19 +110,29 @@ env:
 
 jobs:
   # =====================================================================
-  # Job 1: invoke the builder the way scripts/unixnu/kernel.py does.
+  # Job 1: invoke the builder directly, the way scripts/unixnu/kernel.py
+  # does, on a tree this run prepared itself.
   #
-  # Fast, because it does not build XNU.  It takes the one file an XNU build would
-  # have left behind -- the compile record -- from a prior run's artifact instead.
-  # That provenance is disclosed in the report, and job 2 removes the need for it
-  # entirely by producing the record itself.
+  # It builds XNU's compile records first, because that is not optional:
+  # build-arm-driver.py reads IOPlatformExpert.cpo.json AND the command it
+  # carries includes a generated header relative to its own cwd.  The first
+  # four dispatches took the record from a prior run's artifact to avoid the
+  # build and it cannot work -- measured on run 41223131502, the builder died
+  # with `fatal error: 'meta_features.h' file not found`.  The bootstrap pass
+  # measured 262 s for the whole chain on this runner, so "avoid the build"
+  # was buying very little and costing the measurement.
+  #
+  # What this job still cannot prove is that the DRIVER's own loop over
+  # board.toml reaches the builder, or that a link picks the archive up.  That
+  # is console-in-kernel.
   # =====================================================================
   console-archive:
     name: console-archive (invoke the builder directly)
     runs-on: macos-latest
-    # 60 minutes is generous for what this job does: acquire, assemble, install
-    # headers, compile one driver twice.  It is written as an estimate, not a
-    # measurement -- the same honesty the build-macos job's 180 carries.
+    # One XNU bootstrap pass plus two driver compiles.  60 minutes is generous
+    # and is written as an estimate rather than a measurement, the same honesty
+    # build-macos.yml's 180 carries; the one measurement there is, is 262 s for
+    # a bootstrap pass, the eleven archive builders and the link together.
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -393,63 +403,66 @@ jobs:
       #
       # This runs the REAL build script's own prepare prefix -- clone, availability
       # plugin, patches, prepare-xnu-source, installhdrs, firehose -- and then asks
-      # its final make for `installhdrs` instead of `build`.  Nothing of that prefix
-      # is re-implemented here: a second implementation of "which headers" is the
-      # divergence class this project keeps hitting.  What is deliberately NOT done
-      # is the full XNU compile, which is what the console-in-kernel job is for.
-      - name: Install the XNU headers (the build script's own prepare prefix)
-        id: headers
+      # What the archive builder reads, produced the way scripts/unixnu/kernel.py:83-95
+      # produces it: one bootstrap pass of XNU.  This is the finding that shapes the
+      # whole job.  build-arm-driver.py reads
+      # build/xnu/ios-obj/.../IOPlatformExpert.cpo.json -- a compile record only an
+      # XNU pass leaves behind -- AND the command it carries names a RELATIVE
+      # `-include meta_features.h`, which is generated into that same directory by
+      # the same compile.  So "build ONLY the console archive" is not a thing the
+      # pinned tree can do: either XNU is built, or both the record and a generated
+      # header have to come from somewhere that already built it.
+      #
+      # The first four dispatches took the second route -- the record from a prior
+      # run's artifact -- and it cannot work, because the prior run's
+      # meta_features.h is not in this one's OBJROOT.  Measured on run 41223131502:
+      # the builder ran and died with `fatal error: 'meta_features.h' file not
+      # found`.  So the record is now produced HERE, by the same pass the driver
+      # runs, and the artifact download is kept only as the fallback below.
+      #
+      # XNU_BOOTSTRAP=1 makes the pass skip the archive block (:545) and link without
+      # the archives; :774 is not gated on it, so this is a full XNU compile.  On the
+      # runner that measured 262 s for the whole chain including the link, which is
+      # why this is affordable rather than heroic.
+      - name: Build XNU's compile records (the driver's own bootstrap pass)
+        id: bootstrap
         run: |
           set -uo pipefail
           tree="$OUT_ROOT/$BOARD/tree"
+          member="build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
           status=0
           (
             cd "$tree"
-            XNU_BUILD_TARGET=installhdrs XNU_SDKROOT=macosx bash scripts/build-xnu-4k-baseline.sh
-          ) > "$REPORT_DIR/xnu-headers.log" 2>&1 || status=$?
-          # The script's own prepare prefix runs installhdrs TWICE: once at :115 into
-          # .cache/fakeroot (the SDK the record's -I flags point at) and once at :774
-          # into build/xnu/ios-dst, because that final make is asked for
-          # `installhdrs` instead of `build`.  The second one is redundant for what
-          # the archive builder needs, so a failure there is tolerated IF the things
-          # the builder actually reads are on disk.  That is a measurement, not a
-          # hope: the four paths below are exactly the record's own -I flags (read
-          # out of the record by extracting it from a prior artifact) plus the
-          # unconditional -I of build-arm-driver.py:68.
-          #
-          # The first revision checked build/xnu/obj/EXPORT_HDRS, which the script
-          # creates at :112 whether or not anything else worked -- so it reported
-          # `headers=ok` for the wrong reason on both dispatches.
+            XNU_BOOTSTRAP=1 bash scripts/build-xnu-4k-baseline.sh
+          ) > "$REPORT_DIR/xnu-bootstrap.log" 2>&1 || status=$?
+          # What the builder actually reads, checked rather than assumed: the four -I
+          # paths the record names (read out of the record by extracting it from a
+          # prior artifact with HTTP range requests), the unconditional -I of
+          # build-arm-driver.py:68, and the generated header the command includes
+          # relative to its cwd.
           need_platform="$tree/.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
           need_kernel="$tree/.cache/fakeroot/usr/local/include/kernel"
           need_osfmk="$tree/.cache/xnu-work/osfmk"
           need_exports="$tree/build/xnu/ios-obj/EXPORT_HDRS/iokit"
+          need_record="$tree/$member"
           missing=""
-          for path in "$need_platform" "$need_kernel" "$need_osfmk" "$need_exports"; do
-            [ -d "$path" ] || missing="$missing $path"
+          for path in "$need_platform" "$need_kernel" "$need_osfmk" "$need_exports" "$need_record"; do
+            [ -e "$path" ] || missing="$missing $path"
           done
-          if [ "$status" -eq 0 ] && [ -z "$missing" ]; then
-            echo "headers=ok" >> "$GITHUB_OUTPUT"
-            echo "== headers installed (the script's own prepare prefix, clean)"
-          elif [ -z "$missing" ]; then
-            echo "headers=ok" >> "$GITHUB_OUTPUT"
-            echo "::warning::the header script exited $status, but every path the builder reads is on disk, so the build is given its chance"
+          if [ -z "$missing" ]; then
+            echo "bootstrap=ok" >> "$GITHUB_OUTPUT"
+            echo "== the bootstrap pass left the compile record and every path the builder reads"
           else
-            echo "headers=failed" >> "$GITHUB_OUTPUT"
-            echo "::warning::the header script exited $status and$missing is absent; the builder will be given its chance anyway and the log is the evidence"
-            tail -n 60 "$REPORT_DIR/xnu-headers.log" || true
+            echo "bootstrap=failed" >> "$GITHUB_OUTPUT"
+            echo "::warning::the bootstrap pass exited $status and$missing is absent; the downloaded record is tried next and the log is the evidence"
+            tail -n 60 "$REPORT_DIR/xnu-bootstrap.log" || true
           fi
           exit 0
 
-      # The compile record.  Downloaded rather than built, and the reason is the
-      # finding that shapes this whole job: build-arm-driver.py reads
-      # build/xnu/ios-obj/.../IOPlatformExpert.cpo.json, which only an XNU pass
-      # leaves behind, and scripts/unixnu/kernel.py:83-95 therefore runs a whole
-      # bootstrap pass of XNU first -- a full compile, because
-      # build-xnu-4k-baseline.sh:774 is not gated on BOOTSTRAP.  So "build ONLY the
-      # console archive" is not a thing the pinned tree can do; either XNU is built,
-      # or its record is taken from somewhere that already built it.
-      - name: Obtain the XNU compile record
+      # The compile record, and where it came from.  This run's own bootstrap pass
+      # first; the prior run's artifact only if that pass did not leave one, because
+      # a record from another run carries another run's generated-header layout.
+      - name: Record where this run's compile record came from
         id: record
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -457,6 +470,41 @@ jobs:
           set -uo pipefail
           tree="$OUT_ROOT/$BOARD/tree"
           member="build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
+          if [ -f "$tree/$member" ]; then
+            python3 - "$tree/$member" "$REPORT_DIR/compile-record-provenance.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          source, destination = Path(sys.argv[1]), Path(sys.argv[2])
+          raw = source.read_bytes()
+          # The same normalization build-arm-driver.py:27 applies: XNU's -MJ leaves a
+          # trailing comma separator, so a plain json.loads raises "Extra data".
+          record = json.loads(raw.decode("utf-8").strip().rstrip(","))
+          provenance = {
+              "origin": "compiled by this run's own XNU bootstrap pass",
+              "detail": (
+                  "scripts/unixnu/kernel.py:83-95 runs one bootstrap pass of XNU to "
+                  "leave the compile records behind, so the flags, the generated "
+                  "headers and the compiler are all this run's own"
+              ),
+              "member": source.name,
+              "sha256": hashlib.sha256(raw).hexdigest(),
+              "size_bytes": len(raw),
+              "compiler_the_record_names": (record.get("arguments") or [None])[0],
+              "cwd_the_builder_uses": record.get("directory"),
+              "cwd_exists_here": Path(str(record.get("directory"))).is_dir(),
+          }
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"record: produced by this run, sha256 {provenance['sha256']}")
+          PY
+            echo "record=ok" >> "$GITHUB_OUTPUT"
+            echo "== compile record produced by this run at $tree/$member"
+            exit 0
+          fi
+          echo "::warning::the bootstrap pass left no compile record; the prior run's artifact is tried instead"
           mkdir -p "$tree/$(dirname "$member")"
           status=0
           python3 scripts/ci/fetch-xnu-compile-record.py \
@@ -466,10 +514,10 @@ jobs:
             --provenance "$REPORT_DIR/compile-record-provenance.json" || status=$?
           if [ "$status" -eq 0 ]; then
             echo "record=ok" >> "$GITHUB_OUTPUT"
-            echo "== compile record in place at $tree/$member"
+            echo "== compile record downloaded into place at $tree/$member"
           else
             echo "record=failed" >> "$GITHUB_OUTPUT"
-            echo "::error::the compile record could not be obtained (exit $status)"
+            echo "::error::no compile record: this run's bootstrap pass left none and the download failed (exit $status)"
           fi
           exit 0
 
@@ -525,6 +573,17 @@ jobs:
           # given a chance.  A while-read loop is the portable spelling.
           parts=()
           while IFS= read -r line; do parts+=("$line"); done < "$argv_file"
+          # board.toml's entry names the script RELATIVE TO scripts/, which is where
+          # the driver looks for it: scripts/unixnu/kernel.py:60 is
+          # `ctx.tree / 'scripts' / parts[0]`.  The first four dispatches ran the
+          # bare name from the tree root and died with
+          # "can't open file '.../tree/build-arm-driver.py'" -- measured on run
+          # 41223131502, whose builder log is exactly that one line.  The prefix is
+          # applied here rather than by editing the argv the board names, so what
+          # runs is still the board's own entry.
+          if [ ! -f "$tree/${parts[0]}" ] && [ -f "$tree/scripts/${parts[0]}" ]; then
+            parts=("scripts/${parts[0]}" "${parts[@]:1}")
+          fi
           log="$REPORT_DIR/${component}-builder.log"
           echo "+ (cd $tree && python3 ${parts[*]})"
           started=$(date -u +%s)
@@ -613,7 +672,7 @@ jobs:
           preflight="$preflight,acquire=${{ steps.acquire.outputs.acquire }}"
           preflight="$preflight,toolchain=${{ steps.toolchain.outputs.toolchain }}"
           preflight="$preflight,record=${{ steps.record.outputs.record }}"
-          preflight="$preflight,headers=${{ steps.headers.outputs.headers }}"
+          preflight="$preflight,bootstrap=${{ steps.bootstrap.outputs.bootstrap }}"
           preflight="$preflight,config=$([ -f "$OUT_ROOT/$BOARD/.config" ] && echo ok || echo failed)"
           python3 scripts/ci/kernel-console-verdict.py \
             --component "${{ inputs.console_component }}" \
@@ -725,7 +784,7 @@ jobs:
               (REPORT / "control-summary.md", "auxiliary"),
               (REPORT / "compile-record-provenance.json", "auxiliary"),
               (REPORT / "config-divergence.json", "auxiliary"),
-              (REPORT / "xnu-headers.log", "auxiliary"),
+              (REPORT / "xnu-bootstrap.log", "auxiliary"),
               (REPORT / f"{os.environ['CONSOLE_COMPONENT']}-builder.log", "auxiliary"),
               (REPORT / f"{os.environ['CONTROL_COMPONENT']}-control.log", "auxiliary"),
               (REPORT / f"{os.environ['CONSOLE_COMPONENT']}-argv.txt", "auxiliary"),
