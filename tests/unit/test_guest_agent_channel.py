@@ -1007,3 +1007,52 @@ def test_a_one_shot_probe_still_closes_what_it_opened():
         assert len(guest.received) == 1
     finally:
         guest.close()
+
+
+def test_the_verdict_says_which_connection_it_left_behind():
+    """``connection`` must distinguish "spent the boot's one" from "still held".
+
+    The chardev serves ONE connection per QEMU process, and on this host a
+    connect-then-drop can leave QEMU accept()ing a dead socket after which the
+    port never accepts again.  So a caller that intends to ask a second question
+    cannot read ``reachable`` alone -- a ``reachable: True`` verdict whose
+    ``connection`` is ``"spent"`` has already cost the boot its only connection,
+    and the second question will be refused.
+
+    Without this field the two paths through ``status_probe`` return
+    indistinguishable dicts, and the one that matters is the quiet one.
+    """
+    guest = Listener(echo=True)
+    try:
+        one_shot = status_probe("127.0.0.1", guest.port, timeout_s=5.0)
+        assert one_shot["connection"] == "spent", (
+            "a one-shot probe that does not report its connection as spent reads "
+            "like a connection the caller can still use")
+
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=5.0)
+        try:
+            held = status_probe("127.0.0.1", guest.port, transport=transport)
+            assert held["connection"] == "held"
+            assert transport.connected is True
+        finally:
+            transport.close()
+    finally:
+        guest.close()
+
+
+def test_a_silent_one_shot_also_reports_the_connection_as_spent():
+    """The dangerous path is the one that times out, not the one that answers.
+
+    A timeout is exactly when a caller is most tempted to retry -- and on this
+    host a retry means a second connect, which the chardev refuses.  So the
+    ``no_reply_in_budget`` verdict must carry ``spent`` too, otherwise the one
+    case that most needs the warning is the one case that lacks it.
+    """
+    guest = BecomesReady(silent_for_s=5.0)
+    try:
+        verdict = status_probe("127.0.0.1", guest.port, timeout_s=0.4)
+        assert verdict["reachable"] is False
+        assert verdict["state"] == STATE_SILENT
+        assert verdict["connection"] == "spent"
+    finally:
+        guest.close()

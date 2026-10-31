@@ -310,6 +310,11 @@ def status_probe(
         a short machine-readable reason when ``reachable`` is ``False``.
     ``reply``
         the raw reply envelope when there was one, else ``None``.
+    ``connection``
+        ``"spent"`` when this call opened its own transport and closed it, which
+        is the boot's single connection consumed; ``"held"`` when a transport was
+        passed in and survived.  A caller that intends to ask a second question
+        must read this field, not just ``reachable``.
 
     Why ``transport`` exists, and why the one-shot case still closes
     ----------------------------------------------------------------
@@ -325,6 +330,16 @@ def status_probe(
     really does want one throwaway question still gets one, and the transport is
     closed for it, because leaving a socket open with no owner is its own leak.
 
+    The one-shot case is NOT a safe liveness probe, and that is measured rather
+    than assumed.  On this host a port with no listener TIMES OUT instead of
+    refusing, and a connect-then-drop can leave QEMU ``accept()``ing a socket
+    that is already gone -- after which the port never accepts again.  So this
+    path does not answer "is the guest agent alive?"; it answers "is it
+    answering *right now*", and it may cost the boot its only connection to find
+    out.  A caller that wants to know whether the agent exists should hold an
+    :class:`AgentSession` and ask through it, which is what
+    :meth:`AgentSession.status` is for.
+
     The status message is built through :class:`unipad.guest.protocol.Message`
     -- the same envelope :meth:`unipad.guest.client.GuestClient.status` sends, so
     the probe asks the question the real client asks and not a near-miss of it.
@@ -335,33 +350,40 @@ def status_probe(
     envelope = Message(type=MSG_STATUS_REQUEST, id=new_message_id(), payload={})
     request = envelope.to_dict()
     owned = transport is None
+    # Which connection this call leaves behind.  Recorded on every return so a
+    # caller can tell "the boot's only connection is gone" from "it is still
+    # there" without having to know which path it took through here.
+    connection = "spent" if owned else "held"
     if owned:
         try:
             transport = AgentChannelTransport(host, port, timeout_s=timeout_s)
         except UniPadError as error:
             return {"reachable": False, "state": STATE_REFUSED,
-                    "detail": "invalid_port", "reply": None, "error": str(error)}
+                    "detail": "invalid_port", "reply": None, "error": str(error),
+                    "connection": connection}
     try:
         try:
             transport.connect()
         except OSError as error:
             return {"reachable": False, "state": STATE_REFUSED,
                     "detail": "connection_refused", "reply": None,
-                    "error": str(error)}
+                    "error": str(error), "connection": connection}
         try:
             reply = transport.request(request)
         except TimeoutError:
             return {"reachable": False, "state": STATE_SILENT,
-                    "detail": "no_reply_in_budget", "reply": None}
+                    "detail": "no_reply_in_budget", "reply": None,
+                    "connection": connection}
         except OSError as error:
             return {"reachable": False, "state": STATE_CLOSED,
-                    "detail": "channel_closed", "reply": None, "error": str(error)}
+                    "detail": "channel_closed", "reply": None, "error": str(error),
+                    "connection": connection}
         except UniPadError as error:
             return {"reachable": False, "state": STATE_ANSWERED,
                     "detail": "malformed_reply", "reply": None,
-                    "error": str(error)}
+                    "error": str(error), "connection": connection}
         return {"reachable": True, "state": STATE_ANSWERED, "detail": "",
-                "reply": reply}
+                "reply": reply, "connection": connection}
     finally:
         # Only a transport this call created is closed.  A caller-supplied one
         # belongs to the caller, and closing it would spend the boot's single
