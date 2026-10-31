@@ -1498,6 +1498,45 @@ def _agent_argv(
     ]
 
 
+def _gdb_argv(port: Optional[int]) -> list[str]:
+    """``-gdb`` on loopback, or nothing.
+
+    This exists for the Windows host backend, and the reason it is the gdbstub
+    rather than something purpose-built is worth recording because it looks like
+    a workaround.
+
+    Upstream's host (``qemu-metal-host``) maps the shared window the way the
+    guest does -- ``mmap`` on ``RUN_DIR/shared.bin``, zero copies, memory speed.
+    That needs ``memory-backend-file``, and this host's pinned QEMU does not
+    register it: ``-object help`` prints exactly one hostmem backend
+    (``memory-backend-ram``) and ``-object memory-backend-file,...`` exits 1 with
+    ``invalid object type``.  MEASURED, not inferred (fact 189).
+
+    What this host DOES have is QEMU's gdbstub, and it writes guest memory:
+    ``can-host-write-guest.py`` writes a known pattern through it and reads the
+    same bytes back through QMP ``pmemsave``, with both agreeing.  So a host
+    process can serve the wire by reading with ``pmemsave`` and writing with the
+    gdbstub -- two round-trips per operation instead of zero.  That is not the
+    zero-copy product path and is not claimed as one; it is what this machine
+    has, and it is enough to answer a request that was going unanswered.
+
+    Default ``None`` and one byte of difference in the argv, for the same reason
+    ``agent_port`` defaults to ``None``: every recorded run on this host was made
+    without it, and a run that did not ask for a host backend must not differ
+    from those in any direction a reader could mistake for a measurement.
+    """
+    if port is None:
+        return []
+    port = int(port)
+    if not 1024 <= port <= 65535:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the gdbstub port must be a TCP port the host can bind",
+            port=port,
+        )
+    return ["-gdb", f"tcp::{port}"]
+
+
 def _raw_volume(path: Path, role: str, consequence: str) -> Path:
     """A raw block-device image, resolved, and refused if it cannot be one.
 
@@ -1575,6 +1614,7 @@ def build_argv(
     systemos_image: Optional[Path] = None,
     serial_port: Optional[int] = None,
     agent_port: Optional[int] = None,
+    gdb_port: Optional[int] = None,
 ) -> list[str]:
     """The QEMU argv (without the executable).
 
@@ -1789,6 +1829,7 @@ def build_argv(
         Path(workdir) / "agent.log",
         emit_legacy_global=(root is None and systemos is None),
     )
+    gdb_argv = _gdb_argv(gdb_port)
 
     return [
         "-drive", f"if=pflash,format=raw,readonly=on,file={qpath(firmware)}",
@@ -1967,7 +2008,7 @@ def build_argv(
             if metal_clients else []
         )
         if shared_window_mib else []
-    ) + systemos_argv + agent_argv
+    ) + systemos_argv + agent_argv + gdb_argv
 
 
 # ---------------------------------------------------------------------------
@@ -2085,6 +2126,7 @@ def boot(
     shared_window_backend: str = "file",
     metal_clients: Optional[str] = None,
     agent_port: Optional[int] = None,
+    gdb_port: Optional[int] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
 
@@ -2270,6 +2312,7 @@ def boot(
         shared_window_backend=shared_window_backend,
         metal_clients=metal_clients,
         agent_port=agent_port,
+        gdb_port=gdb_port,
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
         ramfb_size=SCREEN if (esp / RAMFB_NAME).is_file() else None,
@@ -2376,6 +2419,7 @@ def boot_until_mounted(
     systemos_image: Optional[Path] = None,
     attempts: int = MAX_BOOT_ATTEMPTS,
     agent_port: Optional[int] = None,
+    gdb_port: Optional[int] = None,
 ) -> BootReport:
     """Boot until the guest reports the Data volume mounted, or the budget ends.
 
@@ -2427,7 +2471,7 @@ def boot_until_mounted(
             qemu=qemu, device_dir=device_dir, seconds=seconds, every=every,
             qmp_port=qmp_port, serial_port=serial_port, display=display,
             root_image=root_image, systemos_image=systemos_image,
-            agent_port=agent_port,
+            agent_port=agent_port, gdb_port=gdb_port,
         )
         report.attempt = attempt
         if report.data_volume_mounted:
@@ -3009,6 +3053,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              "than a second use of the UART; without it the guest has "
                              "only the UART, which is the kernel console and is not "
                              "free for a guest-side agent to use")
+    parser.add_argument("--gdb-port", type=int, default=None,
+                        help="expose QEMU's gdbstub on this TCP port on 127.0.0.1.  It "
+                             "is how a host process writes the guest's memory on a host "
+                             "whose QEMU has no memory-backend-file, which is what the "
+                             "Metal wire's host backend needs; without it the host can "
+                             "read the guest (QMP pmemsave) but not answer it")
     parser.add_argument("--display", default="none")
     parser.add_argument("--root-image", type=Path, default=None,
                         help="raw OS volume to attach as a second, read-only virtio-blk disk; "
@@ -3077,6 +3127,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             qmp_port=args.qmp_port,
             serial_port=args.serial_port,
             agent_port=args.agent_port,
+            gdb_port=args.gdb_port,
             display=args.display,
             root_image=args.root_image,
             systemos_image=args.systemos_image,
@@ -3144,6 +3195,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"agent channel on 127.0.0.1:{args.agent_port} (virtio-serial, logged to "
               f"agent.log); the guest driver for it is not in this board's kernel "
               f"build, so expect the port to accept connections and stay quiet")
+    if args.gdb_port is None:
+        print("no gdbstub: the host can read the guest through QMP but cannot write "
+              "it, so the Metal wire's host side has no way to answer a request "
+              "(pass --gdb-port to add one)")
+    else:
+        print(f"gdbstub on tcp::{args.gdb_port}; a host backend can answer the guest's "
+              f"Metal requests by writing through it, two round-trips per operation "
+              f"rather than the zero-copy mmap a host with memory-backend-file would use")
     if report.root_image:
         print(f"root volume attached: {report.root_image}")
     else:

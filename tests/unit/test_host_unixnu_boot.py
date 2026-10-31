@@ -5651,3 +5651,120 @@ def test_the_diagnostic_backend_skips_the_preflight_and_seeds_no_file(
     # And the run still says which machine it was, because a report that
     # records the size but not the backend reads the same as its opposite.
     assert seen and seen[0].shared_window_backend == "ram", seen[0]
+
+
+# --- the gdbstub, which is how a Windows host answers the guest's Metal wire ---
+
+
+def test_the_gdb_port_emits_the_stub_and_nothing_else(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """One flag, and it is the only thing the gdbstub adds.
+
+    Upstream's host maps the shared window with ``mmap`` and serves it at memory
+    speed.  This host's QEMU registers only ``memory-backend-ram`` -- MEASURED,
+    ``-object help`` prints one hostmem backend and ``-object
+    memory-backend-file,...`` exits 1 with ``invalid object type`` -- so no
+    process outside the guest can map the window that way.
+
+    What this host does have is a gdbstub that writes guest memory, which
+    ``can-host-write-guest.py`` proves by writing a pattern through it and
+    reading the same bytes back through QMP.  So a host backend can serve the
+    wire by reading with ``pmemsave`` and writing with the gdbstub, and this flag
+    is what makes that reachable from the official boot path rather than a
+    hand-rolled argv.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, gdb_port=14996,
+        shared_window_mib=2048, shared_window_backend="ram",
+    )
+    assert "-gdb" in argv, argv
+    assert _flag(argv, "-gdb") == "tcp::14996", argv
+    # Nothing else moves: a run that asked for a gdbstub must not also change
+    # the QMP port, the serial path or the window.  The window is asserted
+    # because the gdbstub exists to serve it, so a run that moved one and not
+    # the other would be the interesting bug.
+    assert _flag(argv, "-qmp").startswith("tcp:127.0.0.1:"), argv
+    assert "memory-backend-ram,id=ram1,size=2048M" in argv, argv
+
+
+def test_no_gdb_port_leaves_the_argv_exactly_what_it_was(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """Default ``None`` and a byte-identical argv, for the agent_port reason.
+
+    Every recorded run on this host was made without a gdbstub.  A run that did
+    not ask for one must not differ from those in any direction a reader could
+    mistake for a measurement.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    without = ub.build_argv(qemu, inputs, work / "esp", work)
+    explicit = ub.build_argv(qemu, inputs, work / "esp", work, gdb_port=None)
+    assert without == explicit
+    assert "-gdb" not in without, without
+
+
+def test_a_gdb_port_outside_the_tcp_range_is_refused(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """A port QEMU cannot bind is caught here, not by QEMU's exit 1.
+
+    Same rule ``qmp_port``, ``serial_port`` and ``agent_port`` follow: an argv
+    that cannot start costs a whole launch cycle to discover.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    for bad in (0, 80, 70000):
+        caught = _refused(
+            ub.build_argv, qemu, inputs, work / "esp", work, gdb_port=bad
+        )
+        assert caught.code == ErrorCode.CONFIG_INVALID, caught
+        assert bad == caught.details.get("port"), caught.details
+
+
+def test_boot_passes_the_gdb_port_to_the_command_it_builds(
+    inputs: BootInputs, tmp_path: Path, qemu: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``boot()`` forwards it, so the official path can carry a host backend.
+
+    The other three ports are already threaded this far; a flag that reached
+    ``build_argv`` but not ``boot`` would be a flag only a test could use.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    seen: list[list[str]] = []
+    monkeypatch.setattr(ub, "build_argv", lambda *a, **k: (seen.append(k), ["-fake"])[1])
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: a[1])
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited([]))
+    ub.boot(inputs, work, qemu=qemu, device_dir=_synthetic_device(tmp_path),
+            seconds=0, gdb_port=14997)
+    assert seen, "boot() did not call build_argv"
+    assert seen[0].get("gdb_port") == 14997, seen[0]
+
+
+def test_the_gdb_port_survives_the_systemos_pair_staying_last(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The agent tail stays last, and the gdbstub goes after it.
+
+    ``agent_argv`` is appended last because it carries the ``-global`` that the
+    modern MMIO transport needs and that the disk paths must not repeat.  The
+    gdbstub is not in that position and must not displace it.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\x00" * (1 << 20))
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\x00" * (1 << 20))
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, agent_port=14999, gdb_port=14998,
+        root_image=root, systemos_image=cryptex,
+    )
+    assert argv[-2:] == ["-gdb", "tcp::14998"], argv[-4:]
+    # The agent chardev is still there, and the legacy global is still before it.
+    assert "-chardev" in argv and "unipad-agent" in " ".join(argv), argv
+    assert argv.index("-global") < argv.index("-chardev"), argv
