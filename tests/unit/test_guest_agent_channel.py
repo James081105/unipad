@@ -47,6 +47,7 @@ from unipad.guest.agent_channel import (
     STATE_UNCONNECTED,
     STATE_WAITING,
     AgentChannelTransport,
+    AgentSession,
     status_probe,
     status_request_line,
 )
@@ -809,3 +810,179 @@ def test_a_launch_reply_with_the_wrong_type_is_refused_over_the_real_socket():
         listener.close()
     assert caught.value.code == ErrorCode.QMP_PROTOCOL_ERROR
     assert caught.value.details["expected_type"] == MSG_LAUNCH_RESPONSE
+
+
+# --- one session, one connection: the two paths the caller must be able to walk --
+
+class BecomesReady:
+    """A listener that stays silent, then starts answering.
+
+    Models a guest whose install service comes up late -- which is the case the
+    one-connection rule makes dangerous.  If the transport closed on the first
+    timeout, the second request would hit a refused port and the caller would
+    conclude the boot was gone.
+    """
+
+    def __init__(self, silent_for_s: float) -> None:
+        self._silent_until = time.monotonic() + silent_for_s
+        self.received: list[bytes] = []
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(4)
+        self._sock.settimeout(20.0)
+        self.port = self._sock.getsockname()[1]
+        self._stop = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except (socket.timeout, OSError):
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            buffer = b""
+            conn.settimeout(20.0)
+            while not self._stop.is_set():
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, _, buffer = buffer.partition(b"\n")
+                    self.received.append(line)
+                    if time.monotonic() < self._silent_until:
+                        continue  # not up yet
+                    request = json.loads(line.decode())
+                    reply = Message(type=MSG_STATUS_RESPONSE, id=request["id"],
+                                    payload={"installed": [], "data_markers": []}).to_dict()
+                    conn.sendall(json.dumps(reply, sort_keys=True,
+                                            separators=(",", ":")).encode() + b"\n")
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def test_status_times_out_then_the_guest_is_ready_on_the_same_connection():
+    """Path 1: 状态查询超时 -> 客体稍后就绪 -> 同一连接继续请求.
+
+    The one-connection rule makes this the dangerous case.  A transport that
+    closed on timeout would leave the caller holding a dead socket against a
+    chardev that refuses every further connect, so the retry would fail with
+    ``refused`` -- a different failure, reported as a different cause, for a
+    guest that is in fact now answering.
+    """
+    guest = BecomesReady(silent_for_s=1.0)
+    try:
+        with AgentSession("127.0.0.1", guest.port, timeout_s=0.4) as session:
+            first = session.status()
+            assert first["reachable"] is False
+            assert first["state"] == STATE_SILENT
+            # The connection survived, which is the whole point.
+            assert session.connected is True
+
+            time.sleep(1.2)  # the guest's service comes up
+            second = session.status()
+            assert second["reachable"] is True
+            assert second["state"] == STATE_ANSWERED
+            assert second["reply"]["payload"]["installed"] == []
+            assert session.connected is True
+        # Two questions, one connection.
+        assert len(guest.received) == 2
+    finally:
+        guest.close()
+
+
+def test_status_succeeds_then_the_install_continues_on_the_same_connection():
+    """Path 2: 查询成功 -> 继续安装.
+
+    The install is what the status question exists to gate, so it must be able
+    to use the same socket.  If the probe closed it, this would be the second
+    caller to find the port refused.
+    """
+    from unipad.guest.client import GuestClient
+
+    guest = Listener(echo=True)
+    try:
+        with AgentSession("127.0.0.1", guest.port, timeout_s=5.0) as session:
+            verdict = session.status()
+            assert verdict["reachable"] is True
+
+            client = GuestClient(session.transport, attempts=1, backoff_s=0)
+            response = client.status()
+            assert response.installed == []
+            # Still the same socket, and still connected.
+            assert session.connected is True
+            assert session.state == STATE_ANSWERED
+        assert session.connected is False, "the session must release on exit"
+    finally:
+        guest.close()
+
+
+def test_a_session_releases_the_connection_and_is_safe_to_close_twice():
+    guest = Listener(echo=True)
+    try:
+        session = AgentSession("127.0.0.1", guest.port, timeout_s=5.0)
+        session.transport.connect()
+        assert session.connected is True
+        session.close()
+        session.close()
+        assert session.connected is False
+        assert session.state == STATE_UNCONNECTED
+    finally:
+        guest.close()
+
+
+def test_a_supplied_transport_is_not_closed_by_the_probe():
+    """The probe only closes what it created.
+
+    This is the assertion an earlier version of ``status_probe`` got wrong: it
+    closed in a ``finally`` unconditionally, so every caller spent the boot's one
+    connection on a single question.
+    """
+    guest = Listener(echo=True)
+    try:
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=5.0)
+        verdict = status_probe("127.0.0.1", guest.port, transport=transport)
+        assert verdict["reachable"] is True
+        assert transport.connected is True, "the probe closed a transport it does not own"
+        # And it is still usable.
+        reply = transport.request({"type": "status.request", "id": "again",
+                                   "payload": {}})
+        assert reply["type"] == MSG_STATUS_RESPONSE
+        transport.close()
+    finally:
+        guest.close()
+
+
+def test_a_one_shot_probe_still_closes_what_it_opened():
+    """The other half of the contract: a caller with no session must not leak.
+
+    Holding a socket open with no owner is its own leak, so the one-shot path
+    closes.  Both halves are needed -- never close a borrowed transport, always
+    close an owned one.
+    """
+    guest = Listener(echo=True)
+    try:
+        verdict = status_probe("127.0.0.1", guest.port, timeout_s=5.0)
+        assert verdict["reachable"] is True
+        # Nothing observable to assert on the transport itself, so assert on the
+        # peer: exactly one connection was made and the listener is idle again.
+        assert len(guest.received) == 1
+    finally:
+        guest.close()

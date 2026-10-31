@@ -44,7 +44,7 @@ from unipad.acceptance.e2e import (
     release_verdict,
 )
 from unipad.errors import ErrorCode, UniPadError
-from unipad.guest.agent_channel import status_probe
+from unipad.guest.agent_channel import AgentSession
 from unipad.host import payload_seed
 from unipad.host import unixnu_boot as ub
 from unipad.host.guestobserve import (
@@ -70,6 +70,13 @@ LISTENING = b"Serial keyboard started"
 #: line appears at guest t≈40-50s, and the probe needs the firmware's kernel load
 #: line in ``serial.log`` before it can translate anything.
 GUEST_UP_TIMEOUT_S = 300.0
+
+#: Per-request and connect budgets for the agent channel.  The request budget
+#: is generous because a guest that is still coming up may take a while to answer,
+#: and the whole point of holding the connection is that a slow answer is not a
+#: dead channel.
+AGENT_TIMEOUT_S = 60.0
+AGENT_CONNECT_TIMEOUT_S = 10.0
 
 #: SpringBoard's process name in the guest's task list.
 SPRINGBOARD = "SpringBoard"
@@ -185,6 +192,9 @@ class RealGuestRuntime(E2ERuntime):
         #: stage that could not ask the guest can say *which* way it failed
         #: instead of one undifferentiated "no answer".
         self._agent_verdict: Optional[dict[str, Any]] = None
+        #: The one agent-channel session, created on first use and released by
+        #: stop().  One connection per boot is all the chardev serves.
+        self._session: Optional[AgentSession] = None
 
     # -- the guest -------------------------------------------------------
 
@@ -281,6 +291,8 @@ class RealGuestRuntime(E2ERuntime):
             (self._run / "qemu-stderr.log").write_bytes(
                 self._process.stderr.read() if self._process.stderr else b"")
         self._process = None
+        if self._session is not None:
+            self._session.close()
 
     # -- reading the guest ----------------------------------------------
 
@@ -467,6 +479,29 @@ class RealGuestRuntime(E2ERuntime):
             "installed_before": package.bundle_id in installed_before,
         })
 
+    def _agent_session(self) -> Optional[AgentSession]:
+        """The one agent-channel session this runtime holds, or ``None``.
+
+        The chardev serves ONE connection per boot (measured: the first connect
+        is accepted, every later one is refused with ECONNREFUSED, permanently).
+        So the session is created once and reused for every question the cases
+        ask -- what is installed, whether an install may proceed, whether a
+        launch happened -- and released by :meth:`stop`.  A version that opened
+        a connection per question would spend the boot's only connection on the
+        first one, and every later case would see ``connection_refused`` and
+        report the boot as gone.
+
+        ``None`` is returned when no ``agent_port`` was configured, which is the
+        default and what every recorded run on this host used.
+        """
+        if self.agent_port is None:
+            return None
+        if self._session is None:
+            self._session = AgentSession(
+                "127.0.0.1", self.agent_port,
+                timeout_s=AGENT_TIMEOUT_S, connect_timeout_s=AGENT_CONNECT_TIMEOUT_S)
+        return self._session
+
     def _installed_bundle_ids(self) -> Optional[set[str]]:
         """The bundle ids the guest reports as installed, or ``None``.
 
@@ -496,7 +531,10 @@ class RealGuestRuntime(E2ERuntime):
                 "reachable": False, "state": "no_channel",
                 "detail": "agent_port_not_configured", "reply": None}
             return None
-        verdict = status_probe("127.0.0.1", self.agent_port, timeout_s=10.0)
+        session = self._agent_session()
+        if session is None:  # pragma: no cover - _agent_session returns None only without a port
+            return None
+        verdict = session.status()
         self._agent_verdict = verdict
         if not verdict["reachable"]:
             return None

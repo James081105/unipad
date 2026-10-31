@@ -282,6 +282,7 @@ def status_probe(
     host: str,
     port: int,
     *,
+    transport: Optional["AgentChannelTransport"] = None,
     timeout_s: float = 10.0,
 ) -> dict[str, Any]:
     """Ask the agent channel one status question and report how it went.
@@ -289,6 +290,14 @@ def status_probe(
     This exists so a caller can learn whether the guest service exists *before*
     committing to an install, and so that "no" is reported as a structured
     verdict rather than an exception the caller has to interpret.
+
+    Args:
+        host, port: where the channel is.  Ignored when ``transport`` is given,
+            because the transport already knows.
+        transport: an existing transport to ask through.  **When given, it is
+            NOT closed** -- see below.
+        timeout_s: the budget, used only when this call has to build its own
+            transport.
 
     Returns a dict with:
 
@@ -302,6 +311,20 @@ def status_probe(
     ``reply``
         the raw reply envelope when there was one, else ``None``.
 
+    Why ``transport`` exists, and why the one-shot case still closes
+    ----------------------------------------------------------------
+    The chardev serves ONE connection per boot (measured).  An earlier version
+    of this function created a transport and closed it in a ``finally``, which
+    meant every caller spent the boot's only connection on a single question --
+    so a status probe followed by an install was impossible, and the second
+    caller saw ``connection_refused`` and concluded the boot was gone.
+
+    So a caller that intends to do more than ask one question should hold an
+    :class:`AgentSession` and pass its transport here; then nothing is closed
+    and the connection survives for the install and the launch.  A caller that
+    really does want one throwaway question still gets one, and the transport is
+    closed for it, because leaving a socket open with no owner is its own leak.
+
     The status message is built through :class:`unipad.guest.protocol.Message`
     -- the same envelope :meth:`unipad.guest.client.GuestClient.status` sends, so
     the probe asks the question the real client asks and not a near-miss of it.
@@ -311,11 +334,13 @@ def status_probe(
     """
     envelope = Message(type=MSG_STATUS_REQUEST, id=new_message_id(), payload={})
     request = envelope.to_dict()
-    try:
-        transport = AgentChannelTransport(host, port, timeout_s=timeout_s)
-    except UniPadError as error:
-        return {"reachable": False, "state": STATE_REFUSED,
-                "detail": "invalid_port", "reply": None, "error": str(error)}
+    owned = transport is None
+    if owned:
+        try:
+            transport = AgentChannelTransport(host, port, timeout_s=timeout_s)
+        except UniPadError as error:
+            return {"reachable": False, "state": STATE_REFUSED,
+                    "detail": "invalid_port", "reply": None, "error": str(error)}
     try:
         try:
             transport.connect()
@@ -338,7 +363,80 @@ def status_probe(
         return {"reachable": True, "state": STATE_ANSWERED, "detail": "",
                 "reply": reply}
     finally:
-        transport.close()
+        # Only a transport this call created is closed.  A caller-supplied one
+        # belongs to the caller, and closing it would spend the boot's single
+        # connection on a question that was already asked.
+        if owned:
+            transport.close()
+
+
+class AgentSession:
+    """One agent-channel connection, held for the life of a boot.
+
+    The chardev serves exactly one connection per QEMU process (measured: the
+    first connect is accepted, every later one is refused with ECONNREFUSED,
+    immediately and permanently).  So a session that does more than ask one
+    question must hold that connection rather than open a new one per call --
+    status, install, launch and persist all go through :attr:`transport`.
+
+    Use it as a context manager; :meth:`__exit__` is the "release at the end of
+    the boot" the caller is responsible for::
+
+        with AgentSession("127.0.0.1", port) as session:
+            verdict = session.status()
+            if verdict["reachable"]:
+                client = GuestClient(session.transport)
+                client.install_package(...)
+
+    Attributes:
+        transport: the shared :class:`AgentChannelTransport`.  Hand it to
+            :class:`unipad.guest.client.GuestClient` so every call reuses the
+            one socket.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+    ) -> None:
+        self.transport = AgentChannelTransport(
+            host, port, timeout_s=timeout_s, connect_timeout_s=connect_timeout_s
+        )
+
+    @property
+    def host(self) -> str:
+        return self.transport.host
+
+    @property
+    def port(self) -> int:
+        return self.transport.port
+
+    @property
+    def state(self) -> str:
+        """The transport's latest outcome, so a caller can poll mid-session."""
+        return self.transport.state
+
+    @property
+    def connected(self) -> bool:
+        return self.transport.connected
+
+    def status(self) -> dict[str, Any]:
+        """One status question over the held connection.  Never closes it."""
+        return status_probe(self.host, self.port, transport=self.transport)
+
+    def close(self) -> None:
+        """Release the connection.  Safe to call twice; idempotent."""
+        self.transport.close()
+
+    def __enter__(self) -> "AgentSession":
+        self.transport.connect()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def status_request_line() -> bytes:
@@ -353,6 +451,7 @@ def status_request_line() -> bytes:
 
 __all__ = [
     "AgentChannelTransport",
+    "AgentSession",
     "STATE_ANSWERED",
     "STATE_CLOSED",
     "STATE_REFUSED",
