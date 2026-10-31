@@ -42,7 +42,13 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    # NOT Mandatory.  A `push` trigger has no workflow_dispatch inputs, so the
+    # workflow passes the literal empty string -- and PowerShell refuses to bind
+    # an empty string to a Mandatory parameter ("Cannot bind argument to
+    # parameter 'Versions' because it is an empty string"), which is how the
+    # first two runs of this job failed in 13 seconds having measured nothing.
+    # An optional parameter plus the default below is what makes a push run
+    # actually probe something.
     [string]$Versions,
 
     [string]$Output = "qemu-hostmem-probe.json",
