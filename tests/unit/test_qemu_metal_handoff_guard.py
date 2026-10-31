@@ -47,11 +47,16 @@ from pathlib import Path
 
 import pytest
 
+from tests.vendor_paths import require
+
 REPO = Path(__file__).resolve().parents[2]
 KIT = REPO / "vendor" / "UniXNU-qemu" / "package" / "QemuMetal"
 ACCELERATOR = KIT / "QemuMetalAccelerator.cpp"
 PLUGIN = KIT / "QemuMetalPlugin.mm"
 SCANOUT = KIT / "QemuMetalScanout.mm"
+#: The selector search, extracted into plain C++ so this repository can compile
+#: and run it.  ``test_qemu_metal_selector.py`` is the test that does.
+SELECTOR = KIT / "QemuMetalSelector.h"
 BUILDER = REPO / "vendor" / "UniXNU-qemu" / "scripts" / "build-qemu-metal.py"
 #: Upstream's own wire records and the presenter that serves them.  These are
 #: in the device repository, not in this board's kit: the hand-off is a
@@ -89,7 +94,7 @@ def test_the_accelerator_accepts_a_second_open_type_that_is_not_the_slot_type() 
     owners array would then name two processes in a boot where only one
     rendered -- a reading that looks like a bug in the render server.
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     slot = _constant(source, "kOpenType")
     handoff = _constant(source, "kHandoffOpenType")
     assert slot == 0x514D, "kOpenType moved; the plugin's open would be refused"
@@ -106,7 +111,7 @@ def test_the_handoff_branch_is_reached_before_the_slot_refusal() -> None:
     sandbox problem in the render server, and the real cause -- no scanout
     client -- would stay invisible.
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     branch = source.index("if (type == kHandoffOpenType)")
     refusal = source.index("if (type != kOpenType)")
     assert branch < refusal, (
@@ -126,7 +131,7 @@ def test_a_handoff_connection_takes_no_slot_and_writes_no_owner() -> None:
     ``proc_selfname`` would overwrite it, and the next run would show an
     owner that is not the render server.
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     body = source[source.index("bool AGXDeviceUserClient::start("):]
     body = body[: body.index("void AGXDeviceUserClient::giveBack")]
     assert "if (handoff) return true;" in body, (
@@ -153,10 +158,10 @@ def test_the_handoff_method_numbers_are_the_presenters_own(name: str) -> None:
     upstream would serve a different method and still return success for
     the ones that happen to line up.
     """
-    wire = _text(WIRE)
+    wire = _text(require(WIRE))
     values = dict(re.findall(r"\b(NGP_METHOD_\w+)\s*=\s*(\d+)", wire))
     assert values, "NativeGOPWire.h no longer names the hand-off methods"
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     base = _constant(source, "kHandoffBase")
     last = _constant(source, "kHandoffLast")
     method = int(values[name])
@@ -179,7 +184,7 @@ def test_the_scanout_memory_type_is_served_before_the_slot_type_refusal() -> Non
     a hand-off connection asking for a slot gets, so the plugin could not
     tell "no GPU mode" from "wrong connection".
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     assert _constant(source, "kScanoutType") == 0x5343
     body = source[source.index("IOReturn AGXDeviceUserClient::clientMemoryForType"):]
     served = body.index("native_gop_handoff_memory()")
@@ -199,7 +204,7 @@ def test_the_presenter_hands_the_scanout_out_only_in_gpu_mode() -> None:
     GPU mode.  If that gate ever moved, the plugin's scanout would fail at
     step 3 and the reason would not be this guest's boot arguments.
     """
-    presenter = _text(PRESENTER)
+    presenter = _text(require(PRESENTER))
     memory = presenter[presenter.index("IOMemoryDescriptor *NativeGOPPresenter::handoffMemory"):]
     assert "!p->gpuMode" in memory, (
         "handoffMemory no longer refuses when the presenter is not in GPU mode"
@@ -216,7 +221,7 @@ def test_the_plugin_starts_the_scanout_for_the_render_server_only() -> None:
     it also waited for frames, two clients would race for the presenter's
     one frame queue and the loser would report a protocol error.
     """
-    source = _text(PLUGIN)
+    source = _text(require(PLUGIN))
     assert "qemu_metal_serve_scanout((__bridge void *)device, port);" in source
     guard = source.index("qemu_metal_serve_scanout((__bridge void *)device, port);")
     assert "if (server)" in source[:guard], (
@@ -238,16 +243,60 @@ def test_the_scanout_client_probes_for_a_selector_instead_of_assuming_one() -> N
     selector 0x7000 would send its first call into a refusal and report "no
     frames", which is indistinguishable from a black screen for any other
     reason.
+
+    The search lives in ``QemuMetalSelector.h`` so it can be executed by this
+    repository's own tests (``test_qemu_metal_selector.py``); what is asserted
+    here is the two halves of the bug that made that necessary, because a
+    source-level guard cannot see either one:
+
+    * the loop must not read the field it is filling in.  ``tunnel`` takes the
+      selector as a PARAMETER, so a probe of selector 5 cannot silently become
+      a probe of selector 0 -- which is what reading ``link.selector`` did,
+      two hundred and fifty-six times over;
+    * "nothing is admitted" must be a value selector 0 cannot produce, so the
+      caller compares against ``kNoSelector`` rather than testing the selector
+      for truth.  The old ``if (!link.selector)`` read a profile that admitted
+      selector 0 as a profile that admitted nothing, and logged accordingly.
     """
-    source = _text(SCANOUT)
-    assert "for (uint32_t selector = 0; selector < 256; ++selector)" in source, (
-        "the scanout client does not probe the selectors"
+    source = _text(require(SCANOUT))
+    selector_header = _text(require(SELECTOR))
+    assert '#include "QemuMetalSelector.h"' in source, (
+        "the scanout client no longer uses the selector header, so its search "
+        "is back to being untestable from this repository"
     )
-    assert "kProbe" in source and "return selector;" in source
-    assert "if (!link.selector) {" in source, (
-        "a boot whose profile admits no selector is not reported as such"
+    # The search is the header's, not the .mm's, and the header is what the
+    # executable cases in test_qemu_metal_selector.py compile.
+    assert "for (uint32_t selector = 0; selector < 256; ++selector)" in selector_header, (
+        "QemuMetalSelector.h no longer walks the selectors in order"
     )
-    assert "tunnel(link, kProbe, nullptr, 0, nullptr, 0) == 0" in source
+    assert "return kNoSelector;" in selector_header and "if (!probe) return kNoSelector;" in selector_header
+    # The parameter, not the field.
+    assert re.search(r"int tunnel\(Link &link, uint32_t selector, uint32_t method", source), (
+        "tunnel does not take the selector as a parameter, so a probe can ask "
+        "a selector the caller did not choose"
+    )
+    assert "return link.callFn(link.connection, selector," in source, (
+        "tunnel is not using the selector it was given"
+    )
+    assert "tunnel(link, link.selector, method," in source, (
+        "the hand-off methods no longer travel on the selected selector"
+    )
+    # The probe passes through what it was asked, rather than substituting the
+    # field the loop has not written yet.
+    assert "tunnel(*probe->link, selector, kProbe, nullptr, 0, nullptr, 0) == 0" in source, (
+        "the probe is not asking the selector it was handed"
+    )
+    # kNoSelector, and not a truth test on the selector.
+    assert "selected == qemu_metal_selector::kNoSelector" in source, (
+        "the caller does not compare against kNoSelector, so 'selector 0 was "
+        "admitted' and 'nothing was admitted' are the same answer again"
+    )
+    assert "if (!link.selector)" not in source, (
+        "the caller is back to reading selector 0 as failure"
+    )
+    assert "link.selector = selected;" in source, (
+        "the selected selector is never installed on the connection"
+    )
 
 
 def test_the_scanout_client_opens_a_connection_of_its_own() -> None:
@@ -257,7 +306,7 @@ def test_the_scanout_client_opens_a_connection_of_its_own() -> None:
     that opened with the slot type would consume one of the rest and write
     its name into the owners array.
     """
-    source = _text(SCANOUT)
+    source = _text(require(SCANOUT))
     assert "link.openFn(link.port, mach_task_self(), kHandoffOpenType, &link.connection)" in source, (
         "the scanout client does not open a hand-off connection of its own"
     )
@@ -270,7 +319,7 @@ def test_the_scanout_thread_cannot_kill_the_render_server_with_an_exception() ->
     for the same reason (int-075/083: SpringBoard died), and a Metal
     exception on a frame is an ordinary outcome, not a corner case.
     """
-    source = _text(SCANOUT)
+    source = _text(require(SCANOUT))
     assert "@try {" in source, "the serving loop is not inside @try"
     assert "@catch (NSException *exception)" in source, (
         "the serving loop has no @catch"
@@ -297,7 +346,7 @@ def test_every_handoff_outcome_is_counted() -> None:
     last-value counter that someone converts into ``= x + 1`` reports a
     running sum of selector numbers, which is not any reading at all.
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     totals = (
         "native_qemu_metal_handoff_opens",
         "native_qemu_metal_handoff_calls",
@@ -332,7 +381,7 @@ def test_every_handoff_counter_is_four_bytes_wide() -> None:
     be the same width -- and the block has to declare exactly the eight the
     guard above counts, or one of them is silently not read.
     """
-    source = _text(ACCELERATOR)
+    source = _text(require(ACCELERATOR))
     declared = re.search(r"volatile uint32_t (native_qemu_metal_handoff\w[^;]*);", source)
     assert declared, "the hand-off counters are not declared as one uint32_t block"
     names = declared.group(1).replace("\n", " ").split(",")
@@ -351,7 +400,7 @@ def test_the_builder_links_the_scanout_client_into_the_bundle() -> None:
     has to be in its link or the scanout thread does not exist and
     ``native_gop_gpu_offers`` stays 0 for a reason no counter can show.
     """
-    source = _text(BUILDER)
+    source = _text(require(BUILDER))
     bundle = source[source.index("def bundle()"):source.index("def trust(")]
     assert "KIT / 'QemuMetalScanout.mm'" in bundle, (
         "build-qemu-metal.py's bundle link no longer compiles QemuMetalScanout.mm"
@@ -370,7 +419,7 @@ def test_the_builder_links_the_scanout_client_into_the_bundle() -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [ACCELERATOR, PLUGIN, SCANOUT, BUILDER, WIRE, PRESENTER],
+    [ACCELERATOR, PLUGIN, SCANOUT, SELECTOR, BUILDER, WIRE, PRESENTER],
 )
 def test_the_files_this_guard_describes_exist(path: Path) -> None:
     """A guard whose anchors have moved fails as "not found", not as "passing".
@@ -378,5 +427,12 @@ def test_the_files_this_guard_describes_exist(path: Path) -> None:
     Every pattern above is a literal from the file it names.  If a rename
     makes one of them stop matching, the test that owns it goes red -- which
     is the difference between a guard and a comment.
+
+    ``require`` keeps that property while making the clean-checkout case
+    honest: when the owning checkout is absent the test skips, and when the
+    checkout is present but this file is not it fails -- see
+    ``tests/vendor_paths.py`` for why the guard keys on the checkout rather
+    than on the file.
     """
+    require(path)
     assert path.is_file(), f"{path.relative_to(REPO)} is missing"
