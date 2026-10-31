@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from typing import Any, Optional
 
 from unipad.errors import ErrorCode, UniPadError
@@ -266,6 +267,82 @@ class AgentChannelTransport:
         raise UniPadError(  # pragma: no cover - attempts >= 1 is enforced
             ErrorCode.INSTALL_SERVICE_UNAVAILABLE, "the agent channel gave up"
         )
+
+    def listen(self, budget_s: float) -> dict[str, Any]:
+        """Whatever the peer sends within ``budget_s``, without sending anything.
+
+        This exists because on this host the channel is NOT silent before the
+        agent exists.  MEASURED (``agent-channel-firmware-bytes.py``): the guest
+        firmware writes 1015 bytes of EDK2/DarwinBoot boot-console output into
+        it, with ``frontend-open: true``, while the kernel writes nothing.  So a
+        caller that sends ``status.request`` first and reads second collects
+        those 1015 bytes as its reply, then fails in
+        ``GuestClient._validate_reply`` with a type mismatch -- which reads as
+        "the guest replied wrongly" when the truth is that the firmware is
+        talking to itself and the kernel never spoke at all.
+
+        Reading first is therefore not a nicety, it is the only order that can
+        tell the two apart.  The bytes are returned as they arrived rather than
+        parsed, because there is nothing to parse them as: they are not a reply
+        to anything.
+
+        Args:
+            budget_s: how long to keep reading.  A peer that sends nothing for
+                the whole budget has not sent anything, which is an answer.
+
+        Returns:
+            ``{"data": bytes, "bytes": int, "closed": bool, "state": str}``.
+            ``closed`` is ``True`` when the peer hung up underneath, which is a
+            different fact from "nothing arrived" and must not be reported as
+            one.  ``state`` is the transport's own, and is NOT advanced to
+            ``answered`` -- nothing was parsed as a reply.
+
+        Raises:
+            UniPadError: ``install_service_unavailable`` when no socket is held.
+                Listening on a connection that is not there is a caller bug, and
+                reporting it as "the peer sent nothing" would be the exact
+                confusion this method exists to remove.
+        """
+        # The budget is checked first because it is a pure argument validation:
+        # a caller that passes 0 has made the same mistake whether or not a
+        # socket happens to be held, and reporting it as "not connected" would
+        # send them looking for the wrong bug.
+        if budget_s <= 0:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "a listen budget must be positive",
+                budget_s=budget_s,
+            )
+        if self._sock is None:
+            raise UniPadError(
+                ErrorCode.INSTALL_SERVICE_UNAVAILABLE,
+                "cannot listen on a channel that is not connected",
+                state=self.state,
+            )
+        chunks: list[bytes] = []
+        deadline = time.monotonic() + budget_s
+        self._sock.settimeout(1.0)
+        closed = False
+        while time.monotonic() < deadline:
+            try:
+                piece = self._sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                closed = True
+                break
+            if not piece:
+                closed = True
+                break
+            chunks.append(piece)
+        data = b"".join(chunks)
+        if closed:
+            # The peer hung up.  That is the one outcome that does end the
+            # channel, so it is recorded as such rather than left for the next
+            # call to discover.
+            self.state = STATE_CLOSED
+        return {"data": data, "bytes": len(data), "closed": closed,
+                "state": self.state}
 
     def _read_line(self) -> bytes:
         """Block until one complete line is buffered, and return it."""

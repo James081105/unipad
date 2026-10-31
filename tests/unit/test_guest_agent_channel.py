@@ -88,9 +88,16 @@ class Listener:
     def __init__(self, reply: Optional[bytes] = None, *, hang_up: bool = False,
                  delay_s: float = 0.0, echo: bool = False,
                  echo_type: str = MSG_STATUS_RESPONSE,
-                 echo_payload: Optional[dict] = None) -> None:
+                 echo_payload: Optional[dict] = None,
+                 speak_first: Optional[bytes] = None) -> None:
         self._reply = reply
         self._hang_up = hang_up
+        #: Bytes sent the moment a connection is accepted, before anything is
+        #: received.  This is what the guest FIRMWARE does -- fact 200 measured
+        #: 1015 bytes of EDK2/DarwinBoot boot-console output written into the
+        #: channel with no request in front of it -- and a listener that only
+        #: answers a line cannot model it.
+        self._speak_first = speak_first
         self._delay_s = delay_s
         self._echo = echo
         self._echo_type = echo_type
@@ -132,6 +139,11 @@ class Listener:
             if self._hang_up:
                 conn.close()
                 return
+            if self._speak_first is not None:
+                try:
+                    conn.sendall(self._speak_first)
+                except OSError:
+                    return
             buffer = b""
             conn.settimeout(10.0)
             while not self._stop.is_set():
@@ -1054,5 +1066,116 @@ def test_a_silent_one_shot_also_reports_the_connection_as_spent():
         assert verdict["reachable"] is False
         assert verdict["state"] == STATE_SILENT
         assert verdict["connection"] == "spent"
+    finally:
+        guest.close()
+
+
+# --- listen(): read before writing, because the firmware speaks first ---
+
+
+def test_listening_collects_what_the_peer_sends_unprompted():
+    """The firmware writes 1015 bytes before any agent exists (fact 200).
+
+    A caller that sends ``status.request`` first and reads second collects those
+    bytes as its reply, then fails in ``GuestClient._validate_reply`` with a
+    type mismatch -- which reads as "the guest replied wrongly" when the truth is
+    that the firmware is talking to itself and the kernel never spoke at all.
+    So reading first is the only order that can tell the two apart.
+    """
+    firmware = b"EDK2 firmware output that no agent wrote\r\n" * 3
+    guest = Listener(speak_first=firmware)
+    try:
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=2.0)
+        transport.connect()
+        heard = transport.listen(1.5)
+        assert heard["bytes"] == len(firmware), (
+            "listen did not return the bytes the peer sent unprompted")
+        assert heard["data"] == firmware
+        assert heard["closed"] is False
+        # Nothing was parsed as a reply, so the state must not claim one.
+        assert transport.state == STATE_WAITING or transport.state == STATE_UNCONNECTED
+        transport.close()
+    finally:
+        guest.close()
+
+
+def test_listening_to_a_silent_peer_reports_silence_not_a_close():
+    """Zero bytes and a hung-up peer are different facts.
+
+    ``closed`` is the only thing that distinguishes them, and a version that
+    returned ``{"bytes": 0}`` for both would let a caller report "the channel
+    died" for a guest that simply has nothing to say yet.
+    """
+    guest = Listener(reply=None)
+    try:
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=2.0)
+        transport.connect()
+        heard = transport.listen(0.6)
+        assert heard["bytes"] == 0
+        assert heard["closed"] is False
+        assert heard["state"] == STATE_UNCONNECTED
+        transport.close()
+    finally:
+        guest.close()
+
+
+def test_listening_reports_a_peer_that_hangs_up():
+    """The one outcome that really does end the channel.
+
+    It has to be visible in the return value AND in ``state``, because the
+    transport's whole design is that the caller can ask "which failure was
+    that?" after the fact.
+    """
+    guest = Listener(hang_up=True)
+    try:
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=2.0)
+        transport.connect()
+        heard = transport.listen(2.0)
+        assert heard["closed"] is True
+        assert transport.state == STATE_CLOSED
+    finally:
+        guest.close()
+
+
+def test_listening_without_a_connection_is_refused_not_empty():
+    """Listening on a channel that is not there is a caller bug.
+
+    Returning ``{"bytes": 0}`` would report it as "the peer sent nothing", which
+    is the exact confusion this method exists to remove -- the same shape as the
+    probe that once reported "the ring stayed at 0 bytes" for 900 s because its
+    own code was broken.
+    """
+    transport = AgentChannelTransport("127.0.0.1", 1, timeout_s=1.0)
+    with pytest.raises(UniPadError) as caught:
+        transport.listen(0.2)
+    assert caught.value.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+
+
+def test_a_non_positive_listen_budget_is_refused():
+    transport = AgentChannelTransport("127.0.0.1", 1, timeout_s=1.0)
+    with pytest.raises(UniPadError) as caught:
+        transport.listen(0)
+    assert caught.value.code == ErrorCode.CONFIG_INVALID
+
+
+def test_listening_then_asking_uses_the_same_connection():
+    """Read-first must not spend the boot's one connection.
+
+    The chardev serves exactly one connection per QEMU process, so a
+    read-then-ask caller that ended up opening two sockets would have the second
+    refused -- and would report the boot as gone.  This is the path the console
+    probe takes.
+    """
+    guest = Listener(echo=True)
+    try:
+        transport = AgentChannelTransport("127.0.0.1", guest.port, timeout_s=2.0)
+        transport.connect()
+        first = transport.listen(0.4)
+        assert first["bytes"] == 0, "the echo listener should not speak first"
+        reply = transport.request({"type": "status.request", "id": "after-listen",
+                                   "payload": {}})
+        assert reply["type"] == MSG_STATUS_RESPONSE
+        assert reply["id"] == "after-listen"
+        transport.close()
     finally:
         guest.close()
