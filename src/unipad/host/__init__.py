@@ -80,6 +80,13 @@ from unipad.host.logs import (
 )
 from unipad.host.qemu import LaunchResult, QemuLauncher, QmpReadiness, StopResult
 from unipad.host.qmp import QmpClient
+from unipad.host.winsurface import (
+    FrameSource,
+    SurfaceWindow,
+    frame_geometry,
+    ppm_to_bgr,
+    solid_frame,
+)
 
 __all__ = [
     # inventory
@@ -137,4 +144,10 @@ __all__ = [
     "rotate_point",
     "render_progress",
     "stage_vocabulary_drift",
+    # winsurface -- the only thing in this package that puts a pixel on screen
+    "SurfaceWindow",
+    "FrameSource",
+    "ppm_to_bgr",
+    "solid_frame",
+    "frame_geometry",
 ]
