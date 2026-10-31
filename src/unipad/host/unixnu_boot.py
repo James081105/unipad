@@ -1442,6 +1442,62 @@ def _serial_argv(port: Optional[int], log: Path) -> list[str]:
     ]
 
 
+def _agent_argv(
+    port: Optional[int], log: Path, *, emit_legacy_global: bool = False
+) -> list[str]:
+    """A second, dedicated channel into the guest, or nothing at all.
+
+    This is the transport the guest-side install agent would use, and it is a
+    *separate* device from the UART for a reason that has already cost this
+    project its only guest-side evidence: the UART is the kernel console, so
+    anything multiplexed onto it lands in ``serial.log`` interleaved with the
+    kernel's own output -- and ``serial.log`` is what every measurement reads.
+
+    The shape is upstream's own, measured working: ``run-qemu.py``'s offline GPU
+    broker pairs ``virtio-serial-device`` with ``virtconsole``
+    (``vendor/UniXNU/scripts/qemu-entry/gdb-stop.py:373-375``), and the guest
+    kernel has the driver for it (``drivers/NativeVirtioConsole``, which probes
+    for ``compatible == "virtio,mmio"`` with the console's magic, version and
+    device id).  Upstream spells the chardev as a Unix socket; Windows has no
+    ``AF_UNIX``, so this is TCP -- the same substitution ``-qmp`` already makes
+    and for the same documented reason.
+
+    **What this does NOT promise**, because it has not been measured: that the
+    guest reads it.  ``NativeVirtioConsole`` exists in the device repository but
+    is not in this board's build -- ``build-arm-driver.py``'s choices list is the
+    only thing that mentions it and nothing invokes it -- so the guest kernel
+    this host runs will enumerate nothing on this transport, and the port will
+    accept connections and stay silent.  That is the honest state, and it is why
+    the parameter is opt-in: the channel is the transport, and the guest half is
+    a kernel build change with its own evidence to produce.
+
+    ``None`` (the default) emits nothing, so the argv is byte-for-byte what it
+    was.  That is deliberate: a run that did not ask for the channel must not
+    differ from one that did in any way a later reader could mistake for a
+    measurement.
+    """
+    if port is None:
+        return []
+    port = int(port)
+    if not 1024 <= port <= 65535:
+        raise UniPadError(
+            ErrorCode.CONFIG_INVALID,
+            "the agent port must be a TCP port the host can bind",
+            port=port,
+        )
+    return (
+        ["-global", "virtio-mmio.force-legacy=false"] if emit_legacy_global else []
+    ) + [
+        "-chardev",
+        f"socket,id=unipad-agent,host=127.0.0.1,port={port},server=on,wait=off,"
+        f"logfile={qpath(log)},logappend=on",
+        # The MMIO virtio-serial transport and its one console.  The guest's
+        # driver takes port 0 only, which is what ``virtconsole`` gives it.
+        "-device", "virtio-serial-device,id=unipad-agent-serial",
+        "-device", "virtconsole,chardev=unipad-agent,name=unipad-agent-transport",
+    ]
+
+
 def _raw_volume(path: Path, role: str, consequence: str) -> Path:
     """A raw block-device image, resolved, and refused if it cannot be one.
 
@@ -1518,6 +1574,7 @@ def build_argv(
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
     serial_port: Optional[int] = None,
+    agent_port: Optional[int] = None,
 ) -> list[str]:
     """The QEMU argv (without the executable).
 
@@ -1629,6 +1686,15 @@ def build_argv(
     ``virtio-blk-pci``, and that is what restored it, so :func:`build_argv` emits
     it too -- unconditionally, for the reason spelled out at the device below.
     The probe scripts call this function, so they get it without being edited.
+
+    ``agent_port`` is a second channel into the guest, on its own device.  It is
+    opt-in and ``None`` by default, which is not a preference for the old
+    behaviour but a requirement: every recorded run on this host has the argv
+    this function builds without it, so a run that did not ask for the channel
+    must not differ from one that did in any way a later reader could mistake
+    for a measurement.  :func:`_agent_argv` is the whole of it, including what
+    the guest can and cannot do with it today.
+
     """
     if not 1 <= int(qmp_port) <= 65535:
         raise UniPadError(
@@ -1707,6 +1773,22 @@ def build_argv(
             f"if=none,id=systemos,format=raw,readonly=on,file={qpath(systemos)}",
             "-device", "virtio-blk-device,drive=systemos",
         ]
+
+    # The agent channel, last, for the reason the SystemOS pair is last: it is
+    # the newest addition and the position of everything already recorded has to
+    # stay where it was.
+    #
+    # ``emit_legacy_global`` is the one coupling worth naming: the agent's
+    # ``virtio-serial-device`` is MMIO like the block devices, so it needs the
+    # same ``force-legacy=false`` -- but only when neither of them emitted it.
+    # QEMU accepts two identical ``-global`` options without complaint (they are
+    # two entries in one list, both applied), so nothing would *fail*; they would
+    # just read as two intentions in an argv that is evidence.
+    agent_argv = _agent_argv(
+        agent_port,
+        Path(workdir) / "agent.log",
+        emit_legacy_global=(root is None and systemos is None),
+    )
 
     return [
         "-drive", f"if=pflash,format=raw,readonly=on,file={qpath(firmware)}",
@@ -1885,7 +1967,7 @@ def build_argv(
             if metal_clients else []
         )
         if shared_window_mib else []
-    ) + systemos_argv
+    ) + systemos_argv + agent_argv
 
 
 # ---------------------------------------------------------------------------
@@ -2002,6 +2084,7 @@ def boot(
     shared_window_cache: str = "wb",
     shared_window_backend: str = "file",
     metal_clients: Optional[str] = None,
+    agent_port: Optional[int] = None,
 ) -> BootReport:
     """Stage the ESP, start QEMU, watch it, and keep every log.
 
@@ -2186,6 +2269,7 @@ def boot(
         shared_window_cache=shared_window_cache,
         shared_window_backend=shared_window_backend,
         metal_clients=metal_clients,
+        agent_port=agent_port,
         # Only with the driver that reads it: a geometry nothing set is a claim
         # the run cannot support (run-qemu.py:105-116).
         ramfb_size=SCREEN if (esp / RAMFB_NAME).is_file() else None,
@@ -2291,6 +2375,7 @@ def boot_until_mounted(
     root_image: Optional[Path] = None,
     systemos_image: Optional[Path] = None,
     attempts: int = MAX_BOOT_ATTEMPTS,
+    agent_port: Optional[int] = None,
 ) -> BootReport:
     """Boot until the guest reports the Data volume mounted, or the budget ends.
 
@@ -2342,6 +2427,7 @@ def boot_until_mounted(
             qemu=qemu, device_dir=device_dir, seconds=seconds, every=every,
             qmp_port=qmp_port, serial_port=serial_port, display=display,
             root_image=root_image, systemos_image=systemos_image,
+            agent_port=agent_port,
         )
         report.attempt = attempt
         if report.data_volume_mounted:
@@ -2917,6 +3003,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              "127.0.0.1 as well as logging it to serial.log; "
                              "without it the UART is a write-only file and no "
                              "host keystroke can reach the guest")
+    parser.add_argument("--agent-port", type=int, default=None,
+                        help="expose a second, dedicated channel into the guest on this "
+                             "TCP port on 127.0.0.1, as a virtio-serial device rather "
+                             "than a second use of the UART; without it the guest has "
+                             "only the UART, which is the kernel console and is not "
+                             "free for a guest-side agent to use")
     parser.add_argument("--display", default="none")
     parser.add_argument("--root-image", type=Path, default=None,
                         help="raw OS volume to attach as a second, read-only virtio-blk disk; "
@@ -2984,6 +3076,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             every=args.every,
             qmp_port=args.qmp_port,
             serial_port=args.serial_port,
+            agent_port=args.agent_port,
             display=args.display,
             root_image=args.root_image,
             systemos_image=args.systemos_image,
@@ -3039,6 +3132,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(f"serial UART is a TCP chardev on 127.0.0.1:{args.serial_port}; "
               f"SerialInputSink(port={args.serial_port}) can type into it")
+    if args.agent_port is None:
+        print("no agent channel: the guest has only the UART, and a guest-side "
+              "agent sharing it would interleave with the kernel console in "
+              "serial.log (pass --agent-port to add one)")
+    else:
+        # Said plainly, including the half that is not built yet, because a
+        # channel whose guest half is missing is a channel that answers
+        # connections and stays silent -- and an operator reading "agent channel
+        # on 127.0.0.1:14999" would reasonably assume the guest is listening.
+        print(f"agent channel on 127.0.0.1:{args.agent_port} (virtio-serial, logged to "
+              f"agent.log); the guest driver for it is not in this board's kernel "
+              f"build, so expect the port to accept connections and stay quiet")
     if report.root_image:
         print(f"root volume attached: {report.root_image}")
     else:

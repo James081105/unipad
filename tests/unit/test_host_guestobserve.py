@@ -46,6 +46,7 @@ import pytest
 
 from unipad.errors import ErrorCode, UniPadError
 from unipad.host import guestobserve as go
+from unipad.host import qemu_metal as _qm
 
 # No ``acceptance`` marker: this is a unit test of a host module against a
 # synthetic guest, not a milestone-gate simulation, and marking it as one would
@@ -925,18 +926,26 @@ def test_a_malformed_image_does_not_escape_as_a_traceback(tmp_path: Path) -> Non
 PA_COUNTER = 0x9000
 PA_COUNTER_WIDE = 0xA000
 
-#: The six ``QemuMetalPublish.cpp`` counters plus the gate that decides whether
-#: any of them can move.  All seven are ``volatile uint32_t`` in the source, and
-#: all seven sit within 32 bytes of each other in the delivered kernel -- which
-#: is why they are read as one block rather than seven separate probes.
-QMETAL_COUNTERS = (
-    "native_shared_window_stage",
-    "native_qemu_metal_stage",
-    "native_qemu_metal_status",
-    "native_qemu_metal_opens",
-    "native_qemu_metal_refusals",
-    "native_qemu_metal_grants",
-    "native_qemu_metal_owners",
+#: The counters the DELIVERED kernel is expected to define, derived from the
+#: committed list rather than restated here.
+#:
+#: ``unipad.host.qemu_metal`` owns the forward-looking list and includes the
+#: hand-off's eight counters, which this image predates -- it was built before
+#: the hand-off existed.  So this is that list minus the hand-off family, and
+#: the filter is named rather than silent: when a bundle carrying the hand-off
+#: is delivered, ``DELIVERED_KERNEL_SHA256`` moves and the filter goes away.  A
+#: test that kept its own copy of the seven would be the same divergence one
+#: level further out, which is what ``test_qemu_metal_counters.py`` was written
+#: to stop.
+#:
+#: All seven are ``volatile uint32_t`` (``native_qemu_metal_status`` is declared
+#: ``volatile int``, an IOReturn) in the source, and all seven sit within 32
+#: bytes of each other in the delivered kernel -- which is why they are read as
+#: one block rather than seven separate probes.
+QMETAL_COUNTERS = tuple(
+    name
+    for name, _width in _qm.QMETAL_COUNTERS
+    if "handoff" not in name and "scanout_maps" not in name
 )
 
 

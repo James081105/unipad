@@ -1047,6 +1047,314 @@ def test_the_retry_chain_forwards_the_serial_port_to_every_attempt(
     assert seen == [14533, 14533], seen
 
 
+def test_the_agent_port_is_a_second_device_not_a_second_use_of_the_uart(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The transport the guest install agent would use, and why it is not the UART.
+
+    The IPA chain stops at ``transferred`` for a recorded reason: no channel
+    exists on which the host can ask the guest's install service anything.  The
+    obvious fix -- reuse the UART -- is the wrong one, and the wrongness is not
+    aesthetic.  The UART is the kernel console; anything sent down it lands in
+    ``serial.log`` interleaved with the kernel's own output, and ``serial.log``
+    is what every measurement on this host reads.  A channel that corrupts the
+    one evidence stream the project has is not a channel.
+
+    So this is a separate device, in upstream's own spelling: the offline GPU
+    broker pairs ``virtio-serial-device`` with ``virtconsole``
+    (``vendor/UniXNU/scripts/qemu-entry/gdb-stop.py:373-375``), and the guest
+    kernel has the driver for it (``NativeVirtioConsole``, which probes
+    ``compatible == "virtio,mmio"`` with the console's magic, version and device
+    id).  The one substitution is forced by Windows, which has no ``AF_UNIX`` --
+    the same one ``-qmp`` and the serial chardev already make.
+
+    The QEMU ``virt`` machine gives this a home: its device tree carries 32
+    ``virtio,mmio`` nodes and exactly one ``arm,pl011``, measured 2026-10-30, so
+    a second ``-serial`` is impossible and a virtio-serial is the only second
+    channel there is.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, agent_port=14999, display="none"
+    )
+    chardev = _flag(argv, "-chardev")
+    assert chardev.startswith("socket,id=unipad-agent,host=127.0.0.1,port=14999,"), chardev
+    assert f"logfile={(work / 'agent.log').resolve().as_posix()}" in chardev, chardev
+    assert "logappend=on" in chardev, chardev
+    # ``wait=off`` so a run with no agent attached still starts, exactly as the
+    # serial chardev does: the guest's output is dropped, not the boot.
+    assert "server=on,wait=off" in chardev, chardev
+    # Three entries, in this order, and they are a *device* -- not a second
+    # ``-serial``, of which the machine has exactly one to give.
+    assert "virtio-serial-device,id=unipad-agent-serial" in argv, argv
+    assert "virtconsole,chardev=unipad-agent,name=unipad-agent-transport" in argv, argv
+    # Exactly one ``-serial``, and it is still the UART: the agent is a device,
+    # not a second use of the port the machine has only one of.
+    assert argv.count("-serial") == 1, argv
+    serial = _flag(argv, "-serial")
+    assert serial.startswith("file:") and "unipad-agent" not in serial, serial
+
+
+def test_the_agent_port_carries_the_modern_mmio_transport_when_no_disk_does(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """``virtio-serial-device`` is MMIO, so it needs the same global the disks do.
+
+    The OS root volume and the SystemOS cryptex already emit
+    ``virtio-mmio.force-legacy=false``; the agent's virtio-serial is a third MMIO
+    device and legacy mode would hand it the wrong register layout, which the
+    guest's driver would read as a device that is not there.
+
+    Two identical ``-global`` options are not an error to QEMU -- they are two
+    entries in one list, both applied -- so nothing would fail if this emitted
+    its own unconditionally.  They would just read as two intentions in an argv
+    that is evidence, which is what the ``_values`` assertion below is about.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, agent_port=14999, display="none"
+    )
+    assert _values(argv, "-global") == ["virtio-mmio.force-legacy=false"], argv
+    # ...and it comes before the device it is for.
+    assert argv.index("virtio-mmio.force-legacy=false") < argv.index(
+        "virtio-serial-device,id=unipad-agent-serial"
+    ), argv
+
+
+def test_the_agent_port_does_not_repeat_the_global_a_disk_already_emitted(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """With an OS root volume the global is already there; it is not emitted twice.
+
+    A duplicate would be harmless to QEMU and confusing to a reader, and it
+    would also make "which device needed it" unanswerable from the argv alone.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    root = tmp_path / "os-root.raw"
+    root.write_bytes(b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, root_image=root,
+        agent_port=14999, display="none",
+    )
+    assert _values(argv, "-global") == ["virtio-mmio.force-legacy=false"], argv
+    assert "virtio-serial-device,id=unipad-agent-serial" in argv, argv
+
+
+def test_an_agent_port_outside_the_tcp_range_is_refused(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """A port QEMU cannot bind is caught here, not by QEMU's exit 1.
+
+    The same rule ``qmp_port`` and ``serial_port`` already follow: an argv that
+    cannot start costs a whole launch cycle to discover, and the report would say
+    "QEMU exited" rather than naming the port.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    for bad in (0, 80, 70000):
+        caught = _refused(
+            ub.build_argv, qemu, inputs, work / "esp", work, agent_port=bad
+        )
+        assert caught.code == ErrorCode.CONFIG_INVALID, caught
+        assert bad == caught.details.get("port"), caught.details
+
+
+def test_no_agent_port_leaves_the_argv_exactly_what_it_was(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The default is a byte-for-byte no-op, and that is a requirement.
+
+    Every recorded run on this host has the argv this function builds without
+    the channel, so a run that did not ask for it must not differ from one that
+    did in any way a later reader could mistake for a measurement.  Asserted
+    against a second call that passes ``None`` explicitly rather than against a
+    golden file, so the test names the invariant instead of a snapshot of it.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    default = ub.build_argv(qemu, inputs, work / "esp", work, display="none")
+    explicit = ub.build_argv(
+        qemu, inputs, work / "esp", work, display="none", agent_port=None
+    )
+    assert default == explicit, default
+    assert not any("unipad-agent" in item for item in default), default
+    assert "-virtio-serial-device" not in " ".join(default), default
+    assert not any("virtconsole" in item for item in default), default
+    # No stray log file either: a second chardev's log would be a second
+    # evidence stream nobody reads.
+    assert not (work / "agent.log").exists(), list(work.iterdir())
+
+
+def test_the_agent_port_survives_the_systemos_pair_staying_last(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The cryptex keeps the position the verified run gave it.
+
+    ``local-private/boot24/command.txt`` ends with the SystemOS pair, and
+    ``test_a_cryptex_without_an_os_root_volume_still_gets_the_modern_mmio_transport``
+    pins it.  The agent channel is the newest thing here, so it goes after
+    rather than in the middle -- a reordered argv is a different machine as far
+    as any comparison against a recorded one is concerned.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    cryptex = tmp_path / "044-76034-038.dmg"
+    cryptex.write_bytes(b"NXSB" + b"\0" * (1 << 20))
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, systemos_image=cryptex,
+        agent_port=14999, display="none",
+    )
+    assert argv[-10:-6] == [
+        "-drive",
+        f"if=none,id=systemos,format=raw,readonly=on,file={cryptex.resolve().as_posix()}",
+        "-device", "virtio-blk-device,drive=systemos",
+    ], argv[-11:]
+    assert argv[-6:-4] == ["-chardev", _flag(argv, "-chardev")], argv[-8:]
+    assert argv[-4:] == [
+        "-device", "virtio-serial-device,id=unipad-agent-serial",
+        "-device", "virtconsole,chardev=unipad-agent,name=unipad-agent-transport",
+    ], argv[-6:]
+
+
+def test_boot_passes_the_agent_port_to_the_command_it_builds(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``boot(agent_port=...)`` reaches ``build_argv``, not just its signature.
+
+    The same failure the serial-port forwarding test names: a keyword that exists
+    on :func:`boot` and is never forwarded is the exact shape of the
+    ``--trust-cache`` gap, where every layer handled it, the CLI could not
+    express it, and the run reported success while ignoring what the caller asked
+    for.  Asserted on the written ``command.txt`` so the test fails if the
+    forwarding is added somewhere ``build_argv`` is not the consumer.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: a[1])
+
+    ub.boot(
+        inputs, tmp_path / "run", qemu=qemu, device_dir=_synthetic_device(tmp_path),
+        seconds=0, agent_port=14999,
+    )
+
+    assert launched, "boot never reached Popen"
+    argv = launched[0]
+    assert "port=14999" in " ".join(argv), argv
+    assert "virtio-serial-device,id=unipad-agent-serial" in argv, argv
+
+
+def test_boot_without_an_agent_port_builds_the_same_command_it_always_did(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No default, end to end.
+
+    ``build_argv``'s own default is asserted above; this asserts that nothing
+    between :func:`boot` and ``build_argv` invents one, which is what an
+    ``agent_port or DEFAULT_AGENT_PORT`` fallback would do -- and would do
+    invisibly, since a channel nobody asked for still boots.
+    """
+    launched: list[list[str]] = []
+    monkeypatch.setattr(ub.subprocess, "Popen", _already_exited(launched))
+    monkeypatch.setattr(ub, "_watch", lambda *a, **k: a[1])
+
+    ub.boot(
+        inputs, tmp_path / "run", qemu=qemu, device_dir=_synthetic_device(tmp_path),
+        seconds=0,
+    )
+
+    assert launched, "boot never reached Popen"
+    assert "unipad-agent" not in " ".join(launched[0]), launched[0]
+
+
+def test_the_cli_forwards_the_agent_port_it_was_given(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--agent-port 14999`` arrives as ``agent_port=14999``.
+
+    The "prove the payload, not the destination" rule again: ``def fake_boot(**_):``
+    would swallow the keyword and leave a hard-coded value in ``main`` green.
+    """
+    received: dict[str, object] = {}
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        received.update(kwargs)
+        return BootReport(ok=True, workdir=str(work))
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(tmp_path / "run"),
+        "--agent-port", "14999",
+    ])
+
+    assert received.get("agent_port") == 14999, received
+
+
+def test_the_cli_leaves_the_agent_port_unset_when_no_flag_is_given(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No flag means ``None``, and not a default port.
+
+    A default would add a device to every recorded run, which is precisely what
+    ``test_no_agent_port_leaves_the_argv_exactly_what_it_was`` exists to prevent.
+    """
+    received: dict[str, object] = {}
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        received.update(kwargs)
+        return BootReport(ok=True, workdir=str(work))
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.main([
+        "--device", str(_synthetic_device(tmp_path)), "--qemu", str(qemu),
+        "--firmware", str(inputs.firmware), "--kernel", str(inputs.kernel),
+        "--devicetree", str(inputs.devicetree), "--darwinboot", str(inputs.darwinboot),
+        "--unixnu", str(inputs.unixnu), "--workdir", str(tmp_path / "run"),
+    ])
+
+    assert "agent_port" in received, received
+    assert received["agent_port"] is None, received
+
+
+def test_the_retry_chain_forwards_the_agent_port_to_every_attempt(
+    inputs: BootInputs, qemu: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each attempt gets the same channel, for the reason the serial port does.
+
+    Without the forwarding, attempt 1 has the channel and attempt 2 does not --
+    a difference that only shows up in the retry case, which is the case that
+    fires on the 12.5% Data-mount race and is therefore the case nobody watches.
+    """
+    import json
+
+    seen: list[object] = []
+
+    def fake_boot(_inputs: BootInputs, work: Path, **kwargs: object) -> BootReport:
+        seen.append(kwargs.get("agent_port"))
+        work.mkdir(parents=True, exist_ok=True)
+        report = BootReport(ok=True, workdir=str(work))
+        (work / "boot-report.json").write_text(
+            json.dumps(report.to_dict(), indent=2) + chr(10), encoding="utf-8"
+        )
+        return report
+
+    monkeypatch.setattr(ub, "boot", fake_boot)
+
+    ub.boot_until_mounted(
+        inputs, tmp_path / "chain", qemu=qemu,
+        device_dir=_synthetic_device(tmp_path), attempts=2, agent_port=14999,
+    )
+
+    assert seen == [14999, 14999], seen
+
+
 def test_the_display_and_the_port_are_the_callers_to_choose(
     inputs: BootInputs, tmp_path: Path
 ) -> None:
