@@ -184,6 +184,26 @@ function Get-HostmemBackends([string]$exe) {
     return ,@($backends)
 }
 
+function Get-QmpCommandNames([string]$exe) {
+    # Every command name this build's QMP understands, via `query-commands`.
+    # `qmp_capabilities` is sent FIRST -- a client that skips it gets every
+    # command refused, which is how `pmemsave` once looked absent for days on
+    # this project.
+    #
+    # Delegated to scripts/ci/qemu-qmp-commands.py rather than written in
+    # PowerShell: the PowerShell version of this same client timed out on
+    # ReadLine() where the Python one reads the greeting immediately, and a
+    # client that reads NOTHING prints "no PhyMemMode" -- indistinguishable from
+    # a build that really has none.  An instrument that cannot tell "absent" from
+    # "not read" is worse than no instrument.
+    $script = Join-Path $PSScriptRoot "qemu-qmp-commands.py"
+    $output = & python $script $exe
+    if ($LASTEXITCODE -ne 0) {
+        throw "qemu-qmp-commands.py exited $LASTEXITCODE"
+    }
+    return ,@($output | Where-Object { $_ -and $_.Trim() })
+}
+
 function Test-ObjectBackend([string]$exe, [string]$spec, [string]$tag) {
     # A minimal, valid `-object` line for this backend.  `memory-backend-ram`
     # needs only a size; `-file` needs a mem-path, so a scratch file is used.
@@ -226,6 +246,7 @@ foreach ($entry in ($Versions -split ";" | ForEach-Object { $_.Trim() } | Where-
         control_ok   = $false
         version_line = ""
         seconds      = 0
+        qmp_phymem_mode = @()
     }
     $started = Get-Date
     $exe = $null
@@ -278,6 +299,23 @@ foreach ($entry in ($Versions -split ";" | ForEach-Object { $_.Trim() } | Where-
             $record.probes += Test-ObjectBackend $exe.FullName $spec $label
         }
 
+        # The second gate, asked in the same run because it needs the same
+        # download.  `qqemu.PhyMemMode` is the QMP pair that would let the host
+        # read guest-PHYSICAL memory after the guest enables its MMU -- which is
+        # exactly what the gdbstub cannot do (fact 194: `m` and `M` answer E14
+        # at every guest-physical address once the MMU is on, while `g` still
+        # works).  MEASURED on the pinned 11.1.0: 238 QMP commands, none
+        # mentioning phymem, so the transport gap stays closed there.  Whether a
+        # newer build has it is the same download as the hostmem question.
+        $qmpNames = @()
+        try {
+            $qmpNames = Get-QmpCommandNames $exe.FullName
+        } catch {
+            Write-Warning "::warning::$label could not list QMP commands: $($_.Exception.Message)"
+        }
+        $record.qmp_phymem_mode = @($qmpNames | Where-Object { $_ -like "*PhyMemMode*" })
+        Write-Host "QMP commands mentioning PhyMemMode: $(if ($record.qmp_phymem_mode) { $record.qmp_phymem_mode -join ', ' } else { 'NONE' })"
+
         # The negative control.  Without it an "absent" verdict is unfalsifiable.
         $control = $record.probes | Where-Object { $_.spec -eq "memory-backend-ram" } | Select-Object -First 1
         $record.control_ok = [bool]$control.accepted
@@ -318,10 +356,11 @@ $payload | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $workspace $Ou
 $summary = @()
 $summary += "## QEMU hostmem probe"
 $summary += ""
-$summary += "| build | verdict | hostmem backends | control | seconds |"
-$summary += "| --- | --- | --- | --- | --- |"
+$summary += "| build | verdict | hostmem backends | control | QMP PhyMemMode | seconds |"
+$summary += "| --- | --- | --- | --- | --- | --- |"
 foreach ($r in $results) {
-    $summary += "| $($r.label) | $($r.verdict) | $($r.hostmem -join ', ') | $($r.control_ok) | $($r.seconds) |"
+    $phymem = if ($r.qmp_phymem_mode) { $r.qmp_phymem_mode -join ', ' } else { 'none' }
+    $summary += "| $($r.label) | $($r.verdict) | $($r.hostmem -join ', ') | $($r.control_ok) | $phymem | $($r.seconds) |"
 }
 $summary += ""
 foreach ($r in $results) {
