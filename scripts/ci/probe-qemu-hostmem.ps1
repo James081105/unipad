@@ -58,6 +58,17 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is minutes slower without this
 
+#: Used when the caller supplies nothing.  A `push`-triggered run has no
+#: workflow_dispatch inputs at all, so `inputs.versions` is the empty string --
+#: and an empty list would make the job "succeed" having measured nothing, which
+#: is the one outcome this script exists to prevent.  So the default lives here,
+#: where it applies to every trigger.
+$DEFAULT_VERSIONS = "2026.8.11|https://qemu.weilnetz.de/w64/qemu-w64-setup-20260811.exe"
+if ([string]::IsNullOrWhiteSpace($Versions)) {
+    Write-Host "::notice::no versions supplied; using the default: $DEFAULT_VERSIONS"
+    $Versions = $DEFAULT_VERSIONS
+}
+
 # 7-Zip is only needed for the download path.  ``-LocalBinary`` probes a binary
 # already on disk, and requiring an extractor it will never use would make the
 # instrument unrunnable on a host that has the binary but not 7-Zip -- which is
