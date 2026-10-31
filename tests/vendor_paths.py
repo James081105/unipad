@@ -13,10 +13,11 @@ assertions run, and the stage goes red for a reason that has nothing to do with
 the code.
 
 That is not hypothetical.  Measured 2026-10-31 on a ``git archive HEAD``
-checkout: 30 failures and 3 errors in ``tests/unit``, from three files that read
-``vendor/UniXNU-qemu/package/QemuMetal/*`` and
-``vendor/UniXNU/drivers/NativeMobileDisplay/*`` with no guard at all.  The same
-class of defect was recorded twice before -- 2026-10-24 in
+checkout, ``pytest tests/unit`` exited 1 with 32 failures and 3 errors; 34 of
+those 35 red items were a read of ``vendor/UniXNU-qemu/package/QemuMetal/*`` or
+``vendor/UniXNU/drivers/NativeMobileDisplay/*``, from three files with no guard
+at all plus one test whose refusal marker was spelled with this host's absolute
+path.  The same class of defect was recorded twice before -- 2026-10-24 in
 ``tests/unit/test_clean_checkout_selfsufficiency.py``'s own docstring (two
 tests whose guard sat *after* the read it guarded), and fact 32 of
 ``docs/implementation-plan.md`` (two tests whose guard condition was false on
@@ -62,10 +63,21 @@ in a subprocess against a root that does not exist and asserts they skip rather
 than error.  The variable is a test seam and nothing else -- no production code
 reads it, and no workflow sets it.
 
-Both ``tests/unit`` and ``tests/integration`` import this module; it sits at the
-``tests/`` root because that is where the suite's other shared helpers live
-(``tests/fixtures``, ``tests/fakes``) and ``tests/conftest.py:40`` puts the
-repository root on ``sys.path``.
+This module sits at the ``tests/`` root -- where the suite's other shared helpers live
+(``tests/fixtures``, ``tests/fakes``) and where ``tests/conftest.py:40`` puts the
+repository root on ``sys.path`` -- so both ``tests/unit`` and ``tests/integration``
+can import it, which is the whole point of putting it here rather than in one of them.
+
+As of 2026-10-31 only ``tests/unit`` imports it.  ``tests/integration`` reads the same
+pinned tree and guards it correctly, but per file: ``test_gpu_addon_blob.py:102``,
+``test_pinned_source_library.py:502`` and ``test_upstream_flag_table.py:54`` each carry
+their own check and skip message, and ``test_pinned_patches_against_upstream.py:71-72``
+has the short form.  Those guards work -- the integration job clones the pins
+(``preflight.yml:465``), so they fire only where a reader runs the stage by hand -- and
+they were deliberately left alone here, because migrating a stage whose job needs the
+pinned clones is not something this change could measure.  They are the duplication this
+module exists to end, and they are the next thing to fold in, not a thing this change
+claims to have done.
 """
 
 from __future__ import annotations

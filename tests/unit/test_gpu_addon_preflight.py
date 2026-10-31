@@ -54,6 +54,13 @@ def _driver_file(relative: str) -> str:
 # The messages the preflight is allowed to die with.  Each names the tool and
 # the ring that needs it.  A message outside this set means the script got past
 # the preflight and died somewhere expensive.
+#
+# The last one used to be spelled ``"no F:/iosvirtual/vendor/UniXNU"`` -- the
+# literal this host's repository path produces.  That is a marker which matches
+# on exactly one machine: measured 2026-10-31, a clean checkout elsewhere dies
+# with ``no <that path>/vendor/UniXNU; ring 0 (the bootstraps) runs first`` and
+# the test went red on a refusal that was working correctly.  The tail of the
+# message is the part that identifies the refusal; the prefix is a path.
 PREFLIGHT_MARKERS = (
     "cannot install shaderc",
     "is absent;",
@@ -63,7 +70,7 @@ PREFLIGHT_MARKERS = (
     "no python interpreter",
     "the translator checkout is",
     "bootstrap-metal2vulkan.sh has not run",
-    "no F:/iosvirtual/vendor/UniXNU",
+    "vendor/UniXNU; ring 0 (the bootstraps) runs first",
 )
 
 

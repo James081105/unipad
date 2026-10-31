@@ -29,15 +29,23 @@ import pytest
 
 from unipad.host import qemu_metal as qm
 
+from tests.vendor_paths import require
+
 REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
 def declared() -> dict[str, int]:
-    """Every ``native_*`` counter the sources declare, with its width."""
+    """Every ``native_*`` counter the sources declare, with its width.
+
+    ``qm.SOURCES`` is the whole set the list asks for, and ``CLAIMED_SOURCES``
+    is a subset of it, so guarding this loop covers both directions below.  The
+    guard lives in ``tests/vendor_paths.py``: ``vendor/`` is git-excluded, so a
+    clean checkout has none of it and every test that takes this fixture used
+    to die with an ``AssertionError`` naming a path that was never there.
+    """
     for relative in qm.SOURCES:
-        path = REPO.joinpath(*relative)
-        assert path.is_file(), f"{path.relative_to(REPO)} is missing"
+        require(REPO.joinpath(*relative))
     return qm.declared_everywhere(REPO)
 
 

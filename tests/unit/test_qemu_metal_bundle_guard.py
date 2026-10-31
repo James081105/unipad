@@ -41,6 +41,8 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.vendor_paths import require
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO / ".github" / "workflows" / "build-macos.yml"
 BUILDER = REPO / "vendor" / "UniXNU-qemu" / "scripts" / "build-qemu-metal.py"
@@ -110,7 +112,7 @@ def test_the_workflow_runs_the_vendored_builders_guest_action() -> None:
     table = re.search(
         r"\{'host':\s*host,\s*'instruments':\s*instruments,\s*'check':\s*check,"
         r"\s*'guest':\s*guest\}\[action\]\(\)",
-        _text(BUILDER),
+        _text(require(BUILDER)),
     )
     assert table, (
         "build-qemu-metal.py's dispatch table no longer maps 'guest' to guest(); "
@@ -130,7 +132,7 @@ def test_the_step_runs_from_the_assembled_tree_not_the_device_repository() -> No
     ``vendor/UniXNU-qemu/build/`` and find nothing, because the owner root chain
     writes it into the assembled tree.
     """
-    assert "ROOT = Path(__file__).resolve().parents[1]" in _text(BUILDER)
+    assert "ROOT = Path(__file__).resolve().parents[1]" in _text(require(BUILDER))
     body = _body(METAL_STEP_ID)
     assert re.search(r'cd\s+"\$tree"\s*&&\s*python3 scripts/build-qemu-metal\.py', body), (
         "the step does not run the builder from the assembled tree"
@@ -148,7 +150,7 @@ def test_the_step_is_gated_on_the_owner_root_chain() -> None:
     """
     guard = re.search(
         r"hashlib\.sha256\(original\)\.hexdigest\(\) != '([0-9a-f]{64})'",
-        _text(BUILDER),
+        _text(require(BUILDER)),
     )
     assert guard, "build-qemu-metal.py no longer verifies the original trust bundle's digest"
     condition = str(_step(METAL_STEP_ID).get("if") or "")
@@ -170,7 +172,7 @@ def test_every_output_the_builder_writes_is_checked_by_name(output: str) -> None
     writes the Metal Data seed.  If the pinned builder renames one, this test
     says which -- rather than the workflow checking for a file nobody writes.
     """
-    source = _text(BUILDER)
+    source = _text(require(BUILDER))
     stem = output.split("/")[-1]
     if output.startswith("QemuMetal.bundle"):
         assert "BUNDLE = OUT / 'QemuMetal.bundle'" in source
@@ -320,7 +322,7 @@ def test_the_hand_copied_dependencies_are_the_ones_the_files_describe() -> None:
     assert any("QemuMetal userspace plugin" in name for name in names), (
         "the Metal build step was renamed; its id is load-bearing for the gate above"
     )
-    assert BUILDER.is_file(), f"{BUILDER} is not in the pinned device repository"
-    assert "def guest():" in _text(BUILDER), (
+    require(BUILDER)
+    assert "def guest():" in _text(require(BUILDER)), (
         "build-qemu-metal.py no longer defines guest(); nothing produces the bundle"
     )
