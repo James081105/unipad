@@ -295,6 +295,10 @@ def obtain(args, token: str, holder: dict) -> int:
         print(f"::error::{error}")
         return 1
 
+    arguments = record.get("arguments")
+    if not isinstance(arguments, list) or not arguments:
+        print("::error::the record carries no arguments array")
+        return 1
     source = record.get("file")
     if not isinstance(source, str) or not source:
         print("::error::the record carries no file; build-arm-driver.py would substitute nothing")
