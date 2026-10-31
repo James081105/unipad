@@ -849,3 +849,60 @@ for (size_t i = sizeof("/private/var/ngpu/") - 1; parent[i]; ++i) {
 | R9u | **「宿主侧没有解密器」经核对不是缺口，是 PRD 规定的形状——所以它不该被当成待办，而该被钉住防止下一个人再查一遍**：`delivery-channel` 报「加密材质的宿主侧解密器不存在」。查 PRD：H04/FR05/M9b 三处的判据都是**客体自己写**（「客体正常写入、同步、重启与恢复均可靠」「写入随机标记，正常关机，重新创建 QEMU 进程后读取」），没有任何一条要求宿主解密；宿主只负责把镜像交付过去。所以缺的不是解密器，缺的是 M9b 本身（当前状态「仅 RAM disk 内有效」）。**真正待解的问题是客体侧那个**：如果 Data 卷是加密的而这套 userland 没有 keychain，客体自己也写不进去——但那是 guest 问题，且 PRD 第一版只要求正常关机持久化。已记入 ADR 待办而非实现清单 | ✅ 已核对（无代码改动） |
 
 | R9t | **`NativeVirtioConsole` 在 macOS runner 上真的编出来了，且 59 个符号被强制加载进内核——事实 196 留白的唯一 UNVERIFIED 关闭；反向对照弱，弱在它因解析错误失败而非因「未被调用」**（2026-11-01，run 41220529812，513 秒；用户 item 4 的「macOS 构建」）：invoked=`driver-board-toml`（日志 `archive 6/11: build-arm-driver.py NativeVirtioConsole`）；compiled=`libNativeVirtioConsole.a` 277,280 字节 sha256 `4c7fe701…`；object_is_the_driver=True（档案自身符号为判据）；**linked=yes，59 个符号进内核**；两个 config 开关均在。**仍未验证**：console 能否收发（驱动 port 0 行为 + transport 就绪 + 客人侧有没有进程读端口，ADR-0011 记 UNVERIFIED/BLOCKED）。**反向对照需修**：`NativeUfs` 对照 exit 1 来自 `build-arm-driver.py:27` 的 JSON 解析失败，与「是否被调用」无关，不能支撑 not-invoked 判定 | ✅ runner 验证 PASS（compiled + linked，符号级证据）；**客人枚举与双向收发仍 UNVERIFIED**；反向对照待修为「断言 board.toml 列表不含该名」 |
+
+
+**事实 206（item 4 的「双向收发」差的那一环不是客人侧代码，是构建链：那句自我宣告只以「嵌套子模块里一处未提交修改」的形态存在，本机没有任何一颗已构建内核带着它——所以宿主永远看不到字节，而这件事与驱动有没有 bind 无关**）：为让宿主能区分「驱动完美 bind」和「驱动从未枚举」，`NativeVirtioConsole::start()` 里加了 `send(announcement, …)`。核对它的实际形态时量到：
+
+- **源码在**：`vendor/UniXNU/drivers/NativeVirtioConsole/NativeVirtioConsole.cpp` 的 `start()` 内、`native_console_ready=1` 之后，`static char const announcement[]="NativeVirtioConsole: bound virtio,mmio console port 0\n"; send(announcement,sizeof(announcement)-1);`；
+- **未提交**：该嵌套子模块 `git status` 只有 ` M NativeVirtioConsole.cpp` 一条，`vendor/UniXNU` 则把 `drivers/NativeVirtioConsole` 显示成 `066f9bde…-dirty`（指针没动，脏在里面），`drivers/NativeMobileDisplay` 另有一条真实的指针移动（`c031d882`→`eb9c949`）也没提交；
+- **没有一颗内核带着它**：把 `local-private` 下所有 >10 MB 的 `kernel.macho` 逐个 `grep -c "bound virtio,mmio console port"`，**全部为 0**（`b5`、`boot`、`boot10`、`boot12`、`boot15`、`boot24`、`bundle12/unixnu-out`、`bundle12/payload-esp` 八处）；
+- **对照是正的，所以这个零不是仪器问题**：同一批内核里 `native_console_ready`/`native_console_mmio`/`native_console_tx_bytes`/`_native_console_send` 四个符号都解析得出来（`native_console_ready = 0xfffffff00c106268`），`NativeVirtioConsole` 字样出现 **76 次**——与事实 205 的「76 处名字、31 处改编符号」一致。也就是说符号表和全局量都在，缺的恰好是那句字符串。
+
+**所以结论要分成两层，混成一层就会得出错误的下一步**：`native_console_ready` 这一层的测量**现在就是有效的**（全局量在已构建内核里，客人启动后可以直接读，`console-driver-state.py` 量的正是这个）；而「宿主在通道上看到字节」这一层**现在不可能**，因为产出字节的代码没进任何内核。后者要的是一次 macOS 重建加整条 pin 链（任务 #31：嵌套子模块提交→推 fork→`vendor/UniXNU` 钉新 pin→board.toml 的 `trust_cache_sha256` 同步→主仓钉子模块指针），而 commit `a1af0da` 正是把「trust cache 不在 board.toml 里」从警告改成硬失败的那一条，所以这条链省不掉。
+
+**顺带一个仪器注记**：`img.symbol("NativeVirtioConsole")` 返回 `None`，而 `raw.count(b"NativeVirtioConsole")` 是 76——类符号是 C++ 改编名，用未改编名去查符号表查不到，但文本在。下一个用符号表核对「驱动在不在内核里」的人应当用改编名或文本计数，不要用类名。
+
+| R9ab | **item 4 的「双向收发」缺的一环在构建链不在客人侧：那句自我宣告只是嵌套子模块里一处未提交修改，本机八处已构建内核 `grep` 全为 0，而同一批内核的 `native_console_ready`/`_native_console_send` 符号和 76 处 `NativeVirtioConsole` 字样都在——所以「读 `native_console_ready` 判 bind」现在有效，「宿主看到字节」现在不可能**（2026-11-01）：`vendor/UniXNU` 的 `drivers/NativeVirtioConsole` 显示 `066f9bde…-dirty`（指针未动、脏在嵌套子模块内），`drivers/NativeMobileDisplay` 另有一条未提交的真实指针移动；八颗内核逐一 `grep -c "bound virtio,mmio console port"` 均为 0，而 `native_console_ready=0xfffffff00c106268` 等四符号可解析、字样 76 次（与事实 205 一致）。要看到字节必须走完整 pin 链加一次 macOS 重建，而 `a1af0da` 已把 trust-cache 不匹配设为硬失败，故该链不可省 |
+
+
+**事实 207（item 4 的「客体枚举」被一颗 61408 字节的文件卡住，而卡住的方式是「看起来快成功了」：客人启动到把内核交棒之后才拒绝，`DARWINBOOT: boot refused: Compromised Data`，qemu 仍是 `running`、通道仍连着——只有串口日志能看出内核从未执行**）：事实 205 关掉了「ESP 内核不带驱动」这个阻断，`bundle12` 也补上了 `scratch-data.img`（事实 206 之前的修补），但启动仍然进不了内核。串口日志的量测结果：
+
+```
+UNIXNU: xnu: handing off 0 staged kext(s) to loader
+DARWINBOOT: boot refused: Compromised Data; firmware retained
+UNIXNU: menu: entry 0 returned Compromised Data
+```
+
+**根因是 ADT 的 `/chosen/memory-map` 有四个占位，而探针只 staged 了三个**：对 `bundle12` 的 `kernel.macho.adt` 数字节，`TrustCache`、`PackedRAMDisk`、`GpuAddon`、`RAMDisk` 各出现 **1 次`。`DarwinBoot.c` 按名字解析每一个，树里点名而 ESP 上没有对应文件就 `EFI_COMPROMISED_DATA`——与 `_check_addon_pair`（`unixnu_boot.py:1010`）记的 GPU addon 那个异或完全同族。参照实现 `stage_esp` 是写 trust cache 的（`TRUSTCACHE_NAME = "EFI/UniXNU/Payloads/kernel.macho.trustcache"`，`unixnu_boot.py:818`），探针的 `_stage_esp` 没有这一条。
+
+**缺的文件就在包里，而且 Digest 对得上**：`local-private/tmp/bundle12/owner-trust.bundle`，61,408 字节，sha256 `08b149378dc67f8534a7551c2c0a4a9f78e3c5665781aa160a7da07592717c40`，与 `payload.json` 的 `trust_cache_sha256` **逐字节相同**。补上之后串口日志立刻变成 `Exiting boot services. A green bar across the top means the kernel entry code ran.`——内核交棒了。
+
+**同一轮还量到一个会产出假结论的仪器缺陷，而这个缺陷比阻断本身更值得记**：`console-driver-state.py` 原来的活性检查只问 `query-status == running` 和 `transport.connected`。这两个条件在这次失败里**全部为真**（qemu 确实在跑，通道确实连着，客人确实在 UNINU 菜单里空转），于是脚本会继续读 `native_console_ready`，读到 0，然后报 `not_bound`——**一个关于「驱动没枚举」的结论，实际成因是「staging 少了一个文件」**。已修：等待之后先读串口日志，要求出现交棒行（`KERNEL_HANDOFF = "Exiting boot services"`，判据是实测的——`boot8/9/10/12/15` 五个到达过内核的日志都以这一行结尾，且它前面是内核的 entry/args/video/SCTLR 行，所以是 bootloader 在说话而不是通用 EDK2 消息）；没出现就报 `kernel_never_started` 并附串口尾部，**不读计数器、不下驱动结论**。
+
+**方法上的一条**：这个失败形状与「缺 initrd」那一次（事实 206 之前的修补）是同一族——两个文件都不在 `boot-inputs` 的普通成员里，一个要从 `payload.img` 里读，一个在包里但参照实现才写。**共同点是缺失本身静默，而静默的缺失只能靠串口日志发现**。所以「qemu=running + 通道连通」这两条永远不能作为「客人起来了」的判据，这一点现在有两次实测而不是一次推理。
+
+| R9ac | **item 4 的「客体枚举」卡在 trust cache 上：ADT 的 `/chosen/memory-map` 有 `TrustCache`/`PackedRAMDisk`/`GpuAddon`/`RAMDisk` 四个占位，探针只 staged 三个，`DarwinBoot` 交棒内核之后才拒绝（`boot refused: Compromised Data`），而 qemu 仍 `running`、通道仍连着——补上 `owner-trust.bundle`（61,408 字节，sha256 与 `payload.json` 的 `trust_cache_sha256` 相同）后串口立刻出现交棒行**（2026-11-01，bundle12）：数字节得四占位各 1 次；`TRUSTCACHE_NAME` 见 `unixnu_boot.py:818`，参照 `stage_esp` 写它而探针没有。**同一轮修掉一个会产出假结论的仪器缺陷**：原活性检查（`running` + 通道连通）在这次失败里全部为真，会让脚本读到 `native_console_ready=0` 报 `not_bound`——把「staging 缺文件」读成「驱动没枚举」；现在先要求串口出现交棒行（`boot8/9/10/12/15` 五个到过内核的日志都以它结尾），否则报 `kernel_never_started` 且不读计数器 |
+
+
+**事实 208（item 3 的「物理内存访问」那两次实验的结论是空的，空的原因是一个可以一句话避免的仪器错误：探针地址 `0x44000000` 里全是零，于是「stub 与 `pmemsave` 一致」这个判据在结构上不可能失败——拿零比零，既证明不了「读到了同样的字节」，也证明不了「MMU 是关的」**）：事实 197 之后留下的待验证方案是「`Qqemu.PhyMemMode` 能不能让 gdbstub 在 MMU 开启时够到客体物理内存」，两次实验各留下一段日志：
+
+- `phymem-mmu-on.log`：等 240 s，`m 0x44000000,16` 返回 `00000000000000000000000000000000000000000000`（20 个零字节），据此判 `mmu_off`，理由是「虚拟==物理时物理读什么都成功」；
+- `sctlr-mmu.log`：等 300 s，`pmemsave` 真相 = 32 个零字节，`m` 之前 = 32 个零字节，`agrees=True`；`Qqemu.PhyMemMode:1` 之后再 `m` 还是 32 个零字节，`agrees=True`，`mode_changed_the_answer = False`。
+
+**两个结论都站不住，而且是同一个原因**：`0x44000000` 这一页是空的。**一个全零的探针地址让「一致」变成恒真**——无论 stub 读的是物理页、当前虚拟空间、还是一块没映射的区域，答案都是零，都与 `pmemsave` 的零相等。所以 `agrees=True` 不是「stub 读的是物理内存」的证据，它只是「两边都是零」的证据；同理 `mmu_off` 也不是「MMU 关着」的证据，全零与「MMU 开着且这个 VA 映射到零页」完全同形。**用只能在写字者脑子里成立的判据去证一件事，是这本簿第 N 次同族错误**，而这一次的代价是 item 3 的一个待验证方案被两份日志同时「量过」了，却什么也没量到。
+
+**修法不需要新机制，只需要一个可证明非零的探针地址，而刚刚成功的启动正好提供了**：`bundle12` 的串口日志在交棒前打印了
+
+```
+kernel   va 0xFFFFFFF00427C000  pa 0x4807C000
+entry    pa 0x4B1EC488
+args     pa 0x4C170000  window 0x100000000 bytes
+video    base 0x1BC7A0000  800x600  row 3200 bytes  32 bpp
+CurrentEL 1  SCTLR_EL1 0x30D0198D  TCR_EL1 0x280803518
+```
+
+`pa 0x4807C000`（内核）、`pa 0x4B1EC488`（入口）、`pa 0x4C170000`（boot args）都是**已知被写过的**客体物理地址，内核映像里不可能是一页零。拿它们当探针地址，`pmemsave` 与 stub 的比较才第一次有可能失败，因而才第一次有信息量。
+
+**顺带量到两件对 item 3 直接有用的事**：其一，`SCTLR_EL1 0x30D0198D` 是 bootloader 在交棒前打印的，而 bit 0（M）= 1，**所以交棒时 MMU 确实是开的**——这解释了为什么 240 s 那次读到零：不是「MMU 关着」，更可能是「等得不够久或读了一页零」，而 `mmu_off` 这个判定应当撤回。其二，`vm=paused` 在两次实验里都出现了，确认 `_gdb_argv` 记的「附挂会暂停、分离不会恢复」仍然成立，所以 PhyMemMode 即便可用，也只是一个调试器而不是渲染器。
+
+| R9ad | **item 3 的物理内存实验结论是空的：探针地址 `0x44000000` 全零，使「stub 与 `pmemsave` 一致」恒真——`agrees=True` 只是「两边都是零」，`mmu_off` 也不是「MMU 关着」的证据，两个结论都应当撤回**（2026-11-01，`phymem-mmu-on.log` 20 个零字节、`sctlr-mmu.log` 32 个零字节两边相等）：修法是用刚成功的启动提供的已知非零物理地址（串口打印 `kernel pa 0x4807C000`、`entry pa 0x4B1EC488`、`args pa 0x4C170000`）。**同一份串口日志还给出一条独立证据：交棒前 `SCTLR_EL1 0x30D0198D`，bit 0 = 1，所以交棒时 MMU 确实开着**；`vm=paused` 两次都出现，「附挂暂停、分离不恢复」仍成立 |
