@@ -44,6 +44,7 @@ from unipad.acceptance.e2e import (
     release_verdict,
 )
 from unipad.errors import ErrorCode, UniPadError
+from unipad.guest.agent_channel import status_probe
 from unipad.host import payload_seed
 from unipad.host import unixnu_boot as ub
 from unipad.host.guestobserve import (
@@ -112,6 +113,12 @@ class RealGuestRuntime(E2ERuntime):
             needed by any case here -- the cases drive the guest through QMP, not
             through the console -- but accepted so one runtime can serve both.
         qmp_port: The QMP port.
+        agent_port: The port the guest agent channel listens on, when the boot
+            asked for one.  ``None`` means no channel, and every stage that
+            needs to *ask the guest something* fails with that as the reason
+            rather than guessing an answer.  See
+            :mod:`unipad.guest.agent_channel` for why a socket that opens is
+            not a guest that answers.
         seconds: The per-case observation window.
         every: Seconds between guest-log probes.
         attempts: Boots to spend on the Data-mount race (see
@@ -133,6 +140,7 @@ class RealGuestRuntime(E2ERuntime):
         ramfb_driver: Optional[Path] = None,
         serial_port: Optional[int] = None,
         qmp_port: int = ub.DEFAULT_QMP_PORT,
+        agent_port: Optional[int] = None,
         seconds: int = ub.DEFAULT_SECONDS,
         every: int = ub.DEFAULT_EVERY,
         attempts: int = 1,
@@ -150,6 +158,7 @@ class RealGuestRuntime(E2ERuntime):
         self.ramfb_driver = Path(ramfb_driver) if ramfb_driver else None
         self.serial_port = serial_port
         self.qmp_port = int(qmp_port)
+        self.agent_port = int(agent_port) if agent_port is not None else None
         self.seconds = int(seconds)
         self.every = int(every)
         self.attempts = max(int(attempts), 1)
@@ -172,6 +181,10 @@ class RealGuestRuntime(E2ERuntime):
         self._argv: list[str] = []
         self._image: Optional[KernelImage] = None
         self._kernel_digest = ""
+        #: The last :func:`unipad.guest.agent_channel.status_probe` verdict, so a
+        #: stage that could not ask the guest can say *which* way it failed
+        #: instead of one undifferentiated "no answer".
+        self._agent_verdict: Optional[dict[str, Any]] = None
 
     # -- the guest -------------------------------------------------------
 
@@ -200,6 +213,7 @@ class RealGuestRuntime(E2ERuntime):
         self._argv = ub.build_argv(
             self.qemu, self.inputs, self._run / "esp", self._run,
             qmp_port=self.qmp_port, serial_port=self.serial_port,
+            agent_port=self.agent_port,
             memory_mib=ub.MEMORY_MIB, display="none",
             ramfb_size=ub.SCREEN if (self._run / "esp" / ub.RAMFB_NAME).is_file() else None,
             root_image=self.root_image, systemos_image=self.systemos_image,
@@ -460,8 +474,46 @@ class RealGuestRuntime(E2ERuntime):
         able to tell them apart: an empty set is "nothing is installed", which
         is what case 3 needs, while ``None`` is "the guest could not be
         asked".
+
+        How it asks has changed.  It used to return ``None`` unconditionally,
+        which was honest but left case 3 permanently unable to prove a package
+        was new.  Now it goes through :func:`unipad.guest.agent_channel.status_probe`
+        over the real agent channel, and the reason it still cannot be answered
+        on this host is recorded in ``self._agent_verdict`` rather than implied:
+
+        * no ``agent_port`` was configured -- the boot never asked for a channel;
+        * the port never accepted -- no such boot is running;
+        * the port accepted and stayed silent -- **today's measured state**: the
+          guest kernel does not have ``NativeVirtioConsole`` in its build, so
+          nothing on the guest side ever reads the transport.
+
+        A guest that answers is parsed, and the answer is trusted only as far as
+        the reply's own ``installed`` list -- no bundle id is inferred from the
+        host's own ledger or from a previous run's files.
         """
-        return None
+        if self.agent_port is None:
+            self._agent_verdict = {
+                "reachable": False, "state": "no_channel",
+                "detail": "agent_port_not_configured", "reply": None}
+            return None
+        verdict = status_probe("127.0.0.1", self.agent_port, timeout_s=10.0)
+        self._agent_verdict = verdict
+        if not verdict["reachable"]:
+            return None
+        reply = verdict.get("reply") or {}
+        payload = reply.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        installed = payload.get("installed")
+        if not isinstance(installed, list):
+            return None
+        found: set[str] = set()
+        for entry in installed:
+            if isinstance(entry, dict):
+                bundle_id = entry.get("bundle_id")
+                if isinstance(bundle_id, str) and bundle_id:
+                    found.add(bundle_id)
+        return found
 
     def install_hello_ipa(self) -> StepObservation:
         return StepObservation(

@@ -1,0 +1,85 @@
+# UniPad probe: does a QEMU build exist that registers memory-backend-file?
+#
+# WHY THIS JOB EXISTS
+# -------------------
+# PRD item 2 of the current goal is "prove there is a rendering execution end on
+# Windows", measured level by level: memory mapping -> QM_OPEN -> host response
+# -> command execution complete -> pixels presented.  The guest side reaches
+# `opens=1` and stops; the host side has no transport, because upstream's
+# `qemu-metal-host` maps the shared window the way the guest does -- `mmap` on
+# `RUN_DIR/shared.bin` -- and that needs `memory-backend-file`.
+#
+# This host's pinned QEMU does not register it.  MEASURED (fact 189):
+# `-object help` prints exactly one hostmem backend (`memory-backend-ram`), and
+# `-object memory-backend-file,...` exits 1 with `invalid object type`.
+#
+# So the gate question is not "does the code work" but "does a QEMU build exist
+# that has the backend", and that is a question about a 206 MB download this
+# host's route will not carry: sixteen parallel range streams against
+# qemu.weilnetz.de each moved ~11 MB in 570 s and then timed out, eight attempts
+# each, 0 of 16 finished.  A runner has the bandwidth.
+#
+# The source repository is public, so standard GitHub-hosted minutes are free
+# (PRD 8.3 cost note); this job is windows-latest and downloads a few hundred
+# megabytes, which is minutes, not the macOS chain's 180-minute ceiling.
+#
+# WHAT COUNTS AS AN ANSWER
+# -----------------------
+# Three outcomes, and the job reports which one it got rather than folding them:
+#
+#   present   -- `memory-backend-file` appears in `-object help` AND
+#                `-object memory-backend-file,...` is accepted (exit 0).
+#   absent    -- it does not appear, or it appears and is refused.  A NEGATIVE
+#                answer, and a legitimate one.
+#   unmeasured-- the installer could not be downloaded or extracted, or the
+#                binary would not run at all.  This is the one outcome that
+#                FAILS the job, because "we could not measure" must never be
+#                recorded as "it is absent".
+#
+# The negative control is built in: the same binary is asked `-object
+# memory-backend-ram,...`, which is known-present on this host.  If the control
+# is refused while `memory-backend-file` is also refused, the instrument is
+# broken, not the QEMU -- the same lesson as the QMP client that never sent
+# `qmp_capabilities` and made `pmemsave` look absent for days.
+
+name: qemu-hostmem-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: >-
+          Semicolon-separated label|url pairs to probe. Each is downloaded,
+          extracted, and asked which hostmem backends it registers.
+        required: true
+        default: >-
+          2026.8.11|https://qemu.weilnetz.de/w64/qemu-w64-setup-20260811.exe
+  push:
+    paths:
+      - '.github/workflows/qemu-hostmem-probe.yml'
+      - 'scripts/ci/probe-qemu-hostmem.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Probe every requested QEMU build
+        shell: pwsh
+        run: |
+          ./scripts/ci/probe-qemu-hostmem.ps1 -Versions "${{ inputs.versions }}"
+
+      - name: Keep the raw measurement
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-hostmem-probe
+          path: qemu-hostmem-probe.json
+          if-no-files-found: warn
+          retention-days: 30
