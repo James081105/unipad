@@ -727,7 +727,17 @@ class SurfaceWindow:
         """
         if self._hwnd is None:
             return None
-        if not (0 <= x < self.width and 0 <= y < self.height):
+        # The bounds check is against the client area Windows actually
+        # delivered, NOT against ``self.width``.  ``self.width`` is what was
+        # requested, and the two diverge exactly when it matters: if
+        # :meth:`_resize_window` could not resize -- a desktop too small, a
+        # window style that refuses -- the client area stays small while
+        # ``self.width`` grew to the frame's, and a bounds check against the
+        # requested size passes for coordinates the window does not have.
+        # That is the same defect ``client_size`` was added to expose, and it
+        # was living here too.
+        client = self.client_size()
+        if client is None or not (0 <= x < client[0] and 0 <= y < client[1]):
             return None
         window_dc = _USER32.GetDC(self._hwnd)
         if not window_dc:

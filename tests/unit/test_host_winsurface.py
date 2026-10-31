@@ -429,6 +429,57 @@ def test_closing_releases_the_gdi_objects_it_took() -> None:
 
 
 @windows_only
+def test_displayed_pixel_bounds_are_the_client_area_not_the_request(
+    surface: SurfaceWindow,
+) -> None:
+    """``displayed_pixel`` must ask the client area, not ``self.width``.
+
+    ``self.width`` is what was REQUESTED.  They diverge exactly when it matters:
+    if ``_resize_window`` could not resize -- a desktop too small, a window style
+    that refuses -- the client area stays small while ``self.width`` grew to the
+    frame's, and a bounds check against the requested size passes for coordinates
+    the window does not have.  That is the same defect ``client_size`` was added
+    to expose, and a self-review found it living in ``displayed_pixel`` too.
+
+    The first version of this test asserted the invariant only where the two
+    AGREE, so a mutation reverting the bounds check survived it.  The divergence
+    is created here deliberately: Windows enforces a minimum tracking width
+    (measured: a request for 40 comes back 120), so a frame narrower than that
+    leaves the client area wider than the frame -- and a coordinate in the gap
+    must be answerable, because the window really does have it.
+    """
+    surface.present(solid_frame(SURF_W, SURF_H, (0x40, 0x50, 0x60)))
+    client = surface.client_size()
+    assert client is not None
+    assert (surface.width, surface.height) == client, (
+        "this test needs the requested and delivered sizes to agree first")
+
+    # A frame narrower than the window's minimum tracking width.  Windows clamps
+    # the client area, so the delivered size is now WIDER than the request.
+    narrow = 40
+    result = surface.present(solid_frame(narrow, 20, (9, 9, 9)))
+    assert result["blitted"] is True
+    assert surface.width == narrow
+    clamped = surface.client_size()
+    assert clamped is not None
+    assert clamped[0] > narrow, (
+        f"Windows did not clamp a {narrow}px window (client={clamped}); this "
+        "test cannot create the divergence it needs on this host")
+
+    # The frame's own last pixel is answerable either way.
+    assert surface.displayed_pixel(narrow - 1, 19) == (9, 9, 9)
+    # This one is the assertion that fails if the bounds check compares against
+    # the requested size: it is beyond the frame but inside the client area, and
+    # the window really does have it -- it shows the class background, not black.
+    gap = surface.displayed_pixel(clamped[0] - 1, 19)
+    assert gap is not None, (
+        "a coordinate inside the client area was refused, so the bounds check "
+        "is comparing against the requested size rather than the delivered one")
+    # And one past the client area is still a refusal.
+    assert surface.displayed_pixel(clamped[0], 19) is None
+
+
+@windows_only
 def test_a_bad_dimension_is_refused_before_any_window_is_made() -> None:
     """Crash early: a zero-sized surface is a caller bug, not a GDI problem."""
     with pytest.raises(UniPadError) as caught:
