@@ -17,6 +17,14 @@ exists, the icon is registered and the trust decision was actually recorded.
 ``trust_mode`` is whatever the injected policy decided and is *recorded*,
 never assumed.
 
+The four verbs of the install loop are all reachable over the wire: install
+(``install.request``), challenge (``challenge.request``), launch
+(``launch.request``) and persist (``persist.request``) each dispatch through
+:meth:`FakeGuestService.handle` onto the matching method.  A launch-time fault
+is injected at the ``dependency``/``dyld`` points -- the same faults
+:meth:`launch` re-runs -- so an app that installed cleanly can still be
+refused at launch without the install result changing.
+
 Persistence (``persist`` / ``load``) simulates the persistent Data volume for
 M9b: a brand-new service instance loading the same directory sees the same
 installed apps and containers, exactly as a fresh QEMU process would.
@@ -45,18 +53,27 @@ from typing import Any, Mapping, Optional
 from unipad.errors import ErrorCode, UniPadError
 from unipad.guest.protocol import (
     FAILURE_CODES,
+    LAUNCH_STAGES,
     MSG_CHALLENGE_REQUEST,
     MSG_CHALLENGE_RESPONSE,
     MSG_ERROR,
     MSG_INSTALL_REQUEST,
     MSG_INSTALL_RESPONSE,
+    MSG_LAUNCH_REQUEST,
+    MSG_LAUNCH_RESPONSE,
+    MSG_PERSIST_REQUEST,
+    MSG_PERSIST_RESPONSE,
     MSG_STATUS_REQUEST,
     MSG_STATUS_RESPONSE,
     ChallengeResponse,
     InstallProgress,
     InstallRequest,
     InstallResponse,
+    LaunchRequest,
+    LaunchResponse,
     Message,
+    PersistRequest,
+    PersistResponse,
     StatusResponse,
     error_message,
 )
@@ -574,6 +591,10 @@ class FakeGuestService:
                 return self._reply(envelope, MSG_CHALLENGE_RESPONSE, self._handle_challenge(envelope))
             if mtype == MSG_STATUS_REQUEST:
                 return self._reply(envelope, MSG_STATUS_RESPONSE, self.status())
+            if mtype == MSG_LAUNCH_REQUEST:
+                return self._reply(envelope, MSG_LAUNCH_RESPONSE, self._handle_launch(envelope))
+            if mtype == MSG_PERSIST_REQUEST:
+                return self._reply(envelope, MSG_PERSIST_RESPONSE, self._handle_persist(envelope))
             return error_message(
                 ErrorCode.UNSUPPORTED_COMMAND,
                 f"unsupported guest message type '{mtype}'",
@@ -600,6 +621,80 @@ class FakeGuestService:
         if not isinstance(nonce, str) or nonce == "":
             raise UniPadError(ErrorCode.QMP_PROTOCOL_ERROR, "challenge request without a nonce")
         return self.challenge(nonce)
+
+    def _handle_launch(self, envelope: Message) -> LaunchResponse:
+        """Answer a launch request from :meth:`launch`'s own result.
+
+        Two translations happen here and both are deliberate:
+
+        1. **A failure becomes data, not an exception.**  :meth:`launch` raises
+           :class:`UniPadError`; the wire answer is a ``launch.response`` with
+           ``stage='failed'`` and that exception's code *verbatim*.  The client
+           then returns it to the caller the same way it returns a failed
+           install, so a launch-time fault stays attributable to launch.
+        2. **``running`` becomes ``launched``.**  The service's own word for
+           "the entry point executed" is ``running``; the wire vocabulary is
+           :data:`~unipad.guest.protocol.LAUNCH_STAGES`, whose success word is
+           ``launched``.  This is the *only* accepted mapping, and it is checked
+           rather than assumed -- any other stage from the service is a protocol
+           error, not something to rename into a success.
+        """
+        request = LaunchRequest.from_dict(envelope.payload)
+        try:
+            result = self.launch(request.bundle_id)
+        except UniPadError as exc:
+            return LaunchResponse(
+                stage="failed",
+                bundle_id=request.bundle_id,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+        if result.get("stage") != "running":
+            # Refuse to guess: an unrecognized service outcome must not be
+            # rewritten into a success the service never reported.
+            raise UniPadError(
+                ErrorCode.QMP_PROTOCOL_ERROR,
+                "guest launch result does not name a known stage",
+                stage=repr(result.get("stage")),
+                known_stages=list(LAUNCH_STAGES),
+            )
+        return LaunchResponse(
+            stage="launched",
+            bundle_id=result.get("bundle_id"),
+            trust_mode=result.get("trust_mode"),
+        )
+
+    def _handle_persist(self, envelope: Message) -> PersistResponse:
+        """Answer a persist request from :meth:`persist`'s own measurement.
+
+        ``markers_written`` is read back from :meth:`data_markers` *after* the
+        flush, and ``bytes_written`` is the size of the file that was actually
+        written -- both are observations of this guest's state.  A handler that
+        echoed the request, or that counted what the host said it had, would be
+        reporting a flush nobody performed.
+        """
+        request = PersistRequest.from_dict(envelope.payload)
+        try:
+            written = self.persist(request.path)
+        except UniPadError as exc:
+            return PersistResponse(
+                stage="failed",
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+        try:
+            bytes_written = Path(written["path"]).stat().st_size
+        except OSError as exc:
+            raise UniPadError(
+                ErrorCode.PERSISTENCE_FAILED,
+                "persisted state was written but cannot be measured",
+                path=written.get("path"),
+            ) from exc
+        return PersistResponse(
+            stage="persisted",
+            markers_written=self.data_markers(),
+            bytes_written=bytes_written,
+        )
 
     # --- internals ---
 

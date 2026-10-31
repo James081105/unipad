@@ -13,6 +13,12 @@ Import boundary: this package must never import :mod:`unipad.ipa` or
 :mod:`unipad.host`.  Those packages may use ``unipad.guest`` lazily.  Only
 :mod:`unipad.errors` and the standard library are imported here.
 
+The four verbs of the install loop each have one message pair and one client
+method -- install (安装/注册), challenge (挑战应答), launch (启动), persist
+(持久化) -- so the host state machine is complete without a mid-experiment
+protocol change.  Which of them any *real* guest can answer is a separate
+question this package does not answer: see ADR-0010.
+
 :func:`create_install_channel` is the package's zero-argument channel factory:
 the one seam the controller's ``guest_channel`` capability resolves to and calls
 with no arguments.  It lives here, beside the re-exports, because it is the
@@ -32,7 +38,11 @@ from unipad.guest.protocol import (
     InstallProgress,
     InstallRequest,
     InstallResponse,
+    LaunchRequest,
+    LaunchResponse,
     Message,
+    PersistRequest,
+    PersistResponse,
     StatusRequest,
     StatusResponse,
     decode,
@@ -101,6 +111,10 @@ __all__ = [
     "ChallengeResponse",
     "StatusRequest",
     "StatusResponse",
+    "LaunchRequest",
+    "LaunchResponse",
+    "PersistRequest",
+    "PersistResponse",
     "encode",
     "decode",
     "error_message",

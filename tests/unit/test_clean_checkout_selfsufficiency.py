@@ -170,15 +170,55 @@ def _reads_through_a_helper(function: ast.FunctionDef | ast.AsyncFunctionDef) ->
     )
 
 
+def _bare_vendor_checks(
+    node: ast.Assert, vendor_names: set[str], readers: set[str]
+) -> list[ast.Call]:
+    """Existence checks an ``assert`` makes on its own, not inside a read.
+
+    ``assert BUILDER.is_file()`` is a check about the pinned tree, and on a
+    clean checkout it is a failure -- that is the defect.  But ``assert "…" in
+    _text(require(BUILDER))`` also contains an existence check on a vendor path,
+    and that one is fine, because the check is an argument of the read and runs
+    first.  The difference is whether the check is wrapped by a read.
+
+    Matching on "the assert mentions vendor" instead would flag
+    ``assert cpu["vendor"] == "GenuineFake"`` (a CPU field) and
+    ``assert not alias.name.startswith("vendor")`` (an import guard), neither of
+    which touches the filesystem at all.  Measured: both, plus
+    ``PREFLIGHT_MARKERS``'s vendor string, on the revision that tried it.
+    """
+    found: list[ast.Call] = []
+    for call in ast.walk(node.test):
+        if not isinstance(call, ast.Call):
+            continue
+        if _call_name(call) not in GUARD_CALLS:
+            continue
+        if not _mentions_vendor(call, vendor_names):
+            continue
+        wrapped = any(
+            other is not call
+            and isinstance(other, ast.Call)
+            and (_call_name(other) in READING_CALLS or _call_name(other) in readers)
+            and _contains(other, call)
+            for other in ast.walk(node.test)
+        )
+        if not wrapped:
+            found.append(call)
+    return found
+
+
 def _vendor_reads_and_guards(
     body: ast.AST, source: str, vendor_names: set[str], readers: set[str]
 ) -> list[tuple[int, str]]:
-    """``[(line, snippet)]`` for every vendor read in ``body`` that is unguarded.
+    """``[(line, snippet)]`` for every unguarded vendor read in ``body``.
 
-    A read is either a filesystem call on a vendor path or a call to a local
-    helper that does one, handed a vendor path.  The helper case is what the
-    first revision of this scan could not see, and it is the shape all three
-    2026-10-31 offenders used.
+    A read is a filesystem call on a vendor path, a call to a local helper that
+    does one, or a bare ``assert`` that checks a vendor path on its own.  The
+    helper case is what the first revision of this scan could not see, and it is
+    the shape all three 2026-10-31 offenders used.  The bare-assert case is what
+    got past the second: ``assert BUILDER.is_file()`` *contains* an existence
+    check, so a scan that only asks "is there a guard call in this function"
+    reads it as guarded, when what it does on a clean checkout is fail.
 
     "Unguarded" means no existence check is evaluated before it.  Order is
     decided by position, with one exception that matters: in
@@ -186,10 +226,17 @@ def _vendor_reads_and_guards(
     it runs first even though it starts at a later column.  A guard nested
     inside the read's own arguments therefore counts; a guard that is a later
     sibling on the same line does not, and neither does one further down.
+
+    A bare assert gets no such exemption -- the check inside it is the thing
+    being judged, so it cannot also be the thing that excuses it.
     """
     guards: list[ast.Call] = []
-    reads: list[ast.Call] = []
+    reads: list[tuple[ast.AST, bool]] = []  # (node, may a nested guard excuse it)
     for node in ast.walk(body):
+        if isinstance(node, ast.Assert):
+            for check in _bare_vendor_checks(node, vendor_names, readers):
+                reads.append((check, False))
+            continue
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node)
@@ -198,20 +245,18 @@ def _vendor_reads_and_guards(
         if name in GUARD_CALLS:
             guards.append(node)
         elif name in READING_CALLS or name in readers:
-            reads.append(node)
+            reads.append((node, True))
 
     unguarded: list[tuple[int, str]] = []
-    for read in reads:
-        nested = any(
+    for read, nested_excuses in reads:
+        if nested_excuses and any(
             guard is not read and _contains(read, guard) for guard in guards
-        )
-        if nested:
+        ):
             continue
-        before = any(
+        if any(
             (guard.lineno, guard.col_offset) < (read.lineno, read.col_offset)
             for guard in guards
-        )
-        if before:
+        ):
             continue
         segment = ast.get_source_segment(source, read) or ast.dump(read)
         unguarded.append((read.lineno, segment.strip()[:120]))
@@ -290,6 +335,13 @@ def test_the_scan_can_see_the_reads_it_claims_to_see() -> None:
         "    if not text:\n"
         "        return ''\n"
         "    return text\n"
+        "def bare_assert():\n"
+        "    assert (REAL_DEVICE / ADT_TOOL).is_file()\n"
+        "    return _text(REAL_DEVICE / ADT_TOOL)\n"
+        "def assert_after_a_guard():\n"
+        "    require(REAL_DEVICE / ADT_TOOL)\n"
+        "    assert (REAL_DEVICE / ADT_TOOL).is_file()\n"
+        "    return _text(REAL_DEVICE / ADT_TOOL)\n"
         "ADT_TOOL_PATH = REAL_DEVICE / ADT_TOOL\n"
     )
     sample = ast.parse(sample_source)
@@ -310,9 +362,16 @@ def test_the_scan_can_see_the_reads_it_claims_to_see() -> None:
         "matches the literal 'vendor' never sees a read through a constant"
     )
     assert "_text" in readers, "the sample's helper must be recognised as a reader"
-    for shape in ("direct", "through_a_helper", "through_a_constant", "guard_after_the_read"):
+    flagged = (
+        "direct",
+        "through_a_helper",
+        "through_a_constant",
+        "guard_after_the_read",
+        "bare_assert",
+    )
+    for shape in flagged:
         assert offenders_of(shape), f"the scan must flag the {shape!r} shape"
-    for shape in ("guarded_inline", "guarded_before"):
+    for shape in ("guarded_inline", "guarded_before", "assert_after_a_guard"):
         assert not offenders_of(shape), f"the scan must accept the {shape!r} shape"
 
 
@@ -400,6 +459,21 @@ def _run(modules: list[str], env: dict[str, str]) -> subprocess.CompletedProcess
     :func:`_counts_line`) the ``-rs`` report is the only place the run says which
     tests skipped and why, and "did anything skip at all" is the question this
     whole file exists to answer.
+
+    Cost, measured 2026-10-31 on a host carrying several teammates' processes:
+    the whole of this file runs in 17 s, of which this child is 13 s -- it runs
+    with the vendor root absent, so every test in it skips and nothing compiles.
+    The 437 s figure that gets quoted about this file is the cost of the design
+    that was deliberately NOT taken: a second child run against the *real* root,
+    where ``test_qemu_metal_selector.py`` compiles C++ with MSVC.
+    :func:`test_the_guard_does_not_skip_where_the_pin_is_present` covers that
+    direction in-process for 4 s instead, which is why it exists in the shape it
+    does.
+
+    ``timeout`` is per child and there is exactly one child.  At 46x the
+    measured cost it is not the thing that decides whether this file belongs in
+    ``tests/unit``; if it ever fires, the message is a hung child, not a slow
+    host, and the 600 s it spends getting there is the price of finding out.
     """
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", *modules],

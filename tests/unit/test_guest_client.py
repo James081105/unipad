@@ -42,6 +42,10 @@ from unipad.guest.protocol import (
     MSG_ERROR,
     MSG_INSTALL_REQUEST,
     MSG_INSTALL_RESPONSE,
+    MSG_LAUNCH_REQUEST,
+    MSG_LAUNCH_RESPONSE,
+    MSG_PERSIST_REQUEST,
+    MSG_PERSIST_RESPONSE,
     MSG_STATUS_REQUEST,
     MSG_STATUS_RESPONSE,
     error_message,
@@ -812,6 +816,405 @@ def test_challenge_and_status_use_their_own_message_types(staged_service):
     assert [call["type"] for call in transport.calls] == [
         MSG_INSTALL_REQUEST, MSG_CHALLENGE_REQUEST, MSG_STATUS_REQUEST,
     ]
+
+
+# ---------------------------------------------------------------------------
+# launch (M11 precondition) and persist (M9b / M12) -- ADR-0010
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def installed_service(tmp_path):
+    """Arrange: a fake guest with one app installed over the *message* path.
+
+    The bundle id is taken from the install reply rather than from ``meta`` on
+    purpose.  :class:`~unipad.guest.protocol.InstallRequest` has no
+    ``bundle_id`` field, so an install that arrives over a transport is
+    registered under the package file name; a launch test that assumed the
+    metadata's id would be asking for an app that does not exist.
+    """
+    service = FakeGuestService()
+    transport = FakeTransport(service)
+    client = _client(transport)
+    ipa_path = hello_ipa(tmp_path / "HelloUniPad.ipa")
+    data = ipa_path.read_bytes()
+    meta = _install_meta(data)
+    service.stage_package(data, meta)
+    response = client.install_package(data, meta)
+    assert response.stage == "registered"
+    return service, transport, client, response.bundle_id
+
+
+def test_launch_of_an_installed_app_reports_launched(installed_service):
+    """启动: a registered app is confirmed started, with the guest's trust mode."""
+    service, _transport, client, bundle_id = installed_service
+
+    response = client.launch(bundle_id)
+
+    assert response.stage == "launched"
+    assert response.ok is True
+    assert response.bundle_id == bundle_id
+    assert response.error_code is None
+    # Recorded by the guest, never assumed by the host.
+    assert response.trust_mode == DEFAULT_TRUST_MODE
+
+
+def test_launch_of_an_app_that_is_not_installed_returns_the_guests_code_verbatim(installed_service):
+    """An app the guest does not have is ``registration_failed``, verbatim.
+
+    The client must not re-map this into a generic "launch failed": the caller
+    needs to tell "the app was never installed" from "the app installed and
+    then crashed at start", and only the guest's own code says which.
+    """
+    _service, _transport, client, _bundle_id = installed_service
+
+    response = client.launch("com.unipad.absent")
+
+    assert response.stage == "failed"
+    assert response.ok is False
+    assert response.error_code == ErrorCode.REGISTRATION_FAILED
+    assert response.error_message == "application is not installed"
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "expected_code"),
+    [
+        ("dependency", ErrorCode.MISSING_DEPENDENCY),
+        ("dyld", ErrorCode.DYLD_FAILED),
+    ],
+)
+def test_an_injected_launch_failure_surfaces_the_right_code(installed_service, fail_at, expected_code):
+    """A launch-time fault is injected at the point the guest re-runs.
+
+    ``set_failures`` injects at the ``dependency``/``dyld`` points, which are
+    exactly what :meth:`FakeGuestService.launch` re-checks -- so the app stays
+    installed and only the launch is refused.  That separation is the whole
+    point of having a launch verb on the wire at all.
+    """
+    service, _transport, client, bundle_id = installed_service
+    service.set_failures({"fail_at": fail_at, "mode": "always"})
+
+    response = client.launch(bundle_id)
+
+    assert response.stage == "failed"
+    assert response.error_code == expected_code
+    # The install itself did not change: only the launch was refused.
+    assert bundle_id in service.installed
+
+
+def test_a_launch_failure_is_not_an_install_failure(installed_service):
+    """The two stages stay distinguishable in the evidence, not just in prose.
+
+    An app that refuses to launch still reports as installed, so a verifier
+    reading the two answers sees two facts rather than one collapsed one.
+    """
+    service, _transport, client, bundle_id = installed_service
+    service.set_failures({"fail_at": "dyld", "mode": "always"})
+
+    launch = client.launch(bundle_id)
+    status = client.status()
+
+    assert launch.stage == "failed"
+    assert launch.error_code == ErrorCode.DYLD_FAILED
+    assert [app["bundle_id"] for app in status.installed] == [bundle_id]
+
+
+def test_persist_returns_the_markers_the_service_actually_holds(installed_service, tmp_path):
+    """持久化: the reply is the guest's own inventory after the flush.
+
+    Both fields are the guest's observation: the marker list is read back from
+    the containers, and the byte count is the size of the file that was
+    actually written.  A handler that echoed the request, or that counted what
+    the host believed it had, would be reporting a flush nobody performed.
+    """
+    service, _transport, client, bundle_id = installed_service
+    service.set_data_marker(bundle_id, "Documents/notes.txt", "hello from the test run")
+    service.set_data_marker(bundle_id, "Documents/todo.txt", "second marker")
+    volume = tmp_path / "vol"
+
+    response = client.persist(str(volume))
+
+    assert response.stage == "persisted"
+    assert response.ok is True
+    assert response.error_code is None
+    assert response.markers_written == service.data_markers()
+    assert sorted(response.markers_written) == [
+        f"{bundle_id}:Documents/notes.txt",
+        f"{bundle_id}:Documents/todo.txt",
+    ]
+    # A real measurement, not a constant: the state file exists and is non-empty.
+    assert response.bytes_written > 0
+    assert (volume / "guest-state.json").stat().st_size == response.bytes_written
+
+
+def test_persist_with_no_markers_reports_no_markers(installed_service, tmp_path):
+    """An empty guest is an empty answer -- not an error and not a fabrication."""
+    _service, _transport, client, _bundle_id = installed_service
+
+    response = client.persist(str(tmp_path / "vol"))
+
+    assert response.stage == "persisted"
+    assert response.markers_written == []
+
+
+def test_a_guest_that_never_answers_is_never_a_launch_success():
+    """A timeout is not a launch.  There is no default ``launched``.
+
+    This is the property the whole "no fabricated success" rule exists for: a
+    caller that got a ``launched`` back here would record an app start that
+    never happened, and nothing downstream could tell the difference.
+    """
+    client = _client(SilentTransport())
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert excinfo.value.details["detail"] == "timeout"
+    assert excinfo.value.details["request_type"] == MSG_LAUNCH_REQUEST
+
+
+def test_a_guest_that_never_answers_is_never_a_persist_success():
+    """The same rule for the flush: an unanswered guest has flushed nothing."""
+    client = _client(SilentTransport())
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.persist("/volumes/unipad-data")
+
+    assert excinfo.value.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert excinfo.value.details["detail"] == "timeout"
+    assert excinfo.value.details["request_type"] == MSG_PERSIST_REQUEST
+
+
+def test_a_transport_failure_is_never_a_launch_success():
+    """A broken channel is indistinguishable from a silent guest, and both fail."""
+    client = _client(SilentTransport(exc=OSError("the agent channel closed the connection")))
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+
+
+def test_launch_reply_with_the_wrong_type_is_refused():
+    """A reply naming another verb's type is not an answer to this request."""
+    transport = ScriptedTransport(always={
+        "type": MSG_INSTALL_RESPONSE, "id": "corr-1",
+        "payload": {"stage": "launched", "bundle_id": "com.unipad.hello"},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+    assert excinfo.value.details["expected_type"] == MSG_LAUNCH_RESPONSE
+    assert excinfo.value.details["actual_type"] == MSG_INSTALL_RESPONSE
+
+
+def test_launch_reply_with_the_wrong_id_is_refused():
+    """A reply that cannot be attributed to this request is not an answer."""
+    transport = ScriptedTransport(always={
+        "type": MSG_LAUNCH_RESPONSE, "id": "someone-elses-id",
+        "payload": {"stage": "launched", "bundle_id": "com.unipad.hello"},
+    }, echo_id=False)
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+    assert excinfo.value.details["expected_id"] == transport.calls[0]["id"]
+
+
+def test_persist_reply_with_the_wrong_type_is_refused():
+    transport = ScriptedTransport(always={
+        "type": MSG_STATUS_RESPONSE, "id": "corr-1",
+        "payload": {"installed": [], "data_markers": []},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.persist("/volumes/unipad-data")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+    assert excinfo.value.details["expected_type"] == MSG_PERSIST_RESPONSE
+
+
+def test_launch_claiming_success_without_a_bundle_id_is_refused():
+    """An unattributable launch is ambiguous, and ambiguous is never success."""
+    transport = ScriptedTransport(always={
+        "type": MSG_LAUNCH_RESPONSE, "id": "corr-1", "payload": {"stage": "launched"},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_launch_claiming_success_and_an_error_is_refused():
+    transport = ScriptedTransport(always={
+        "type": MSG_LAUNCH_RESPONSE, "id": "corr-1",
+        "payload": {"stage": "launched", "bundle_id": "com.unipad.hello", "error_code": ErrorCode.DYLD_FAILED},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.launch("com.unipad.hello")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_persist_claiming_success_and_an_error_is_refused():
+    """A flush cannot both have happened and have failed.
+
+    This is the one combination where a caller reading only the stage would
+    take a failed flush for a good one, so it is refused rather than resolved
+    in the guest's favour.
+    """
+    transport = ScriptedTransport(always={
+        "type": MSG_PERSIST_RESPONSE, "id": "corr-1",
+        "payload": {"stage": "persisted", "markers_written": [], "bytes_written": 12,
+                    "error_code": ErrorCode.PERSISTENCE_FAILED},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.persist("/volumes/unipad-data")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_persist_reply_with_a_non_conforming_marker_list_is_refused():
+    transport = ScriptedTransport(always={
+        "type": MSG_PERSIST_RESPONSE, "id": "corr-1",
+        "payload": {"stage": "persisted", "markers_written": ["ok", 7], "bytes_written": 12},
+    })
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        client.persist("/volumes/unipad-data")
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_a_launch_stage_the_contract_does_not_know_is_refused_not_renamed(tmp_path):
+    """The launch stage vocabulary is closed: an unknown word is an error.
+
+    ``FakeGuestService.launch()`` says ``running`` and its handler maps *exactly*
+    that one word to the wire's ``launched``.  A guest reporting anything else --
+    ``starting``, ``installed``, ``registered`` -- must be refused, because
+    renaming it into a success is the host inventing an outcome the guest never
+    gave.  This test drives a guest that says ``starting`` precisely so the
+    refusal is reachable; without it the guard is dead code that no amount of
+    happy-path testing can exercise, which is what the mutation check found.
+    """
+    class OddStageGuest(FakeGuestService):
+        """A guest whose launch reports a stage the wire vocabulary lacks."""
+
+        def launch(self, bundle_id: str) -> dict:
+            result = super().launch(bundle_id)
+            result["stage"] = "starting"
+            return result
+
+    service = OddStageGuest()
+    ipa_path = hello_ipa(tmp_path / "HelloUniPad.ipa")
+    data = ipa_path.read_bytes()
+    meta = _install_meta(data)
+    service.stage_package(data, meta)
+    transport = FakeTransport(service)
+    client = _client(transport)
+    bundle_id = client.install_package(data, meta).bundle_id
+
+    response = client.launch(bundle_id)
+
+    assert response.stage == "failed"
+    assert response.error_code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_launch_and_persist_guest_error_envelopes_keep_the_code_verbatim():
+    """A guest that answers with an ``error`` envelope still says why.
+
+    The client turns it into a failed response carrying the guest's own code,
+    exactly as it does for install -- the caller gets the fact *and* the reason,
+    and nothing in between invents a new code.
+    """
+    transport = ScriptedTransport(always=error_message(
+        ErrorCode.INSTALL_SERVICE_UNAVAILABLE, "guest install service is down", message_id="corr-1"
+    ).to_dict())
+    client = _client(transport)
+
+    launch = client.launch("com.unipad.hello")
+    persist = client.persist("/volumes/unipad-data")
+
+    assert launch.stage == "failed"
+    assert launch.error_code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert launch.error_message == "guest install service is down"
+    assert persist.stage == "failed"
+    assert persist.error_code == ErrorCode.INSTALL_SERVICE_UNAVAILABLE
+    assert persist.markers_written == []
+    assert persist.bytes_written == 0
+
+
+def test_launch_and_persist_use_their_own_message_types(installed_service):
+    """Each call speaks the message type its reply must match."""
+    service, transport, client, bundle_id = installed_service
+    service.set_data_marker(bundle_id, "Documents/notes.txt", "hello")
+
+    client.launch(bundle_id)
+    client.persist("/volumes/unipad-data")
+
+    assert [call["type"] for call in transport.calls][-2:] == [
+        MSG_LAUNCH_REQUEST, MSG_PERSIST_REQUEST,
+    ]
+    # The launch request names the app; the persist request names the volume.
+    assert transport.calls[-2]["payload"] == {"bundle_id": bundle_id}
+    assert transport.calls[-1]["payload"] == {"path": "/volumes/unipad-data"}
+
+
+@pytest.mark.parametrize("call", ["launch", "persist"])
+def test_a_blank_argument_never_reaches_the_guest(call):
+    """A request that names nothing is refused before the guest is contacted.
+
+    Asking a guest to launch ``""`` or to flush ``""`` would put a meaningless
+    request on the wire and then require the guest to invent an answer to it.
+    """
+    transport = FakeTransport(FakeGuestService())
+    client = _client(transport)
+
+    with pytest.raises(UniPadError) as excinfo:
+        getattr(client, call)("")
+
+    assert excinfo.value.code == ErrorCode.CONFIG_INVALID
+    assert transport.calls == []
+
+
+def test_the_four_verbs_of_the_loop_are_four_message_types(installed_service, tmp_path):
+    """安装/注册/启动/持久化 are four questions, not one.
+
+    The loop is only closed if each stage can be asked separately, so the wire
+    carries four distinct types and the client speaks each one.  A single
+    "do everything" message would make a launch failure indistinguishable from
+    an install failure.
+    """
+    service, transport, client, bundle_id = installed_service
+    service.set_data_marker(bundle_id, "Documents/notes.txt", "hello")
+
+    launched = client.launch(bundle_id)
+    persisted = client.persist(str(tmp_path / "vol"))
+    status = client.status()
+
+    assert [call["type"] for call in transport.calls] == [
+        MSG_INSTALL_REQUEST,
+        MSG_LAUNCH_REQUEST,
+        MSG_PERSIST_REQUEST,
+        MSG_STATUS_REQUEST,
+    ]
+    assert launched.stage == "launched"
+    assert persisted.stage == "persisted"
+    assert status.data_markers == [f"{bundle_id}:Documents/notes.txt"]
 
 
 def test_install_package_carries_a_named_source_onto_the_wire(staged_service):

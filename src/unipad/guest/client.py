@@ -22,6 +22,14 @@ Guarantees implemented here:
 - No fabricated success: a missing, id-mismatched or ambiguous reply is an
   error, never a success stage.
 
+The four verbs of the install loop each get their own method and their own
+message pair: :meth:`GuestClient.install_package` (安装/注册),
+:meth:`GuestClient.challenge`, :meth:`GuestClient.launch` (启动) and
+:meth:`GuestClient.persist` (持久化).  They are deliberately separate
+questions -- an app that registered can still refuse to start, and a flush can
+fail while every app stays installed -- so a failure is attributed to the stage
+that actually failed rather than collapsed into one "install failed".
+
 Dependency direction: imports :mod:`unipad.errors` and
 :mod:`unipad.guest.protocol` only.  It must never import :mod:`unipad.ipa`
 or :mod:`unipad.host`.
@@ -40,13 +48,21 @@ from unipad.guest.protocol import (
     MSG_ERROR,
     MSG_INSTALL_REQUEST,
     MSG_INSTALL_RESPONSE,
+    MSG_LAUNCH_REQUEST,
+    MSG_LAUNCH_RESPONSE,
+    MSG_PERSIST_REQUEST,
+    MSG_PERSIST_RESPONSE,
     MSG_STATUS_REQUEST,
     MSG_STATUS_RESPONSE,
     ChallengeRequest,
     ChallengeResponse,
     InstallRequest,
     InstallResponse,
+    LaunchRequest,
+    LaunchResponse,
     Message,
+    PersistRequest,
+    PersistResponse,
     StatusResponse,
     new_message_id,
 )
@@ -185,6 +201,76 @@ class GuestClient:
         for app in response.installed:
             if not app.get("bundle_id"):
                 raise self._protocol_error("status response entry without bundle_id", reply=reply)
+        return response
+
+    def launch(self, bundle_id: str) -> LaunchResponse:
+        """Ask the guest to start one already-installed app (M11 precondition).
+
+        This is the "启动" half of the install loop.  It is a *separate*
+        question from installing: an app that registered cleanly can still fail
+        to start (a missing dependency, an entry point that did not execute), and
+        reporting that as an install failure would blame the wrong stage.
+
+        Returns:
+            LaunchResponse: the guest's answer, ``stage='launched'`` or
+                ``stage='failed'`` with the guest's verbatim ``error_code``.  A
+                guest-reported failure is **returned, not raised**, exactly like
+                :meth:`install_package`, so the caller can log it as evidence
+                and decide what it means.
+
+        Raises:
+            UniPadError: ``config_invalid`` for a blank bundle id (the guest is
+                not contacted at all); ``install_service_unavailable`` when the
+                guest never answers -- a guest that cannot be asked has not
+                launched anything.
+        """
+        if not isinstance(bundle_id, str) or bundle_id == "":
+            raise UniPadError(ErrorCode.CONFIG_INVALID, "launch requires a non-empty bundle_id")
+        request = LaunchRequest(bundle_id=bundle_id)
+        reply = self._exchange(MSG_LAUNCH_REQUEST, MSG_LAUNCH_RESPONSE, request.to_dict())
+
+        if reply.type == MSG_ERROR:
+            return self._launch_response_from_error(reply)
+
+        try:
+            response = LaunchResponse.from_dict(reply.payload)
+        except UniPadError as exc:
+            raise self._protocol_error("launch response payload is not conforming", reply=reply) from exc
+
+        self._reject_fabricated_launch(response, reply)
+        return response
+
+    def persist(self, path: str) -> PersistResponse:
+        """Ask the guest to flush its Data volume and report what it now holds.
+
+        This is the "持久化" half of the install loop (M9b/M12).  The host never
+        computes the answer: ``markers_written`` and ``bytes_written`` are the
+        guest's own observation of the flush, because a host that derived them
+        from its own model would be reporting a flush it never saw.
+
+        Returns:
+            PersistResponse: ``stage='persisted'`` with the guest's own marker
+                inventory, or ``stage='failed'`` with its verbatim error code.
+
+        Raises:
+            UniPadError: ``config_invalid`` for a blank path (the guest is not
+                contacted at all); ``install_service_unavailable`` when the guest
+                never answers.
+        """
+        if not isinstance(path, str) or path == "":
+            raise UniPadError(ErrorCode.CONFIG_INVALID, "persist requires a non-empty volume path")
+        request = PersistRequest(path=path)
+        reply = self._exchange(MSG_PERSIST_REQUEST, MSG_PERSIST_RESPONSE, request.to_dict())
+
+        if reply.type == MSG_ERROR:
+            return self._persist_response_from_error(reply)
+
+        try:
+            response = PersistResponse.from_dict(reply.payload)
+        except UniPadError as exc:
+            raise self._protocol_error("persist response payload is not conforming", reply=reply) from exc
+
+        self._reject_fabricated_persist(response, reply)
         return response
 
     # --- internals ---
@@ -356,6 +442,39 @@ class GuestClient:
         )
 
     @staticmethod
+    def _launch_response_from_error(reply: Message) -> LaunchResponse:
+        """Convert a guest error envelope into a failed launch response.
+
+        The code passes through verbatim: a guest that refuses to launch an app
+        it does not have says ``registration_failed``, and that is the fact the
+        caller needs.  Re-mapping it to a generic "launch failed" would destroy
+        the distinction between "not installed" and "started and crashed".
+        """
+        code = reply.payload.get("code")
+        text = reply.payload.get("message")
+        return LaunchResponse(
+            stage="failed",
+            error_code=code if isinstance(code, str) and code else ErrorCode.INSTALL_SERVICE_UNAVAILABLE,
+            error_message=text if isinstance(text, str) else "guest reported an error",
+        )
+
+    @staticmethod
+    def _persist_response_from_error(reply: Message) -> PersistResponse:
+        """Convert a guest error envelope into a failed persist response.
+
+        A failed flush is *not* "nothing to persist": the marker inventory stays
+        empty because the guest reported no successful write, never because the
+        host decided there was nothing there.
+        """
+        code = reply.payload.get("code")
+        text = reply.payload.get("message")
+        return PersistResponse(
+            stage="failed",
+            error_code=code if isinstance(code, str) and code else ErrorCode.INSTALL_SERVICE_UNAVAILABLE,
+            error_message=text if isinstance(text, str) else "guest reported an error",
+        )
+
+    @staticmethod
     def _reject_fabricated_success(response: InstallResponse, reply: Message) -> None:
         """Guard against a reply that claims success without the required fields.
 
@@ -367,6 +486,33 @@ class GuestClient:
             raise GuestClient._protocol_error("install reply claims success and an error at once", reply=reply)
         if response.stage in ("installed", "registered") and not response.bundle_id:
             raise GuestClient._protocol_error("install reply claims success without bundle_id", reply=reply)
+
+    @staticmethod
+    def _reject_fabricated_launch(response: LaunchResponse, reply: Message) -> None:
+        """Guard against a launch reply that claims success without the fields.
+
+        Same rule as :meth:`_reject_fabricated_success`: ``launched`` must name
+        the bundle that started, and must not carry an error code.  A reply that
+        breaks either rule is ambiguous, and an ambiguous reply is an error --
+        never a launch the caller may report.
+        """
+        if response.error_code is not None and response.stage == "launched":
+            raise GuestClient._protocol_error("launch reply claims success and an error at once", reply=reply)
+        if response.stage == "launched" and not response.bundle_id:
+            raise GuestClient._protocol_error("launch reply claims success without bundle_id", reply=reply)
+
+    @staticmethod
+    def _reject_fabricated_persist(response: PersistResponse, reply: Message) -> None:
+        """Guard against a persist reply that claims a flush and an error at once.
+
+        There is no equivalent "must name a bundle" rule here, because the
+        markers are the payload and an empty marker list is a legitimate answer
+        for a guest holding no data.  What must never happen is a reply that
+        both claims ``persisted`` and reports a failure code -- that is the one
+        combination where a caller could read success out of a failed flush.
+        """
+        if response.error_code is not None and response.stage == "persisted":
+            raise GuestClient._protocol_error("persist reply claims success and an error at once", reply=reply)
 
 
 __all__ = ["Transport", "GuestClient", "DEFAULT_ATTEMPTS", "DEFAULT_BACKOFF_S"]

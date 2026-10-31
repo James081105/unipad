@@ -13,6 +13,14 @@ tests pin:
   dropped, never guessed at;
 * the stage vocabulary and the failure-code table stay aligned with PRD 10.
 
+ADR-0010 adds ``launch.request``/``launch.response`` and
+``persist.request``/``persist.response`` to the vocabulary, so the four verbs of
+the install loop -- install, challenge, launch, persist -- are all on the wire
+and the host state machine needs no protocol change mid-experiment.  These
+tests pin the *spelling* and the *shape* of those four messages.  They do not
+and cannot show that any guest implements them: on this host there is no guest
+install service, so every one of them stays ``UNVERIFIED`` on the guest side.
+
 Simulation only (docs/testing-strategy.md D3): nothing here touches QEMU, a
 real guest, the network or the wall clock.  Field verification of the real
 guest install service stays ``UNVERIFIED`` -- these tests prove the host-side
@@ -30,21 +38,31 @@ from unipad.errors import ErrorCode, UniPadError
 from unipad.guest.protocol import (
     FAILURE_CODES,
     KNOWN_TYPES,
+    LAUNCH_STAGES,
     MSG_CHALLENGE_REQUEST,
     MSG_CHALLENGE_RESPONSE,
     MSG_ERROR,
     MSG_INSTALL_PROGRESS,
     MSG_INSTALL_REQUEST,
     MSG_INSTALL_RESPONSE,
+    MSG_LAUNCH_REQUEST,
+    MSG_LAUNCH_RESPONSE,
+    MSG_PERSIST_REQUEST,
+    MSG_PERSIST_RESPONSE,
     MSG_STATUS_REQUEST,
     MSG_STATUS_RESPONSE,
+    PERSIST_STAGES,
     STAGES,
     ChallengeRequest,
     ChallengeResponse,
     InstallProgress,
     InstallRequest,
     InstallResponse,
+    LaunchRequest,
+    LaunchResponse,
     Message,
+    PersistRequest,
+    PersistResponse,
     StatusRequest,
     StatusResponse,
     decode,
@@ -310,6 +328,191 @@ def test_status_response_round_trips_apps_and_markers():
     assert decoded == response
     assert [app["bundle_id"] for app in decoded.installed] == ["com.unipad.hello", "com.unipad.notes"]
     assert decoded.data_markers == ["com.unipad.notes:Documents/container-data.txt"]
+
+
+# ---------------------------------------------------------------------------
+# ADR-0010: launch and persist on the wire
+# ---------------------------------------------------------------------------
+
+
+def test_launch_and_persist_are_the_dotted_spelling_and_nothing_else():
+    """The wire vocabulary is ``<verb>.request`` / ``<verb>.response``.
+
+    The spelling is load-bearing, not cosmetic.  ``GuestClient._validate_reply``
+    correlates the reply's ``type`` against the constant, and ``decode`` rejects
+    anything outside :data:`KNOWN_TYPES` as ``unsupported_command``.  A peer
+    that answered ``launch_response`` (underscore) would be refused by a client
+    that is working correctly, which makes a working guest look broken -- the
+    same trap an earlier draft of ``test_guest_agent_channel.py`` fell into
+    with ``status_response``.
+    """
+    assert MSG_LAUNCH_REQUEST == "launch.request"
+    assert MSG_LAUNCH_RESPONSE == "launch.response"
+    assert MSG_PERSIST_REQUEST == "persist.request"
+    assert MSG_PERSIST_RESPONSE == "persist.response"
+
+    # All four are inside the closed vocabulary, so decode() accepts them and
+    # reports them as known types rather than dropping them.
+    for mtype in (MSG_LAUNCH_REQUEST, MSG_LAUNCH_RESPONSE, MSG_PERSIST_REQUEST, MSG_PERSIST_RESPONSE):
+        assert mtype in KNOWN_TYPES
+
+    # The underscore spellings are NOT on the wire: a reply using one is
+    # unknown, not tolerated.
+    for wrong in ("launch_request", "launch_response", "persist_request", "persist_response"):
+        assert wrong not in KNOWN_TYPES
+
+
+def test_launch_request_requires_a_bundle_id():
+    """A launch request that names no app cannot be answered honestly.
+
+    Guessing a target would start something the host never asked for, so the
+    field is required and non-empty rather than defaulted.
+    """
+    assert LaunchRequest(bundle_id="com.unipad.hello").to_dict() == {"bundle_id": "com.unipad.hello"}
+
+    for payload in ({}, {"bundle_id": ""}, {"bundle_id": 7}):
+        with pytest.raises(UniPadError) as excinfo:
+            LaunchRequest.from_dict(payload)
+        assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_launch_response_round_trip_keeps_the_guests_code_verbatim():
+    """PRD 10: a launch-time fault is the guest's code, not a re-mapped one.
+
+    ``dyld_failed`` at launch and ``dyld_failed`` at install are the same
+    taxonomy code with a different stage attached; collapsing them into one
+    generic "launch failed" would destroy the distinction the M11 evidence
+    needs.
+    """
+    response = LaunchResponse(
+        stage="failed",
+        bundle_id="com.unipad.hello",
+        error_code=ErrorCode.DYLD_FAILED,
+        error_message="entry point did not execute",
+    )
+
+    decoded = LaunchResponse.from_dict(_payload_round_trip(response.to_dict()).payload)
+
+    assert decoded == response
+    assert decoded.stage == "failed"
+    assert decoded.error_code == "dyld_failed"
+    assert decoded.ok is False
+
+
+def test_launch_response_ok_is_only_the_launched_stage_with_no_error():
+    """Only a guest-confirmed launch with no error code is a success.
+
+    ``ok`` deliberately says nothing about the bundle id: naming the app that
+    started is the *client's* attribution check (a reply that claims a launch
+    without one is ambiguous), while ``ok`` is the contract's own stage/error
+    verdict.  Keeping the two apart is what makes the client's guard a real
+    guard instead of a duplicate of this property.
+    """
+    assert LaunchResponse(stage="launched", bundle_id="com.unipad.hello").ok is True
+    assert LaunchResponse(stage="failed", error_code=ErrorCode.DYLD_FAILED).ok is False
+    assert LaunchResponse(stage="launched", error_code=ErrorCode.DYLD_FAILED).ok is False
+
+
+def test_persist_request_names_the_volume_to_flush():
+    """The host is the side that created the Data volume, so it names it.
+
+    "Flush the default whatever" is not a request either side can verify, so
+    the field is required.  What a *real* guest would accept in it is
+    unverified (ADR-0010); the in-memory fake reads it as the directory its
+    simulated volume is written to.
+    """
+    assert PersistRequest(path="/volumes/unipad-data").to_dict() == {"path": "/volumes/unipad-data"}
+
+    for payload in ({}, {"path": ""}, {"path": None}):
+        with pytest.raises(UniPadError) as excinfo:
+            PersistRequest.from_dict(payload)
+        assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_persist_response_round_trips_the_guests_own_inventory():
+    """M9b/M12: the marker list and byte count are the guest's observation.
+
+    The host must not compute either one -- a host that derived them from its
+    own model would be reporting a flush it never saw.  So the contract carries
+    them and this test pins that they survive the wire unchanged.
+    """
+    response = PersistResponse(
+        stage="persisted",
+        markers_written=["com.unipad.hello:Documents/notes.txt", "com.unipad.hello:Documents/todo.txt"],
+        bytes_written=1615,
+    )
+
+    decoded = PersistResponse.from_dict(_payload_round_trip(response.to_dict()).payload)
+
+    assert decoded == response
+    assert decoded.markers_written == [
+        "com.unipad.hello:Documents/notes.txt",
+        "com.unipad.hello:Documents/todo.txt",
+    ]
+    assert decoded.bytes_written == 1615
+    assert decoded.ok is True
+
+
+def test_persist_response_defaults_an_absent_inventory_to_empty():
+    """A guest holding no data legitimately reports no markers.
+
+    ``markers_written``/``bytes_written`` are optional on the reply so a peer
+    that predates them still produces a conforming frame; absent means empty,
+    never an error and never a fabricated count.
+    """
+    decoded = PersistResponse.from_dict({"stage": "persisted"})
+
+    assert decoded.stage == "persisted"
+    assert decoded.markers_written == []
+    assert decoded.bytes_written == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"stage": "persisted", "markers_written": "nope"},
+        {"stage": "persisted", "markers_written": [1, 2]},
+        {"stage": "persisted", "markers_written": [None]},
+        {"stage": "persisted", "bytes_written": "1615"},
+        {"stage": "persisted", "bytes_written": True},
+        {"bundle_id": "com.unipad.hello"},
+    ],
+)
+def test_persist_response_rejects_non_conforming_shapes(payload):
+    """A persist reply that is not the documented shape is an error."""
+    with pytest.raises(UniPadError) as excinfo:
+        PersistResponse.from_dict(payload)
+
+    assert excinfo.value.code == ErrorCode.QMP_PROTOCOL_ERROR
+
+
+def test_the_launch_and_persist_stage_vocabularies_are_closed_lists():
+    """Each new exchange has exactly one success word and one failure word.
+
+    There is deliberately no ``launching``/``persisting``: a stage that means
+    "in progress" would be read as an outcome by a caller that only checks for
+    success, and an in-flight launch is not a launch that happened.
+    """
+    assert LAUNCH_STAGES == ("launched", "failed")
+    assert PERSIST_STAGES == ("persisted", "failed")
+    for vocabulary in (LAUNCH_STAGES, PERSIST_STAGES):
+        assert vocabulary[-1] == "failed"
+        assert len(vocabulary) == 2
+
+
+def test_a_launch_stage_outside_the_vocabulary_is_not_silently_accepted():
+    """``running`` is the service's internal word, not a wire stage.
+
+    The wire vocabulary is :data:`LAUNCH_STAGES`.  A frame carrying the
+    service's internal word decodes without complaint (``from_dict`` is not a
+    vocabulary gate, matching :class:`InstallResponse`), which is exactly why
+    the *client* has to refuse a success it does not recognise -- see
+    ``test_guest_client.py``.  This test pins the vocabulary itself so the two
+    words cannot drift apart unnoticed.
+    """
+    assert "running" not in LAUNCH_STAGES
+    assert "installed" not in LAUNCH_STAGES
+    assert "registered" not in LAUNCH_STAGES
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +824,22 @@ REPRESENTATIVE_PAYLOADS: tuple[tuple[str, dict, object], ...] = (
             "data_markers": ["com.unipad.hello:Documents/notes.txt"],
         },
         StatusResponse,
+    ),
+    (MSG_LAUNCH_REQUEST, {"bundle_id": "com.unipad.hello"}, LaunchRequest),
+    (
+        MSG_LAUNCH_RESPONSE,
+        {"stage": "launched", "bundle_id": "com.unipad.hello", "trust_mode": "self-signed-dev-trust"},
+        LaunchResponse,
+    ),
+    (MSG_PERSIST_REQUEST, {"path": "/volumes/unipad-data"}, PersistRequest),
+    (
+        MSG_PERSIST_RESPONSE,
+        {
+            "stage": "persisted",
+            "markers_written": ["com.unipad.hello:Documents/notes.txt"],
+            "bytes_written": 1615,
+        },
+        PersistResponse,
     ),
     (
         MSG_ERROR,

@@ -13,6 +13,14 @@ Design rules enforced here:
   stable code by the caller (``unipad.guest.client``).
 - The wire vocabulary is closed (:data:`KNOWN_TYPES`): :func:`decode` reports
   an unknown message type as ``unsupported_command`` instead of dropping it.
+- The vocabulary is a *dotted* pair per exchange (``<verb>.request`` /
+  ``<verb>.response``).  The spelling is what the client correlates a reply
+  against and what :func:`decode` accepts, so an underscore spelling
+  (``launch_request``) is simply not on the wire -- a peer using one would be
+  refused by a client that is working correctly.  The precedent is recorded in
+  ``tests/unit/test_guest_agent_channel.py``, where an earlier draft typed
+  ``status_response`` and every "successful" test failed with ``guest reply type
+  does not match the request``.
 - No secrets in any message (PRD 9.2): package bytes, hashes and derived
   challenge values only -- never tokens, keys or user documents.
 - Guest-reported ``error_code`` values are already stable taxonomy codes
@@ -45,11 +53,25 @@ MSG_CHALLENGE_REQUEST = "challenge.request"
 MSG_CHALLENGE_RESPONSE = "challenge.response"
 MSG_STATUS_REQUEST = "status.request"
 MSG_STATUS_RESPONSE = "status.response"
+MSG_LAUNCH_REQUEST = "launch.request"
+MSG_LAUNCH_RESPONSE = "launch.response"
+MSG_PERSIST_REQUEST = "persist.request"
+MSG_PERSIST_RESPONSE = "persist.response"
 MSG_ERROR = "error"
 
 #: Stage vocabulary shared with :class:`unipad.models.InstallResult`.
 #: ``registered`` is the furthest stage a successful install reaches.
 STAGES = ("received", "checked", "transferred", "installed", "registered", "failed")
+
+#: Stage vocabulary for a launch reply.  ``launched`` means the guest confirmed
+#: the app started; ``failed`` means it did not.  A request that was never
+#: answered is not a stage -- it is a transport failure the client reports as
+#: ``install_service_unavailable``.
+LAUNCH_STAGES = ("launched", "failed")
+
+#: Stage vocabulary for a persist reply.  ``persisted`` means the guest
+#: confirmed the Data volume was flushed; ``failed`` means it was not.
+PERSIST_STAGES = ("persisted", "failed")
 
 #: Closed vocabulary of message types on the wire.  Anything else is not part
 #: of the contract and must be reported, never silently dropped (PRD 9.1).
@@ -62,6 +84,10 @@ KNOWN_TYPES: frozenset[str] = frozenset(
         MSG_CHALLENGE_RESPONSE,
         MSG_STATUS_REQUEST,
         MSG_STATUS_RESPONSE,
+        MSG_LAUNCH_REQUEST,
+        MSG_LAUNCH_RESPONSE,
+        MSG_PERSIST_REQUEST,
+        MSG_PERSIST_RESPONSE,
         MSG_ERROR,
     }
 )
@@ -335,6 +361,148 @@ class StatusResponse(DictView):
         return cls(installed=[dict(a) for a in installed], data_markers=list(markers))
 
 
+@dataclass(eq=False)
+class LaunchRequest(DictView):
+    """Host -> guest launch request: start one already-installed app.
+
+    The bundle id is the guest's own registry key, so it is required and
+    non-empty -- a request that does not name an app cannot be answered, and
+    guessing a target would launch something the host never asked for.
+    """
+
+    bundle_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"bundle_id": self.bundle_id}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LaunchRequest":
+        return cls(bundle_id=_req_str(data, "bundle_id"))
+
+
+@dataclass(eq=False)
+class LaunchResponse(DictView):
+    """Guest -> host launch outcome (M11 precondition: the app really starts).
+
+    ``stage`` is ``launched`` only when the guest confirmed the entry point
+    executed.  A launch-time fault is reported with ``stage='failed'`` and the
+    guest's verbatim ``error_code`` -- the app *installed*, so this is not an
+    install failure and must not be recorded as one.
+
+    ``trust_mode`` is recorded by the guest, never assumed, exactly as in
+    :class:`InstallResponse`.
+    """
+
+    stage: str
+    bundle_id: Optional[str] = None
+    trust_mode: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "bundle_id": self.bundle_id,
+            "trust_mode": self.trust_mode,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LaunchResponse":
+        return cls(
+            stage=_req_str(data, "stage"),
+            bundle_id=_opt_str(data.get("bundle_id")),
+            trust_mode=_opt_str(data.get("trust_mode")),
+            error_code=_opt_str(data.get("error_code")),
+            error_message=_opt_str(data.get("error_message")),
+        )
+
+    @property
+    def ok(self) -> bool:
+        """True only when the guest confirmed the launch with no error."""
+        return self.stage == "launched" and self.error_code is None
+
+
+@dataclass(eq=False)
+class PersistRequest(DictView):
+    """Host -> guest persist request: flush the Data volume and report it.
+
+    ``path`` names the volume to flush.  It is required because "flush the
+    default whatever" is not a request either side can verify: the host is the
+    side that created and attached the Data volume, so it is the side that
+    knows the name, and a request without one cannot be answered honestly.
+
+    The field's *real* guest-side meaning (a mount point? a volume label? a
+    service endpoint?) is unverified -- see ADR-0010.  The in-memory fake
+    interprets it as the directory its simulated Data volume is written to,
+    which is the only interpretation this host can exercise.
+    """
+
+    path: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PersistRequest":
+        return cls(path=_req_str(data, "path"))
+
+
+@dataclass(eq=False)
+class PersistResponse(DictView):
+    """Guest -> host persist outcome (M9b/M12: the data survived the flush).
+
+    ``markers_written`` is the guest's own inventory of the data markers it
+    holds *after* the flush -- the same list :class:`StatusResponse` reports --
+    and ``bytes_written`` is the measured size of what was committed.  Both are
+    the guest's observation; the host must not compute either itself, because a
+    host that invented them would be reporting a flush it never saw.
+    """
+
+    stage: str
+    markers_written: list[str] = field(default_factory=list)
+    bytes_written: int = 0
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "markers_written": list(self.markers_written),
+            "bytes_written": self.bytes_written,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PersistResponse":
+        markers = data.get("markers_written", [])
+        if not isinstance(markers, list) or not all(isinstance(m, str) for m in markers):
+            raise UniPadError(
+                ErrorCode.QMP_PROTOCOL_ERROR,
+                "persist response 'markers_written' is not a list of strings",
+            )
+        raw_bytes = data.get("bytes_written", 0)
+        if isinstance(raw_bytes, bool) or not isinstance(raw_bytes, int):
+            raise UniPadError(
+                ErrorCode.QMP_PROTOCOL_ERROR,
+                "persist response 'bytes_written' is not an integer",
+            )
+        return cls(
+            stage=_req_str(data, "stage"),
+            markers_written=list(markers),
+            bytes_written=raw_bytes,
+            error_code=_opt_str(data.get("error_code")),
+            error_message=_opt_str(data.get("error_message")),
+        )
+
+    @property
+    def ok(self) -> bool:
+        """True only when the guest confirmed the flush with no error."""
+        return self.stage == "persisted" and self.error_code is None
+
+
 # --- small helpers: strict, non-fabricating field extraction ---
 
 def _req_str(data: Mapping[str, Any], key: str) -> str:
@@ -431,8 +599,14 @@ __all__ = [
     "MSG_CHALLENGE_RESPONSE",
     "MSG_STATUS_REQUEST",
     "MSG_STATUS_RESPONSE",
+    "MSG_LAUNCH_REQUEST",
+    "MSG_LAUNCH_RESPONSE",
+    "MSG_PERSIST_REQUEST",
+    "MSG_PERSIST_RESPONSE",
     "MSG_ERROR",
     "STAGES",
+    "LAUNCH_STAGES",
+    "PERSIST_STAGES",
     "KNOWN_TYPES",
     "FAILURE_CODES",
     "new_message_id",
@@ -445,6 +619,10 @@ __all__ = [
     "ChallengeResponse",
     "StatusRequest",
     "StatusResponse",
+    "LaunchRequest",
+    "LaunchResponse",
+    "PersistRequest",
+    "PersistResponse",
     "encode",
     "decode",
     "error_message",
