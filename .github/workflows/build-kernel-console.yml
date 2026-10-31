@@ -1209,11 +1209,13 @@ jobs:
               "size_bytes": len(raw),
               "cwd_the_builder_uses": record.get("directory"),
               "cwd_exists_here": Path(str(record.get("directory"))).is_dir(),
-              "source_the_record_names": next(
-                  (value for value in (record.get("arguments") or [])
-                   if isinstance(value, str) and value.endswith("IOPlatformExpert.c")),
-                  None,
-              ),
+              # The stem plus any source suffix, not the literal ".c": XNU compiles
+              # this TU as C++, so the record's source is IOPlatformExpert.cpp.  The
+              # first revision required the literal and reported null on run
+              # 41224024385, whose record is the same cf5784fd... file the artifact
+              # download validated.
+              "source_the_record_names": record.get("file"),
+              "compiler_the_record_names": (record.get("arguments") or [None])[0],
           }
           destination.parent.mkdir(parents=True, exist_ok=True)
           destination.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
