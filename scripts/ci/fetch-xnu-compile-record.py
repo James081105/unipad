@@ -18,18 +18,20 @@ part of the build artifact twice.  This script takes it from there instead.
 
 What it refuses to do
 ---------------------
-Hand the builder a record it has not checked.  Three checks, and each one is a
+Hand the builder a record it has not checked.  The checks, and each one is a
 failure that would otherwise read as success:
 
-1. the sha256 must equal the digest that was measured on two prior runs, so a
-   truncated download or a different file cannot pass;
-2. ``record['arguments']`` must contain the XNU source path, because
-   ``build-arm-driver.py:56`` substitutes that exact argument.  A record whose
-   source is not in its own arguments compiles XNU instead of the driver, and the
-   builder's own Mach-O audit still passes -- a green message and the wrong archive;
-3. ``record['directory']`` must exist, because the builder runs clang with
-   ``cwd=record['directory']``.  A record from a different workspace layout fails
-   here rather than compiling in the wrong directory.
+1. the sha256 must equal the digest measured on two prior runs, so a truncated
+   download or a different file cannot pass;
+2. the record's ``file`` must be the translation unit the builder's recipe path
+   names, AND must appear verbatim among its ``arguments``, because
+   ``build-arm-driver.py:56`` substitutes the one argument equal to it.  A record
+   whose source is not in its own arguments compiles XNU instead of the driver,
+   and the builder's own Mach-O audit still passes -- a green message and the
+   wrong archive;
+3. the ``directory`` the builder runs clang in has to exist, because the command
+   carries a relative ``-I .``.  A run that installed the headers without
+   compiling an object does not have it, so it is created here and recorded.
 
 The token is read from the environment and never printed, and nothing this script
 writes contains an absolute path from the machine that ran it: the provenance
@@ -57,10 +59,18 @@ MEMBER = "unixnu-out/qemu/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit
 #: third value means the file is not the one those runs built.
 EXPECTED_SHA256 = "cf5784fd4cbe3a801f7ce453c13c188b70c61b44fa418238f7958db3039ef805"
 
-#: The source file the record must name.  The builder substitutes the argument
-#: equal to ``record['file']``; if that string is nowhere in ``arguments`` the
-#: substitution never fires and clang compiles XNU instead of the driver.
-EXPECTED_SOURCE_BASENAME = "IOPlatformExpert.c"
+#: The translation unit the record must describe.  Matched as a STEM plus a source
+#: suffix, not as an exact filename: the first revision required the literal
+#: ``IOPlatformExpert.c`` and refused the real record, whose source is
+#: ``iokit/Kernel/IOPlatformExpert.cpp`` -- measured by extracting the member from
+#: the artifact with three HTTP range requests, which also reproduced its sha256
+#: cf5784fd... exactly.  A guard stricter than the thing it guards is a broken
+#: instrument, not a strict one.
+EXPECTED_SOURCE_STEM = "IOPlatformExpert"
+
+#: What a translation unit looks like.  XNU compiles this one as C++ even though
+#: the archive it produces is named for a driver, so the suffix is not fixed.
+SOURCE_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".C", ".c", ".m", ".mm")
 
 
 class RecordError(Exception):
@@ -285,16 +295,25 @@ def obtain(args, token: str, holder: dict) -> int:
         print(f"::error::{error}")
         return 1
 
-    arguments = record.get("arguments")
-    if not isinstance(arguments, list) or not arguments:
-        print("::error::the record carries no arguments array")
+    source = record.get("file")
+    if not isinstance(source, str) or not source:
+        print("::error::the record carries no file; build-arm-driver.py would substitute nothing")
         return 1
-    if not any(
-        isinstance(value, str) and os.path.basename(value) == EXPECTED_SOURCE_BASENAME
-        for value in arguments
-    ):
+    basename = os.path.basename(source)
+    if not (basename.startswith(EXPECTED_SOURCE_STEM) and basename.endswith(SOURCE_SUFFIXES)):
         print(
-            f"::error::no argument of the record names {EXPECTED_SOURCE_BASENAME}: "
+            f"::error::the record's source is {source!r}, which is not "
+            f"{EXPECTED_SOURCE_STEM}<a source suffix>: this is the record for a "
+            "different translation unit"
+        )
+        return 1
+    # The substitution itself.  build-arm-driver.py:56 replaces the one argument
+    # EQUAL to record['file']; if that string is not among the arguments the
+    # substitution never fires, clang is pointed at XNU's own source, and the
+    # builder's Mach-O audit still passes -- a green message and the wrong archive.
+    if source not in arguments:
+        print(
+            f"::error::{source!r} does not appear in the record's own arguments: "
             "build-arm-driver.py would substitute nothing and compile XNU instead "
             "of the driver, and its own Mach-O audit would still pass"
         )
@@ -303,15 +322,25 @@ def obtain(args, token: str, holder: dict) -> int:
     if not isinstance(directory, str) or not directory:
         print("::error::the record carries no directory; the builder's cwd would be unknown")
         return 1
+    # The builder runs clang with cwd=record['directory'], and the command carries a
+    # relative `-I .`, so the directory has to exist.  A run that installed the XNU
+    # headers without compiling any object has OBJROOT but not this subdirectory, so
+    # it is created here -- and recorded, because "a directory was made" is a fact
+    # about this run and not something to leave implicit.  It is safe: in the real
+    # build that directory holds only .cpo objects, never headers.
+    created_cwd = False
     if not Path(directory).is_dir():
-        # Not fatal on its own: the directory is an absolute path from the run that
-        # produced the record, and this run's workspace may differ.  It is recorded
-        # as a warning because the builder will then run clang in a directory that
-        # does not exist, which fails loudly rather than silently.
-        print(
-            f"::warning::the record's directory {directory} does not exist in this "
-            "workspace; the builder runs clang there and will fail if it matters"
-        )
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            created_cwd = True
+            print(
+                f"::notice::created {directory}: the record's cwd, which a run that "
+                "installed the XNU headers without compiling an object does not have. "
+                "It holds only objects in the real build, never headers."
+            )
+        except OSError as error:
+            print(f"::error::cannot create the record's directory {directory}: {error}")
+            return 1
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(raw)
@@ -330,10 +359,10 @@ def obtain(args, token: str, holder: dict) -> int:
         "member": args.member,
         "sha256": digest,
         "size_bytes": len(raw),
-        "xnu_source": next(
-            value for value in arguments if os.path.basename(value) == EXPECTED_SOURCE_BASENAME
-        ),
+        "xnu_source": source,
+        "compiler_the_record_names": arguments[0],
         "cwd_the_builder_uses": directory,
+        "cwd_created_here": created_cwd,
         "cwd_exists_here": Path(directory).is_dir(),
     }
     args.provenance.parent.mkdir(parents=True, exist_ok=True)

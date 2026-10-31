@@ -413,13 +413,19 @@ jobs:
           # `installhdrs` instead of `build`.  The second one is redundant for what
           # the archive builder needs, so a failure there is tolerated IF the things
           # the builder actually reads are on disk.  That is a measurement, not a
-          # hope: the three paths below are the ones build-arm-driver.py:68 and the
-          # record's own include flags resolve against.
-          need_fakeroot="$tree/.cache/fakeroot/System/Library/Frameworks/Kernel.framework"
+          # hope: the four paths below are exactly the record's own -I flags (read
+          # out of the record by extracting it from a prior artifact) plus the
+          # unconditional -I of build-arm-driver.py:68.
+          #
+          # The first revision checked build/xnu/obj/EXPORT_HDRS, which the script
+          # creates at :112 whether or not anything else worked -- so it reported
+          # `headers=ok` for the wrong reason on both dispatches.
+          need_platform="$tree/.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+          need_kernel="$tree/.cache/fakeroot/usr/local/include/kernel"
           need_osfmk="$tree/.cache/xnu-work/osfmk"
-          need_exports="$tree/build/xnu/obj/EXPORT_HDRS"
+          need_exports="$tree/build/xnu/ios-obj/EXPORT_HDRS/iokit"
           missing=""
-          for path in "$need_fakeroot" "$need_osfmk" "$need_exports"; do
+          for path in "$need_platform" "$need_kernel" "$need_osfmk" "$need_exports"; do
             [ -d "$path" ] || missing="$missing $path"
           done
           if [ "$status" -eq 0 ] && [ -z "$missing" ]; then
