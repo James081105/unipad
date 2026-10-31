@@ -1,0 +1,1334 @@
+# UniPad: does the agent channel's console driver actually compile?
+#
+# ONE question, and it is asked of a macOS runner because it cannot be asked
+# anywhere else: `build-arm-driver.py NativeVirtioConsole` is now named by
+# `vendor/UniXNU-qemu/board.toml`'s `[kernel] archives` and enabled by
+# `qemu_root_defconfig`'s `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y`, both at the pinned
+# device-repo commit acf2f86.  Neither of those is a measurement.  The builder has
+# never been INVOKED on a runner, so whether `NativeVirtioConsole.cpp` compiles at
+# all is UNVERIFIED -- and `tests/unit/test_kernel_archive_builder_guard.py`, which
+# distinguishes "the builder exists" from "the builder is invoked", can only read
+# the pinned trees; it cannot run a compiler.
+#
+# This workflow runs the compiler and reports four things SEPARATELY, because this
+# project has been burned repeatedly by conflating them:
+#
+#   invoked            the builder actually ran, not merely appears in board.toml
+#   compiled           it exited 0 and the .a is on disk, with size and sha256
+#   archive            that .a, its size and its sha256
+#   linked             a kernel link picked it up (only where a link is cheap)
+#
+# and the verdict is exactly one of four strings:
+#
+#   compiled           the archive exists, size and digest recorded
+#   invoked-but-failed the builder ran and failed; the log is the evidence
+#   not-invoked        board.toml's entry did not cause a run -- a WIRING bug,
+#                      reported as one and never as a build failure
+#   unmeasured         the runner could not check out, could not find the
+#                      toolchain, could not obtain the compile record.  This is
+#                      the ONLY outcome that fails the job, because "we could not
+#                      measure" must never be recorded as "it failed".
+#
+# A negative control runs the same builder for a driver that is NOT in board.toml's
+# archives list (NativeUfs, one of the guard test's DORMANT_KEYS).  Without it,
+# "not-invoked" is unfalsifiable: a detector that always said "not invoked" would
+# pass.
+#
+# WHAT THIS WORKFLOW DOES NOT CLAIM, and says so in its own output:
+# "the archive builds" is NOT "the console enumerates in the guest" and NOT "the
+# console can send and receive".  Those are boot measurements.  The driver's four
+# probe() conditions are all measured on QEMU's side (docs/implementation-plan.md
+# fact 195/196); the guest-side build and the transport's readiness are not.
+#
+# PRD 12: this workflow uploads ONLY the report, the logs and the console archive.
+# No IPSW, no DMG, no raw disk payload, nothing from local-private/.  The staging
+# step is default-deny and records every exclusion.
+
+name: build-kernel-console
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment_id:
+        description: 'Experiment identity; also the concurrency dedupe key.'
+        required: true
+        default: 'kernel-console'
+        type: string
+      console_component:
+        description: 'The board.toml archives component under test.'
+        required: true
+        default: 'NativeVirtioConsole'
+        type: choice
+        options:
+          - NativeVirtioConsole
+          - NativeUfs
+      control_component:
+        description: 'The negative control: a driver that is NOT in board.toml [kernel] archives (one of the guard test DORMANT_KEYS).'
+        required: true
+        default: 'NativeUfs'
+        type: choice
+        options:
+          - NativeUfs
+          - NativeAdreno
+          - NativeOfflineGPU
+      run_kernel_link:
+        description: 'Also run console-in-kernel: the driver''s own kernel step, which needs a full XNU build (hours of free macOS minutes). Set false to measure only the archive.'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      record_run_id:
+        description: 'Run whose build artifact carries the XNU compile record the archive builder reads. Used only by console-archive, which does not build XNU itself; console-in-kernel produces its own.'
+        required: false
+        default: '41139423523'
+        type: string
+
+# Least privilege: the job reads the repository and uploads an artifact.
+permissions:
+  contents: read
+
+# One run per experiment id.  cancel-in-progress is false on purpose -- cancelling
+# a macOS build throws away minutes AND evidence, so a duplicate is queued.
+concurrency:
+  group: unipad-kernel-console-${{ inputs.experiment_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  VENDOR_DIR: vendor
+  OUT_ROOT: build-output/unixnu-out
+  REPORT_DIR: build-kernel-console
+  # The board name is board.toml's ([board] name).  Read from the assembled tree's
+  # path rather than written here twice; the driver puts the tree at
+  # <out>/<board>/tree (scripts/unixnu/config.py:83-84, tree.py:41).
+  BOARD: qemu
+
+jobs:
+  # =====================================================================
+  # Job 1: invoke the builder the way scripts/unixnu/kernel.py does.
+  #
+  # Fast, because it does not build XNU.  It takes the one file an XNU build would
+  # have left behind -- the compile record -- from a prior run's artifact instead.
+  # That provenance is disclosed in the report, and job 2 removes the need for it
+  # entirely by producing the record itself.
+  # =====================================================================
+  console-archive:
+    name: console-archive (invoke the builder directly)
+    runs-on: macos-latest
+    # 60 minutes is generous for what this job does: acquire, assemble, install
+    # headers, compile one driver twice.  It is written as an estimate, not a
+    # measurement -- the same honesty the build-macos job's 180 carries.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the start epoch (for elapsed seconds)
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          date -u +%s > "$REPORT_DIR/started_epoch"
+          echo "started at $(date -u -r "$(cat "$REPORT_DIR/started_epoch")" 2>/dev/null || cat "$REPORT_DIR/started_epoch")"
+
+      # Every commit comes from config/sources.lock.json and from nowhere else.  A
+      # second place that knows a sha is the divergence class this project keeps
+      # hitting, so nothing below is hardcoded and the URL is read, not assumed.
+      - name: Resolve the pins from sources.lock.json
+        id: pins
+        env:
+          LOCK_PATH: config/sources.lock.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+          raw = Path("config/sources.lock.json").read_bytes()
+          lock = json.loads(raw.decode("utf-8"))
+          out = {}
+          for key in ("unixnu", "device_repo", "uefi_sheng"):
+              section = lock.get(key)
+              if not isinstance(section, dict):
+                  raise SystemExit(f"sources.lock.json has no '{key}' object")
+              for field in ("repo", "commit"):
+                  value = section.get(field)
+                  if not isinstance(value, str) or not value.strip():
+                      raise SystemExit(f"{key}.{field} is {value!r}: an empty pin is not a pin")
+                  if field == "commit" and not SHA_RE.match(value.strip()):
+                      raise SystemExit(f"{key}.commit {value!r} is not a git sha")
+                  out[f"{key}_{field}"] = value.strip()
+          out["lock_sha256"] = hashlib.sha256(raw).hexdigest()
+          out["lock_frozen"] = "true" if lock.get("frozen") else "false"
+          for key, value in out.items():
+              print(f"{key}={value}")
+          print(f"pins: device_repo {out['device_repo_repo']} {out['device_repo_commit']}", file=sys.stderr)
+          print(f"pins: unixnu      {out['unixnu_repo']} {out['unixnu_commit']}", file=sys.stderr)
+          print(f"pins: uefi_sheng  {out['uefi_sheng_repo']} {out['uefi_sheng_commit']}", file=sys.stderr)
+          PY
+
+      # The three checkouts the upstream driver cannot fetch for itself.  vendor/
+      # is fetched material: it is never committed here, and the acquisition proves
+      # each checkout is at the commit the lock pins before anything is built.
+      - name: Acquire the pinned checkouts (vendor/)
+        id: acquire
+        env:
+          LOCK_SHA256: ${{ steps.pins.outputs.lock_sha256 }}
+        run: |
+          set -euo pipefail
+          acquire() {
+            local url="$1" commit="$2" dest="$3"
+            if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$commit" ]; then
+              echo "== $dest already at $commit"
+              return 0
+            fi
+            mkdir -p "$dest"
+            git -C "$dest" init -q
+            if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+              git -C "$dest" remote set-url origin "$url"
+            else
+              git -C "$dest" remote add origin "$url"
+            fi
+            # By SHA, never by branch: a branch is a moving target and the lock
+            # pins a commit.
+            git -C "$dest" fetch -q --depth 1 origin "$commit"
+            git -C "$dest" checkout -q --detach FETCH_HEAD
+            local head
+            head="$(git -C "$dest" rev-parse HEAD)"
+            if [ "$head" != "$commit" ]; then
+              echo "::error::$dest is at $head but the lock pins $commit"
+              return 1
+            fi
+            echo "== $dest acquired at $head"
+          }
+          acquire "${{ steps.pins.outputs.unixnu_repo }}"     "${{ steps.pins.outputs.unixnu_commit }}"     "$VENDOR_DIR/UniXNU"
+          acquire "${{ steps.pins.outputs.device_repo_repo }}" "${{ steps.pins.outputs.device_repo_commit }}" "$VENDOR_DIR/UniXNU-qemu"
+          acquire "${{ steps.pins.outputs.uefi_sheng_repo }}"  "${{ steps.pins.outputs.uefi_sheng_commit }}"  "$VENDOR_DIR/uefi-sheng"
+          # vendor/ must never be committable: the pin lives in the lock, once.
+          if git ls-files -- "$VENDOR_DIR" | grep -q .; then
+            echo "::error::$VENDOR_DIR has tracked files; fetched material must not be committed"
+            exit 1
+          fi
+          echo "acquire=ok" >> "$GITHUB_OUTPUT"
+
+      # The archive builders take the clang command out of an XNU compile record,
+      # whose argv[0] is the RESOLVED compiler path.  That is Homebrew's LLVM on a
+      # runner, for the same reason build-macos.yml installs it: without the keg the
+      # record points at a binary that is not there and the builder dies naming a
+      # path nobody chose.  $GITHUB_PATH rather than an exported PATH, so the keg is
+      # visible to every later step.
+      - name: Install the toolchain (Homebrew LLVM, cmake, ninja, unifdef)
+        id: toolchain
+        run: |
+          set -euo pipefail
+          for formula in llvm lld cmake ninja unifdef; do
+            if ! brew list --formula "$formula" >/dev/null 2>&1; then
+              echo "installing $formula"
+              brew install --quiet "$formula"
+            fi
+          done
+          found=0
+          for keg in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            if [ -d "$keg" ]; then
+              echo "$keg" >> "$GITHUB_PATH"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no llvm keg on disk after brew install llvm"
+            exit 1
+          fi
+          {
+            echo "clang=$(clang --version 2>/dev/null | head -n 1 || true)"
+            echo "xcode=$(xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//' || true)"
+            echo "python=$(python3 --version 2>&1 || true)"
+          } >> "$GITHUB_OUTPUT"
+          echo "toolchain=ok" >> "$GITHUB_OUTPUT"
+
+      # The driver's own assembly, not a second implementation of it.  `unixnu tree`
+      # updates the module submodules, resolves the modules, fetches the non-refer
+      # ones and assembles the tree (cli.py prepare()); `unixnu fetch` also brings
+      # the git references (xnu, libplatform, ...) that the kernel build reads.
+      - name: Assemble the pinned tree (unixnu fetch + tree)
+        id: assemble
+        run: |
+          set -euo pipefail
+          run_driver() {
+            echo "+ python3 $VENDOR_DIR/UniXNU/unixnu $*"
+            python3 "$VENDOR_DIR/UniXNU/unixnu" "$@" -D "$VENDOR_DIR/UniXNU-qemu" --out "$OUT_ROOT" -j 3
+          }
+          run_driver fetch
+          run_driver tree
+          tree="$OUT_ROOT/$BOARD/tree"
+          if [ ! -d "$tree" ]; then
+            echo "::error::no assembled tree at $tree"
+            exit 1
+          fi
+          echo "tree=$PWD/$tree" >> "$GITHUB_OUTPUT"
+          echo "assemble=ok" >> "$GITHUB_OUTPUT"
+          echo "== tree: $PWD/$tree"
+
+
+      # prepare-xnu-source.py fetches three directory listings from api.github.com
+      # with a bare urlopen -- unauthenticated, so it shares the 60-per-hour per-IP
+      # limit with every other Actions runner on that address.  Measured on run
+      # 40066399042: "HTTP Error 403: rate limit exceeded", which failed build-kernel
+      # before a single translation unit was compiled.  The script caches the
+      # listings by path and verifies every blob by its git SHA-1, so seeding them
+      # with an authenticated request removes all three API calls without changing
+      # any content.
+      #
+      # It runs AFTER the assembly, not before: it globs <out>/*/tree, so a run
+      # whose tree does not exist yet would refuse with "no assembled build tree"
+      # rather than seed anything.  The first revision of this workflow put it
+      # before the assembly for exactly that reason and was wrong.
+      - name: Pre-seed the XNU header listings with an authenticated request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_ROOT: ${{ env.OUT_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ.get("GITHUB_TOKEN", "")
+          feeds = tomllib.loads(Path("vendor/UniXNU/feeds.toml").read_text(encoding="utf-8"))
+          xnu = feeds.get("xnu", {})
+          driverkit = xnu.get("driverkit_tag", "xnu-10063.121.3")
+          trustcache = xnu.get("trustcache_tag", "xnu-8796.101.5")
+          repo = "https://api.github.com/repos/apple-oss-distributions/xnu/contents"
+          wanted = [
+              (f"{repo}/iokit/DriverKit?ref={driverkit}", f"xnu-driverkit-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/iokit/DriverKit/crypto?ref={driverkit}", f"xnu-driverkit-crypto-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/EXTERNAL_HEADERS/TrustCache?ref={trustcache}", f"xnu-trustcache-{trustcache.removeprefix('xnu-')}.json"),
+          ]
+          headers = {"Accept": "application/vnd.github+json"}
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+          root = Path(os.environ.get("OUT_ROOT", "build-output/unixnu-out"))
+          trees = sorted(root.glob("*/tree"))
+          if not trees:
+              raise SystemExit(f"no assembled build tree under {root}: assemble the tree first")
+          for url, name in wanted:
+              body = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60).read()
+              entries = json.loads(body)
+              if not isinstance(entries, list):
+                  raise SystemExit(f"{url} did not return a directory listing")
+              for tree in trees:
+                  target = tree / ".cache" / "sources" / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(body)
+              print(f"seeded {name}: {len(entries)} entries into {len(trees)} tree(s)")
+          PY
+
+
+      # The two switches the real path needs, read out of the generated .config.
+      #
+      # CONFIG_XNU_BUILD_ARCHIVES is the one scripts/unixnu/kernel.py:54 tests
+      # before it runs ANY builder; without it build_archives() returns immediately
+      # and board.toml's entry is inert.  qemu_defconfig does not set it, which is
+      # why scripts/macos/build-macos.sh:2705-2714 appends it to the generated
+      # .config and records that as a divergence from the pin.  This is the same
+      # divergence for the same reason, and it is recorded rather than silent.
+      #
+      # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is the one that makes the link add
+      # -Wl,-force_load,<archive> (build-xnu-4k-baseline.sh:666-671).  qemu_root_defconfig
+      # carries it; qemu_defconfig does not, and using qemu_root_defconfig here would
+      # require the owner root chain (two verified volume policies and a Data seed)
+      # that only build-os-root.py produces.  So the flag is added to the generated
+      # .config of the board's own defconfig -- a divergence from the pin, recorded
+      # as one, exactly as the line above is.
+      - name: Select the defconfig and inject the two switches
+        id: config
+        run: |
+          set -euo pipefail
+          python3 "$VENDOR_DIR/UniXNU/unixnu" defconfig qemu_defconfig -D "$VENDOR_DIR/UniXNU-qemu" --out "$OUT_ROOT"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = Path(os.environ["OUT_ROOT"]) / os.environ["BOARD"] / ".config"
+          if not config.is_file():
+              raise SystemExit(f"no generated .config at {config.as_posix()}")
+          text = config.read_text(encoding="utf-8")
+          wanted = {
+              "CONFIG_XNU_BUILD_ARCHIVES": "build_archives() runs at all (kernel.py:54)",
+              "CONFIG_XNU_NATIVE_VIRTIO_CONSOLE": "the link force-loads the archive (build-xnu-4k-baseline.sh:666)",
+          }
+          added = []
+          for key, why in wanted.items():
+              if any(line.strip().startswith(key + "=") for line in text.splitlines()):
+                  continue
+              with config.open("a", encoding="utf-8") as handle:
+                  handle.write(f"\n# Added by .github/workflows/build-kernel-console.yml: {why}\n{key}=y\n")
+              added.append(key)
+          print(f"config: {config.as_posix()}")
+          print(f"config: added {added or 'nothing'} (recorded divergence from the pin)")
+          Path(os.environ["REPORT_DIR"], "config-divergence.json").write_text(
+              json.dumps({"path": config.as_posix(), "added": added, "defconfig": "qemu_defconfig"}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"config_path={config.as_posix()}" )
+          PY
+          echo "config=$PWD/$OUT_ROOT/$BOARD/.config" >> "$GITHUB_OUTPUT"
+
+      # The XNU headers the driver's #includes need, and the .cache/xnu-work clone
+      # the builder's unconditional -I points at (build-arm-driver.py:68).
+      #
+      # This runs the REAL build script's own prepare prefix -- clone, availability
+      # plugin, patches, prepare-xnu-source, installhdrs, firehose -- and then asks
+      # its final make for `installhdrs` instead of `build`.  Nothing of that prefix
+      # is re-implemented here: a second implementation of "which headers" is the
+      # divergence class this project keeps hitting.  What is deliberately NOT done
+      # is the full XNU compile, which is what the console-in-kernel job is for.
+      - name: Install the XNU headers (the build script's own prepare prefix)
+        id: headers
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          status=0
+          (
+            cd "$tree"
+            XNU_BUILD_TARGET=installhdrs XNU_SDKROOT=macosx bash scripts/build-xnu-4k-baseline.sh
+          ) > "$REPORT_DIR/xnu-headers.log" 2>&1 || status=$?
+          # The script's own prepare prefix runs installhdrs TWICE: once at :115 into
+          # .cache/fakeroot (the SDK the record's -I flags point at) and once at :774
+          # into build/xnu/ios-dst, because that final make is asked for
+          # `installhdrs` instead of `build`.  The second one is redundant for what
+          # the archive builder needs, so a failure there is tolerated IF the things
+          # the builder actually reads are on disk.  That is a measurement, not a
+          # hope: the three paths below are the ones build-arm-driver.py:68 and the
+          # record's own include flags resolve against.
+          need_fakeroot="$tree/.cache/fakeroot/System/Library/Frameworks/Kernel.framework"
+          need_osfmk="$tree/.cache/xnu-work/osfmk"
+          need_exports="$tree/build/xnu/obj/EXPORT_HDRS"
+          missing=""
+          for path in "$need_fakeroot" "$need_osfmk" "$need_exports"; do
+            [ -d "$path" ] || missing="$missing $path"
+          done
+          if [ "$status" -eq 0 ] && [ -z "$missing" ]; then
+            echo "headers=ok" >> "$GITHUB_OUTPUT"
+            echo "== headers installed (the script's own prepare prefix, clean)"
+          elif [ -z "$missing" ]; then
+            echo "headers=ok" >> "$GITHUB_OUTPUT"
+            echo "::warning::the header script exited $status, but every path the builder reads is on disk, so the build is given its chance"
+          else
+            echo "headers=failed" >> "$GITHUB_OUTPUT"
+            echo "::warning::the header script exited $status and$missing is absent; the builder will be given its chance anyway and the log is the evidence"
+            tail -n 60 "$REPORT_DIR/xnu-headers.log" || true
+          fi
+          exit 0
+
+      # The compile record.  Downloaded rather than built, and the reason is the
+      # finding that shapes this whole job: build-arm-driver.py reads
+      # build/xnu/ios-obj/.../IOPlatformExpert.cpo.json, which only an XNU pass
+      # leaves behind, and scripts/unixnu/kernel.py:83-95 therefore runs a whole
+      # bootstrap pass of XNU first -- a full compile, because
+      # build-xnu-4k-baseline.sh:774 is not gated on BOOTSTRAP.  So "build ONLY the
+      # console archive" is not a thing the pinned tree can do; either XNU is built,
+      # or its record is taken from somewhere that already built it.
+      - name: Obtain the XNU compile record
+        id: record
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          member="build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
+          mkdir -p "$tree/$(dirname "$member")"
+          status=0
+          python3 scripts/ci/fetch-xnu-compile-record.py \
+            --repo "${{ github.repository }}" \
+            --run-id "${{ inputs.record_run_id }}" \
+            --output "$tree/$member" \
+            --provenance "$REPORT_DIR/compile-record-provenance.json" || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "record=ok" >> "$GITHUB_OUTPUT"
+            echo "== compile record in place at $tree/$member"
+          else
+            echo "record=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::the compile record could not be obtained (exit $status)"
+          fi
+          exit 0
+
+      # The measurement, and the one thing this job cannot prove is stated in the
+      # comment at the top of this job: this is a DIRECT invocation.  It proves that
+      # the builder board.toml names, run the way the driver runs it, compiles.  It
+      # does NOT prove that the driver's own loop over [kernel] archives reaches it
+      # -- that is what console-in-kernel measures, and what run 40076039682 already
+      # measured for the ten entries that existed then.
+      #
+      # It is run the way scripts/unixnu/kernel.py:57-64 runs it: cwd is the
+      # assembled tree, PATH has the Homebrew kegs first, and the exit status and the
+      # log are recorded whatever they are, because a build that failed without a log
+      # is not a measurement.
+      - name: Invoke the console archive builder
+        id: builder
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          component="${{ inputs.console_component }}"
+          argv_file="$REPORT_DIR/${component}-argv.txt"
+          mkdir -p "$REPORT_DIR"
+          # The argv is board.toml's OWN entry, read with the driver's own parser
+          # (tomllib, which scripts/unixnu/kernel.py:56 uses) rather than by
+          # scanning lines.  The first revision scanned lines, stripped the quotes
+          # before the trailing comma, and got `shlex.split` "No closing quotation"
+          # on every single entry -- measured locally against the real board.toml,
+          # which is why it is not the shipped version.
+          if ! python3 - "$VENDOR_DIR/UniXNU-qemu/board.toml" "$component" "$argv_file" <<'PY'
+          import shlex
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          board, component, destination = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+          data = tomllib.loads(board.read_text(encoding="utf-8"))
+          entries = (data.get("kernel") or {}).get("archives") or []
+          for entry in entries:
+              argv = shlex.split(entry)
+              if component in argv[1:]:
+                  destination.write_text("\n".join(argv) + "\n", encoding="utf-8")
+                  raise SystemExit(0)
+          raise SystemExit(f"no [kernel] archives entry names {component}")
+          PY
+          then
+            echo "::error::board.toml names no builder for $component; nothing was run"
+            echo "builder_ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t parts < "$argv_file"
+          log="$REPORT_DIR/${component}-builder.log"
+          echo "+ (cd $tree && python3 ${parts[*]})"
+          started=$(date -u +%s)
+          status=0
+          (
+            cd "$tree"
+            PATH="/opt/homebrew/opt/llvm/bin:/usr/local/opt/llvm/bin:$PATH" \
+              python3 "${parts[@]}"
+          ) > "$log" 2>&1 || status=$?
+          finished=$(date -u +%s)
+          {
+            echo "builder_ran=true"
+            echo "builder_exit=$status"
+            echo "builder_log=$PWD/$log"
+            echo "builder_seconds=$((finished - started))"
+            echo "builder_argv=${parts[*]}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ]; then
+            echo "== $component: the builder exited 0"
+          else
+            echo "::error::$component: the builder exited $status; the last 60 lines follow"
+            tail -n 60 "$log" || true
+          fi
+          exit 0
+
+      # The negative control.  Same builder script, a driver board.toml does NOT
+      # name.  Its point is the INVOCATION, not the compile: without this, a
+      # detector that always reported "not invoked" would pass.  Its compile outcome
+      # is recorded and explicitly NOT required -- NativeUfs needs the storage-abi
+      # headers that only the owner root chain produces, so it is expected to fail
+      # to compile, and that failure says nothing about the console.
+      - name: 'Negative control: the same builder for a driver board.toml does not name'
+        id: control
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          control="${{ inputs.control_component }}"
+          # The driver's own parser again: board.toml is TOML, and a line scan of
+          # it is a second implementation of something tomllib already answers.
+          if python3 - "$VENDOR_DIR/UniXNU-qemu/board.toml" "$control" <<'PY'
+          import shlex
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          board, component = Path(sys.argv[1]), sys.argv[2]
+          data = tomllib.loads(board.read_text(encoding="utf-8"))
+          entries = (data.get("kernel") or {}).get("archives") or []
+          named = any(component in shlex.split(entry)[1:] for entry in entries)
+          raise SystemExit(0 if named else 3)
+          PY
+          then
+            echo "::error::the control $control IS named by board.toml, so it is not a control"
+            echo "control_named_by_board=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "control_named_by_board=false" >> "$GITHUB_OUTPUT"
+          log="$REPORT_DIR/${control}-control.log"
+          status=0
+          (
+            cd "$tree"
+            PATH="/opt/homebrew/opt/llvm/bin:/usr/local/opt/llvm/bin:$PATH" \
+              python3 scripts/build-arm-driver.py "$control"
+          ) > "$log" 2>&1 || status=$?
+          {
+            echo "control_exit=$status"
+            echo "control_log=$PWD/$log"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ]; then
+            echo "::warning::the control $control COMPILED when run directly. That is the point: it proves the detector separates 'not wired up' from 'cannot compile'. It is still not invoked by board.toml."
+          else
+            echo "== the control $control did not compile when run directly (exit $status); that is expected and is not the measurement"
+            tail -n 20 "$log" || true
+          fi
+          exit 0
+
+      # The report.  Runs on every path, including the ones where the builder never
+      # got a chance, because a run that could not measure must still say so.
+      - name: Write the verdict report
+        if: always()
+        id: verdict
+        run: |
+          set -uo pipefail
+          ELAPSED=$(( $(date -u +%s) - $(cat "$REPORT_DIR/started_epoch") ))
+          preflight="tree=$([ -d "$OUT_ROOT/$BOARD/tree" ] && echo ok || echo failed)"
+          preflight="$preflight,acquire=${{ steps.acquire.outputs.acquire }}"
+          preflight="$preflight,toolchain=${{ steps.toolchain.outputs.toolchain }}"
+          preflight="$preflight,record=${{ steps.record.outputs.record }}"
+          preflight="$preflight,headers=${{ steps.headers.outputs.headers }}"
+          preflight="$preflight,config=$([ -f "$OUT_ROOT/$BOARD/.config" ] && echo ok || echo failed)"
+          python3 scripts/ci/kernel-console-verdict.py \
+            --component "${{ inputs.console_component }}" \
+            --tree "$OUT_ROOT/$BOARD/tree" \
+            --board-toml "$VENDOR_DIR/UniXNU-qemu/board.toml" \
+            --config "$OUT_ROOT/$BOARD/.config" \
+            --record-provenance "$REPORT_DIR/compile-record-provenance.json" \
+            --invoked-directly "${{ steps.builder.outputs.builder_ran }}" \
+            --direct-argv "${{ steps.builder.outputs.builder_argv }}" \
+            --preflight "$preflight" \
+            --elapsed-seconds "$ELAPSED" \
+            --report "$REPORT_DIR/console-report.json" \
+            --summary "$REPORT_DIR/console-summary.md"
+          python3 scripts/ci/kernel-console-verdict.py \
+            --component "${{ inputs.control_component }}" \
+            --tree "$OUT_ROOT/$BOARD/tree" \
+            --board-toml "$VENDOR_DIR/UniXNU-qemu/board.toml" \
+            --config "$OUT_ROOT/$BOARD/.config" \
+            --invoked-directly false \
+            --preflight "$preflight" \
+            --elapsed-seconds "$ELAPSED" \
+            --report "$REPORT_DIR/control-report.json" \
+            --summary "$REPORT_DIR/control-summary.md"
+          {
+            echo "## build-kernel-console (${{ inputs.console_component }})"
+            echo
+            cat "$REPORT_DIR/console-summary.md"
+            echo "### negative control (${{ inputs.control_component }})"
+            echo
+            cat "$REPORT_DIR/control-summary.md"
+            # A failed build with no log is not a measurement, so the log's tail is
+            # in the summary rather than only in an artifact a reader must go and
+            # find.
+            if [ "${{ steps.builder.outputs.builder_exit }}" != "0" ] && [ -n "${{ steps.builder.outputs.builder_exit }}" ]; then
+              echo "### the builder's last 60 lines"
+              echo
+              echo '```'
+              tail -n 60 "$REPORT_DIR/${{ inputs.console_component }}-builder.log" 2>/dev/null || echo "(no log)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The four outcomes are also machine-readable step outputs, so a later job
+          # or a reader of the API does not have to parse prose.
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          for name in ("console", "control"):
+              path = Path(os.environ["REPORT_DIR"], f"{name}-report.json")
+              if not path.is_file():
+                  continue
+              report = json.loads(path.read_text(encoding="utf-8"))
+              archive = report.get("archive") or {}
+              print(f"{name}_verdict={report['verdict']}")
+              print(f"{name}_invoked={report['invocation']['invoked']}")
+              print(f"{name}_invocation_mode={report['invocation']['mode']}")
+              print(f"{name}_compiled={bool(archive.get('exists'))}")
+              print(f"{name}_archive_size={archive.get('size_bytes') or ''}")
+              print(f"{name}_archive_sha256={archive.get('sha256') or ''}")
+              print(f"{name}_linked={report['linked']}")
+          PY
+
+      # PRD 8.2 step 4 / PRD 12: stage ONLY allowlisted roles and record every
+      # exclusion.  Default deny -- an unrecognised file is excluded and named, never
+      # uploaded.  This job has no IPSW, no DMG and no disk payload to begin with;
+      # the patterns are here so that stays true if the job grows.
+      - name: Stage allowlisted artifacts and write the manifest
+        if: always()
+        id: stage
+        env:
+          STAGE_DIR: staged-kernel-console
+          REPORT_DIR: ${{ env.REPORT_DIR }}
+          OUT_ROOT: ${{ env.OUT_ROOT }}
+          CONSOLE_COMPONENT: ${{ inputs.console_component }}
+          CONTROL_COMPONENT: ${{ inputs.control_component }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          REPORT = Path(os.environ.get("REPORT_DIR", "build-kernel-console"))
+          STAGE = Path(os.environ.get("STAGE_DIR", "staged-kernel-console"))
+          TREE = Path(os.environ.get("OUT_ROOT", "build-output/unixnu-out")) / "qemu" / "tree"
+
+          ALLOWED_ROLES = ("firmware", "bootloader", "kernel", "devicetree", "auxiliary")
+          # The same deny list build-macos.yml uses, so the two jobs agree about
+          # what a system image is rather than each having its own opinion.
+          PRIVATE_PATTERNS = (
+              "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
+              "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
+              "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+              "*.decompressed", "private/*", "*.enc",
+          )
+
+          # Explicit, not scanned: what this job publishes is the report, the logs
+          # and the console archive.  A scan of the whole build output would be a
+          # default-allow with extra steps.
+          WANTED = [
+              (REPORT / "console-report.json", "auxiliary"),
+              (REPORT / "console-summary.md", "auxiliary"),
+              (REPORT / "control-report.json", "auxiliary"),
+              (REPORT / "control-summary.md", "auxiliary"),
+              (REPORT / "compile-record-provenance.json", "auxiliary"),
+              (REPORT / "config-divergence.json", "auxiliary"),
+              (REPORT / "xnu-headers.log", "auxiliary"),
+              (REPORT / f"{os.environ['CONSOLE_COMPONENT']}-builder.log", "auxiliary"),
+              (REPORT / f"{os.environ['CONTROL_COMPONENT']}-control.log", "auxiliary"),
+              (REPORT / f"{os.environ['CONSOLE_COMPONENT']}-argv.txt", "auxiliary"),
+          ]
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          staged, excluded = [], []
+          for source, role in WANTED:
+              if not source.is_file():
+                  excluded.append({"path": source.name, "reason": "the file was not produced"})
+                  continue
+              rel = source.name
+              if "local-private" in str(source.resolve()).lower().replace("\\", "/"):
+                  excluded.append({"path": rel, "reason": "path is under local-private/ (PRD 12)"})
+                  continue
+              if any(fnmatch.fnmatch(rel.lower(), pattern) for pattern in PRIVATE_PATTERNS):
+                  excluded.append({"path": rel, "reason": "filename matches a system-image/private-data pattern"})
+                  continue
+              if source.stat().st_size == 0:
+                  excluded.append({"path": rel, "reason": "zero-size file"})
+                  continue
+              destination = STAGE / rel
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination)
+              staged.append({
+                  "name": rel,
+                  "role": role,
+                  "sha256": sha256_of(destination),
+                  "size_bytes": destination.stat().st_size,
+              })
+
+          # The archive itself, and the command that produced it.  Both are small
+          # and both are the evidence: without the archive a reader cannot re-hash
+          # it, and without the command they cannot see which source was compiled.
+          for rel in (
+              "build/native-virtio-console/libNativeVirtioConsole.a",
+              "build/native-virtio-console/compile-command.json",
+              "build/native-virtio-console/compile.log",
+          ):
+              source = TREE / rel
+              if not source.is_file():
+                  excluded.append({"path": rel, "reason": "the file was not produced"})
+                  continue
+              if any(fnmatch.fnmatch(source.name.lower(), pattern) for pattern in PRIVATE_PATTERNS):
+                  excluded.append({"path": rel, "reason": "filename matches a system-image/private-data pattern"})
+                  continue
+              destination = STAGE / rel
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination)
+              # A kernel extension archive is part of the kernel: it is linked into
+              # it with -Wl,-force_load.  It is classified "kernel" explicitly rather
+              # than left to a name table that would default-deny it.
+              staged.append({
+                  "name": rel,
+                  "role": "kernel" if rel.endswith(".a") else "auxiliary",
+                  "sha256": sha256_of(destination),
+                  "size_bytes": destination.stat().st_size,
+              })
+
+          manifest = {
+              "schema_version": 1,
+              "check": "kernel-console-artifacts",
+              "allowed_roles": list(ALLOWED_ROLES),
+              "staged": staged,
+              "excluded": excluded,
+              "status": "pass" if staged else "fail",
+          }
+          (REPORT / "artifact-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          for entry in staged:
+              print(f"staged {entry['role']:11} {entry['name']} ({entry['size_bytes']} bytes)")
+          for entry in excluded:
+              print(f"excluded {entry['path']}: {entry['reason']}")
+          if not staged:
+              print("::error::nothing was staged; a failed build with no evidence is not a measurement")
+              sys.exit(1)
+          PY
+
+      - name: Upload the kernel-console evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-console-${{ inputs.experiment_id }}-${{ github.run_id }}
+          path: staged-kernel-console/
+          if-no-files-found: error
+          retention-days: 30
+
+  # =====================================================================
+  # Job 2: the driver's own kernel step.
+  #
+  # Everything job 1 measures, plus the two things it cannot: that the DRIVER's
+  # loop over board.toml's [kernel] archives reaches the console builder, and that
+  # a kernel LINK picks the archive up.  The price is a full XNU build, because
+  # build-arm-driver.py reads a compile record only an XNU pass leaves behind and
+  # scripts/unixnu/kernel.py:83-95 therefore runs a whole bootstrap pass first.
+  #
+  # The repository is public, so standard GitHub-hosted macOS minutes are free; the
+  # ceiling that actually binds is the timeout below.
+  # =====================================================================
+  console-in-kernel:
+    name: console-in-kernel (the driver's own kernel step)
+    runs-on: macos-latest
+    if: inputs.run_kernel_link == 'true'
+    # One full XNU build, the eleven archive builders of the board list, and the
+    # link.  build-macos.yml holds the same chain plus the GPU addon's seven rings
+    # in 180 and calls that an estimate rather than a measurement, so 200 is the
+    # same kind of number for strictly less work.
+    timeout-minutes: 200
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the start epoch (for elapsed seconds)
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          date -u +%s > "$REPORT_DIR/started_epoch"
+
+      - name: Resolve the pins from sources.lock.json
+        id: pins
+        env:
+          LOCK_PATH: config/sources.lock.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+          raw = Path("config/sources.lock.json").read_bytes()
+          lock = json.loads(raw.decode("utf-8"))
+          out = {}
+          for key in ("unixnu", "device_repo", "uefi_sheng"):
+              section = lock.get(key)
+              if not isinstance(section, dict):
+                  raise SystemExit(f"sources.lock.json has no '{key}' object")
+              for field in ("repo", "commit"):
+                  value = section.get(field)
+                  if not isinstance(value, str) or not value.strip():
+                      raise SystemExit(f"{key}.{field} is {value!r}: an empty pin is not a pin")
+                  if field == "commit" and not SHA_RE.match(value.strip()):
+                      raise SystemExit(f"{key}.commit {value!r} is not a git sha")
+                  out[f"{key}_{field}"] = value.strip()
+          out["lock_sha256"] = hashlib.sha256(raw).hexdigest()
+          for key, value in out.items():
+              print(f"{key}={value}")
+          PY
+
+      - name: Acquire the pinned checkouts (vendor/)
+        id: acquire
+        run: |
+          set -euo pipefail
+          acquire() {
+            local url="$1" commit="$2" dest="$3"
+            if [ -d "$dest/.git" ] && [ "$(git -C "$dest" rev-parse HEAD)" = "$commit" ]; then
+              echo "== $dest already at $commit"
+              return 0
+            fi
+            mkdir -p "$dest"
+            git -C "$dest" init -q
+            if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+              git -C "$dest" remote set-url origin "$url"
+            else
+              git -C "$dest" remote add origin "$url"
+            fi
+            git -C "$dest" fetch -q --depth 1 origin "$commit"
+            git -C "$dest" checkout -q --detach FETCH_HEAD
+            local head
+            head="$(git -C "$dest" rev-parse HEAD)"
+            if [ "$head" != "$commit" ]; then
+              echo "::error::$dest is at $head but the lock pins $commit"
+              return 1
+            fi
+            echo "== $dest acquired at $head"
+          }
+          acquire "${{ steps.pins.outputs.unixnu_repo }}"     "${{ steps.pins.outputs.unixnu_commit }}"     "$VENDOR_DIR/UniXNU"
+          acquire "${{ steps.pins.outputs.device_repo_repo }}" "${{ steps.pins.outputs.device_repo_commit }}" "$VENDOR_DIR/UniXNU-qemu"
+          acquire "${{ steps.pins.outputs.uefi_sheng_repo }}"  "${{ steps.pins.outputs.uefi_sheng_commit }}"  "$VENDOR_DIR/uefi-sheng"
+          if git ls-files -- "$VENDOR_DIR" | grep -q .; then
+            echo "::error::$VENDOR_DIR has tracked files; fetched material must not be committed"
+            exit 1
+          fi
+          echo "acquire=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Install the toolchain (Homebrew LLVM, cmake, ninja, unifdef)
+        id: toolchain
+        run: |
+          set -euo pipefail
+          for formula in llvm lld cmake ninja unifdef; do
+            if ! brew list --formula "$formula" >/dev/null 2>&1; then
+              echo "installing $formula"
+              brew install --quiet "$formula"
+            fi
+          done
+          found=0
+          for keg in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            if [ -d "$keg" ]; then
+              echo "$keg" >> "$GITHUB_PATH"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no llvm keg on disk after brew install llvm"
+            exit 1
+          fi
+          echo "toolchain=ok" >> "$GITHUB_OUTPUT"
+
+      # The driver's own assembly, not a second implementation of it.  `unixnu tree`
+      # updates the module submodules, resolves the modules, fetches the non-refer
+      # ones and assembles the tree (cli.py prepare()); `unixnu fetch` also brings
+      # the git references (xnu, libplatform, ...) that the kernel build reads.
+      - name: Assemble the pinned tree (unixnu fetch + tree)
+        id: assemble
+        run: |
+          set -euo pipefail
+          run_driver() {
+            echo "+ python3 $VENDOR_DIR/UniXNU/unixnu $*"
+            python3 "$VENDOR_DIR/UniXNU/unixnu" "$@" -D "$VENDOR_DIR/UniXNU-qemu" --out "$OUT_ROOT" -j 3
+          }
+          run_driver fetch
+          run_driver tree
+          tree="$OUT_ROOT/$BOARD/tree"
+          if [ ! -d "$tree" ]; then
+            echo "::error::no assembled tree at $tree"
+            exit 1
+          fi
+          echo "tree=$PWD/$tree" >> "$GITHUB_OUTPUT"
+          echo "assemble=ok" >> "$GITHUB_OUTPUT"
+          echo "== tree: $PWD/$tree"
+
+
+      # prepare-xnu-source.py fetches three directory listings from api.github.com
+      # with a bare urlopen -- unauthenticated, so it shares the 60-per-hour per-IP
+      # limit with every other Actions runner on that address.  Measured on run
+      # 40066399042: "HTTP Error 403: rate limit exceeded", which failed build-kernel
+      # before a single translation unit was compiled.  The script caches the
+      # listings by path and verifies every blob by its git SHA-1, so seeding them
+      # with an authenticated request removes all three API calls without changing
+      # any content.
+      #
+      # It runs AFTER the assembly, not before: it globs <out>/*/tree, so a run
+      # whose tree does not exist yet would refuse with "no assembled build tree"
+      # rather than seed anything.
+      - name: Pre-seed the XNU header listings with an authenticated request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_ROOT: ${{ env.OUT_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ.get("GITHUB_TOKEN", "")
+          feeds = tomllib.loads(Path("vendor/UniXNU/feeds.toml").read_text(encoding="utf-8"))
+          xnu = feeds.get("xnu", {})
+          driverkit = xnu.get("driverkit_tag", "xnu-10063.121.3")
+          trustcache = xnu.get("trustcache_tag", "xnu-8796.101.5")
+          repo = "https://api.github.com/repos/apple-oss-distributions/xnu/contents"
+          wanted = [
+              (f"{repo}/iokit/DriverKit?ref={driverkit}", f"xnu-driverkit-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/iokit/DriverKit/crypto?ref={driverkit}", f"xnu-driverkit-crypto-{driverkit.removeprefix('xnu-')}.json"),
+              (f"{repo}/EXTERNAL_HEADERS/TrustCache?ref={trustcache}", f"xnu-trustcache-{trustcache.removeprefix('xnu-')}.json"),
+          ]
+          headers = {"Accept": "application/vnd.github+json"}
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+          root = Path(os.environ.get("OUT_ROOT", "build-output/unixnu-out"))
+          trees = sorted(root.glob("*/tree"))
+          if not trees:
+              raise SystemExit(f"no assembled build tree under {root}: assemble the tree first")
+          for url, name in wanted:
+              body = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60).read()
+              entries = json.loads(body)
+              if not isinstance(entries, list):
+                  raise SystemExit(f"{url} did not return a directory listing")
+              for tree in trees:
+                  target = tree / ".cache" / "sources" / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(body)
+              print(f"seeded {name}: {len(entries)} entries into {len(trees)} tree(s)")
+          PY
+
+
+      - name: Select the defconfig and inject the two switches
+        id: config
+        run: |
+          set -euo pipefail
+          python3 "$VENDOR_DIR/UniXNU/unixnu" defconfig qemu_defconfig -D "$VENDOR_DIR/UniXNU-qemu" --out "$OUT_ROOT"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = Path(os.environ["OUT_ROOT"]) / os.environ["BOARD"] / ".config"
+          if not config.is_file():
+              raise SystemExit(f"no generated .config at {config.as_posix()}")
+          text = config.read_text(encoding="utf-8")
+          wanted = {
+              "CONFIG_XNU_BUILD_ARCHIVES": "build_archives() runs at all (kernel.py:54)",
+              "CONFIG_XNU_NATIVE_VIRTIO_CONSOLE": "the link force-loads the archive (build-xnu-4k-baseline.sh:666)",
+          }
+          added = []
+          for key, why in wanted.items():
+              if any(line.strip().startswith(key + "=") for line in text.splitlines()):
+                  continue
+              with config.open("a", encoding="utf-8") as handle:
+                  handle.write(f"\n# Added by .github/workflows/build-kernel-console.yml: {why}\n{key}=y\n")
+              added.append(key)
+          print(f"config: {config.as_posix()} added {added or 'nothing'} (recorded divergence from the pin)")
+          Path(os.environ["REPORT_DIR"], "config-divergence.json").write_text(
+              json.dumps({"path": config.as_posix(), "added": added, "defconfig": "qemu_defconfig"}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          echo "config=$PWD/$OUT_ROOT/$BOARD/.config" >> "$GITHUB_OUTPUT"
+
+      # The measurement.  `unixnu build kernel` runs kernel.build() -- which runs
+      # the bootstrap pass for the compile records, then board.toml's archive
+      # builders, then the real pass and the link -- and then kernel.prelink().
+      #
+      # prelink is EXPECTED to fail here and its failure is immaterial: it needs the
+      # original kernelcache, which only the IPSW carries, and it runs AFTER the
+      # link (cli.py:128-130).  So the driver's exit code is recorded rather than
+      # trusted, and the link evidence is read out of the tree.
+      - name: Run the driver's kernel step (unixnu build kernel)
+        id: kernel
+        run: |
+          set -uo pipefail
+          started=$(date -u +%s)
+          status=0
+          python3 "$VENDOR_DIR/UniXNU/unixnu" build kernel \
+            -D "$VENDOR_DIR/UniXNU-qemu" --out "$OUT_ROOT" -j 3 \
+            > "$REPORT_DIR/kernel-driver.log" 2>&1 || status=$?
+          finished=$(date -u +%s)
+          {
+            echo "driver_exit=$status"
+            echo "driver_log=$PWD/$REPORT_DIR/kernel-driver.log"
+            echo "driver_seconds=$((finished - started))"
+          } >> "$GITHUB_OUTPUT"
+          echo "== unixnu build kernel exited $status after $((finished - started))s"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::the driver exited $status. A prelink failure (no original kernelcache) is expected and is after the link; a build or link failure is the measurement. The last 60 lines follow."
+            tail -n 60 "$REPORT_DIR/kernel-driver.log" || true
+          fi
+          # The per-builder logs the driver wrote, kept under their own names: four
+          # entries of the board list share the stem build-arm-driver, so the index
+          # in archive-NN-<stem>.log is the only thing that tells them apart.
+          logs="$OUT_ROOT/$BOARD/logs"
+          if [ -d "$logs" ]; then
+            mkdir -p "$REPORT_DIR/driver-logs"
+            cp -f "$logs"/*.log "$REPORT_DIR/driver-logs/" 2>/dev/null || true
+            echo "== per-builder logs:"
+            ls -1 "$REPORT_DIR/driver-logs" | sed 's/^/   /' || true
+          fi
+          exit 0
+
+      # The record this run produced itself, so the provenance is not a download:
+      # the flags are this tree's own XNU's, compiled by this run's toolchain.  A
+      # separate step, because a step cannot read its own outputs.
+      - name: Record where this run's compile record came from
+        if: always()
+        id: record
+        env:
+          REPORT_DIR: ${{ env.REPORT_DIR }}
+          OUT_ROOT: ${{ env.OUT_ROOT }}
+          BOARD: ${{ env.BOARD }}
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          member="build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json"
+          if [ -f "$tree/$member" ]; then
+            python3 - "$tree/$member" "$REPORT_DIR/compile-record-provenance.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          source, destination = Path(sys.argv[1]), Path(sys.argv[2])
+          raw = source.read_bytes()
+          record = json.loads(raw.decode("utf-8"))
+          provenance = {
+              "origin": "compiled by this run's own XNU bootstrap pass",
+              "detail": (
+                  "scripts/unixnu/kernel.py:83-95 ran one bootstrap pass of XNU to "
+                  "leave the compile records behind, so the flags are the pinned "
+                  "XNU's own and this run's toolchain's"
+              ),
+              "member": source.name,
+              "sha256": hashlib.sha256(raw).hexdigest(),
+              "size_bytes": len(raw),
+              "cwd_the_builder_uses": record.get("directory"),
+              "cwd_exists_here": Path(str(record.get("directory"))).is_dir(),
+          }
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"record: produced by this run, sha256 {provenance['sha256']}")
+          PY
+            echo "record=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "record=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::no compile record was produced; the XNU bootstrap pass did not reach iokit"
+          fi
+          exit 0
+
+      - name: Write the verdict report
+        if: always()
+        id: verdict
+        env:
+          REPORT_DIR: ${{ env.REPORT_DIR }}
+        run: |
+          set -uo pipefail
+          ELAPSED=$(( $(date -u +%s) - $(cat "$REPORT_DIR/started_epoch") ))
+          logs="$OUT_ROOT/$BOARD/logs"
+          kernel="$OUT_ROOT/$BOARD/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+          preflight="tree=$([ -d "$OUT_ROOT/$BOARD/tree" ] && echo ok || echo failed)"
+          preflight="$preflight,acquire=${{ steps.acquire.outputs.acquire }}"
+          preflight="$preflight,toolchain=${{ steps.toolchain.outputs.toolchain }}"
+          preflight="$preflight,config=$([ -f "$OUT_ROOT/$BOARD/.config" ] && echo ok || echo failed)"
+          preflight="$preflight,assemble=${{ steps.assemble.outputs.assemble }}"
+          preflight="$preflight,record=${{ steps.record.outputs.record }}"
+          python3 scripts/ci/kernel-console-verdict.py \
+            --component "${{ inputs.console_component }}" \
+            --tree "$OUT_ROOT/$BOARD/tree" \
+            --board-toml "$VENDOR_DIR/UniXNU-qemu/board.toml" \
+            --config "$OUT_ROOT/$BOARD/.config" \
+            --driver-log "$REPORT_DIR/kernel-driver.log" \
+            --driver-log-dir "$logs" \
+            --kernel "$kernel" \
+            --link-log "$logs/kernel.log" \
+            --record-provenance "$REPORT_DIR/compile-record-provenance.json" \
+            --invoked-directly false \
+            --preflight "$preflight" \
+            --elapsed-seconds "$ELAPSED" \
+            --report "$REPORT_DIR/console-report.json" \
+            --summary "$REPORT_DIR/console-summary.md"
+          {
+            echo "## build-kernel-console (${{ inputs.console_component }}), the driver's own kernel step"
+            echo
+            cat "$REPORT_DIR/console-summary.md"
+            echo
+            echo "### what this run still does not claim"
+            echo
+            echo "The archive builds is NOT the console enumerates in the guest and NOT the console can send and receive. Both are boot measurements, and the transport's readiness has never been measured."
+            if [ "${{ steps.kernel.outputs.driver_exit }}" != "0" ] && [ -n "${{ steps.kernel.outputs.driver_exit }}" ]; then
+              echo "### the driver's last 60 lines"
+              echo
+              echo '```'
+              tail -n 60 "$REPORT_DIR/kernel-driver.log" 2>/dev/null || echo "(no log)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["REPORT_DIR"], "console-report.json")
+          if path.is_file():
+              report = json.loads(path.read_text(encoding="utf-8"))
+              archive = report.get("archive") or {}
+              print(f"verdict={report['verdict']}")
+              print(f"invoked={report['invocation']['invoked']}")
+              print(f"invocation_mode={report['invocation']['mode']}")
+              print(f"compiled={bool(archive.get('exists'))}")
+              print(f"archive_size={archive.get('size_bytes') or ''}")
+              print(f"archive_sha256={archive.get('sha256') or ''}")
+              print(f"linked={report['linked']}")
+          PY
+
+      - name: Stage allowlisted artifacts and write the manifest
+        if: always()
+        id: stage
+        env:
+          STAGE_DIR: staged-kernel-console
+          REPORT_DIR: ${{ env.REPORT_DIR }}
+          OUT_ROOT: ${{ env.OUT_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          REPORT = Path(os.environ.get("REPORT_DIR", "build-kernel-console"))
+          STAGE = Path(os.environ.get("STAGE_DIR", "staged-kernel-console"))
+          TREE = Path(os.environ.get("OUT_ROOT", "build-output/unixnu-out")) / "qemu" / "tree"
+
+          ALLOWED_ROLES = ("firmware", "bootloader", "kernel", "devicetree", "auxiliary")
+          PRIVATE_PATTERNS = (
+              "*.ipsw", "*.dmg", "*.img", "*.qcow2", "*.qcow", "*.raw", "*.sparseimage",
+              "*.vmdk", "*.vhd", "*.vdi", "*.iso", "*.p12", "*.pfx", "*.mobileprovision",
+              "*.pem", "*.key", "*.cer", "*.mobileconfig", "*.trustcache", "*.seed",
+              "*.decompressed", "private/*", "*.enc",
+          )
+
+          def sha256_of(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          staged, excluded = [], []
+
+          def stage(source: Path, role: str):
+              if not source.is_file():
+                  excluded.append({"path": source.name, "reason": "the file was not produced"})
+                  return
+              if "local-private" in str(source.resolve()).lower().replace("\\", "/"):
+                  excluded.append({"path": str(source), "reason": "path is under local-private/ (PRD 12)"})
+                  return
+              if any(fnmatch.fnmatch(source.name.lower(), pattern) for pattern in PRIVATE_PATTERNS):
+                  excluded.append({"path": source.name, "reason": "filename matches a system-image/private-data pattern"})
+                  return
+              if source.stat().st_size == 0:
+                  excluded.append({"path": source.name, "reason": "zero-size file"})
+                  return
+              destination = STAGE / source.name
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination)
+              staged.append({
+                  "name": source.name,
+                  "role": role,
+                  "sha256": sha256_of(destination),
+                  "size_bytes": destination.stat().st_size,
+              })
+
+          # The report and the evidence, named explicitly.  A scan of the build
+          # output would be a default-allow with extra steps.
+          for name in (
+              "console-report.json",
+              "console-summary.md",
+              "compile-record-provenance.json",
+              "config-divergence.json",
+              "kernel-driver.log",
+          ):
+              stage(REPORT / name, "auxiliary")
+
+          # The per-builder logs.  These are the evidence that the DRIVER ran the
+          # console builder, which is the thing job 1 cannot show.
+          driver_logs = REPORT / "driver-logs"
+          if driver_logs.is_dir():
+              for path in sorted(driver_logs.glob("*.log")):
+                  stage(path, "auxiliary")
+
+          # The console archive and the command that produced it.  Small, and the
+          # archive's digest is the measurement.
+          for rel in (
+              "build/native-virtio-console/libNativeVirtioConsole.a",
+              "build/native-virtio-console/compile-command.json",
+              "build/native-virtio-console/compile.log",
+          ):
+              source = TREE / rel
+              if not source.is_file():
+                  excluded.append({"path": rel, "reason": "the file was not produced"})
+                  continue
+              if any(fnmatch.fnmatch(source.name.lower(), pattern) for pattern in PRIVATE_PATTERNS):
+                  excluded.append({"path": rel, "reason": "filename matches a system-image/private-data pattern"})
+                  continue
+              destination = STAGE / rel
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination)
+              staged.append({
+                  "name": rel,
+                  "role": "kernel" if rel.endswith(".a") else "auxiliary",
+                  "sha256": sha256_of(destination),
+                  "size_bytes": destination.stat().st_size,
+              })
+
+          manifest = {
+              "schema_version": 1,
+              "check": "kernel-console-artifacts",
+              "allowed_roles": list(ALLOWED_ROLES),
+              "staged": staged,
+              "excluded": excluded,
+              "status": "pass" if staged else "fail",
+          }
+          (REPORT / "artifact-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          for entry in staged:
+              print(f"staged {entry['role']:11} {entry['name']} ({entry['size_bytes']} bytes)")
+          for entry in excluded:
+              print(f"excluded {entry['path']}: {entry['reason']}")
+          if not staged:
+              print("::error::nothing was staged; a failed build with no evidence is not a measurement")
+              sys.exit(1)
+          PY
+
+      - name: Upload the kernel-console evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-console-kernel-${{ inputs.experiment_id }}-${{ github.run_id }}
+          path: staged-kernel-console/
+          if-no-files-found: error
+          retention-days: 30
