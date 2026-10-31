@@ -2261,7 +2261,8 @@ jobs:
           trust_sha="$(shasum -a 256 "$metal/owner-trust.bundle" | cut -d' ' -f1)"
           echo "metal: owner-trust.bundle sha256 $trust_sha"
           if ! grep -qF "$trust_sha" "$VENDOR_DIR/UniXNU-qemu/board.toml"; then
-            echo "::warning::owner-trust.bundle sha256 $trust_sha is not in board.toml [payload] trust_cache_sha256; build-payload will refuse it.  Add that digest to the fork's board.toml -- do NOT widen the list to a wildcard."
+            echo "::error::owner-trust.bundle sha256 $trust_sha is not in board.toml [payload] trust_cache_sha256, so build-payload will refuse it.  Add that digest to the fork's board.toml -- do NOT widen the list to a wildcard."
+            exit 1
           else
             echo "metal: owner-trust.bundle digest is in the board's allowlist"
           fi

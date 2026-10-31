@@ -53,11 +53,18 @@ param(
 
     [string]$Output = "qemu-hostmem-probe.json",
 
-    #: Probe a binary already on disk instead of downloading one, as
-    #: ``label|path|exe``.  This exists so the instrument can be validated on a
-    #: build whose answer is already known -- the pinned 11.1.0, measured by hand
-    #: as fact 189 -- rather than first being trusted against a 206 MB download.
-    #: An instrument that has never produced a known answer is not an instrument.
+    #: A path to a QEMU binary already on disk, probed instead of downloading
+    #: one.  NOT ``label|path|exe``: the label still comes from the -Versions
+    #: entry, and this is a bare path.  MEASURED: the ``label|path|exe`` form
+    #: this docstring used to promise does not parse -- the parameter is handed
+    #: straight to ``Get-Item``, so a caller following the old wording gets
+    #: "Cannot find path ... known-absent|F:..." and an ``unmeasured`` verdict
+    #: that reads like a broken instrument rather than a mis-typed argument.
+    #:
+    #: This exists so the instrument can be validated on a build whose answer is
+    #: already known -- the pinned 11.1.0, measured by hand as fact 189 -- rather
+    #: than first being trusted against a 206 MB download.  An instrument that
+    #: has never produced a known answer is not an instrument.
     [string]$LocalBinary
 )
 
