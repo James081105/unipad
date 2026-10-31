@@ -144,3 +144,46 @@ def test_the_handoff_group_covers_the_eight_counters_the_kernel_counts() -> None
         "native_qemu_metal_handoff_last_status",
     ):
         assert name in handoff, f"{name} is no longer asked for"
+
+
+def test_the_parser_sees_an_array_declaration_at_the_elements_width() -> None:
+    """``declared_in`` must not be blind to ``volatile uint64_t name[N];``.
+
+    The three scalar patterns require a ``;`` immediately after the name, so an
+    array declaration matched none of them and the name was reported as
+    UNDECLARED.  That is how ``native_gop_wait_stats`` -- the only counter that
+    separates "the Metal client never ran" from "it ran and was refused" -- came
+    to be missing from :data:`~unipad.host.qemu_metal.GOP_COUNTERS` for as long
+    as it did: adding it would have failed
+    ``test_every_counter_the_list_asks_for_the_kernel_declares``, because the
+    parser said the kernel did not declare it.
+
+    The width is the ELEMENT's, not the array's.  A read of ``[0]`` is one
+    element, and asking for all 56 bytes would fold seven slots into one number
+    and answer neither question.  It is the same rule ``_CHAR_ARRAY`` already
+    follows for ``native_qemu_metal_owners``.
+    """
+    declared = qm.declared_in(
+        REPO, *qm.PRESENTER_SOURCE,
+    )
+    assert "native_gop_wait_stats" in declared, (
+        "the parser cannot see native_gop_wait_stats, so the counter that says "
+        "whether the Metal client ever entered waitSwap cannot be asked for")
+    assert declared["native_gop_wait_stats"] == 8, (
+        "the array must be asked for at the element's width, not the array's")
+
+
+def test_the_wait_ring_is_asked_for_at_the_elements_width() -> None:
+    """``native_gop_wait_stats`` is in the GOP group, at eight bytes.
+
+    Fact 202 measured it at 0 on two independent boots, with eight known-present
+    counters validated every round.  It is the counter whose zero moved the
+    blocker a whole loop upstream: the plugin loaded, opened the accelerator and
+    is held by backboardd, but its scanout thread never reached the presenter's
+    hand-off entry points at all.
+    """
+    asked = dict(qm.GOP_COUNTERS)
+    assert "native_gop_wait_stats" in asked, (
+        "the waitSwap call counter is no longer asked for, so the reading that "
+        "says whether the Metal client ever ran is gone")
+    assert asked["native_gop_wait_stats"] == 8

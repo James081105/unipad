@@ -128,6 +128,27 @@ QMETAL_COUNTERS: Tuple[Tuple[str, int], ...] = (
 #: against a previous list.
 GOP_COUNTERS: Tuple[Tuple[str, int], ...] = (
     ("native_gop_ready", 4),
+    #: The ``waitSwap`` ring's call counter, and the only one that separates
+    #: "the Metal client never ran" from "it ran and was refused".  It is
+    #: incremented as the fifth statement of ``waitSwap`` -- AFTER the
+    #: ``gpuMode`` guard and the timeout clamp, BEFORE the lock and
+    #: ``gpuClient=true`` -- so a reading of 0 on a live presenter in GPU mode
+    #: means no client ever asked.  Every downstream zero (``gpu_offers``,
+    #: ``transfer_calls``, ``swap_validation_calls``, ``frame_count``) is that
+    #: one fact restated, not four independent facts.
+    #:
+    #: It is an ARRAY (``volatile uint64_t native_gop_wait_stats[7]``,
+    #: ``NativeGOPPresenter.cpp:18``) and is asked for at the element's eight
+    #: bytes, because that is what a read of ``[0]`` uses.  Reading the whole
+    #: 56 would fold seven slots into one number.
+    #:
+    #: The zero has a cause of its own and the obvious reading is the wrong one:
+    #: ``waitSwap`` returns ``kIOReturnUnsupported`` BEFORE touching the counter
+    #: when ``gpuMode`` is false, and ``gpuMode`` is set only from the boot arg
+    #: ``sheng-fb-gpu``.  So ``[0] == 0`` can mean "GPU mode is off".  Fact 202
+    #: measured 0 on two boots and cleared that guard first, by checking the
+    #: staged ESP's ``unixnu.toml`` for ``sheng-fb-gpu=1``.
+    ("native_gop_wait_stats", 8),
     ("native_gop_gpu_offers", 8),
     ("native_gop_gpu_completions", 8),
     ("native_gop_gpu_failures", 8),
@@ -197,6 +218,29 @@ _SIGNED_DECLARATION = re.compile(r"volatile\s+int\s+([A-Za-z_][A-Za-z0-9_]*(?:\s
 #: head and name a process that does not exist.
 _CHAR_ARRAY = re.compile(r"volatile\s+char\s+(native_[A-Za-z0-9_]+)\s*\[")
 
+#: ``volatile uint32_t name[N];`` and ``volatile uint64_t name[N];`` -- an ARRAY
+#: of counters, asked for at the width of ONE ELEMENT.
+#:
+#: The three scalar patterns above all require a ``;`` immediately after the
+#: name, so they do not match an array declaration at all: before this was
+#: added, ``declared_in`` could not see ``volatile uint64_t
+#: native_gop_wait_stats[7];`` and reported it as undeclared -- which meant the
+#: one counter that says whether the Metal client ever entered ``waitSwap``
+#: could not be put in :data:`GOP_COUNTERS` without the guard test going red.
+#:
+#: The width is the ELEMENT's, not the array's, for the same reason
+#: :data:`_CHAR_ARRAY` uses four: a read of element ``[0]`` is one element wide.
+#: ``native_gop_wait_stats[0]`` is incremented as the fifth statement of
+#: ``NativeGOPPresenter::waitSwap`` -- after the ``gpuMode`` guard and the
+#: timeout clamp, before the lock -- so it is the counter that separates "no
+#: client ever asked for a frame" from "a client asked and was refused".
+#: Reading it at the array's 56 bytes would fold seven slots into one number
+#: and answer neither question.  Fact 202 measured it at 0 on two boots, with
+#: the ``gpuMode`` guard cleared first because ``waitSwap`` returns BEFORE
+#: touching the counter when it is false.
+_U32_ARRAY = re.compile(r"volatile\s+uint32_t\s+(native_[A-Za-z0-9_]+)\s*\[")
+_U64_ARRAY = re.compile(r"volatile\s+uint64_t\s+(native_[A-Za-z0-9_]+)\s*\[")
+
 
 def declared_in(repo_root: Path, *relative: str) -> Dict[str, int]:
     """Every ``native_*`` counter a source declares, with the width a read uses.
@@ -220,6 +264,10 @@ def declared_in(repo_root: Path, *relative: str) -> Dict[str, int]:
                     found[name] = width
     for name in _CHAR_ARRAY.findall(text):
         found[name] = 4
+    for name in _U32_ARRAY.findall(text):
+        found[name] = 4
+    for name in _U64_ARRAY.findall(text):
+        found[name] = 8
     return found
 
 
