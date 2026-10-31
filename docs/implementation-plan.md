@@ -808,3 +808,19 @@ for (size_t i = sizeof("/private/var/ngpu/") - 1; parent[i]; ++i) {
 **第 5 条是这一族的教科书形状，而抓住它的过程值得记**：一次独立诊断（`local-private/tmp/why-ring-not-ready.py`，同样的 argv、同样的探针）**15 秒就 READY**。所以「ring 始终 0 字节」从来不是客人的陈述，是仪器的。修法不是猜，是让仪器把探针自己的 `reason` 打印出来——`_guest_log_probe` 本来就返回 `{"ready": False, "reason": ...}` 而不是抛异常（设计如此，为的是慢启动不被中止），而我的仪器把它扔了。**一个把自己的诊断信息扔掉的仪器，和一个没有诊断信息的仪器，在报告上完全一样。**
 
 | R9s | **帧缓冲实测静态且对两次点击无反应；这是一个带正向对照的否定，所以可信；但它不区分三种成因，L5 验收未满足**（2026-11-01，事实 198；用户 item 2 的 L5）：`real-pixel-change.py` 第一次把 `InteractionProbe` 对真客人跑起来。正向对照（翻转一字节）报 `changed_bytes=1`——differ 能测出变化；对照（无输入）4,227,072 字节 0 变化；两次点击 QMP 全部接受、0 字节变化；判定 `no_change`。**仪器自身五处缺陷全部记录并修复**，其中 `ub` 的 `NameError` 被裸 `except` 吞掉 180 次/900 秒，报「ring 始终 0 字节」，而独立诊断证明同一探针 15 秒就 READY。**未满足**：item 2 要的「实际像素变化」；也未区分「无 HID 设备」/「客人不重绘」/「点击落空」，且 `processes` 读到 0 个进程（观察器失败被吞），连 SpringBoard 是否在跑都没能成为判据 | ✅ 已测量且带正向对照（**`no_change`，一个可信的否定**）；**L5 验收仍未满足**；三种成因未区分；GPU 完成记录（QM_OPEN→命令执行→completion）仍 UNMET，且事实 197 已证明宿主侧无传输 |
+
+---
+
+**事实 199（事实 196 留白的唯一一件 UNVERIFIED 被 runner 关掉了：`NativeVirtioConsole` 真的编出来了，`libNativeVirtioConsole.a` 277,280 字节、59 个符号被 `-Wl,-force_load` 强制塞进链接后的内核；而同一个 run 的反向对照是弱的，弱的原因值得单独记**）：事实 196 收尾写「仍然 UNVERIFIED 的只剩一件，而且它与地址无关：内核要在 macOS runner 上真的编出来（`build-arm-driver.py NativeVirtioConsole` 第一次被调用）」。**现在量到了，答案是 PASS**，run 41220529812（`build-kernel-console`，macOS runner，513 秒）：
+
+- **invoked**: `driver-board-toml`——内核日志原文 `kernel: archive 6/11: build-arm-driver.py NativeVirtioConsole`；
+- **compiled**: `libNativeVirtioConsole.a` **277,280 字节**，sha256 `4c7fe70191c6e3e72a4ebfce0c2cf6b1a58396c7316257167c916ef4935aff0e`；
+- **object_is_the_driver**: `True`，判据是档案自己的符号（报告原文：「this is the check that decides」）——**不是「源文件在」也不是「日志提到过」**；
+- **linked**: `yes`——链接后的内核携带 **59 个** 含 `NativeVirtioConsole` 字样的符号，`-Wl,-force_load` 放进去，与有没有人引用无关；
+- 两个 config 开关都在（`CONFIG_XNU_BUILD_ARCHIVES=y`、`CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y`），每 builder 一份日志（`archive-06-build-arm-driver.log`）。
+
+**所以事实 196 的四条 probe 条件 + 「archive 编出来」现在全部有测量**，`board.toml`/`qemu_root_defconfig` 那两行改动的效果第一次被证明到「符号进了内核」这一层，而不是「源文件在树里」。**这仍然不是「console 能收发」**：驱动的 port 0 only 行为、transport 就绪、以及客人有没有一个进程去读那个端口，都还是一次真启动加一个客人侧实现的测量（ADR-0011 把后者记成 UNVERIFIED / BLOCKED）。
+
+**同一个 run 的反向对照是弱的，而弱的原因是一个方法错误不是疏忽**：对照用同一个 builder 跑 `NativeUfs`（`DORMANT_KEYS` 里确实没有它），预期是「没有被调用」，**实际是 exit 1，而 1 来自 `build-arm-driver.py:27` 的 `json.loads(recipe...)` 解析失败**——也就是对照失败了，但失败的原因和「有没有被调用」无关。报告自己的措辞是诚实的（"that is expected and is not the measurement"），但**一个因为别的原因失败的对照，不能用来支撑「not-invoked」这个判定**。这与本簿第 N 次同族：**用一个只在写字者脑子里成立的探针，去证一件用别种机制成立的事**。要修它，对照必须断言的是「board.toml 的 archives 列表里没有这个名字」这件事本身（那是可判定的），而不是「跑一次看它失不失败」（那不是）。
+
+| R9t | **`NativeVirtioConsole` 在 macOS runner 上真的编出来了，且 59 个符号被强制加载进内核——事实 196 留白的唯一 UNVERIFIED 关闭；反向对照弱，弱在它因解析错误失败而非因「未被调用」**（2026-11-01，run 41220529812，513 秒；用户 item 4 的「macOS 构建」）：invoked=`driver-board-toml`（日志 `archive 6/11: build-arm-driver.py NativeVirtioConsole`）；compiled=`libNativeVirtioConsole.a` 277,280 字节 sha256 `4c7fe701…`；object_is_the_driver=True（档案自身符号为判据）；**linked=yes，59 个符号进内核**；两个 config 开关均在。**仍未验证**：console 能否收发（驱动 port 0 行为 + transport 就绪 + 客人侧有没有进程读端口，ADR-0011 记 UNVERIFIED/BLOCKED）。**反向对照需修**：`NativeUfs` 对照 exit 1 来自 `build-arm-driver.py:27` 的 JSON 解析失败，与「是否被调用」无关，不能支撑 not-invoked 判定 | ✅ runner 验证 PASS（compiled + linked，符号级证据）；**客人枚举与双向收发仍 UNVERIFIED**；反向对照待修为「断言 board.toml 列表不含该名」 |
