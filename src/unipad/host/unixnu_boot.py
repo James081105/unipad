@@ -1499,31 +1499,50 @@ def _agent_argv(
 
 
 def _gdb_argv(port: Optional[int]) -> list[str]:
-    """``-gdb`` on loopback, or nothing.
+    """``-gdb`` on loopback, or nothing.  A DIAGNOSTIC switch, not a product one.
 
-    This exists for the Windows host backend, and the reason it is the gdbstub
-    rather than something purpose-built is worth recording because it looks like
-    a workaround.
-
-    Upstream's host (``qemu-metal-host``) maps the shared window the way the
-    guest does -- ``mmap`` on ``RUN_DIR/shared.bin``, zero copies, memory speed.
-    That needs ``memory-backend-file``, and this host's pinned QEMU does not
-    register it: ``-object help`` prints exactly one hostmem backend
+    What it is for, and what it turned out NOT to be for
+    ---------------------------------------------------
+    Upstream's host (``qemu-metal-host``) maps the shared window the way the guest
+    does -- ``mmap`` on ``RUN_DIR/shared.bin``, zero copies, memory speed.  That
+    needs ``memory-backend-file``, and this host's pinned QEMU does not register
+    it: ``-object help`` prints exactly one hostmem backend
     (``memory-backend-ram``) and ``-object memory-backend-file,...`` exits 1 with
-    ``invalid object type``.  MEASURED, not inferred (fact 189).
+    ``invalid object type``.  MEASURED (fact 189).
 
-    What this host DOES have is QEMU's gdbstub, and it writes guest memory:
-    ``can-host-write-guest.py`` writes a known pattern through it and reads the
-    same bytes back through QMP ``pmemsave``, with both agreeing.  So a host
-    process can serve the wire by reading with ``pmemsave`` and writing with the
-    gdbstub -- two round-trips per operation instead of zero.  That is not the
-    zero-copy product path and is not claimed as one; it is what this machine
-    has, and it is enough to answer a request that was going unanswered.
+    The hope was that QEMU's gdbstub could stand in for it: read with QMP
+    ``pmemsave``, write with the gdbstub.  ``can-host-write-guest.py`` measured a
+    PASS for that on a freshly started, ``-S``-stopped QEMU, and for a while this
+    docstring said the wire was therefore servable on this host.  **That was
+    wrong, and the reason it was wrong is the interesting part**: a fresh
+    ``-S`` boot sits at the reset vector with the MMU off, so guest-physical
+    addresses ARE the CPU's current address space and the gdbstub reaches them.
+    On a real boot the guest kernel has enabled its MMU, and then BOTH directions
+    fault -- ``m`` and ``M`` answer ``E14`` (EFAULT) at every guest-physical
+    address, including ones ``pmemsave`` reads fine.  Register reads (``g``)
+    still work, which is what pins the cause: the gdbstub addresses the CPU's
+    current VIRTUAL space, and the window is at a guest-PHYSICAL address.  Once
+    the MMU is on those are not the same thing.
+
+    Two further measurements rule it out as a serving transport:
+
+    * **Attaching pauses the VM, and detaching does not resume it.**  Measured:
+      connect and do nothing for 12 s -> ``query-status`` says ``paused``;
+      close and wait 5 s -> still ``paused``.  An explicit QMP ``cont`` (or a
+      gdbstub ``c``) is required, and every memory access after that needs a
+      ```` to stop the VM back.  A backend built that way holds the guest
+      stopped during each access, which is a debugger, not a renderer.
+    * So the transport gap on this host is NOT closable with the installed QEMU.
+      It needs a build with ``memory-backend-file``.
+
+    What it IS still good for: one-shot diagnostic reads and writes against a
+    guest that has not enabled its MMU, which is a real if narrow use, and the
+    reason the flag exists at all.
 
     Default ``None`` and one byte of difference in the argv, for the same reason
     ``agent_port`` defaults to ``None``: every recorded run on this host was made
-    without it, and a run that did not ask for a host backend must not differ
-    from those in any direction a reader could mistake for a measurement.
+    without it, and a run that did not ask for a gdbstub must not differ from
+    those in any direction a reader could mistake for a measurement.
     """
     if port is None:
         return []
