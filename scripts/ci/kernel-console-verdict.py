@@ -372,6 +372,18 @@ def main() -> int:
         help="the argv this workflow ran, space-separated. Recorded verbatim; it is a fact about the run, not something to parse.",
     )
     parser.add_argument(
+        "--listed",
+        default="",
+        help=(
+            "true / false / empty.  Whether board.toml's [kernel] archives list names "
+            "this component -- a TEXT fact, readable with no build and no toolchain.  "
+            "It is what a negative control must assert, because a build's exit code "
+            "says nothing about whether the builder was called: the control's own "
+            "compile can fail for a missing header, a missing record or a missing SDK, "
+            "and none of those is the fact under test."
+        ),
+    )
+    parser.add_argument(
         "--preflight",
         default="",
         help=(
@@ -521,6 +533,17 @@ def main() -> int:
         preflight[name.strip()] = state.strip()
     failed_preflight = sorted(name for name, state in preflight.items() if state != "ok")
 
+    # The listed fact, normalised.  Three states on purpose: an absent value is
+    # "nobody told this script", which is not the same as false.
+    listed_text = (args.listed or "").strip().lower()
+    listed = True if listed_text in ("1", "true", "yes") else False if listed_text in ("0", "false", "no") else None
+    if listed is not None and listed != (entry["entry"] is not None):
+        warnings.append(
+            f"--listed says {listed} but board.toml parsed as "
+            f"entry_present={entry['entry'] is not None}; the parsed value is the one "
+            "the verdict uses"
+        )
+
     # ---- 7. the verdict ------------------------------------------------
     if failed_preflight:
         # The only place unmeasured is decided.  Everything else here is a
@@ -536,7 +559,24 @@ def main() -> int:
         verdict_reason = "the assembled tree is absent, so nothing could be measured"
     elif not invoked:
         verdict = "not-invoked"
-        verdict_reason = board_says.get("reason") or "nothing ran the builder"
+        # The reason is the TEXT fact where it is available, and it says so.  A
+        # negative control that rests on a build's exit code proves nothing: the
+        # control's own compile can fail for a missing header or a missing record,
+        # and neither is the fact under test.  board.toml either carries the entry
+        # or it does not, and that is decidable with no toolchain at all.
+        if listed is False:
+            verdict_reason = (
+                f"not-listed: board.toml's [kernel] archives list carries no entry "
+                f"naming {component} (a text fact, read with the driver's own TOML "
+                "parser, no build and no toolchain)"
+            )
+        elif listed is True:
+            verdict_reason = (
+                f"WIRING BUG: board.toml's [kernel] archives list DOES name "
+                f"{component} and nothing ran it"
+            )
+        else:
+            verdict_reason = board_says.get("reason") or "nothing ran the builder"
     elif compiled:
         verdict = "compiled"
         verdict_reason = "the builder ran and the archive is on disk"
@@ -581,6 +621,7 @@ def main() -> int:
         "board_toml": {
             "path": args.board_toml.as_posix(),
             **board_says,
+            "listed": listed,
         },
         "invocation": {
             "mode": invocation,
@@ -619,6 +660,14 @@ def main() -> int:
         f"- **invoked**: `{invocation}`"
         + (f" (driver log: `{driver['line']}`)" if driver.get("line") else "")
         + (" (this workflow ran the builder itself)" if invocation == "workflow-direct" else ""),
+        "- **listed in board.toml**: "
+        + (
+            "`true` (a text fact, no build)"
+            if listed is True
+            else "`false` (a text fact, no build)"
+            if listed is False
+            else "`unknown`"
+        ),
         f"- **compiled**: `{compiled}`",
     ]
     if compiled:

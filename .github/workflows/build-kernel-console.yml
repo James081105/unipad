@@ -609,38 +609,97 @@ jobs:
           fi
           exit 0
 
-      # The negative control.  Same builder script, a driver board.toml does NOT
-      # name.  Its point is the INVOCATION, not the compile: without this, a
-      # detector that always reported "not invoked" would pass.  Its compile outcome
-      # is recorded and explicitly NOT required -- NativeUfs needs the storage-abi
-      # headers that only the owner root chain produces, so it is expected to fail
-      # to compile, and that failure says nothing about the console.
-      - name: 'Negative control: the same builder for a driver board.toml does not name'
-        id: control
+      # The negative control's ACTUAL measurement, and it needs no build and no
+      # toolchain at all: board.toml's [kernel] archives list either carries
+      # `build-arm-driver.py <Name>` or it does not.
+      #
+      # This used to be inferred from a build's exit code, and that cannot work.  The
+      # control's own compile fails for reasons that have nothing to do with whether
+      # the builder was called -- measured on run 41223131502 (`meta_features.h` not
+      # found) and on run 41224024385 (`IOBlockStorageDevice.h` not found) -- so an
+      # exit 1 says the control cannot compile, never that it is not invoked.  A
+      # detector that reads "exit 1" as "not invoked" would also read a broken
+      # toolchain as "not invoked", which is the false negative this guard exists to
+      # prevent.
+      #
+      # Two assertions, not one.  The positive side is here on purpose: the
+      # console's own `invoked` claim rests on the SAME fact, so a control that only
+      # checked the negative could pass while the positive was reading a list that
+      # does not contain it either.
+      - name: 'Negative control: assert what board.toml''s archives list says (no build)'
+        id: listed
         run: |
           set -uo pipefail
-          tree="$OUT_ROOT/$BOARD/tree"
+          console="${{ inputs.console_component }}"
           control="${{ inputs.control_component }}"
-          # The driver's own parser again: board.toml is TOML, and a line scan of
-          # it is a second implementation of something tomllib already answers.
-          if python3 - "$VENDOR_DIR/UniXNU-qemu/board.toml" "$control" <<'PY'
+          # The driver's own parser: board.toml is TOML, and a line scan of it is a
+          # second implementation of something tomllib already answers.  The first
+          # revision scanned lines, stripped the quotes before the trailing comma,
+          # and got `shlex.split` "No closing quotation" on every entry.
+          python3 - "$VENDOR_DIR/UniXNU-qemu/board.toml" "$console" "$control" \
+            "$REPORT_DIR/archives-listing.json" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
           import shlex
           import sys
           import tomllib
           from pathlib import Path
 
-          board, component = Path(sys.argv[1]), sys.argv[2]
+          board, console, control, destination = (Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4]))
           data = tomllib.loads(board.read_text(encoding="utf-8"))
           entries = (data.get("kernel") or {}).get("archives") or []
-          named = any(component in shlex.split(entry)[1:] for entry in entries)
-          raise SystemExit(0 if named else 3)
+
+          def names(component):
+              return [entry for entry in entries if component in shlex.split(entry)[1:]]
+
+          listing = {
+              "schema_version": 1,
+              "check": "board-archives-listing",
+              "board": board.as_posix(),
+              "entry_count": len(entries),
+              "entries": entries,
+              "console_component": console,
+              "console_listed": bool(names(console)),
+              "control_component": control,
+              "control_listed": bool(names(control)),
+          }
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_text(json.dumps(listing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          for key in ("console", "control"):
+              value = listing[f"{key}_listed"]
+              print(f"{key}_listed={'true' if value else 'false'}")
+              print(
+                  f"{key}_verdict={'listed' if value else 'not-listed'}: board.toml's "
+                  f"[kernel] archives list {'carries' if value else 'carries no'} entry "
+                  f"naming {listing[f'{key}_component']} "
+                  f"({len(entries)} entries in total)"
+              )
+          if not listing["console_listed"]:
+              print(
+                  "::error::the console component is NOT in board.toml's archives list, "
+                  "so the positive result's `invoked` claim has nothing behind it"
+              )
+          if listing["control_listed"]:
+              print(
+                  "::error::the control component IS in board.toml's archives list, so "
+                  "it is not a control"
+              )
           PY
-          then
-            echo "::error::the control $control IS named by board.toml, so it is not a control"
-            echo "control_named_by_board=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "control_named_by_board=false" >> "$GITHUB_OUTPUT"
+          cat "$REPORT_DIR/archives-listing.json" >/dev/null
+          echo "== console: $( [ "${{ steps.listed.outputs.console_listed }}" = true ] && echo listed || echo 'see above' )"
+          exit 0
+
+      # The build-based control, kept and labelled for what it is.  It runs the same
+      # builder script for the control component, so a reader can see that the
+      # detector is not simply "everything fails".  Its exit code is NOT the
+      # measurement and is never read as one: it is recorded next to the exit code
+      # and the last lines of its log, and the verdict comes from the step above.
+      - name: 'Negative control: run the same builder for a driver board.toml does not list'
+        id: control
+        run: |
+          set -uo pipefail
+          tree="$OUT_ROOT/$BOARD/tree"
+          control="${{ inputs.control_component }}"
           log="$REPORT_DIR/${control}-control.log"
           status=0
           (
@@ -652,10 +711,12 @@ jobs:
             echo "control_exit=$status"
             echo "control_log=$PWD/$log"
           } >> "$GITHUB_OUTPUT"
+          echo "== the control $control was run DIRECTLY (nothing in board.toml asks for it) and exited $status"
+          echo "== that exit code is a COMPILE outcome, not an invocation outcome; the invocation fact is the archives-listing step"
           if [ "$status" -eq 0 ]; then
-            echo "::warning::the control $control COMPILED when run directly. That is the point: it proves the detector separates 'not wired up' from 'cannot compile'. It is still not invoked by board.toml."
+            echo "::notice::the control $control COMPILED when run directly. That is the useful outcome: it separates 'not wired up' from 'cannot compile'."
           else
-            echo "== the control $control did not compile when run directly (exit $status); that is expected and is not the measurement"
+            echo "::notice::the control $control did not compile when run directly (exit $status). Expected -- it needs inputs only the owner root chain produces -- and it is not the measurement."
             tail -n 20 "$log" || true
           fi
           exit 0
@@ -682,6 +743,7 @@ jobs:
             --record-provenance "$REPORT_DIR/compile-record-provenance.json" \
             --invoked-directly "${{ steps.builder.outputs.builder_ran }}" \
             --direct-argv "${{ steps.builder.outputs.builder_argv }}" \
+            --listed "${{ steps.listed.outputs.console_listed }}" \
             --preflight "$preflight" \
             --elapsed-seconds "$ELAPSED" \
             --report "$REPORT_DIR/console-report.json" \
@@ -692,6 +754,7 @@ jobs:
             --board-toml "$VENDOR_DIR/UniXNU-qemu/board.toml" \
             --config "$OUT_ROOT/$BOARD/.config" \
             --invoked-directly false \
+            --listed "${{ steps.listed.outputs.control_listed }}" \
             --preflight "$preflight" \
             --elapsed-seconds "$ELAPSED" \
             --report "$REPORT_DIR/control-report.json" \
@@ -703,6 +766,8 @@ jobs:
             echo "### negative control (${{ inputs.control_component }})"
             echo
             cat "$REPORT_DIR/control-summary.md"
+            echo
+            echo "The control's own compile outcome (exit ${{ steps.control.outputs.control_exit }}) is a COMPILE result, not an invocation result; the invocation fact is the \`listed\` line above."
             # A failed build with no log is not a measurement, so the log's tail is
             # in the summary rather than only in an artifact a reader must go and
             # find.
@@ -783,6 +848,7 @@ jobs:
               (REPORT / "control-report.json", "auxiliary"),
               (REPORT / "control-summary.md", "auxiliary"),
               (REPORT / "compile-record-provenance.json", "auxiliary"),
+              (REPORT / "archives-listing.json", "auxiliary"),
               (REPORT / "config-divergence.json", "auxiliary"),
               (REPORT / "xnu-bootstrap.log", "auxiliary"),
               (REPORT / f"{os.environ['CONSOLE_COMPONENT']}-builder.log", "auxiliary"),
