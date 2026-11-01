@@ -375,3 +375,30 @@ Recorded so the next run does not repeat them:
   leaving F: at 6.7 GB free — which is not enough for a 310 MB boot-inputs
   bundle plus its extraction. Reclaimed to 30 GB by deleting the stale
   `pytest-*` basetemp dirs, never `shell/` and never `pytest-of-*`.
+
+### Correction recorded after the first commit of this revision
+
+The mountpoint assertions in `tests/unit/test_pinned_patches_apply.py` were
+wrong for a whole revision and nothing went red. They took whichever
+`#define XNU_OWNER_CACHE_MOUNTPOINT` the patch carried LAST — the `#else`
+arm, `/private/preboot` — on the reasoning that `build-xnu-4k-baseline.sh:438`
+defaults `XNU_OWNER_UNION_SYSTEMOS` to 0 and nothing overrides it.
+**`qemu_root_defconfig:36` does override it**, and that config is the one that
+matters: `build-macos.sh:2590-2596` selects it for the second pass, and
+`build-macos.sh:2930-2940` says in those words that the second pass's kernel is
+the one the ESP carries. So the booting kernel is built with the union arm, the
+mount overlays `/`, and the record was being checked against a mount point this
+board never uses.
+
+The emitted record was never wrong — the macro resolves at compile time either
+way, so it says `/` and the mount is at `/`. What was wrong is that nothing
+checked the record against the build. The fix derives the expected mount point
+from the defconfig, and three new assertions cover the arm structure, the
+defconfig going silent, and each arm naming its own branch's mount point.
+
+**The generalisable lesson, and it is the third time in this project:** an
+assertion that reads its expectation from the same source as the value under
+test agrees with itself and measures nothing. The `uuid` mutation taught it
+first (the test substituted its own UUID), the mountpoint taught it second,
+and the fix is the same both times — derive the expectation from something the
+value does not control.
