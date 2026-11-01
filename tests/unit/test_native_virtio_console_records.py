@@ -501,3 +501,149 @@ def test_the_gate_still_reads_what_the_driver_emits(source):
         assert f'"{event}"' in gate, (
             f"the driver emits {event} but no probe in milestones.py names it; "
             f"the record can never satisfy anything")
+
+
+# ---------------------------------------------------------------------------
+# The report port: a second way on, for code that runs after IOKit matching
+# ---------------------------------------------------------------------------
+
+HEADER = DRIVER.parent / "NativeVirtioConsoleTransport.h"
+
+#: The definition's signature, whitespace-insensitive.  Written out rather than
+#: matched loosely, because a prototype that disagrees with the definition is a
+#: different return type and the caller compiles against the prototype.
+REPORT_SIGNATURE = "IOReturnnative_console_report(constvoid*,size_t)"
+
+
+def _report_body(source: str) -> str:
+    """The brace-balanced body of native_console_report()'s DEFINITION.
+
+    ``_call_arguments`` gives the text between the parentheses, which for a
+    definition is only the parameter list -- so every assertion about what the
+    function DOES has to be made against the braces that follow.  An earlier
+    revision of these tests read the parameter list and then asserted
+    ``kIOReturnNotOpen`` was in it, which passed for the wrong reason and would
+    have passed just as well with the body deleted.
+    """
+    body = _strip_comments(source)
+    hit = re.search(
+        r"native_console_report\s*\(\s*const\s+void\s*\*\s*bytes\s*,"
+        r"\s*size_t\s+size\s*\)\s*\{", body)
+    assert hit is not None, "native_console_report is not defined with this signature"
+    depth, i = 1, hit.end()
+    while i < len(body) and depth:
+        if body[i] == "{":
+            depth += 1
+        elif body[i] == "}":
+            depth -= 1
+        i += 1
+    assert depth == 0, "native_console_report's body is not balanced"
+    return body[hit.end():i - 1]
+
+
+def test_the_report_entry_point_is_declared_for_its_callers(source):
+    """Declared in the transport header, not only in the .cpp.
+
+    The caller is an XNU patch in bsd/kern/kern_exec.c, compiled as C against a
+    force-included header.  A declaration that lives only in the .cpp is one the
+    caller cannot see, and the patch would declare its own -- which is how the
+    return type drifts.
+    """
+    require(HEADER)
+    header = HEADER.read_text(encoding="utf-8")
+    assert "native_console_report" in header, (
+        "NativeVirtioConsoleTransport.h does not declare native_console_report; "
+        "its caller in bsd/kern/kern_exec.c has no prototype to compile against"
+    )
+    # Whitespace removed from both sides: the declaration's spacing is the
+    # author's, and a signature check that depends on it fails on a reformat.
+    assert REPORT_SIGNATURE in "".join(header.split()), (
+        "the header's declaration does not match the definition's signature "
+        f"({REPORT_SIGNATURE}); the patch's caller compiles against the header"
+    )
+
+
+def test_the_report_path_needs_no_open_client(source):
+    """No isOpen() on the report path.
+
+    native_console_send() refuses while isOpen(owner) is false and nothing on
+    this board opens the port, so a report path that checked isOpen would be a
+    second copy of the function that already could not serve the mount.
+    """
+    report = _report_body(source)
+    assert "isOpen" not in report, (
+        "the report path checks isOpen(); nothing on this board opens the port, "
+        "so the SystemCryptex mount could never report through it"
+    )
+
+
+def test_the_report_refuses_rather_than_dereferencing(source):
+    """kIOReturnNotOpen when there is no live console.
+
+    A caller that runs before start() or after cleanup() must be told, not
+    silently dropped and not dereferenced.
+    """
+    report = _report_body(source)
+    assert "kIOReturnNotOpen" in report, (
+        "the report path does not return kIOReturnNotOpen when g_console is null"
+    )
+    assert "g_console?" in report.replace(" ", ""), (
+        "the report path does not test g_console before sending through it"
+    )
+    assert "send(" in report, (
+        "the report path does not put the bytes on the port at all"
+    )
+
+
+def test_the_port_is_published_only_after_the_port_is_really_there(source):
+    """g_console=this comes after native_console_ready=1 in start().
+
+    configure() allocates both queue buffers, publishes both rings and sets
+    online.  Publishing the port before that hands a caller a port whose queue
+    does not exist, and send() would lock a null IOLock and panic.
+    """
+    body = _strip_comments(source)
+    ready = body.find("native_console_ready=1")
+    publish = body.find("g_console=this")
+    assert ready != -1, "start() no longer sets native_console_ready"
+    assert publish != -1, "start() no longer publishes g_console"
+    assert publish > ready, (
+        "g_console is published before native_console_ready is set; a caller "
+        "could reach send() before configure() allocated the queue buffers"
+    )
+    # And it must be inside start(), not at file scope where it would run
+    # before probe() has matched anything.
+    assert body.find("bool NativeVirtioConsole::start") < publish, (
+        "g_console is published outside start()"
+    )
+
+
+def test_the_port_is_withdrawn_when_the_device_is_stopped(source):
+    """g_console=nullptr in cleanup(), and only when the port was stopped.
+
+    The pointer is written under the same IOLock send() takes, which is what
+    makes the teardown race safe: a reporter that read a non-null g_console
+    just before cleanup() blocks on the lock, and by the time it gets in,
+    online is false and send() refuses without touching freed memory.
+    """
+    body = _strip_comments(source)
+    cleanup = body.find("void NativeVirtioConsole::cleanup")
+    assert cleanup != -1, "cleanup() is gone"
+    stop = body.find("bool stopped=reset()", cleanup)
+    withdraw = body.find("g_console=nullptr", cleanup)
+    assert stop != -1, "cleanup() no longer calls reset()"
+    assert withdraw != -1, "cleanup() no longer withdraws g_console"
+    assert withdraw > stop, (
+        "g_console is withdrawn before reset() reports whether the port was "
+        "stopped; a failed reset leaves the device reachable and the pointer "
+        "must survive it"
+    )
+    body = _strip_comments(source)
+    # The declaration initialises the pointer too, and counting it as a
+    # withdrawal would make this assertion require zero -- i.e. that the port is
+    # never published at all.  Remove the declaration, then count.
+    without_declaration = body.replace(
+        "static NativeVirtioConsole *g_console=nullptr;", "")
+    assert without_declaration.count("g_console=nullptr") == 1, (
+        "g_console is withdrawn in more than one place"
+    )
