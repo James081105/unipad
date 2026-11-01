@@ -71,11 +71,15 @@ KNOWN_UNREACHABLE = {
         # The hunk in offline-owner-systemos-mount.patch is the SAME one that was
     # already unreachable before 2026-11-01; only its line number moved.  That
     # session added 38 lines to the hunk above it (the system.mount reporter),
-    # which shifted every later header down by exactly 38: 270 -> 308, and the
-    # four after it by the same amount.  Its old-side start (7086) is unchanged,
-    # so this is a renumbering and not a new defect.  The 5-line offset it
-    # carries against the hunk above is the systematic one described above and
-    # is deliberately left alone here.
+    # which shifted this header from line 270 to 308.  Its old-side start (7086)
+    # is unchanged, so this is a renumbering and not a new defect.
+    #
+    # It is the ONLY entry for this patch, and that is the checker's design
+    # rather than a sign the others are clean: check_patch_hunks compares each
+    # hunk against the PREVIOUS one, so once this header declares its position
+    # the four after it are consistent with it and pass.  They are wrong by the
+    # same 5-line systematic offset against hunk 2 -- the offset described in the
+    # module docstring -- and that offset is deliberately left alone here.
     ("offline-owner-systemos-mount.patch", 308),
     ("zzz-boot-progress.patch", 223),
     ("zzz-boot-progress.patch", 264),
