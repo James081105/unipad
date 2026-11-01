@@ -255,6 +255,378 @@ def test_the_ngpu_directory_fix_is_in_the_patch_that_carries_it():
 
 
 # ---------------------------------------------------------------------------
+# The dyld shared cache read reports the mapping it just established
+# ---------------------------------------------------------------------------
+
+#: The event the acceptance gate looks for (milestones.py:1510).
+CACHE_READ_EVENT = "dyld.cache_read"
+
+#: The defconfig the FIRST kernel pass builds.  board.toml [kernel] names it and
+#: build-macos.sh:2590-2596 uses it whenever the owner root chain is not yet on
+#: disk, which is every run that has to build the archives from it.  It sets
+#: CONFIG_XNU_NATIVE_CS_HASH_CACHE and does NOT set
+#: CONFIG_XNU_NATIVE_VIRTIO_CONSOLE -- the fact the emitter's gate turns on.
+FIRST_PASS_DEFCONFIG = (
+    REPO / "vendor" / "UniXNU-qemu" / "configs" / "qemu_defconfig"
+)
+
+
+def _cache_read_patch() -> Path | None:
+    for patch in _patches():
+        if patch.name == "native-dyld-cache-read.patch":
+            return patch
+    return None
+
+
+def _cache_read_hunks(text: str) -> list[tuple[str, list[str]]]:
+    """``(header, body)`` per hunk, with the diff markers still on the body.
+
+    The site assertions need the CONTEXT lines, not just the added ones: what
+    makes the emitter's position meaningful is which function's tail it sits in,
+    and that is carried by the context on both sides of it.
+    """
+    import re
+
+    hunks: list[tuple[str, list[str]]] = []
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^@@ .* @@$", lines[index])
+        if match is None:
+            index += 1
+            continue
+        body: list[str] = []
+        index += 1
+        while index < len(lines) and not lines[index].startswith("@@"):
+            if lines[index].startswith(("--- ", "+++ ", "diff ")):
+                break
+            body.append(lines[index])
+            index += 1
+        hunks.append((match.group(0), body))
+    return hunks
+
+
+def _cache_read_record(text: str) -> dict:
+    """Expand the record's adjacent literals and parse the result as JSON.
+
+    Not :func:`_record_payload`, which expands the mount patch's
+    XNU_OWNER_CACHE_* macros and refuses a patch that does not define them.  The
+    shape is the same on purpose: the literals are joined the way C's
+    concatenation does, the backslash-n is still two characters until it is
+    decoded on the next line, and the record must END a line because the host's
+    _guest_records splits the guest log by line and parses each one.
+    """
+    import json
+    import re
+
+    hit = re.search(r"static char const cache_read_record\[\] =\s*(.*?);", text, re.S)
+    assert hit is not None, "cache_read_record is not defined in the patch"
+    literals = re.findall(r'"((?:[^"\\]|\\.)*)"', hit.group(1))
+    assert literals, "cache_read_record holds no string literal"
+    joined = "".join(literals)
+    assert joined.endswith("\\n"), (
+        "cache_read_record does not end with a newline escape; an unterminated "
+        "record runs into the next line the host parses"
+    )
+    decoded = joined.replace('\\"', '"').replace("\\n", "\n")
+    assert decoded.endswith("\n"), "cache_read_record does not decode to a trailing newline"
+    return json.loads(decoded)
+
+
+def test_the_cache_read_patch_is_in_the_set_at_all():
+    """Coverage that looks total and is not, in the other direction.
+
+    Every assertion below is about one patch.  If that patch stops being walked
+    -- renamed, moved out of ``patches/xnu``, or excluded by a glob -- every one
+    of them still passes, because each looks its own file up by name and skips
+    when it is absent.  The count and the target file are asserted here so that
+    a patch nobody walks is a red test rather than seven green ones.
+    """
+    patches = _patches()
+    names = {p.name for p in patches}
+    assert "native-dyld-cache-read.patch" in names, (
+        "native-dyld-cache-read.patch is not being walked; the assertions about "
+        "it below would each skip and read as not-verified-here"
+    )
+    patch = next(p for p in patches if p.name == "native-dyld-cache-read.patch")
+    text = patch.read_text(encoding="utf-8")
+    assert "--- a/bsd/vm/vm_unix.c" in text and "+++ b/bsd/vm/vm_unix.c" in text, (
+        "the emitter no longer targets bsd/vm/vm_unix.c, so the vm_unix.o "
+        "CFLAGS_ADD pairing this patch depends on is about the wrong file"
+    )
+
+
+def test_the_cache_read_record_is_valid_json_naming_the_gates_event():
+    """The record parses as JSON and names the event M7's third requirement wants.
+
+    Asserted on the PARSED record, not on the presence of the event name: the
+    mount emitter's two drafts carried the literal "system.mount" and produced a
+    record that parsed as nothing, and both defects compiled clean.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    payload = _cache_read_record(patch.read_text(encoding="utf-8"))
+    assert payload["event"] == CACHE_READ_EVENT, (
+        f"the record names {payload['event']!r}, not {CACHE_READ_EVENT!r}; the "
+        "probe for it reports the event missing, which reads as the guest never "
+        "reading the dyld shared cache"
+    )
+    assert payload["source"] == "XNU._shared_region_map_and_slide", (
+        f"the record's source is {payload.get('source')!r}, not the function that "
+        "emits it; a record whose source names a different site cannot be "
+        "cross-checked against the one that produced it"
+    )
+
+
+def test_the_cache_read_report_is_gated_on_success():
+    """Emitted only when the shared-region mapping succeeded AND the port exists.
+
+    The null check stays even though the reference is strong, for the reason the
+    mount emitter gives: a strong reference that somehow resolved to null would
+    otherwise be a call through zero, and the linker's guarantee costs one dead
+    branch to keep visible.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    code = _code_lines(patch.read_text(encoding="utf-8"))
+    assert any("if (!error && native_console_report)" in line for line in code), (
+        "the emitter is not gated on !error AND the symbol"
+    )
+    assert any(
+        line.startswith("native_console_report(cache_read_record") for line in code
+    ), "the cache read record is never handed to the port"
+    # And only once: a second emission of the same event is silently dropped by
+    # the host (_guest_events uses setdefault), so a reader would never see it.
+    assert patch.read_text(encoding="utf-8").count(
+        "native_console_report(cache_read_record") == 1
+
+
+def test_the_cache_read_reference_is_strong_not_weak():
+    """``native_console_report`` must be a STRONG reference.
+
+    The whole reason build 41330622788 existed.  This used to be
+    ``__attribute__((weak_import))`` in the mount emitter on the reasoning that
+    the console archive is behind its own build switch, and MEASURED on a real
+    guest it resolved to null: both records were dropped with a green build and
+    the records byte-level in the booting kernel.  A weak reference does not
+    oblige the linker to keep the definition, so the symbol the call site tests
+    for is simply absent, and the null check makes that absence look deliberate.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    code = _code_lines(patch.read_text(encoding="utf-8"))
+    declarations = [
+        line for line in code
+        if line.startswith("extern") and "native_console_report" in line
+    ]
+    assert len(declarations) == 1, (
+        f"expected exactly one declaration of native_console_report, found "
+        f"{len(declarations)}: {declarations}"
+    )
+    assert "weak_import" not in declarations[0], (
+        "native_console_report is weak-imported. Measured on build 41330622788: "
+        "the symbol then resolves to null and the records are dropped silently, "
+        "with the build green and the records byte-level present in the kernel. "
+        "Use a strong extern."
+    )
+    assert declarations[0].startswith("extern int native_console_report("), (
+        f"the declaration is not the expected strong extern: {declarations[0]!r}"
+    )
+
+
+def test_the_cache_read_record_is_an_array_whose_sizeof_is_of_the_array():
+    """``sizeof(record) - 1`` on an ARRAY, never on a decayed pointer.
+
+    This is the defect that cost the previous driver pin three records on a real
+    guest: the record was selected by a ternary whose two arms were arrays of
+    different lengths, the conditional operator decayed both to ``char *``, and
+    ``sizeof`` became 8.  The literals were in the kernel the whole time and the
+    build was green, so neither a build nor a byte-level grep of the image could
+    see it.  Both halves are asserted: the declaration must be the array form,
+    and the call must pass that array directly rather than an expression that
+    could select between two of them.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    code = _code_lines(patch.read_text(encoding="utf-8"))
+
+    declarations = [
+        line for line in code if line.startswith("static char const cache_read_record")
+    ]
+    assert len(declarations) == 1, (
+        f"expected exactly one declaration of cache_read_record, found "
+        f"{len(declarations)}: {declarations}"
+    )
+    assert declarations[0].endswith("[] ="), (
+        f"cache_read_record is not declared as an array: {declarations[0]!r}. "
+        "sizeof on a pointer is 8 on arm64, which is the seven-byte record"
+    )
+    assert "*" not in declarations[0], (
+        f"cache_read_record is declared through a pointer: {declarations[0]!r}"
+    )
+    assert any(
+        line == "native_console_report(cache_read_record, sizeof(cache_read_record) - 1);"
+        for line in code
+    ), (
+        "the record is not handed to the port as sizeof(cache_read_record) - 1; "
+        "any other length expression is the eight-byte record"
+    )
+    # No conditional operator anywhere in the emitter: the ternary that decayed
+    # two arrays to one pointer is the shape being excluded.
+    start = next(i for i, line in enumerate(code)
+                 if "if (!error && native_console_report)" in line)
+    block = code[start:start + 8]
+    assert not any("?" in line for line in block), (
+        f"the emitter block carries a conditional operator: {block}"
+    )
+
+
+def test_the_cache_read_site_is_the_shared_cache_mapping_function():
+    """The emitter is the last statement of the function dyld calls for the cache.
+
+    Two hunks, and the context is what identifies them.  The first sits between
+    the end of ``shared_region_map_and_slide_setup()`` and the comment block that
+    introduces ``_shared_region_map_and_slide()``, whose own words are "dyld uses
+    this to map a shared cache file into a shared region" -- so the extern is
+    declared at file scope immediately before the right function.  The second
+    sits between that function's ``<- map`` trace and its ``return error;``, so
+    the emitter is the last thing it does before returning, after the cleanup.
+
+    This is the assertion that would have caught the site the first revision of
+    this patch was written for.  ``cs_native4k_prepare()`` in
+    bsd/kern/ubc_subr.c reads and authenticates the signed region of an ARBITRARY
+    code-signed vnode -- every 16K-hashed Mach-O on the board, not the dyld
+    shared cache -- so an event named dyld.cache_read emitted there is false for
+    the overwhelming majority of its calls.  The mapped line numbers were exact
+    (function at 5767, the vn_rdwr at 5818, error = 0 at 5858) and the site was
+    still wrong.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    hunks = _cache_read_hunks(patch.read_text(encoding="utf-8"))
+    assert len(hunks) == 2, f"expected two hunks, found {len(hunks)}"
+
+    first_header, first_body = hunks[0]
+    assert any(
+        "dyld uses this to map a shared cache file into a shared region" in line
+        for line in first_body
+    ), (
+        f"the first hunk ({first_header}) is not immediately before the function "
+        "documented as mapping a shared cache file into a shared region, so the "
+        "extern it declares is not in scope of the right function"
+    )
+
+    second_header, second_body = hunks[1]
+    trace_at = next(
+        (i for i, line in enumerate(second_body) if "<- map" in line), None
+    )
+    return_at = next(
+        (i for i, line in enumerate(second_body)
+         if line.lstrip("+ ").strip() == "return error;"), None
+    )
+    gate_at = next(
+        (i for i, line in enumerate(second_body)
+         if "if (!error && native_console_report)" in line), None
+    )
+    assert trace_at is not None and return_at is not None and gate_at is not None, (
+        f"the second hunk ({second_header}) does not carry the trace, the return "
+        "and the gate, so the emitter's position inside the function cannot be "
+        "read from the patch"
+    )
+    assert trace_at < gate_at < return_at, (
+        f"the emitter is not between the function's trace and its return: trace "
+        f"at {trace_at}, gate at {gate_at}, return at {return_at}"
+    )
+
+
+def test_the_cache_read_emitter_is_gated_on_the_switch_that_links_the_console():
+    """Guarded on XNU_NATIVE_VIRTIO_CONSOLE, not on the hash-cache switch.
+
+    A strong reference makes the definition load-bearing: if the archive is ever
+    missing while this code is compiled, the link fails naming the symbol.  That
+    is the loud failure and the correct one -- but it means the gate has to be
+    the switch that actually puts the archive on the link.
+
+    XNU_NATIVE_VIRTIO_CONSOLE is that switch: build-xnu-4k-baseline.sh:197-198
+    adds -DXNU_NATIVE_VIRTIO_CONSOLE=1 and :666-670 adds
+    -Wl,-force_load,<archive>.  XNU_NATIVE_CS_HASH_CACHE is NOT: both defconfigs
+    set it, and the first-pass one sets it without the console, so an emitter
+    gated on it would fail the first-pass link with an undefined symbol -- or, if
+    the reference were weak to avoid that, drop the record silently.  Both halves
+    are asserted here, because the first-pass defconfig is a file that can change
+    independently of this patch.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    text = patch.read_text(encoding="utf-8")
+    guard = "#if defined(XNU_NATIVE_VIRTIO_CONSOLE) && XNU_NATIVE_VIRTIO_CONSOLE"
+    assert text.count(guard) == 1, (
+        f"the console switch guard appears {text.count(guard)} times, not once"
+    )
+    # The extern and the emitter must both be inside it.  The extern is in hunk
+    # 1; the emitter is inside the function the guard precedes, and the function
+    # only exists under the hash-cache switch -- which is a separate, outer
+    # condition the patch's own file does not carry, so what is asserted is that
+    # nothing between the guard and the emitter re-opens a different one.
+    between = text[text.index(guard):]
+    assert "#endif" in between, "the console guard is never closed"
+    assert "extern int native_console_report(const void *, size_t);" in between.split(
+        "#endif", 1)[0], (
+        "the strong extern is not inside the console switch guard, so it is "
+        "declared whether or not the archive is on the link"
+    )
+
+    first_pass = FIRST_PASS_DEFCONFIG
+    if not first_pass.is_file():
+        pytest.skip(
+            f"{first_pass.name} is not in this checkout, so which switches the "
+            "first kernel pass builds with is unknown"
+        )
+    config = first_pass.read_text(encoding="utf-8")
+    assert "CONFIG_XNU_NATIVE_CS_HASH_CACHE=y" in config, (
+        f"{first_pass.name} no longer sets CONFIG_XNU_NATIVE_CS_HASH_CACHE; the "
+        "claim that this switch is not a console proxy is no longer measurable "
+        "and the gate has to be re-derived"
+    )
+    assert "CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y" not in config, (
+        f"{first_pass.name} now sets CONFIG_XNU_NATIVE_VIRTIO_CONSOLE, so the "
+        "two switches are no longer distinguishable and this assertion's premise "
+        "has to be re-derived"
+    )
+
+
+def test_the_cache_read_patch_applies_to_its_own_minus_side():
+    """``git apply`` itself, plus the header check, for this patch alone.
+
+    The whole-file tests above already do both for every patch.  This one exists
+    because those tests walk a directory: a patch that is added, applies, and is
+    never named by any other assertion here would pass them and be measured by
+    nothing.  It is also the only place the new patch's OWN hunk headers are
+    checked for reachability, which is the defect that cost run 40981242194 a
+    patch whose every count was correct.
+    """
+    patch = _cache_read_patch()
+    if patch is None:
+        pytest.skip("the dyld cache read patch is not in this pinned tree")
+    checker = _load_checker()
+    problems = checker.check(patch)
+    assert not problems, (
+        f"{len(problems)} problem(s) in this patch's hunks:\n" + "\n".join(problems)
+    )
+    proc = _run("verify_patch_applies.py", str(patch))
+    assert proc.returncode == 0 and "exit: 0" in proc.stdout, (
+        f"the patch does not apply to its own reconstructed minus side:\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The offline owner cache mount reports the two relations it establishes
 # ---------------------------------------------------------------------------
 
