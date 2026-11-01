@@ -6,7 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (mount reporter revision). Main repo at `5778bd4`.
+Last updated: 2026-11-02 (inter-patch context guard; `dyld.cache_read` and
+`virtio_blk.read_back` emitters in flight). Main repo at `7bc0da9`.
 
 ---
 
@@ -167,28 +168,48 @@ built, and nothing has reached the guest channel. In particular:
 
 ## Next actions, in order
 
-1. **Read run 41313323081's boot-inputs bundle and re-capture the guest.**
-   `local-private/tmp/root-mount-capture.py` pulls the bundle; the capture is
-   what tells us whether `system.mount` reached the channel whole or not at
-   all. Then re-read the gate. This is the same cycle that produced M4/M5.
-2. **`dyld.cache_read` — M7's third and last requirement.** Not covered by the
-   emitter in this revision. It is the only thing between M7 and a pass, given
-   the other two records land.
-3. **`guest_install_service` (M10/M10a/M11/M12) — gap B, and independent.** No
+1. **Read build 41350610831.** It is the one that answers the diagnostic
+   question. Fetch the boot inputs with
+   `python -u local-private/tmp/fetch-boot-inputs-run.py 41350610831` and run
+   `python -u local-private/tmp/root-mount-capture.py`, whose `REQUIRED_EVENTS`
+   already includes `system.mount` and `system.volume_identity`. Then re-read the
+   gate with `python -u local-private/tmp/reread-gate.py`. **Look for
+   `diag.load_init_program_entered` first** — that record, not the mount records,
+   is what this build was dispatched to measure. If it is absent, stop and read
+   the two outcomes in the 2026-11-02 section below before touching anything.
+2. **`dyld.cache_read` — M7's third requirement. IN FLIGHT** (worktree branch
+   `dyld-cache-read-emitter`). Mapped site: `cs_native4k_prepare()` at
+   `bsd/kern/ubc_subr.c:5765`, the read at `:5818`, `error = 0` at `:5858`.
+   `native-4k-signature-hash-cache.patch` already touches that file. Known
+   caveat: the function has no path knowledge, so the record cannot name a
+   directory — emit only what the function holds.
+3. **M6's `virtio_blk.read_back`. IN FLIGHT** (worktree branch
+   `virtio-blk-readback-emitter`). Mapped site: `vr_verify_block`'s loop at
+   `NativeVirtioBlock.cpp:435-444`, content verified against the owner-signed
+   manifest's per-block digest table. Needs a NEW driver fork. **Emit that one
+   event and nothing else under the `virtio_blk.` prefix** — the
+   `device_enumeration_without_readback` veto at
+   `milestones.py:1719` is dormant today (zero `virtio_blk.*` emitters exist) and
+   any second event arms it. Ordering risk: the block driver's `start()` may run
+   before the console's, and `if (native_console_report)` is not an acceptable
+   answer to that.
+4. **`guest_install_service` (M10/M10a/M11/M12) — gap B, and independent.** No
    guest agent reads the host's six install/launch/persist ops. This can be
-   pushed in parallel and does not wait on anything above.
-4. **M9/M9a need real interaction evidence, and the veto names what will not
+   pushed in parallel and does not wait on anything above. The host half is
+   complete and `native_console_receive` works, but the port is exclusive-owner
+   (`NativeOfflineGPU.cpp:132` is the only `open()`) and there is no dispatcher.
+5. **M9/M9a need real interaction evidence, and the veto names what will not
    count.** `m9.veto.homescreen_screenshot_only` and
    `m9a.veto.wallpaper_only` mean a screenshot — however good — can never
    satisfy them. What they want is input reaching the guest and the guest
    responding.
-4. **M6/M7/M8 are UNVERIFIED with their blockers gone.** They need their own
+6. **M6/M7/M8 are UNVERIFIED with their blockers gone.** They need their own
    guest evidence: `m6.known_content_read_back`, `m7.volume_identity`,
    `m7.mount_relations`, `m7.dyld_cache_read`, `m8.original_launchd`,
    `m8.later_daemons`. Several of these fall out of step 1 for free.
-5. **The broker, if the render path is next.** That is the Part A + Part B +
+7. **The broker, if the render path is next.** That is the Part A + Part B +
    Part C change fact 221 describes, and it is a device-repo re-pin.
-6. **Not started at all:** audio, network, launcher, performance acceptance
+8. **Not started at all:** audio, network, launcher, performance acceptance
    (gap F).
 
 ### What just finished, for the record
@@ -210,6 +231,14 @@ whose kernel carries the announcement; it is already extracted at
 `local-private/tmp/bundle13`.
 
 ```bash
+# The current run: 41350610831 (inter-patch fix at 94a131e). The scripts are
+# parameterised, but not the same way: the fetcher takes the run id as argv[1],
+# the capture reads UNIPAD_RUN_ID from the environment and defaults its bundle
+# to local-private/tmp/bundle-<run-id>.
+python -u local-private/tmp/fetch-boot-inputs-run.py 41350610831
+UNIPAD_RUN_ID=41350610831 python -u local-private/tmp/root-mount-capture.py
+python -u local-private/tmp/reread-gate.py
+
 # Byte-level proof the records are in the kernel the guest boots.
 python -u local-private/tmp/verify-records-in-kernel.py local-private/tmp/bundle15-check
 
@@ -254,6 +283,17 @@ python scripts/windows/build-coverage-table.py --output local-private/tmp/covera
 ## Instrument lessons that cost time here
 
 Recorded so the next run does not repeat them:
+
+- **A per-unit check that reconstructs the PRISTINE input cannot see a constraint
+  that exists only BETWEEN units.** Measured 2026-11-02. Every pinned patch is
+  verified against its own reconstructed minus side, which is the pristine file,
+  so `zzz-boot-progress.patch`'s hunk — whose context is three lines
+  `offline-owner-systemos-mount.patch` ADDS — is never exercised against the
+  patched file. Build 41346094752 failed at `kern_exec.c:7389` naming a patch
+  nobody edited. The check was not wrong; it answered a narrower question than
+  the build asks. **When a failure names a file you did not touch, that is the
+  signature.** The fix is to assert the cross-unit constraint at the site of the
+  edit: `test_this_patch_keeps_the_lines_the_next_patch_uses_as_context`.
 
 - **A missing ESP member is silent and fatal.** `scratch-data.img` and
   `kernel.macho.trustcache` are both absent from a fresh `boot-inputs` bundle by
@@ -764,3 +804,77 @@ Also worth recording: the escape in the new literal was mangled by the heredoc
 that inserted it (the documented lesson, third time), splitting a C string
 across two source lines. That also stopped the hunk checker at a line that was
 neither context nor added, so one cause produced two red instruments.
+
+---
+
+## 2026-11-02 — the build dispatched to measure the diagnostic failed on a patch nobody edited
+
+Build **41346094752** was dispatched to answer the question the previous
+revision left open. It never got to the guest: it failed at
+`build-xnu-4k-baseline.sh:44` with
+
+```
+error: patch failed: bsd/kern/kern_exec.c:7389
+error: bsd/kern/kern_exec.c: patch does not apply
+```
+
+Line 7389 is `zzz-boot-progress.patch`'s hunk. **Nobody edited that patch.**
+
+### The cause is a dependency between two patches that no local check can see
+
+`zzz-boot-progress.patch:200-205` carries a hunk whose *context* is
+
+```c
+(void) mach_vm_allocate_kernel(map, &scratch_addr, ...)
+user_addr_t init_envp = USER_ADDR_NULL;
+#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+int cache_error = native_owner_cache_prepare(...)
+```
+
+and **three of those four lines are lines `offline-owner-systemos-mount.patch`
+ADDS.** So the patch set is order-dependent in a way that
+`test_every_patch_applies_to_its_own_minus_side` structurally cannot catch: that
+test reconstructs each patch's minus side, which is the *pristine* file, and
+applies it there. The pair is never exercised together locally.
+
+The previous revision inserted the diagnostic between
+`mach_vm_allocate_kernel` and `user_addr_t init_envp`. That kept its own patch
+self-consistent — the hunk counts were right, the patch applied to its own minus
+side, every unit test passed — and broke the patch after it.
+
+**The generalisable lesson, and it is the fourth of this shape.** A per-unit
+check that reconstructs the *pristine* input cannot see a constraint that only
+exists *between* units. The check is not wrong; it is answering a narrower
+question than the one the build asks. When a failure names a file you did not
+touch, that is the signature.
+
+The fix (`94a131e`) moves the diagnostic below `user_addr_t init_envp`. The
+adjacency is restored and the diagnostic stays where the measurement needs it —
+above the prepare calls, above the `init_programs[]` loop whose
+`"attempting to load"` line the ring prints at **t=71.8**.
+
+`test_this_patch_keeps_the_lines_the_next_patch_uses_as_context` now asserts
+the adjacency directly, with the failing build named in the message. It was
+mutation-checked by putting the comment back above the shared line: red on that
+exact state, with that message, green again after the restore.
+
+### Also recorded: a submodule pointer that looks like an edit and is not
+
+`vendor/UniXNU`'s working tree shows `drivers/NativeMobileDisplay` as modified:
+gitlink `c031d88`, checkout `eb9c949`. That is **intended and documented** — the
+lock pins `eb9c949` because the gitlink's `c031d88` cannot compile
+(`only virtual member functions can be marked 'override'`, measured on run
+40187668943), and `run_driver` re-pins to the lock before every driver call
+because every `unixnu` subcommand that reaches `prepare()` runs
+`git submodule update --init --recursive` and resets the checkout to the gitlink.
+The lock's `commit_note` has recorded this across four revisions. It was left
+dirty again, and the commit was path-scoped so it stays that way.
+
+### State
+
+- Pin: `unixnu.commit` = `94a131e` (fifteenth revision), driver pin unchanged at `2f9a89a`.
+- Main repo: `7bc0da9`. Fork: `James081105/UniXNU` branch `unipad/gpu-addon-ngpu-dir` at `94a131e`.
+- **Build 41350610831** dispatched at `7bc0da9`, stage M7, payload tcg.
+- Status: CODE COMPLETE, compile UNVERIFIED, wire UNVERIFIED. This build tells us
+  the tree compiles and whether the diagnostic arrives; nothing more.
+- The two outcomes and what each would mean are unchanged from the section above.
