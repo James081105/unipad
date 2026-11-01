@@ -146,7 +146,9 @@ def test_the_handoff_group_covers_the_eight_counters_the_kernel_counts() -> None
         assert name in handoff, f"{name} is no longer asked for"
 
 
-def test_the_parser_sees_an_array_declaration_at_the_elements_width() -> None:
+def test_the_parser_sees_an_array_declaration_at_the_elements_width(
+    declared: dict[str, int],
+) -> None:
     """``declared_in`` must not be blind to ``volatile uint64_t name[N];``.
 
     The three scalar patterns require a ``;`` immediately after the name, so an
@@ -162,10 +164,20 @@ def test_the_parser_sees_an_array_declaration_at_the_elements_width() -> None:
     element, and asking for all 56 bytes would fold seven slots into one number
     and answer neither question.  It is the same rule ``_CHAR_ARRAY`` already
     follows for ``native_qemu_metal_owners``.
+
+    This test takes the :func:`declared` fixture rather than reading
+    ``PRESENTER_SOURCE`` itself, and the reason is measured rather than tidy.
+    MEASURED 2026-10-31 on a clean checkout (CI run 41250241181, ``preflight``,
+    ``Run unit tests (tests/unit)``): the direct ``qm.declared_in(REPO,
+    *qm.PRESENTER_SOURCE)`` this test used to make raised ``FileNotFoundError``
+    on ``vendor/UniXNU/drivers/NativeMobileDisplay/NativeGOPPresenter.cpp``,
+    because ``vendor/`` is git-excluded and that path is absent from a fresh
+    clone.  The guard in :func:`declared` turns that into a skip, so the module
+    reports "not measured here" instead of dying -- and
+    ``declared_everywhere`` is the stronger call anyway: it reads every source
+    in ``SOURCES`` and raises when one name is declared at two widths, which a
+    single-file read cannot see.
     """
-    declared = qm.declared_in(
-        REPO, *qm.PRESENTER_SOURCE,
-    )
     assert "native_gop_wait_stats" in declared, (
         "the parser cannot see native_gop_wait_stats, so the counter that says "
         "whether the Metal client ever entered waitSwap cannot be asked for")
