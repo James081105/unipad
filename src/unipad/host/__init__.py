@@ -87,6 +87,21 @@ from unipad.host.winsurface import (
     ppm_to_bgr,
     solid_frame,
 )
+from unipad.host.framebuffer import (
+    BYTES_PER_PIXEL,
+    FrameGeometry,
+    GuestFrameSource,
+    bgra_to_ppm,
+    read_guest_frame,
+)
+from unipad.host.surface_runner import (
+    FrameTiming,
+    GuestSurfacePresenter,
+    RunReport,
+    RunRefused,
+    guest_frame_source,
+    video_geometry_from_serial,
+)
 
 __all__ = [
     # inventory
@@ -150,4 +165,17 @@ __all__ = [
     "ppm_to_bgr",
     "solid_frame",
     "frame_geometry",
+    # framebuffer -- where the pixels come from
+    "BYTES_PER_PIXEL",
+    "FrameGeometry",
+    "GuestFrameSource",
+    "bgra_to_ppm",
+    "read_guest_frame",
+    # surface_runner -- the two halves, run together, with timings
+    "FrameTiming",
+    "GuestSurfacePresenter",
+    "RunReport",
+    "RunRefused",
+    "guest_frame_source",
+    "video_geometry_from_serial",
 ]
