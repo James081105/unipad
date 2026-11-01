@@ -36,6 +36,7 @@ What is pinned, and why each direction matters
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -318,3 +319,75 @@ def test_the_milestone_probe_survives_a_scratch_directory(
     assert "not adopted" in (verdict.evidence[0].digest_reason or "")
     assert not (evidence_dir / SCRATCH).exists()
     assert _stubs(evidence_dir), "the refusal was not recorded on disk"
+
+
+def test_adoption_keeps_what_the_producer_said_about_the_measurement(
+    tmp_path: Path,
+) -> None:
+    """An adopted reference keeps its scope and its witness.
+
+    The measured defect behind this
+    -------------------------------
+    ``_adopt`` used to rebuild its ``EvidenceRef`` from scratch, keeping only the
+    path, the kind and the digest of the copy.  Two fields a bundle validates
+    were dropped, and each failed somewhere different:
+
+    * ``scope`` was hardcoded to SIMULATION, so ``write_bundle`` refused every
+      on-site PASS -- M4 measured ``scopes=['simulation']`` against
+      ``required_scope=onsite``.  ``build-coverage-table.py`` could not write a
+      bundle at all, which is why ``docs/coverage-matrix.md`` still showed M7
+      and M9b blocked by ``xnu_initialised``, a blocker cleared two milestones
+      earlier, and could not be regenerated.
+    * ``witness`` was dropped, so ``Verdict.__post_init__`` raised "on-site
+      evidence requires a witness only the target could produce", the runner
+      caught it as ``probe_error:M4``, and the row read FAIL.
+
+    Copying a file into the run directory does not change what it is.  The bytes
+    are the same bytes, measured the same way, on the same host, so everything
+    the producer said still holds.
+    """
+    from unipad.acceptance import record
+    from unipad.acceptance.probes import _adopt
+
+    repo = tmp_path / "repo"
+    (repo / "local-private" / "boot41" / "xnu-records").mkdir(parents=True)
+    guest_log = repo / "local-private" / "boot41" / "xnu-records" / "guest.log"
+    guest_log.write_text('{"event":"xnu.page_tables"}\n', encoding="utf-8")
+    evidence_dir = tmp_path / "run" / "acceptance"
+
+    original = record.EvidenceRef(
+        path="local-private/boot41/xnu-records/guest.log",
+        kind="guest_log",
+        sha256="0" * 64,
+        scope=record.EvidenceScope.ONSITE,
+        witness="local-private/boot41/xnu-records/guest.log:20:xnu.page_tables",
+        observed_at="2026-11-01T00:00:00Z",
+    )
+
+    adopted = _adopt(original.path, repo, evidence_dir, _OwnEverything(), original)
+    assert adopted is not None, "a repository file was refused for no reason"
+
+    assert adopted.scope == record.EvidenceScope.ONSITE, (
+        "adoption downgraded an on-site reference; a bundle recording a real "
+        "guest measurement could then never be written"
+    )
+    assert adopted.witness == original.witness, (
+        "adoption dropped the witness; Verdict.__post_init__ refuses an on-site "
+        "reference without one, so the probe raises and the row reads FAIL"
+    )
+    assert adopted.observed_at == original.observed_at, (
+        "adoption dropped when the measurement was taken"
+    )
+    # The copy is real and digested, which is the whole reason adoption exists.
+    assert adopted.sha256 and re.fullmatch(r"[a-f0-9]{64}", adopted.sha256)
+    assert adopted.path.startswith("acceptance/"), adopted.path
+    assert (evidence_dir.parent / adopted.path).is_file(), (
+        "the adopted path does not resolve to a file inside the run directory"
+    )
+
+
+class _OwnEverything:
+    """A ``RepoContent`` that claims everything, so only scope is under test."""
+
+    def owns(self, path: str) -> bool:
+        return True

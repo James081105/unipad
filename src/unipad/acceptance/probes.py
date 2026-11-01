@@ -499,11 +499,44 @@ def _adopt(
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    # ADOPT the reference rather than rebuild it.
+    #
+    # Copying a file into the run directory changes three things and nothing
+    # else: where it lives, what kind of entry cites it, and the digest taken
+    # over the copy.  Everything the producer said about the measurement --
+    # its scope, its witness, when it was observed -- is still true of the same
+    # bytes and has to survive.
+    #
+    # Rebuilding the ref from scratch dropped both of the fields a bundle
+    # validates, and each drop failed in a different place:
+    #
+    # * ``scope`` was hardcoded to SIMULATION, so ``write_bundle`` refused
+    #   every on-site PASS -- M4 measured ``scopes=['simulation']`` against
+    #   ``required_scope=onsite`` -- and the coverage table could not be
+    #   generated at all.
+    # * ``witness`` was dropped, so ``Verdict.__post_init__`` raised
+    #   "on-site evidence requires a witness only the target could produce",
+    #   the runner caught it as ``probe_error:M4``, and the row read FAIL.
+    #
+    # Measured 2026-11-01, both from the same one-line defect, two runner
+    # cycles apart.
+    #
+    # ``p1.Evidence`` is deliberately NOT an ``EvidenceRef`` (p1.py:270 -- it is
+    # a note about what a check opened, with a free-text kind and no digest), so
+    # it cannot be ``replace``d and is converted instead.  Its own ``scope`` is
+    # honoured: p1 documents that it may only be ``simulation`` or ``host_real``,
+    # so nothing here can promote a p1 note to on-site.
+    destination_path = (Path(evidence_dir.name) / path).as_posix()
+    if isinstance(item, record.EvidenceRef):
+        return replace(
+            item, path=destination_path, kind="probe_log", sha256=digest,
+            digest_reason=None,
+        )
     return EvidenceRef(
-        path=(Path(evidence_dir.name) / path).as_posix(),
+        path=destination_path,
         kind="probe_log",
         sha256=digest,
-        scope=record.EvidenceScope.SIMULATION,
+        scope=str(getattr(item, "scope", None) or record.EvidenceScope.SIMULATION),
     )
 
 
