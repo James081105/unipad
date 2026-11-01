@@ -1056,3 +1056,40 @@ answer: mode_matters
 **顺带修掉的仪器缺陷，它是本轮所有混乱的源头**：GDB remote 协议的 `m`/`M` 长度字段是**十六进制**，而脚本写的是 `f"m{probe:x},32"`——字面量 `32` 被 stub 当成 `0x32` = **50 字节**。于是「要 32 字节」拿回 50 字节，与 `pmemsave` 的 32 字节比较必然不相等，报 `agrees: False`，而**前 32 字节其实完全相同**（多出来的是 `__LINKEDIT`，Mach-O 的段名）。一个协议进制的错误，把一次正确的测量显示成了失败。
 
 | R9aj | **item 3 的宿主写路径重新打开：MMU 开启时默认寻址 `m` 复现 `E14`，`Qqemu.PhyMemMode:1` 之后读到与 `pmemsave` 逐字节相同的物理内存，且 `M` 写入被 `pmemsave` 读回——事实 194 对默认值对、对天花板错**（2026-11-01，bundle12，客体真启动，串口 2023 字节）：`mode_changed_the_answer: True` 是自我验证的一环（翻转开关改变答案，只有 MMU 开且虚拟≠物理时才可能）。**事实 210 由此修订：宿主侧有两条路**——virtio 通道（不暂停客人，需客人侧渲染 op）与 gdbstub+PhyMemMode（不需客人侧改动，但每次写都暂停，`vm=paused`，一次写 15 ms，调试器级）。**必须记的不一致**：第一次跑基线返回数据而非 `E14`（两次 `g` 寄存器不同），故「基线一定 E14」不是不变量。**仪器缺陷是源头**：`m` 的长度字段是十六进制，`,32` 被当成 `0x32`=50 字节，使一次正确的比较显示为失败 |
+
+
+**事实 215（任务 #31 的 pin 链闭合了，而且是**从 GitHub 读回来**证明的：那句自我告白现在在 `61dc680` 的 `NativeVirtioConsole.cpp` 第 221-222 行，四层各自钉住；而审计预测的仓库名是错的，真名是 `VirtioMmioConsole`，`.gitmodules` 的 URL 若按审计写会让 CI 连驱动都 clone 不到**）：`pin-executor` teammate 执行了 9 步链，一步没跳，三处偏离全部有证据：
+
+| 层 | 仓库 | 分支 | 提交 | 记录什么 |
+|---|---|---|---|---|
+| 0 | `James081105/unipad` | `unipad/console-announcement-pin` | `a4648c98` | lock |
+| 1 | `James081105/UniXNU` | `unipad/console-announcement` | `04466512` | gitlink → `61dc680`，`.gitmodules` URL → fork |
+| 2 | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `61dc680` | 那句告白，父提交是 `066f9bd` |
+
+**三处偏离，每一处都是「照审计做就会坏」**：
+
+1. **仓库真名是 `VirtioMmioConsole`，不是 `NativeVirtioConsole`**——上游 `UniXNU/NativeVirtioConsole` 是个重定向别名（`gh api repos/UniXNU/NativeVirtioConsole` 返回 `full_name: UniXNU/VirtioMmioConsole`）。fork 因此落在 `James081105/VirtioMmioConsole`，与审计预测的名字不同。
+2. **审计第 6 步的 `.gitmodules` URL 会让 CI 硬失败，而不是审计预测的「静默丢掉告白」**。别名对上游仓库解析，对 fork 不解析：
+
+```
+$ git ls-remote https://github.com/James081105/NativeVirtioConsole.git
+remote: Repository not found.
+$ git ls-remote https://github.com/James081105/VirtioMmioConsole.git
+70253216890b2afcaa6333948726f896f84fc757	HEAD
+```
+
+`feeds.py:165` 的 `git submodule update --init --recursive` 会**根本 clone 不到那个驱动**。所以第 6 步写的是 fork 的真实名字。**这是一个「预测的失败模式比实际失败模式更轻」的实例，而更轻的那个是审计写出来的**。
+3. **嵌套子模块需要自己的 git 身份**——主仓的身份是 repo-local 不是 global，不会被嵌套子模块继承，第 4 步第一次提交因此 abort 在 `unable to auto-detect email address`。修在子模块自己的 `.git/config`（本地状态，不进任何 diff）。
+
+**闭合的证明是从 GitHub 读回来的，不是从本地树**：`repos/James081105/VirtioMmioConsole/contents/NativeVirtioConsole.cpp?ref=61dc680…` 的第 221-222 行是
+
+```
+    static char const announcement[]="NativeVirtioConsole: bound virtio,mmio console port 0\n";
+    send(announcement,sizeof(announcement)-1);
+```
+
+**顺带关掉了审计提的一条真实缺陷**：`config/sources.lock.json` 的 `device_repo.commit_note` 里有一条被否掉的预测（「内核的 sha256 预期会动，payload 步骤会因此拒绝承认 board.toml 的 `[payload] trust_cache_sha256`」。第 8 步的提交把它改正了，**而且改正的方式是保留原句、紧跟着附上 `REFUTED 2026-11-01` 的更正**，而不是删掉——理由写在同一段里：那个列表的唯一消费者 grep 的是 `owner-trust.bundle`（一个 QemuMetal 用户态插件包）的 sha256，而 console 驱动的档案是被 `-Wl,-force_load` 塞进**内核**的，从来不进那个包；`kernelcache_sha256` 是 Apple 从钉住的 IPSW 里取出的原始 kernelcache；lock 里根本没有内核摘要。**「省掉一次 trust cache 重钉」和「防止下一个人再钉一次」是同一件事的两面。**
+
+**已触发 macOS 构建**（run 41257576606，分支 `unipad/console-announcement-pin`，`unixnu_commit=04466512`，`device_commit=efa03c98`，experiment `exp-2026-11-01-console-announcement`）。这是 item 4「macOS 构建」那一步：告白进了源码和 pin，但**还没有进任何一颗内核**，而这个 run 就是让它进内核的那一次。
+
+| R9ak | **任务 #31 的 pin 链闭合，证明从 GitHub 读回：告白在 `61dc680` 的 `NativeVirtioConsole.cpp` 221-222 行，四层各自钉住（unipad `a4648c98` → UniXNU `04466512` → VirtioMmioConsole `61dc680` → lock 两条）**（2026-11-01，9 步全执行、三处偏离有证据）：仓库真名是 `VirtioMmioConsole`（`NativeVirtioConsole` 只是重定向别名）；**审计第 6 步的 `.gitmodules` URL 会让 CI 连驱动都 clone 不到**（`git ls-remote` 对 fork 的别名返回 Repository not found），是硬失败而非审计预测的静默丢弃；嵌套子模块需要自己的 git 身份。**审计提的真实缺陷已修**：lock 里被否掉的「内核 sha256 会动」预测已改正，且保留原句附 `REFUTED` 标记。**macOS 构建已触发**（run 41257576606）——告白进了 pin，还没进任何内核 |
