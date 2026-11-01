@@ -906,3 +906,93 @@ CurrentEL 1  SCTLR_EL1 0x30D0198D  TCR_EL1 0x280803518
 **顺带量到两件对 item 3 直接有用的事**：其一，`SCTLR_EL1 0x30D0198D` 是 bootloader 在交棒前打印的，而 bit 0（M）= 1，**所以交棒时 MMU 确实是开的**——这解释了为什么 240 s 那次读到零：不是「MMU 关着」，更可能是「等得不够久或读了一页零」，而 `mmu_off` 这个判定应当撤回。其二，`vm=paused` 在两次实验里都出现了，确认 `_gdb_argv` 记的「附挂会暂停、分离不会恢复」仍然成立，所以 PhyMemMode 即便可用，也只是一个调试器而不是渲染器。
 
 | R9ad | **item 3 的物理内存实验结论是空的：探针地址 `0x44000000` 全零，使「stub 与 `pmemsave` 一致」恒真——`agrees=True` 只是「两边都是零」，`mmu_off` 也不是「MMU 关着」的证据，两个结论都应当撤回**（2026-11-01，`phymem-mmu-on.log` 20 个零字节、`sctlr-mmu.log` 32 个零字节两边相等）：修法是用刚成功的启动提供的已知非零物理地址（串口打印 `kernel pa 0x4807C000`、`entry pa 0x4B1EC488`、`args pa 0x4C170000`）。**同一份串口日志还给出一条独立证据：交棒前 `SCTLR_EL1 0x30D0198D`，bit 0 = 1，所以交棒时 MMU 确实开着**；`vm=paused` 两次都出现，「附挂暂停、分离不恢复」仍成立 |
+
+
+**事实 209（事实 208 的更正，而且更正是往坏的方向：那两次物理内存实验的客体**根本没有启动过内核**——串口日志停在 `cannot read initrd … Not Found`，所以 `mmu_off` 和那个恒真的交叉验证都是在「客人从未执行过内核」的前提下取得的，item 3 的这个问题是 UNMEASURED，不是「量过了但不结论」**）：事实 208 把两次实验的空结果归因于探针地址是全零页。归因没错，但**不是全部**。读那两次实验自己留在 `local-private/tmp/{sctlr,phymem-mmu}-evidence/serial.log` 里的串口日志（各 1456 字节），结尾是：
+
+```
+UNIXNU: boot: entry 'xnu' (QEMU virt: source 4K XNU)
+UNIXNU: boot: cannot read initrd \EFI\UniXNU\Payloads\scratch-data.img: Not Found
+UNIXNU: menu: entry 0 returned Not Found
+```
+
+**也就是说内核从未被加载**，两次实验量测的都是一个在 UNINU 菜单里空转的固件，与事实 207 里那次「补 trust cache 之前」的失败同形，而且比它更早一环（连 initrd 都没有，是事实 206 之前那类缺失）。于是：
+
+- `phymem-mmu-on.py` 的 `mmu_off` 判定作废，理由从「探针地址是零页」升级为「客体没有内核，MMU 状态这个问题在当时连提问的对象都不存在」；
+- `sctlr-mmu-phymem.py` 的 `agrees=True` / `mode_changed_the_answer=False` 同样作废，且现在有两个独立原因（客体没启动 + 探针地址全零）；
+- **item 3 的「`Qqemu.PhyMemMode` 能否让 gdbstub 在 MMU 开启时够到客体物理内存」这个问题，一次都没有被量过**。把它记成「量过了，结论是不确定」是错的，必须记成 UNMEASURED。
+
+**这一次错误的形状值得单独钉住，因为它和事实 207 那个仪器缺陷是同一个病的两个症状**：病是**用「进程还活着」代替「客体在做我要量的事」**。事实 207 里 qemu `running` + 通道连通被当成了「客人起来了」；这里 `qemu status running; agent channel connected=True`（`phymem-mmu-on.log` 原文）被当成了「内核已经开了 MMU」。两个实验都打印了活性，两个实验的客体都在菜单里空转。**活性是必要条件，从来不是充分条件**，而这两次都把它当成了充分条件。
+
+**所以重跑 item 3 这个实验的前置条件现在有三条，缺一条结论就不可信**：(1) ESP 必须同时 staged `scratch-data.img` 与 `kernel.macho.trustcache`（事实 206/207）；(2) 必须从串口日志确认出现交棒行 `Exiting boot services` 再动手，确认不了就不测；(3) 探针地址必须先用 `pmemsave` 证明非零，是全零页就拒绝而不是硬读。前两条已经在 `console-driver-state.py` 里落地，第三条是重跑时要新加的。
+
+| R9ae | **事实 208 的更正：那两次物理内存实验的客体根本没启动内核（串口停在 `cannot read initrd … Not Found`，各 1456 字节），所以 `mmu_off` 与恒真的交叉验证都是在「客人从未执行内核」的前提下取得的——item 3 的 PhyMemMode 问题是 UNMEASURED，不是「量过但不结论」**（2026-11-01，`sctlr-mmu-evidence/serial.log` 与 `phymem-mmu-evidence/serial.log` 同文）：两次实验都打印了 `qemu status running; agent channel connected=True`，而客体都在菜单里空转——**用「进程活着」代替「客体在做我要量的事」，与事实 207 的仪器缺陷同病**。重跑前置条件三条：staged 两个缺失成员、串口确认交棒行、探针地址先用 `pmemsave` 证明非零 |
+
+
+**事实 210（item 3 的「扫描门」和「QMTL 停顿」是同一个阻断的两个深度，不是两个阻断；而那个 145/145 像素的 Windows 后端根本不在请求路径上——产品里没有任何代码调用它**）：`scanout-gate`  teammate 追了整条链，结论是客人把请求**写对了**，但 Windows 上**没有一个进程能映射那个共享窗口**，所以 `reply` 和 `hostBeat` 从来没有人写：
+
+```
+QemuMetalRemote.cpp:641        call(QM_OPEN, ...) 等 60 s 超时  ->  return nullptr
+NativeBridgeMetalFrontend.mm:1545-1546  gDevice = nmb_device_open(...); if (!gDevice) return nil;
+QemuMetalPlugin.mm:105         if (!device) { qemu_metal_log("no device"); return nil; }
+QemuMetalPlugin.mm:115         if (server) qemu_metal_serve_scanout(...)   <-- 从未执行
+QemuMetalScanout.mm:134        admittedSelector(probeAdmits, &probe)        <-- 从未运行
+```
+
+每一环都是普通的 `nil` 传播，没有哪一环能救回来。所以事实 202 的 `handoff_probes=0` 和事实 191 的 `request=1, reply=0, hostBeat=0` 是**同一次测量在两个深度上的读数**。推论值得单独记：**修好 QMTL 宿主会同时解掉扫描门**，不需要动 `QemuMetalScanout.mm`；反过来，动 `QemuMetalScanout.mm` 不可能让 `hostBeat` 动。顺序是强制的。
+
+**根因在传输层，而且本机只有一条路**：`unixnu_boot.py:2295-2310` 在 `shared_window_backend == "file"` 且 `memory-backend-file` 未注册时直接抛 `CONFIG_INVALID`，而错误信息自己说清了后果——`"ram"` 那个诊断用的第二内存节点「客人能找到，但客体外面没有任何东西能映射」。事实 197 已经量过 `util/mmap-alloc.c` 把 `memory-backend-file` 关在 `CONFIG_POSIX` 后面，w64 构建不注册。**所以 Windows 渲染链的宿主侧只剩 virtio 通道这一条路**，而这条路的零件两端都有：`NativeVirtioConsole` 在内核里（事实 199/204/205），`_agent_argv` 已经发出 chardev + `virtio-serial-device` + `virtconsole` 三件套（`src/unipad/guest/agent_channel.py:11-15`）。**缺的只是一个渲染 op**：`src/unipad/guest/protocol.py` 目前只有 install / challenge / status / launch / persist。
+
+**这一条把 item 3 和 item 4 合并成了同一个关键路径**：console 通道能不能通，同时决定 item 4 的「双向收发」和 item 3 的「真实像素变化」。这也正是本轮那个 console 驱动状态测量在量的东西。
+
+**顺带纠正一个会误导下一个人的印象**：`SurfaceWindow.present`（`src/unipad/host/winsurface.py:589-624`）是全仓唯一被真实截图验证过的像素路径（145 个采样点逐字节相同），但**可达性审计的结果是它只被测试和一个临时仪器调用**——`SurfaceWindow` 在全仓只出现四处：定义、`host/__init__.py` 的再导出、`tests/unit/test_host_winsurface.py`、`local-private/tmp/surface-fidelity.py`。`cli.py:3412-3535` 列出的子命令里没有 surface，`src/unipad/` 下也没有任何代码把 `screendump` 的输出喂给它。**所以「Windows 渲染后端已建成并验证」这句话的字面意思成立，但它验证的是一条产品不走的路径**——把它记成 item 3 已接近完成是错的。
+
+**还有一条仪器缺陷值得记，因为它与事实 194 的结论互为因果**：`local-private/tmp/metal-host-windows.py` 是树上唯一的 Windows QMTL 宿主，设计是对的（先写 `QM_REPLY` 数据、再写 `reply`，顺序是承重的），但它每一次读写都过 `Gdb.read()`，而后者对任何以 `E` 开头的回复返回 `None`（`:195-196`）。事实 194 量到 MMU 开启时每个客体物理地址都答 `E14`，于是 `Host.control()` 第一次轮询就返回 `None`，`serve_one()` 在检查 `request` 之前就打印 `control unreadable` 然后返回。**它会永远每 0.25 秒打印一次 `control unreadable`，而这与活客人表现出来的 `request=1/reply=0/hostBeat=0` 完全同形**——所以「跑得更用力」不可能有帮助，这一点现在有机制解释而不是猜测。
+
+| R9af | **item 3 的扫描门与 QMTL 停顿是同一个阻断：`QM_OPEN` 60 s 超时 → `nmb_device_open` 返回 nullptr → `QemuMetalPlugin.mm:105` 早退 → `:115` 的扫描线程从未创建 → `QemuMetalScanout.mm:134` 从未探问；所以 `handoff_probes=0`（事实 202）与 `request=1/reply=0/hostBeat=0`（事实 191）是同一次测量的两个深度**（2026-11-01，`scanout-gate` teammate，只读诊断）：修好 QMTL 宿主会同时解掉扫描门，动 `QemuMetalScanout.mm` 不可能让 `hostBeat` 动。**根因是传输层**：`memory-backend-file` 在 w64 不注册（事实 197），`"ram"` 后端「客人能找到但外面无法映射」，**Windows 渲染链只剩 virtio 通道一条路，而缺的只是一个渲染 op**（`protocol.py` 目前只有 install/challenge/status/launch/persist）。**同时纠正一个印象**：145/145 的 `SurfaceWindow.present` 全仓只被测试和一个临时仪器调用，产品不走这条路 |
+
+
+**事实 211（item 4 的「客体枚举」量到了，答案是 `bound`：`native_console_ready = 1`，而且 `native_console_mmio = 0xa003e00` 正是 agent 通道那个 transport——驱动不仅 bind 了，还 bind 在正确的那一个上；240 秒 0 字节的解释是 (b)，不是缺陷**）：`console-driver-state.py` 对 `bundle12` 跑了一次完整启动（ESP 同时 staged `scratch-data.img` 与 `kernel.macho.trustcache`，串口 2023 字节且出现交棒行），900 秒后直接读驱动自己的全局量：
+
+```
+after 900s: qemu=running, channel connected=True
+the kernel was handed off (2023 serial bytes), so the driver's counters mean something
+  native_console_ready: va 0xfffffff00c106268 -> pa 0x4ff06268
+  native_console_ready = 1
+  native_console_tx_requests = 0     native_console_rx_requests = 0
+  native_console_failures = 0        native_console_tx_bytes = 0
+  native_console_rx_bytes = 0        native_console_mmio = 167788032
+  guest processes: 1
+=== bound ===
+```
+
+**三条各自独立的证据，所以这个结论不是单一读数**：
+
+1. **`native_console_ready = 1`**——按 `NativeVirtioConsole.cpp` 的写法，它在 `start()` 里、`configure()` 之后才置 1，而 `configure()` 已经分配了两个队列缓冲、发布了两个 ring 并设了 `online`。所以端口**确实可写**。
+2. **`native_console_mmio = 0xa003e00`**，与 `EXPECTED_MMIO_BASE` **逐位相同**。ADT 的 32 个 `virtio,mmio` 窗口翻译成 `0x0a000000 + n*0x200`，#31 是 device id 3，也就是 agent 通道那个 transport。**一个 bind 到别处的驱动会显示不同的 base**，所以这一条排除了「驱动枚举到了另一个 virtio 设备」这个解释。
+3. **`native_console_failures = 0`**，且全部请求/字节计数为 0——后者正是解释 (b)：`kernel_args` 带 `serial=3`，内核的 `printf` 走串口，所以**一个工作正常的驱动在这里也产生 0 字节**。事实 203/204 的「240 秒 0 字节」到此有了确定答案，而且答案不是缺陷。
+
+**所以 item 4 的「客体枚举」这一步是 PASS**，而它 PASS 的方式值得记：不是「看到字节了」，是「问了驱动本人」。这与事实 206 记的互补——**读 `native_console_ready` 判 bind 现在就是有效的，看到字节需要那句自我宣告进内核**（pin 链 + 一次 macOS 重建）。
+
+**顺带验证了一件对 item 3 有用的事**：`va 0xfffffff00c106268 -> pa 0x4ff06268` 这个翻译是在 **MMU 开启的客人**上做出来的，而且读回来的值自洽（`mmio` 正好是预期的 transport base）。也就是说宿主走客人自己的页表格 + `pmemsave` 这条路，在真启动上读得到内核内存——见事实 212。
+
+| R9ag | **item 4 的「客体枚举」PASS：`native_console_ready=1`、`native_console_mmio=0xa003e00` 与 agent 通道的 transport 逐位相同、`native_console_failures=0`，而全部字节计数为 0 的解释是 (b)（`serial=3`，内核 printf 走串口，正常驱动也产生 0 字节）**（2026-11-01，bundle12，ESP staged `scratch-data.img` + `kernel.macho.trustcache`，串口 2023 字节且出现交棒行，900 s 后直读驱动全局量）：`mmio` 与 `EXPECTED_MMIO_BASE` 相同这一条排除了「枚举到另一个 virtio 设备」。**判定方式是「问驱动本人」而不是「等字节」**；看到字节仍需自我宣告进内核（事实 206）。**同一轮在 MMU 开启的客人上做出了 `va 0xfffffff00c106268 -> pa 0x4ff06268` 的翻译**（事实 212） |
+
+
+**事实 212（事实 194 的「宿主没有任何写客人内存的路」只对 gdbstub 成立，而刚量到的这条路它没覆盖：走客人自己的页表格翻译 VA→PA，再用 `pmemsave` 读物理——在 MMU 开启的真启动上读到了内核内存，而且同一份串口日志直接给出了帧缓的物理地址**）：事实 194 的结论是「MMU 开启时 gdbstub 两个方向都答 `E14`，所以宿主写不进去」，那个结论**没有错，但它的主语是 gdbstub 的寻址方式**。`GuestObserver.translate()`（`src/unipad/host/guestobserve.py:710-744`）走的是完全不同的机制：从 `table_root` 开始，按 `_TABLE_SHIFTS` 四级逐层读描述符，每个描述符用 `self._page(table)` 取，而 `_page` 最终落到 `physical_read` → `pmemsave`。**也就是宿主自己当 MMU，而不是求 gdbstub 当 MMU。**
+
+**这条路刚刚在 MMU 开启的真启动上跑通了**（事实 211 那一次启动）：`native_console_ready` 的 `va 0xfffffff00c106268` 被翻译成 `pa 0x4ff06268` 并读出值 1，而且读回来的 `native_console_mmio = 0xa003e00` 与预期的 transport base 自洽——**一个错的翻译会读到别的东西，不会正好读到自洽的值**。
+
+**对 item 3 的直接后果，而且比 PhyMemMode 便宜得多**：`bundle12` 的串口日志在交棒前打印了
+
+```
+video    base 0x1BC7A0000  800x600  row 3200 bytes  32 bpp
+```
+
+**帧缓的客体物理地址是已知的，而 `pmemsave` 读物理内存是已经量过能用的（事实 189/193）。所以「宿主取到一帧」根本不需要 QMTL 共享窗口、不需要 `memory-backend-file`、也不需要 `Qqemu.PhyMemMode`**——一条 `pmemsave` 就够了。事实 210 记的「Windows 渲染链只剩 virtio 通道一条路」因此要补一句：**取帧这一环已经有一条可用的路了，缺的是把取到的帧送到屏幕上的那一段**（`SurfaceWindow.present` 已验证但不被产品调用，事实 210 §1.6）。
+
+**要把这件事从「推断」变成「测量」，下一步很便宜**：对同一次启动的 `0x1BC7A0000` 做一次 `pmemsave`，读 800x600x4 = 1,920,000 字节，检查它非零、检查行跨度 3200 字节，并与 QMP `screendump` 的 PNG 逐像素对拍。**如果两者一致，帧获取路径就是 PASS，而且它不依赖任何未构建的东西。**
+
+**同时要诚实记下这条路的天花板**：`pmemsave` 是只读的，所以「取帧」可行不等于「写帧」可行。写的那一半仍然要过 gdbstub 的 `M` 包，也就仍然要过 PhyMemMode 那个问题——而那个问题按事实 208/209 是 UNMEASURED（两次实验的客体都没启动内核，探针地址还是零页）。`phymem-retry.py` 已经按三条前置条件写好（staged 两个缺失成员、串口确认交棒行、探针地址先用 `pmemsave` 证明非零），可以直接跑。
+
+| R9ah | **事实 194 的「宿主没有写客人内存的路」只对 gdbstub 成立：走客人自己的页表格（`guestobserve.py:710-744` 四级描述符）+ `pmemsave` 读物理，在 MMU 开启的真启动上读到了内核内存（`va 0xfffffff00c106268 -> pa 0x4ff06268`，读回值自洽）**（2026-11-01，事实 211 那次启动）：宿主自己当 MMU，而不是求 gdbstub 当 MMU。**对 item 3 的直接后果**：串口日志给出 `video base 0x1BC7A0000 800x600 row 3200 32bpp`，帧缓物理地址已知，`pmemsave` 已量过可用——**取帧不需要 QMTL 窗口、不需要 `memory-backend-file`、不需要 PhyMemMode**，事实 210 的「只剩 virtio 通道一条路」要补成「取帧已有一条可用路，缺的是送到屏幕那一段」。**天花板**：`pmemsave` 只读，写帧仍要过 gdbstub `M`，PhyMemMode 那个问题按事实 208/209 仍是 UNMEASURED |
