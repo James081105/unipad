@@ -1112,3 +1112,29 @@ $ git ls-remote https://github.com/James081105/VirtioMmioConsole.git
 **全量单测 3320 个通过、0 失败**，其中包含本次修掉的 `test_qemu_metal_counters.py` 那个绕过自己守卫的缺陷（CI run 41250241181 的红）。
 
 | R9al | **item 3 的「取帧→送屏幕」补齐，而它缺的一直是接线不是能力：`framebuffer.py` 能读、`SurfaceWindow.present` 能画、两者都已验证，却从未被接起来**（2026-11-01，`f936e4d` + `502a12a`）：通道序 BGRA 100% 是量的，第四字节不当颜色（450,000 个 `0x00` / 绿条 30,000 个 `0xFF`）。**交到时有一个真缺陷并被自己的测试抓到**：`_report()` 算完 geometry 硬编码传 `None`。**拒绝纪律**：读不到/没 blit/泵不动都以 `RunRefused` 结束并带真实呈现帧数——「窗口没 blit」按失败而非跳过，因为跳过去会让上一帧留在屏幕上，与「客人没在画」完全同形，而事实 198 恰好量到帧静止。两个模块 4+7 个变异体全部击杀；全量单测 3320 通过 0 失败 |
+
+
+**事实 217（item 4 第一次有客人自己发出来的字节：`NativeVirtioConsole: bound virtio,mmio console port 0` 真的出现在 agent 通道上，978 字节里第 924 字节起——而这件事把「virtio 通道可不可用」从推断变成了实测，同时它正是事实 210/214 指出的 item 3 唯一剩余渲染路径的载体**）：事实 211 量到驱动 bind 在正确的 transport 上（`native_console_ready=1`、`native_console_mmio=0xa003e00`），事实 206 量到那句自我告白只以「嵌套子模块里一处未提交修改」的形态存在、八颗已构建内核 `grep` 全为 0，事实 215 闭合了 pin 链，run 41257576606 建出了带着它的内核。**但「Mach-O 里有这个字符串」只证明档案链接进去了，不证明 `start()` 走到了那句 `send()`。** 所以量了它跑不跑：
+
+```
+the announcement literal is in the ESP kernel: True
+the kernel was handed off; reading the channel
+  +978 bytes (total 978)
+=== announced ===
+the literal arrived on the agent channel after 978 bytes
+context around it:
+b'...ID_AA64PFR0_EL1  0x1201001121110012\r\nNativeVirtioConsole: bound virtio,mmio console port 0\n'
+```
+
+- **`answer: announced`**，`announcement_seen: true`，`kernel_handed_off: true`；
+- **`firmware_bytes_before_announcement: 924`**——前 924 字节是 bootloader 自己的 EDK2/DarwinBoot  chatter（换行是 `\r\n`），告白是第 924 到 978 字节；
+- **上下文证明了时机**：告白紧跟 `ID_AA64PFR0_EL1` 那一行，也就是**交棒的那一刻**，正是 `NativeVirtioConsole::start()` 运行的时点。源码里 `send()` 就在 `native_console_ready=1` 之后，所以这个位置与源码一致，不是巧合；
+- **内核侧的字节级证据**（bundle13 的 ESP 内核，sha256 `dca5b3bb…` 与 `payload.json` 的 `payload_kernel_sha256` 相同）：告白字面量在文件偏移 242876、以 NUL 结尾，`bundle12` 出现 0 次、`bundle13` 出现 1 次——**差值恰好就是这一句**；`NativeVirtioConsole` 字样从 76 变成 78。
+
+**所以「客人→宿主」这个方向现在是端到端实测通的**：驱动枚举到正确的 transport → 告白代码在内核里 → 告白真的上线。这是本仓第一次有客人侧应用程序数据到达宿主，也是事实 203/204 那个「240 秒 0 字节」的最终答案——**0 字节的原因是那句 `send()` 从未被编译进任何内核，不是通道不通。**
+
+**这一条同时改了 item 3 的判断**。事实 210 的结论是「Windows 渲染链的宿主侧只剩 virtio 通道一条路」，事实 214 补上「还有 gdbstub+PhyMemMode 一条，但每次写都要暂停客人」。现在 virtio 通道**载客了**：`_agent_argv` 已经发出 chardev + `virtio-serial-device` + `virtconsole` 三件套，驱动已经证明能往这个端口写。**缺的只是一个渲染 op**（`src/unipad/guest/protocol.py` 目前只有 install/challenge/status/launch/persist）加客人侧一个读端。而取帧那一环已经 PASS（事实 213：`pmemsave` 一条命令，480,000/480,000 像素与 `screendump` 逐字节相同），送屏幕那一环也已经写好（事实 216）。**item 3 剩下的是协议扩展加客人侧消费者，不再是传输层。**
+
+**还没量的**：宿主→客人这个方向（`native_console_rx_requests`/`rx_bytes` 仍应是 0，这一轮没有读它们），以及客人侧有没有一个进程去读那个端口。这两件是下一步，而且都不需要再构建内核。
+
+| R9am | **item 4 第一次有客人自己发出来的字节：告白真的出现在 agent 通道上，978 字节里第 924 字节起，紧跟 bootloader 的 `ID_AA64PFR0_EL1` 行（即交棒那一刻，正是 `start()` 的运行时点）**（2026-11-01，bundle13，`answer: announced`）：内核侧字节级证据——告白在 ESP 内核（sha256 `dca5b3bb…` 与 `payload.json` 相符）文件偏移 242876、NUL 结尾，`bundle12` 0 次 / `bundle13` 1 次，差值恰好是这一句；`NativeVirtioConsole` 字样 76→78。**「客人→宿主」端到端实测通，事实 203/204 的 0 字节最终答案是「那句 `send()` 从未进过任何内核」**。**item 3 随之改判**：virtio 通道载客了，缺的只是渲染 op 加客人侧读端，传输层不再是阻断；取帧（事实 213）与送屏幕（事实 216）都已就绪。**未测**：宿主→客人方向、客人侧有没有读端 |
