@@ -1021,3 +1021,38 @@ video    base 0x1BC7A0000  800x600  row 3200 bytes  32 bpp
 **所以 item 3 的 Acceptance 拆开看，状态是这样的**：「宿主取得一帧真实像素」**PASS**；「宿主把帧送到屏幕上」缺的是一段 Windows 代码——`SurfaceWindow.present`（`src/unipad/host/winsurface.py:589-624`）已经被真实截图验证过（事实 201），而事实 210 的可达性审计说产品里没有任何代码调用它。**现在它有帧源了**：把这次的 `pmemsave` 取帧 + BGRA 转换接到 `present()` 上，就是一条不依赖任何未构建东西的完整取帧→显示路径。剩下的是客人要真的画东西（事实 198：帧静止，且客人自己的显示驱动帧路径从未运行，`native_legacy_transfer_calls=0`，事实 183）。
 
 | R9ai | **item 3 的「取帧」PASS，而且是 100%：一条 `pmemsave` 从客体物理 `0x1BC7A0000` 读出 1,920,000 字节（0.02 s，1,148,931 非零，50 种值），与 QMP `screendump` 逐像素对拍 **480,000/480,000 全部相同（BGRA）**——不需要 QMTL 窗口、不需要 `memory-backend-file`、不需要 PhyMemMode**（2026-11-01，bundle12，串口出现交棒行）：两条不同代码路径对 48 万像素逐字节相同，所以这是关于帧缓的证据。**第一轮交叉验证因格式假设错了而失败**：`screendump` 写的文件名叫 `.png` 但头是 `P6\n800 600\n255\n`，这台 QEMU 写的是 PPM。帧里有绿条（690 个采样点），与 bootloader 原话「A green bar across the top means the kernel entry code ran」对得上。**「送到屏幕上」现在缺的只是一段 Windows 代码**：`SurfaceWindow.present` 已验证但不被产品调用（事实 210），现在有帧源了 |
+
+
+**事实 214（item 3 的宿主写路径重新打开了，而打开它的正是事实 194 判定「不可关闭」的那个开关：MMU 开启时默认寻址下 `m` 复现 `E14`，`Qqemu.PhyMemMode:1` 之后读到与 `pmemsave` 逐字节相同的物理内存，而且 `M` 写进去的字节被 `pmemsave` 读回来了——事实 194 对默认值是对的，对天花板是错的**）：事实 208/209 把两次物理内存实验的结论全部撤回（客体没启动内核 + 探针地址是零页），并按三条前置条件重跑。第二次跑（协议用法正确的那次）结果是：
+
+```
+the kernel was handed off (2023 serial bytes)
+the bootloader named these physical addresses: ['0x4807c000', '0x4f7e4488', '0x507ac000']
+  0x4807c000: non-zero (cffaedfe0c000001...) -- using it
+  control: g (registers)             -> '005a070cf0ffffff...' (0 ms, vm=paused)
+  control: Q nonsense                -> '' (0 ms, vm=paused)
+  baseline m (MMU on)                -> 'E14'          <-- 事实 194 的判定复现
+  Qqemu.PhyMemMode:1                 -> 'OK'
+  m after PhyMemMode=1               -> 'cffaedfe0c000001...'   <-- 读到物理内存
+  M write                            -> 'OK' (15 ms)
+  readback of the write              -> 'deadbeef'
+physical memory now deadbeef                            <-- pmemsave 确认写入落地
+answer: mode_matters
+```
+
+**四条证据，各自独立**：
+
+1. **`E14` 复现**——客体物理地址 `0x4807c000` 在默认寻址下读不到，与事实 194 一致。而且这一次客体是真的启动了（串口 2023 字节、交棒行在、`kernel_handed_off: true`），所以它不是事实 209 那种「客人从未运行」的假象。
+2. **`Qqemu.PhyMemMode:1` 之后读到正确内容**——`cffaedfe` 是 AArch64 Mach-O magic，且 `stub after PhyMemMode=1 agrees with pmemsave: True`，**逐字节相同**。
+3. **`mode_changed_the_answer: True`**——这是自我验证的那一环：同一个地址、同一次启动，翻转开关前后答案从 `E14` 变成数据。**寻址模式起作用了，而这只有在 MMU 开启且虚拟 != 物理时才可能。**
+4. **写落地了，而且确认写落的不是 gdbstub 自己**——`pmemsave`（QMP，完全另一条代码路径）在写之后读回 `deadbeef`。
+
+**所以事实 194 的结论要按主语拆开**：它对「gdbstub 的默认寻址」是对的，对「这台 QEMU 的天花板」是错的——`_gdb_argv` docstring 里「It needs a build with `memory-backend-file`」那句，现在有了反例。事实 210 由此要修订：**Windows 渲染链的宿主侧不再是「只剩 virtio 通道一条路」，而是有两条**——virtio 通道（不暂停客人，但要客人侧实现一个渲染 op）和 gdbstub + PhyMemMode（不需客人侧改动，但每次写都要暂停客人）。
+
+**必须同时记下的天花板，否则这个结论会被用错**：整个测量过程 `vm=paused`——附挂即暂停，`c` 才恢复（`after cont=running`）。所以这是一个**调试器级**的写路径：适合一次性注入一帧，不适合当合成器。事实 210 已经记过同一个性质（「a backend that holds the guest stopped per frame is a debugger」），现在有了数字：一次写 15 ms，加上暂停/恢复的代价。
+
+**还有一处必须老实记的不一致，因为它关系到第一次跑的读数**：第一次跑（协议用法有误的那次）基线 `m` 返回的是数据而不是 `E14`，两次的 `g` 寄存器也不同（第一次 X0 = `0x507ac000` 即 args 的物理地址，第二次 X0 = `0x0c075a00`）。**同一次启动形状、同一个地址，一次映射一次不映射**，说明客人对该虚拟地址的映射在两次之间变了（交棒行相同，但客人可以在交棒后处于不同阶段）。第二次跑的自验证性（开关翻转改变答案）不依赖这个解释，所以结论不受影响；但**「基线一定返回 E14」这句话不能当成不变量**，这一点与事实 208 记的「探针地址要可证明非零」是同一类仪器纪律。
+
+**顺带修掉的仪器缺陷，它是本轮所有混乱的源头**：GDB remote 协议的 `m`/`M` 长度字段是**十六进制**，而脚本写的是 `f"m{probe:x},32"`——字面量 `32` 被 stub 当成 `0x32` = **50 字节**。于是「要 32 字节」拿回 50 字节，与 `pmemsave` 的 32 字节比较必然不相等，报 `agrees: False`，而**前 32 字节其实完全相同**（多出来的是 `__LINKEDIT`，Mach-O 的段名）。一个协议进制的错误，把一次正确的测量显示成了失败。
+
+| R9aj | **item 3 的宿主写路径重新打开：MMU 开启时默认寻址 `m` 复现 `E14`，`Qqemu.PhyMemMode:1` 之后读到与 `pmemsave` 逐字节相同的物理内存，且 `M` 写入被 `pmemsave` 读回——事实 194 对默认值对、对天花板错**（2026-11-01，bundle12，客体真启动，串口 2023 字节）：`mode_changed_the_answer: True` 是自我验证的一环（翻转开关改变答案，只有 MMU 开且虚拟≠物理时才可能）。**事实 210 由此修订：宿主侧有两条路**——virtio 通道（不暂停客人，需客人侧渲染 op）与 gdbstub+PhyMemMode（不需客人侧改动，但每次写都暂停，`vm=paused`，一次写 15 ms，调试器级）。**必须记的不一致**：第一次跑基线返回数据而非 `E14`（两次 `g` 寄存器不同），故「基线一定 E14」不是不变量。**仪器缺陷是源头**：`m` 的长度字段是十六进制，`,32` 被当成 `0x32`=50 字节，使一次正确的比较显示为失败 |
