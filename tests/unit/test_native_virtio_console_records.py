@@ -541,6 +541,62 @@ def _report_body(source: str) -> str:
     return body[hit.end():i - 1]
 
 
+def test_the_report_path_is_a_friend_of_the_class_whose_member_it_calls(source):
+    """A free function calling a protected member must be declared a friend.
+
+    send() is protected.  native_console_report() is a free function, so
+    reaching it needs a friend declaration inside the class, exactly as
+    native_console_send() and native_console_receive() have.
+
+    This is not a style rule and it is not hypothetical.  Run 41313323081
+    failed archive 6/11 with
+
+        NativeVirtioConsole.cpp:119:33: error: 'send' is a protected member of
+        'NativeVirtioConsole'
+
+    and every source-level guard in this file passed on the commit that caused
+    it, because they read the function's SHAPE -- its name, its signature, its
+    guard, its ordering -- and none of them read the class's access control.
+    The five assertions about this entry point were all green while the driver
+    did not compile.
+
+    So the assertion is on the class, not the function: for every free function
+    this file guards that calls a protected member, the class must name it as a
+    friend.
+    """
+    body = _strip_comments(source)
+    # The BODY, not the parameter list: _call_arguments gives the text between
+    # the parentheses, which for a definition is the signature.  The first
+    # revision of this test made exactly that mistake and then found no member
+    # call to guard.
+    definition = _report_body(body)
+    assert definition is not None, "native_console_report is not defined"
+
+    # Which protected members does the report path actually call?  Only the
+    # ones it names, so a friend grant is required only for those.
+    protected = set(re.findall(
+        r"^\s*(?:IOReturn|bool|void|IOMemoryMap|IOLock|IOService)\s+"
+        r"([A-Za-z_]\w*)\s*\(", body, re.M))
+    called = {name for name in protected if re.search(
+        r"g_console\s*(?:->|\.)\s*" + re.escape(name) + r"\b", definition)}
+    assert called, (
+        "the report path calls no member of the console, so this test has "
+        "nothing to guard; check whether native_console_report was rewritten"
+    )
+
+    friends = set(re.findall(
+        r"^\s*friend\s+((?:IOReturn|bool|void)\s+\w+\s*\([^)]*\)\s*);", body, re.M))
+    normalized = {"".join(f.split()) for f in friends}
+    assert REPORT_SIGNATURE in normalized, (
+        f"native_console_report calls the protected member(s) "
+        f"{sorted(called)} but the class does not declare it a friend with "
+        f"this signature. Found: {sorted(normalized)}. A friend naming a "
+        "different parameter list declares a different overload and grants "
+        "nothing, so the driver does not compile -- measured on run "
+        "41313323081, archive 6/11, with 'send' is a protected member"
+    )
+
+
 def test_the_report_entry_point_is_declared_for_its_callers(source):
     """Declared in the transport header, not only in the .cpp.
 
