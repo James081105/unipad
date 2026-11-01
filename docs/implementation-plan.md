@@ -1189,3 +1189,26 @@ counters after the second write:
 - **virtio-mmio 的队列地址寄存器不在 0x30-0x44，在 0x80/0x90/0xa0**。驱动用 `address(n,v)`（`write32(n,lo); write32(n+4,hi)`）把三个环的物理地址写到 0x80（desc）、0x90（driver/avail）、0xa0（device/used），而 0x30-0x44 是 `QueueSel`/`QueueNum`/`QueueSize`/`QueueReady`。所以 arrival 那一轮读到的 `desc=0x8000000000` 之类是**读错了偏移**的产物，`idx_unchanged` 这个结论因此不成立——**它量的是最后一次配置的队列（queue 1，TX）而不是 RX**。要重读得读 0xa0。
 
 | R9ao | **item 4 的客人侧消费者写好了但从没进内核：`NativeOfflineGPU.cpp`（21,455 字节）是在控制台通道上跑整套 Metal 会话线协议的 broker，自带一整套 `native_gpu_broker_*` 计数器，而内核里 `NativeOfflineGPU`/`native_gpu_broker`/`OFFLINE_METAL`/`OM_WIRE_MAGIC` 四字样各 0 次、十个 broker 符号全 ABSENT（同一张表里 `native_console_ready` 在，排除仪器问题）**（2026-11-01）：根因是 `build-xnu-4k-baseline.sh:306` 的 `NATIVE_OFFLINE_GPU=${XNU_NATIVE_OFFLINE_GPU:-0}`，开关默认关，而 `board.toml` 的 `[kernel]` 只有 `defconfig`/`archives` 两个键、没有任何设置它的机制。**item 4 的形状因此清楚**：传输层已通（事实 217/211）、消费者已写好（本事实），缺的是那一个开关加一次重建。**两条仪器发现**：`cpu_ttep` 在交棒时仍为 0（bootloader 的交棒行早于内核装页表格，等 `cpu_ttep` 本身比固定 900 秒好）；virtio-mmio 队列环地址在 **0x80/0x90/0xa0** 而非 0x30-0x44，arrival 那一轮因此读错偏移、`idx_unchanged` 不成立 |
+
+
+**事实 220（M5 从「BLOCKED，原因笼统」变成了一个有确定形状的代码任务：它要的两件事是「IOKit 服务匹配」和「驱动探测结果」，而且明确要求 **from a guest channel**——而通道现在通了；全仓只有验收器引用这两个事件名，客人侧一行都没有**）：覆盖矩阵（`docs/coverage-matrix.md`，2026-11-01 重新生成）说 M5 BLOCKED，笼统理由是「IOKit 服务匹配与驱动探测——零证据」。读 `milestones.py:2306-2332` 才看清它要的到底是什么：
+
+```
+m5.service_matching   必要服务匹配: IOKit service matching, from a guest channel   p.iokit_service_match
+m5.driver_probe       驱动探测证据: driver probe results, from a guest channel     p.iokit_driver_probe
+```
+
+两条都带 `_ONSITE`（现场）证据域，而且探针是 `_guest_probe`（`:1427`），它的判据是 `_guest_events(view)` 里存在 `event` 字段等于 `iokit.service_match` / `iokit.driver_probe` 的记录。**这些记录从哪来也是确定的**：`_GUEST_LOG_GLOBS`（`:295-301`）只认五种文件名——`**/guest.log`、`**/guest-*.log`、`**/*guest*.log`、`**/guest.json`、`**/guest-*.json`——每行一个 JSON 对象（或整文件一个 JSON dict），并且 `_is_simulation_path()` 会把模拟路径下的记录标记掉，**模拟记录永远不能满足 `onsite` 要求**。文档字符串还把边界写死了：「A serial log is not a guest channel (PRD 7.4)」。
+
+**所以 M5 的充要条件是三件，每件都有确定形状**：
+1. 客人侧往控制台通道发 `{"event":"iokit.service_match",…}` 和 `{"event":"iokit.driver_probe",…}`；
+2. 宿主把通道收到的字节写进一个匹配 `**/guest*.log` 的文件，且路径不在模拟目录下；
+3. 重跑门禁。
+
+**第 1 件目前全仓只有验收器在说，客人侧一行都没有**：`grep -rln "iokit.service_match" --include=*.cpp --include=*.h --include=*.mm vendor/` **返回空**，全仓命中只在 `src/unipad/acceptance/milestones.py`（三处）和一个 `.pyc`。**所以这是一个要新写的客人侧组件，不是要打开的开关。**
+
+**而第 2、3 件的成本现在很低，因为通道已经通了**：事实 217 量到告白真的上线（978 字节、第 924 字节起），`AgentChannelTransport.listen()` 已经能把收到的字节原样取回。**把 `listen()` 的输出落到 `guest.log` 就是宿主侧的全部工作**——不需要新机制，只需要一个落盘的步骤。
+
+**这条发现的价值在于它把 M5 从「零证据」变成一个可执行的任务，而且顺带纠正了一个印象**：覆盖矩阵里 M5/M6/M7/M8/M9/M9a/M9b 的阻断理由都写着「firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction」，读起来像「这些里程碑都在等同一条旧路线」。**不是**：那条免固件路线是 PRD Tier-1 里一个**独立的**条目（`_probe_el1_entry`，`probes.py` 那条探针的文档字符串自己写着「this proves the CPU entered kernel code and does not prove kernel initialisation」），而 M5 要的是另一回事——**从客人通道拿到 IOKit 服务匹配与驱动探测**。我这一路用的固件路线（EDK2 + UNINU + DarwinBoot）已经让 `NativeVirtioConsole::start()` 跑起来了（事实 217），**那本身就是 IOKit 服务匹配加驱动探测成功的一次实例**，只是它还没有以 `guest.log` 的形式交给门禁。
+
+| R9ap | **M5 的形状确定了：它要「IOKit 服务匹配」和「驱动探测结果」两条，且明确 `from a guest channel`（`_ONSITE` 证据域），记录必须落在 `**/guest.log`/`**/guest-*.log`/`**/*guest*.log`/`**/guest.json`/`**/guest-*.json` 之一、每行一个带 `event` 字段的 JSON，模拟路径下的记录一律不算**（2026-11-01，`milestones.py:1427`、`:2306-2332`、`:295-301`）：**全仓只有验收器引用 `iokit.service_match`/`iokit.driver_probe`，客人侧一行都没有**（`grep --include=*.cpp/..h/..mm vendor/` 返回空），所以第 1 件要新写。**第 2、3 件成本很低**：通道已通（事实 217），`listen()` 已能取回字节，落成 `guest.log` 就是宿主侧全部工作。**顺带纠正一个印象**：M5-M9b 的阻断理由都写着免固件路线撞未定义指令，但那是 PRD Tier-1 的**独立**条目；M5 要的是另一回事，而我用的固件路线已经让 `start()` 跑起来，那本身就是服务匹配加探测成功的一次实例，只是没以 `guest.log` 交给门禁 |
