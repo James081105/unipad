@@ -651,3 +651,56 @@ def test_the_mount_report_is_emitted_after_the_mount_is_authorized():
     # And only once: a second emission of the same event is silently dropped by
     # the host (_guest_events uses setdefault), so a reader would never see it.
     assert text.count("native_console_report(mount_record") == 1
+
+
+def test_this_patch_keeps_the_lines_the_next_patch_uses_as_context() -> None:
+    """The patch set has inter-patch dependencies no per-patch check can see.
+
+    ``zzz-boot-progress.patch`` carries a hunk at ``@@ -7389,11 +7393,22 @@``
+    whose CONTEXT is
+
+        (void) mach_vm_allocate_kernel(map, &scratch_addr, ...)
+        user_addr_t init_envp = USER_ADDR_NULL;
+        #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+        int cache_error = native_owner_cache_prepare(...)
+
+    and three of those four lines are lines THIS patch adds.  So the set is
+    order-dependent in a way that :func:`test_every_patch_applies_to_its_own_minus_side`
+    structurally cannot catch: that test reconstructs each patch's minus side,
+    which is the PRISTINE file, and applies it there.  A change that keeps a
+    patch self-consistent can still break the patch that follows it.
+
+    Measured: build 41346094752 failed at ``build-xnu-4k-baseline.sh:44`` with
+    ``patch failed: bsd/kern/kern_exec.c:7389`` -- a line in
+    ``zzz-boot-progress.patch``, from an edit to THIS patch that inserted a
+    diagnostic between the two shared lines.  The failure named a file nobody
+    had touched.
+
+    So the constraint is asserted here, where the edit happens: the two lines
+    ``zzz-boot-progress.patch`` needs adjacent must stay adjacent, in its order.
+    """
+    patch = _mount_patch()
+    if patch is None:
+        pytest.skip("the offline owner cache mount patch is not in this pinned tree")
+    text = patch.read_text(encoding="utf-8")
+    lines = text.split("\n")
+
+    # The other patch's context, spelled as the lines this patch must emit.
+    first = "mach_vm_allocate_kernel(map, &scratch_addr"
+    second = "user_addr_t init_envp = USER_ADDR_NULL;"
+
+    for index, line in enumerate(lines):
+        if first not in line:
+            continue
+        # Context lines carry a leading space, added lines a '+'; either way the
+        # NEXT line has to be the shared one, with nothing in between.
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        assert nxt.lstrip("+ ").strip() == second, (
+            "the line after mach_vm_allocate_kernel is "
+            f"{nxt.strip()!r}, not {second!r}. zzz-boot-progress.patch:200-205 "
+            "uses those two lines as its context, so anything between them "
+            "breaks a patch that was not edited (measured: build 41346094752 "
+            "failed at kern_exec.c:7389)"
+        )
+        return
+    pytest.fail(f"{first!r} is not in the patch, so the constraint is unchecked")
