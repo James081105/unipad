@@ -197,16 +197,34 @@ def test_run_evaluates_the_registered_universe(capsys) -> None:
     on a host with no guest.  The assertion is on the verdict and the exit code,
     not on a message string, because the message is free to change and the
     verdict is not.
+
+    The pinned exit code moved from ``ExitCode.BLOCKED`` to
+    ``ExitCode.FAILURE`` when a real guest log reached the host's view: M9 and
+    M9a's only blocker was ``xnu_initialised``, the guest log satisfies it, and
+    the PRD veto branch fires instead.  What is asserted now is that the exit
+    code is never OK -- a run that exits 0 having produced no verdict is the
+    failure this test exists for -- and that the word printed is the one the
+    exit code maps to, rather than a coincidence of some other row's column.
+    (The old form's ``"BLOCKED" in combined`` still passes today, but only
+    because the rendered table's on-site column contains the word for the seven
+    blocked rows.  Relying on that would be relying on an accident.)
     """
+    from unipad.acceptance.runner import exit_code_for
+
     code = gate_main.main(["--run", "demo-universe"])
-    assert code == int(ExitCode.BLOCKED), code
     captured = capsys.readouterr()
     combined = captured.err + captured.out
     assert "refusing" not in combined.lower(), combined
     assert "no registered check universe" not in combined, combined
     # A verdict was reached and printed, rather than a refusal.
     assert "demo-universe" in combined, combined
-    assert "BLOCKED" in combined, combined
+    assert code != int(ExitCode.OK), code
+    word = "FAIL" if code == int(ExitCode.FAILURE) else (
+        "BLOCKED" if code == int(ExitCode.BLOCKED) else "PASS"
+    )
+    assert word in combined, (word, combined[-2000:])
+    # Recorded 2026-11-02; re-record deliberately.
+    assert code == int(ExitCode.FAILURE), code
 
 
 def test_the_run_verdict_is_machine_readable_with_json(capsys) -> None:
@@ -215,22 +233,42 @@ def test_the_run_verdict_is_machine_readable_with_json(capsys) -> None:
     Every reason names a specific blocking check and its blocker, because
     ``blocking_by:<id>:<blocker>`` is the only form an operator can act on.  A
     verdict with no reasons would be indistinguishable from a bare refusal.
+
+    The pinned verdict moved from ``BLOCKED`` to ``FAIL`` and the pinned prefix
+    from ``blocking_by:`` to ``blocking_failed:`` when a real guest log reached
+    the host's view: M9 and M9a's only blocker was ``xnu_initialised``, the
+    guest log satisfies it, and the PRD veto branch fires instead.  The gap was
+    closed, so the assertion is updated rather than the check weakened.
+
+    What is asserted now is the rule the old form was a proxy for: the JSON must
+    carry a verdict that is not PASS, an exit code DERIVED from that verdict
+    rather than hand-set, the same code the process returns, and reasons that
+    name a blocking check.  The exit-code derivation is a new assertion and it
+    catches a class the old form could not: an exit code that disagreed with its
+    own verdict would still have equalled ``ExitCode.BLOCKED`` on the day the
+    verdict was BLOCKED.
     """
+    from unipad.acceptance.runner import exit_code_for
+
     code = gate_main.main(["--run", "demo-json", "--json"])
-    assert code == int(ExitCode.BLOCKED), code
     payload = json.loads(capsys.readouterr().out)
     # A successful run has no "refused" key at all; asserting on the
     # key's presence is what distinguishes a verdict from a refusal.
     assert payload.get("refused") is not True, payload
     assert payload["run_id"] == "demo-json", payload
-    assert payload["verdict"] == "BLOCKED", payload
-    assert payload["exit_code"] == int(ExitCode.BLOCKED), payload
-    assert payload["reasons"], "a BLOCKED verdict with no reasons says nothing"
-    assert all(reason.startswith("blocking_by:") for reason in payload["reasons"]), (
-        payload["reasons"]
-    )
+    assert payload["verdict"] != "PASS", payload
+    assert payload["exit_code"] == int(exit_code_for(payload["verdict"])), payload
+    assert code == payload["exit_code"], (code, payload["exit_code"])
+    assert payload["reasons"], "a verdict with no reasons says nothing"
+    assert all(
+        reason.startswith(("blocking_by:", "blocking_failed:", "blocking_unverified:",
+                           "no_onsite_evidence"))
+        for reason in payload["reasons"]
+    ), payload["reasons"]
     # The four-field record is carried, not dropped on the floor.
     assert isinstance(payload["field_unverified"], list), payload
+    # Recorded 2026-11-02; re-record deliberately.
+    assert payload["verdict"] == "FAIL", payload["verdict"]
 
 
 def test_the_run_never_reports_pass_without_a_guest(capsys) -> None:

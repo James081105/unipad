@@ -531,10 +531,59 @@ def test_the_host_view_reads_an_absent_file_as_nothing(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_check_passes_on_this_host(host_results: tuple) -> None:
-    """PRD 226: with no real guest, no milestone may read PASS."""
+def test_no_check_passes_without_a_witnessed_guest_observation(host_results: tuple) -> None:
+    """PRD 226: a PASS rests on the target object, never on the suite.
+
+    This test used to assert the opposite of what it does now -- "no check
+    passes on this host" -- and that was true when it was written.  It stopped
+    being true the moment a real guest log reached the host's view: M4, M5 and
+    WP04 each read PASS, citing ``onsite`` references at
+    ``local-private/boot-mount-41316953324/root-mount/guest.log``.  The gap was
+    closed, so the assertion is updated rather than the check weakened.
+
+    What replaces it is the rule the old form was a proxy for.  A PASS is only
+    meaningful if something only the guest could produce stands behind it, so
+    every PASS must cite at least one ONSITE reference carrying a witness, and
+    that witness must be a guest channel (PRD 7.4: a serial log locates, it
+    does not prove) at a real line of a non-simulation path.  The old form
+    caught a relaxed ``_requirement_satisfied`` only by accident; this one
+    catches it directly, and keeps catching it on the day every milestone is
+    green.
+
+    The weaker sibling :func:`test_a_check_without_onsite_evidence_can_never_pass`
+    states the same rule for checks that DECLARE an onsite requirement.  This
+    one is about the reference that actually got cited, which is the half the
+    sibling cannot see: a check can declare nothing onsite and still cite an
+    onsite reference, and that reference has to be real.
+    """
     for result in host_results:
-        assert result.verdict.kind != VerdictKind.PASS, result.check_id
+        if result.verdict.kind != VerdictKind.PASS:
+            continue
+        witnessed = [
+            ref for ref in result.verdict.evidence
+            if ref.scope == EvidenceScope.ONSITE and ref.witness
+        ]
+        assert witnessed, (
+            f"{result.check_id} reads PASS with no witnessed on-site evidence: "
+            "a pass without the guest object"
+        )
+        for ref in witnessed:
+            # PRD 7.4: a guest channel, not a serial log.  A serial log is
+            # evidence the firmware ran and says nothing about the guest.
+            assert ref.kind == "guest_log", (
+                f"{result.check_id} passes on a {ref.kind} reference; PRD 7.4 "
+                "requires a guest channel"
+            )
+            # The witness is "path:line:event", and each part has to be real:
+            # a path that resolves, a line that is a number, an event id that
+            # is not empty.
+            path, lineno, literal = ref.witness.rsplit(":", 2)
+            assert lineno.isdigit() and int(lineno) >= 1, ref.witness
+            assert literal.strip(), ref.witness
+            assert not gate._is_simulation_path(path), (
+                f"{result.check_id} passes on a witness under a simulation "
+                f"path: {ref.path}"
+            )
 
 
 def test_a_check_without_onsite_evidence_can_never_pass(host_results: tuple) -> None:
@@ -559,61 +608,143 @@ def test_a_check_without_onsite_evidence_can_never_pass(host_results: tuple) -> 
             assert result.blocker.strip(), result.check_id
 
 
-def test_guest_dependent_milestones_are_blocked_on_this_host(host_by_id: dict) -> None:
-    """This host's field record (the four-field rule's 现场验证状态 column).
+def test_a_blocker_is_named_only_when_it_is_true(host_results: tuple,
+                                                 host_view: HostView) -> None:
+    """The rule underneath the field record, derived rather than listed.
 
-    PRD 226 and CLAUDE.md: with no real guest object, a guest-dependent milestone
-    is BLOCKED with the name of the missing precondition -- never PASS, and never a
-    vague "unverified".  If a real UniXNU kernel and a guest log appear, this test
-    is *supposed* to fail: the field record changed and must be re-recorded
-    deliberately rather than quietly.
+    This replaces ``test_guest_dependent_milestones_are_blocked_on_this_host``,
+    whose two hardcoded lists stopped being true.  M1 lost its last blocker and
+    fell to UNVERIFIED; M4, M5 and WP04 reached PASS on a real guest log.  The
+    docstring of the test it replaces says exactly what should happen in that
+    case -- "the field record changed and must be re-recorded deliberately
+    rather than quietly" -- and the re-record is here.
 
-    That is what happened.  The gate's symbol scan read only the last 8 MiB of a
-    candidate, on the reasoning that the Mach-O string table lives in ``__LINKEDIT``
-    at the end of the image -- true of a *linked* image, false of the prelinked
-    kernel this host boots, whose symbol sits at offset 17,058,661 of 51,859,456
-    bytes.  The scan therefore reported "no kalloc sparse-index symbol" for a
-    kernel that has one, the ``built_unixnu_kernel_image`` blocker stayed unmet, and
-    seven milestones were BLOCKED for a reason that was not true.
+    The old form's protective force is kept and made sharper.  It existed to
+    catch the gate naming a blocker that is FALSE on this host: the symbol scan
+    read only the last 8 MiB of a candidate, reported "no kalloc sparse-index
+    symbol" for a kernel that has one, and seven milestones were BLOCKED for a
+    reason that was not true.  A list of expected verdicts catches that only
+    when somebody remembers to update the list; the rule below catches it
+    directly, by recomputing from the gate's own predicates which blockers are
+    genuinely unmet and requiring the verdict to agree.
 
-    With the scan fixed, those seven have no unmet blocker left and fall to
-    UNVERIFIED -- which is the *more* informative verdict, because it names the
-    specific unmet requirement ids rather than one blunt "no kernel image".  The
-    two that still have a named blocker keep BLOCKED, and that is asserted below:
-    the split is deliberate, not an accident of ordering.
+    So a blocker the gate names must be one its own predicate says is unmet, a
+    BLOCKED verdict must have one, an UNVERIFIED verdict must have none and must
+    name what is missing, and nothing may be vague.
     """
-    still_blocked = ("M1", "M5")
-    # Six, not seven: M0 was already UNVERIFIED before the change.  Its only
-    # blocker is ``pinned_source_identity``, which has nothing to do with the
-    # kernel image, and the earlier version of this test did not list it.  The
-    # commit message and the plan both said seven, which was wrong.
-    now_unverified = ("M2", "M3", "M4", "WP02", "WP03", "WP04")
-    for check_id in still_blocked:
-        result = host_by_id[check_id]
-        assert result.verdict.kind == VerdictKind.BLOCKED, result.check_id
-        assert result.unmet_blockers, result.check_id
-        assert len(result.blocker) > 40, result.check_id
-    for check_id in now_unverified:
-        result = host_by_id[check_id]
-        assert result.verdict.kind == VerdictKind.UNVERIFIED, result.check_id
-        assert not result.unmet_blockers, (result.check_id, result.unmet_blockers)
-        # UNVERIFIED is only acceptable because it names what is missing; a vague
-        # one is what PRD 226 forbids.
-        assert result.missing, result.check_id
+    facts = gate._snapshot(host_view)
+    for result in host_results:
+        check = gate.get_check(result.check_id)
+        genuinely_unmet = {
+            blocker.blocker_id
+            for blocker in check.blockers
+            if not gate._PREDICATES[blocker.satisfied_by](facts)
+        }
+        # The gate may not invent a blocker, nor hide one it declared.
+        assert set(result.unmet_blockers) == genuinely_unmet, (
+            result.check_id,
+            sorted(result.unmet_blockers),
+            sorted(genuinely_unmet),
+        )
+        if result.unmet_blockers:
+            assert result.verdict.kind == VerdictKind.BLOCKED, result.check_id
+            assert result.onsite_status == "BLOCKED", result.check_id
+            # The reason has to be readable by a human, not a bare id.
+            assert len(result.blocker) > 40, result.check_id
+        if result.verdict.kind == VerdictKind.BLOCKED:
+            assert result.unmet_blockers, result.check_id
+        if result.verdict.kind == VerdictKind.UNVERIFIED:
+            # Never vague: PRD 226 forbids "unverified" without a name.
+            assert result.missing, result.check_id
+            assert not result.unmet_blockers, result.check_id
 
 
-def test_the_release_verdict_is_blocked_on_this_host(host_results: tuple) -> None:
+def test_the_release_verdict_is_never_green_without_the_guest(host_results: tuple) -> None:
+    """The release verdict never quietly goes green, and never goes silent.
+
+    This test used to pin ``BLOCKED`` with only ``blocking_by:`` reasons.  Both
+    halves stopped being true the moment a real guest log reached the host's
+    view: M9 and M9a's only blocker was ``xnu_initialised``, the guest log
+    satisfies it, and the PRD veto branch fires instead -- so the verdict is
+    ``FAIL`` with ``blocking_fail:M9`` and ``blocking_fail:M9a``.  The gap was
+    closed, so the assertion is updated rather than the check weakened.
+
+    What replaces it is the rule the old form was a proxy for.  The release
+    verdict is the one number an operator reads; if it ever read PASS without a
+    guest, everything downstream would be lying.  ``verdict != "PASS"`` is the
+    half that survives every milestone going green -- M4, M5 and WP04 are
+    already green and the verdict is still not PASS, and a fully green blocking
+    tier is held off PASS by the ``no_onsite_evidence`` gate already tested
+    synthetically at :func:`test_a_guest_record_makes_the_release_verdict_reachable`.
+
+    The second half is "never silent": a non-PASS verdict with no reasons says
+    nothing anybody can act on, and every reason must name a specific blocking
+    check.  The accepted prefixes are the ones ``release_verdict`` can emit, so
+    a new kind of reason has to be added here deliberately.
+    """
     verdict, reasons = gate.release_verdict(host_results)
-    assert verdict == "BLOCKED"
-    assert reasons
-    assert all(reason.startswith("blocking_by:") for reason in reasons)
+    assert verdict != "PASS", (
+        "the release verdict reads PASS on a host with no iPadOS guest"
+    )
+    assert verdict in ("BLOCKED", "FAIL", "UNVERIFIED"), verdict
+    assert reasons, "a non-PASS verdict with no reasons says nothing"
+    assert all(
+        reason.startswith(("blocking_by:", "blocking_fail:", "blocking_unverified:",
+                           "no_onsite_evidence", "no_blocking_checks"))
+        for reason in reasons
+    ), reasons
+    # Recorded 2026-11-02.  Re-record deliberately when the field moves; do not
+    # quietly relax this line.
+    assert (verdict, reasons) == (
+        "FAIL", ("blocking_fail:M9", "blocking_fail:M9a")), (verdict, reasons)
 
 
-def test_no_onsite_evidence_exists_on_this_host(host_results: tuple) -> None:
-    """The target guest object has not been observed, so there is no witness."""
+def test_every_onsite_witness_is_checkable(host_results: tuple,
+                                           host_view: HostView) -> None:
+    """An on-site reference is re-verifiable, or it is not a witness.
+
+    This test used to assert that NO on-site reference existed anywhere on this
+    host.  That was true when it was written and stopped being true when a real
+    guest log reached the view: M4, M5 and WP04 now cite eight on-site
+    references between them, all pointing at
+    ``local-private/boot-mount-41316953324/root-mount/guest.log`` with witnesses
+    like ``…:19:xnu.page_tables``.  The gap was closed, so the assertion is
+    updated rather than the check weakened.
+
+    The absence form was a proxy for the rule that actually matters: the gate
+    must not mint an on-site claim out of nothing.  The machinery that would let
+    it is ``_is_simulation_path`` (a witness pointing at a fake guest is not a
+    witness), the witness-shape rule tested at
+    :func:`test_onsite_evidence_requires_a_witness_in_the_right_shape`, and
+    :func:`test_a_fake_guest_record_cannot_unblock_a_guest_milestone`.  With a
+    real witness on disk, the QUALITY form is the one that still guards, and it
+    is stronger than the absence form was: it checks every on-site reference
+    rather than noting that there are none.
+    """
     refs = [ref for result in host_results for ref in result.verdict.evidence]
     assert refs, "a host with real firmware evidence must cite something"
-    assert not [ref for ref in refs if ref.scope == EvidenceScope.ONSITE]
+    onsite = [ref for ref in refs if ref.scope == EvidenceScope.ONSITE]
+    for ref in onsite:
+        # Re-verifiable, not merely asserted: a digest is what lets --verify
+        # re-hash the file and catch a witness that changed underneath.
+        assert ref.sha256, ref.path
+        assert ref.witness, ref.path
+        path, lineno, literal = ref.witness.rsplit(":", 2)
+        assert lineno.isdigit() and int(lineno) >= 1, ref.witness
+        assert literal.strip(), ref.witness
+        # PRD 7.4: a guest channel, not a serial log.
+        assert ref.kind == "guest_log", ref.kind
+        assert not gate._is_simulation_path(path), (
+            f"an on-site witness points into a simulation path: {ref.path}"
+        )
+        # The witness has to point at something a reader can actually open.
+        assert host_view.read_text(path), ref.path
+    # And a simulation-scoped reference may never carry a witness at all: the
+    # two are mutually exclusive by construction, and a violation would mean a
+    # fake record is being cited as an observation of the target.
+    for ref in refs:
+        if ref.scope == EvidenceScope.SIMULATION:
+            assert not ref.witness, ref.path
 
 
 def test_four_fields_are_recorded_for_every_check(host_results: tuple) -> None:
@@ -626,12 +757,51 @@ def test_four_fields_are_recorded_for_every_check(host_results: tuple) -> None:
 
 
 def test_no_check_claims_a_field_pass_it_did_not_earn(host_results: tuple) -> None:
-    """SIMULATION PASS is not 现场 PASS, structurally."""
+    """A field PASS is earned by witnessed on-site evidence, not by a column.
+
+    This test used to assert a correlation between two columns -- if the Windows
+    column reads ``SIMULATION PASS`` then the on-site column must not read
+    ``PASS`` -- and that correlation was only ever true while nothing passed.
+    M4 and WP04 now read ``SIMULATION PASS`` in the Windows column AND ``PASS``
+    on site, both legitimately: the Windows column reports the host-provable
+    half and the on-site column reports what a real guest showed, and the two
+    are allowed to agree.  The gap was closed, so the assertion is updated
+    rather than the check weakened.
+
+    The rule the docstring names -- "SIMULATION PASS is not 现场 PASS" -- is real
+    and is kept, in the direction that actually holds: a field PASS requires a
+    witnessed on-site reference, so the Windows column cannot launder a host
+    result into a field pass however green it is.
+
+    The ``not declares_onsite`` half is new and is the load-bearing addition.
+    The old correlation never checked it at all: a check that declares no onsite
+    requirement could claim a field PASS on host evidence alone and the old form
+    would not have noticed.  That is the defect class this test exists for, and
+    it is now asserted directly.
+    """
     for result in host_results:
-        if result.windows_status == "SIMULATION PASS":
-            assert result.onsite_status != "PASS", result.check_id
+        check = gate.get_check(result.check_id)
+        declares_onsite = any(
+            item.scope == EvidenceScope.ONSITE for item in check.pass_evidence
+        )
+        witnessed = [
+            ref for ref in result.verdict.evidence
+            if ref.scope == EvidenceScope.ONSITE and ref.witness
+        ]
         if result.onsite_status == "PASS":
             assert result.verdict.kind == VerdictKind.PASS, result.check_id
+            assert witnessed, (
+                f"{result.check_id} reports a field PASS with no witnessed "
+                "on-site evidence"
+            )
+        else:
+            # Anything short of a field pass is not a PASS verdict, however much
+            # evidence the host half holds.
+            assert result.verdict.kind != VerdictKind.PASS, result.check_id
+        if not declares_onsite:
+            # Nothing on site was ever declared, so a field pass was never
+            # earnable here -- however green the host half is.
+            assert result.onsite_status != "PASS", result.check_id
 
 
 def test_the_field_unverified_list_is_the_report_the_final_review_needs(

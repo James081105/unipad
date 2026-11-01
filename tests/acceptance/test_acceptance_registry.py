@@ -185,18 +185,51 @@ def _evaluate(tmp_path: Path, **overrides: object):
     ).run()
 
 
-def test_a_run_on_this_host_is_blocked_and_names_its_blockers(tmp_path: Path) -> None:
+def test_a_run_on_this_host_names_its_blockers(tmp_path: Path) -> None:
     """The honest verdict, end to end.
 
-    Not UNVERIFIED, not PASS, and not silent: every reason names a specific
-    blocking check and the blocker it hit, which is the only form an operator
-    can act on.
+    Not PASS, and not silent: every reason names a specific blocking check and
+    the blocker it hit, which is the only form an operator can act on.
+
+    This test used to pin ``BLOCKED`` with exit 3 and only ``blocking_by:``
+    reasons.  All three stopped being true when a real guest log reached the
+    host's view: M9 and M9a's only blocker was ``xnu_initialised``, the guest
+    log satisfies it, and the PRD veto branch fires instead -- so the verdict is
+    ``FAIL`` with exit 1 and ``blocking_failed:M9`` / ``blocking_failed:M9a``.
+    The gap was closed, so the assertion is updated rather than the check
+    weakened.
+
+    What replaces it is the rule the old form was a proxy for, and the module
+    docstring states the purpose of pinning it: "so a future change that makes
+    the gate greener has to break a test to do it".  ``verdict != "PASS"`` is
+    the half that does that -- it survives every milestone going green, because
+    a green blocking tier is held off PASS by the ``no_onsite_evidence`` gate
+    that :func:`test_forced_green_probes_cannot_produce_a_pass` drives directly.
+
+    The exit code is now required to be DERIVED from the verdict rather than
+    hand-set.  That is a defect class the old form could not see: an exit code
+    that disagreed with its verdict would still have equalled ``ExitCode.BLOCKED``
+    on the day the verdict was BLOCKED, and would quietly mean something else the
+    day it was not.
     """
+    from unipad.acceptance.runner import exit_code_for
+
     outcome = _evaluate(tmp_path)
-    assert outcome.verdict == "BLOCKED", outcome.verdict
-    assert outcome.exit_code == ExitCode.BLOCKED, outcome.exit_code
-    assert outcome.reasons, "a BLOCKED verdict with no reasons says nothing"
-    assert all(r.startswith("blocking_by:") for r in outcome.reasons), outcome.reasons
+    assert outcome.verdict != "PASS", outcome.verdict
+    assert outcome.exit_code == exit_code_for(outcome.verdict), (
+        outcome.verdict, outcome.exit_code
+    )
+    assert outcome.exit_code != ExitCode.OK, outcome.exit_code
+    assert outcome.reasons, "a non-PASS verdict with no reasons says nothing"
+    assert all(
+        r.startswith(("blocking_by:", "blocking_failed:", "blocking_unverified:",
+                      "no_onsite_evidence"))
+        for r in outcome.reasons
+    ), outcome.reasons
+    # Recorded 2026-11-02.  Re-record deliberately when the field moves.
+    assert (outcome.verdict, outcome.exit_code) == ("FAIL", ExitCode.FAILURE), (
+        outcome.verdict, outcome.exit_code
+    )
 
 
 def test_forced_green_probes_cannot_produce_a_pass(tmp_path: Path) -> None:
@@ -235,19 +268,42 @@ def test_the_release_verdict_changes_when_a_gate_leaves_the_blocking_tier(
 ) -> None:
     """The承重 test DESIGN §7.1 asks for: tier is data, and it must matter.
 
-    Demote M10a alone.  With the real tier its blocker appears in the release
-    reasons; demoted, it does not -- while every other gate still blocks, so the
-    verdict string is unchanged and the *composition* is what moves.  Asserting
-    on the string would pass either way; asserting on M10a's presence is what
-    proves the tier table is load-bearing rather than decoration.
+    Demote one gate the verdict actually NAMES, and its reason must leave the
+    list -- while every other gate still blocks, so the verdict string is
+    unchanged and the *composition* is what moves.  Asserting on the string
+    would pass either way; asserting on the named gate's presence is what proves
+    the tier table is load-bearing rather than decoration.
 
-    M10a rather than M0: M0 is UNVERIFIED, and ``release_verdict`` reports
-    BLOCKED before UNVERIFIED, so M0's reason never reaches the list either way
-    and the test would pass without testing anything.
+    The target used to be hardcoded as ``M10a``.  That stopped working when the
+    verdict moved from BLOCKED to FAIL: ``release_verdict`` checks FAIL before
+    BLOCKED, so M9 and M9a's ``blocking_failed:`` reasons are reported and NO
+    ``blocking_by:`` reason reaches the list at all -- which means the old
+    assertion failed not because tier stopped mattering but because the gate it
+    picked had stopped being named.  Deriving the target from the measured
+    reasons is what keeps the test testing tier rather than testing one gate's
+    current verdict.
+
+    The recorded caveat: the final "verdict is unchanged" assertion holds only
+    while the demoted gate is not the sole carrier of the run's worst kind.
+    Deriving the target makes that true by construction today (M9 and M9a both
+    FAIL), and if it ever stops being true the test should say so rather than
+    pass.
     """
     from dataclasses import replace
 
-    target = "M10a"
+    def named(reasons: tuple) -> set:
+        return {
+            reason.split(":", 2)[1]
+            for reason in reasons
+            if reason.startswith(("blocking_by:", "blocking_failed:",
+                                  "blocking_unverified:"))
+        }
+
+    with_tier = _evaluate(tmp_path / "a", checks=registry.CHECKS)
+    before = named(with_tier.reasons)
+    assert before, with_tier.reasons
+    # A gate the verdict actually names, so demoting it must move the verdict.
+    target = sorted(before)[0]
 
     def demote(rows: tuple) -> tuple:
         return tuple(
@@ -255,18 +311,15 @@ def test_the_release_verdict_changes_when_a_gate_leaves_the_blocking_tier(
             for row in rows
         )
 
-    with_tier = _evaluate(tmp_path / "a", checks=registry.CHECKS)
-    assert any(r.startswith("blocking_by:%s:" % target) for r in with_tier.reasons), (
-        with_tier.reasons
-    )
-
     demoted = _evaluate(tmp_path / "b", checks=demote(registry.CHECKS))
-    assert not any(r.startswith("blocking_by:%s:" % target) for r in demoted.reasons), (
-        demoted.reasons
-    )
+    after = named(demoted.reasons)
+    assert target in before and target not in after, (target, sorted(before), sorted(after))
     # ...and the rest of the blocking tier still blocks, so this is a change in
     # composition and not in whether the gate runs at all.
-    assert any(r.startswith("blocking_by:") for r in demoted.reasons), demoted.reasons
+    assert after, demoted.reasons
+    assert with_tier.verdict == demoted.verdict, (
+        with_tier.verdict, demoted.verdict
+    )
 
 
 def test_a_check_with_no_probe_is_blocked_not_failed(tmp_path: Path) -> None:
