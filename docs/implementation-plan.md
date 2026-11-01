@@ -996,3 +996,28 @@ video    base 0x1BC7A0000  800x600  row 3200 bytes  32 bpp
 **同时要诚实记下这条路的天花板**：`pmemsave` 是只读的，所以「取帧」可行不等于「写帧」可行。写的那一半仍然要过 gdbstub 的 `M` 包，也就仍然要过 PhyMemMode 那个问题——而那个问题按事实 208/209 是 UNMEASURED（两次实验的客体都没启动内核，探针地址还是零页）。`phymem-retry.py` 已经按三条前置条件写好（staged 两个缺失成员、串口确认交棒行、探针地址先用 `pmemsave` 证明非零），可以直接跑。
 
 | R9ah | **事实 194 的「宿主没有写客人内存的路」只对 gdbstub 成立：走客人自己的页表格（`guestobserve.py:710-744` 四级描述符）+ `pmemsave` 读物理，在 MMU 开启的真启动上读到了内核内存（`va 0xfffffff00c106268 -> pa 0x4ff06268`，读回值自洽）**（2026-11-01，事实 211 那次启动）：宿主自己当 MMU，而不是求 gdbstub 当 MMU。**对 item 3 的直接后果**：串口日志给出 `video base 0x1BC7A0000 800x600 row 3200 32bpp`，帧缓物理地址已知，`pmemsave` 已量过可用——**取帧不需要 QMTL 窗口、不需要 `memory-backend-file`、不需要 PhyMemMode**，事实 210 的「只剩 virtio 通道一条路」要补成「取帧已有一条可用路，缺的是送到屏幕那一段」。**天花板**：`pmemsave` 只读，写帧仍要过 gdbstub `M`，PhyMemMode 那个问题按事实 208/209 仍是 UNMEASURED |
+
+
+**事实 213（item 3 的「取帧」量到了，而且是 100%：宿主用一条 `pmemsave` 从客体物理内存读出整个帧缓，与 QMP `screendump` 逐像素对拍，480,000/480,000 全部相同（BGRA）——不需要 QMTL 共享窗口、不需要 `memory-backend-file`、不需要 `Qqemu.PhyMemMode`**）：事实 212 推断「取帧可能已经有一条可用路」，现在量了。对 `bundle12` 做一次完整启动（ESP staged `scratch-data.img` + `kernel.macho.trustcache`，串口出现交棒行），然后：
+
+- **地址和几何从客人自己的日志里解析**，不是硬编码：`video base 0x1BC7A0000 800x600 row 3200 bytes 32 bpp`；
+- **一条 `pmemsave`**：`pmemsave: 1920000/1920000 bytes in 0.02s, 1148931 non-zero, 50 distinct values`——0.02 秒，比一次 gdbstub 往返还快；
+- **行跨度核对为真**：`row 3200 vs width*bpp/8 = 3200: True`；
+- **帧在 5 秒内不变**：`frame_static_over_5s: True`（与事实 198 一致，静止是预期结果，不是缺陷）。
+
+**承重的那一项是交叉验证，而它第一轮因为一个格式假设错了而没做成，值得记下错在哪**：`screendump` 写出来的文件叫 `screendump.png`，但它的头四个字节是 `P6\n800 600\n255\n`——**这台 QEMU 的 `screendump` 写的是 PPM 不是 PNG**（1,440,015 字节 = 15 字节头 + 800x600x3）。第一版解码器按 PNG 解，于是报 `screendump_decoded: false`。修正后按 P6 解析，然后逐个像素对拍四种通道序：
+
+```
+  RGBA: 142934/480000 pixels identical (29.7779%)
+  BGRA: 480000/480000 pixels identical (100.0000%)
+  ARGB:  87023/480000 pixels identical (18.1298%)
+  ABGR:  87023/480000 pixels identical (18.1298%)
+```
+
+**BGRA 是 100.0000%，一个像素都不差。** 这不是「差不多对」：`pmemsave` 和 `screendump` 是两条完全不同的代码路径，它们对 48 万个像素给出逐字节相同的结果，所以这个判据是关于帧缓的证据，不是关于某一个读取器的证据。通道序也由此确定（BGRA），不需要猜。
+
+**帧里确实有内容，而且内容与 bootloader 自己的话对得上**：主色是深底 `(11,12,15)`，另有纯黑、**纯绿 `(0,255,0)` 690 个采样点**、灰 `(152,152,152)`、蓝 `(42,91,215)`、白 `(255,255,255)`；第 420-599 行是 144000/144000 全非零的实心带。而 bootloader 在交棒前打印的原话是「A green bar across the top means the kernel entry code ran」——**帧里那条绿条就是客人自己在报告内核入口代码跑过了**。
+
+**所以 item 3 的 Acceptance 拆开看，状态是这样的**：「宿主取得一帧真实像素」**PASS**；「宿主把帧送到屏幕上」缺的是一段 Windows 代码——`SurfaceWindow.present`（`src/unipad/host/winsurface.py:589-624`）已经被真实截图验证过（事实 201），而事实 210 的可达性审计说产品里没有任何代码调用它。**现在它有帧源了**：把这次的 `pmemsave` 取帧 + BGRA 转换接到 `present()` 上，就是一条不依赖任何未构建东西的完整取帧→显示路径。剩下的是客人要真的画东西（事实 198：帧静止，且客人自己的显示驱动帧路径从未运行，`native_legacy_transfer_calls=0`，事实 183）。
+
+| R9ai | **item 3 的「取帧」PASS，而且是 100%：一条 `pmemsave` 从客体物理 `0x1BC7A0000` 读出 1,920,000 字节（0.02 s，1,148,931 非零，50 种值），与 QMP `screendump` 逐像素对拍 **480,000/480,000 全部相同（BGRA）**——不需要 QMTL 窗口、不需要 `memory-backend-file`、不需要 PhyMemMode**（2026-11-01，bundle12，串口出现交棒行）：两条不同代码路径对 48 万像素逐字节相同，所以这是关于帧缓的证据。**第一轮交叉验证因格式假设错了而失败**：`screendump` 写的文件名叫 `.png` 但头是 `P6\n800 600\n255\n`，这台 QEMU 写的是 PPM。帧里有绿条（690 个采样点），与 bootloader 原话「A green bar across the top means the kernel entry code ran」对得上。**「送到屏幕上」现在缺的只是一段 Windows 代码**：`SurfaceWindow.present` 已验证但不被产品调用（事实 210），现在有帧源了 |
