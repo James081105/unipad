@@ -1169,3 +1169,23 @@ counters after the second write:
 **下一步**：走第 1 条。同时把 guest agent 作为独立代码任务并行推进（它本来就要做，而且它与这个问题不互斥）。
 
 | R9an | **RX 那一轮的 0 被我读错了，真实结论是「未测量」：`native_console_rx_requests` 数的是「有没有用户态客户端来取」（`receive()` 只从 `NativeVirtioConsoleClient::receiveAction` 这个 externalMethod 进来），不是「字节有没有到达」——没有 guest agent，这两个计数器必然是 0**（2026-11-01，bundle13，写 54 字节两轮后 RX 仍 0/0、failures 0）：报成 `written_but_not_received` 会造出一个假阻断。**TX 侧是硬的**：`tx_requests=1`、`tx_bytes=54`，54 正是告白长度，与宿主在通道上看到的 54 字节互相独立对上。**要真量到达**：读 virtio-mmio 队列寄存器（`0xa003e00+0x30..0x44`）拿队列环物理地址再看 used ring（最便宜，不需重建）；或给驱动加到达计数器重建；或建 guest agent（同时是 item 4 必经路） |
+
+
+**事实 219（item 4 的「客人侧消费者」不是没写，是写好了但从没被编进内核：`NativeOfflineGPU.cpp` 21,455 字节在树里、`XNU_NATIVE_OFFLINE_GPU` 默认 0，所以内核里 `NativeOfflineGPU`/`native_gpu_broker`/`OFFLINE_METAL`/`OM_WIRE_MAGIC` 四个字样**各 0 次**——而它正是控制台通道上唯一的客人侧消费者**）：事实 217 证明客人能写（告白上线）、事实 218 证明 RX 计数器量的是「有没有用户态客户端来取」。追「谁来取」时读到 `vendor/UniXNU/drivers/NativeMetal/NativeOfflineGPU.cpp`——**一个完整的离线 GPU broker，用 `native_console_receive`/`native_console_send` 在控制台通道上跑一整套 Metal 会话线协议**（`OfflineMetalSessionWire.h`/`OfflineMetalQueueWire.h`/`OfflineMetalTextureWire.h`/`OfflineMetalDepthStencilWire.h`/`OfflineMetalSharedEventWire.h`），并且自带一整套计数器（`native_gpu_broker_stage/clients/active/closed/requests/failures/refusals/status/reply_bytes`、`native_gpu_shared_exports/imports/drops/refusals/tokens_live/ports`）。
+
+**但它不在启动的那颗内核里**，三条独立证据：
+
+1. **符号全缺**：`native_gpu_broker_stage`、`native_gpu_broker_clients`、`native_gpu_broker_active`、`native_gpu_broker_closed`、`native_gpu_broker_requests`、`native_gpu_broker_failures`、`native_gpu_broker_refusals`、`native_gpu_broker_status`、`native_gpu_broker_reply_bytes`、`native_gpu_shared_exports/imports/drops` **全部 ABSENT**（同一张符号表里 `native_console_ready`、`native_console_rx_requests`、`cpu_ttep` 都在，所以不是仪器问题）；
+2. **文本全缺**：内核里 `NativeOfflineGPU`、`native_gpu_broker`、`OFFLINE_METAL`、`OM_WIRE_MAGIC` 四个字样**各 0 次**；
+3. **构建从未引用它**：`board.toml` 的 `[kernel] archives` 里没有它，全仓 `grep NativeOfflineGPU` 只命中文档、`build-xnu-4k-baseline.sh` 和几个 `check-*.py`，**没有任何构建步骤把它编进去**。
+
+**根因是一个默认值**：`build-xnu-4k-baseline.sh:306` 是 `NATIVE_OFFLINE_GPU=${XNU_NATIVE_OFFLINE_GPU:-0}`，而 `patches/xnu/offline-native-gpu-broker.patch:7` 的编译条件是 `#if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU`——**开关默认关，且 `board.toml` 没有任何设置它的机制**（`[kernel]` 只有 `defconfig` 和 `archives` 两个键）。补丁本身还在 `bsd/kern/bsd_init.c` 里加了一句 `native_offline_gpu_publish()`，同样被这个开关守着。
+
+**所以 item 4 的形状比原来想的清楚**：控制台通道的**传输层已经通了**（事实 217：客人写得进来；事实 211：bind 在正确的 transport 上），**客人侧的消费者也写好了**（这一事实），缺的是**把它编进内核的那一个开关加一次重建**。这与事实 206/215 是同一族——「源码在、pin 没到、内核里没有」——只是这一次卡在 `XNU_NATIVE_OFFLINE_GPU=0` 而不是一条 sha256。
+
+**顺带记两条这一轮的仪器发现**：
+
+- **`cpu_ttep` 在交棒时还是 0**。bootloader 打印 `Exiting boot services` **早于**内核安装自己的页表格；交棒后立刻读 `cpu_ttep` 会得到 `GuestObserver` 的拒绝「the guest's page-table root is zero, so its own tables are not installed yet」。参照实现（`console-driver-state.py`）用固定 900 秒等待正是为了这个。**等 `cpu_ttep` 本身比固定预算好**：它就是要等的就绪信号，而且它能失败。
+- **virtio-mmio 的队列地址寄存器不在 0x30-0x44，在 0x80/0x90/0xa0**。驱动用 `address(n,v)`（`write32(n,lo); write32(n+4,hi)`）把三个环的物理地址写到 0x80（desc）、0x90（driver/avail）、0xa0（device/used），而 0x30-0x44 是 `QueueSel`/`QueueNum`/`QueueSize`/`QueueReady`。所以 arrival 那一轮读到的 `desc=0x8000000000` 之类是**读错了偏移**的产物，`idx_unchanged` 这个结论因此不成立——**它量的是最后一次配置的队列（queue 1，TX）而不是 RX**。要重读得读 0xa0。
+
+| R9ao | **item 4 的客人侧消费者写好了但从没进内核：`NativeOfflineGPU.cpp`（21,455 字节）是在控制台通道上跑整套 Metal 会话线协议的 broker，自带一整套 `native_gpu_broker_*` 计数器，而内核里 `NativeOfflineGPU`/`native_gpu_broker`/`OFFLINE_METAL`/`OM_WIRE_MAGIC` 四字样各 0 次、十个 broker 符号全 ABSENT（同一张表里 `native_console_ready` 在，排除仪器问题）**（2026-11-01）：根因是 `build-xnu-4k-baseline.sh:306` 的 `NATIVE_OFFLINE_GPU=${XNU_NATIVE_OFFLINE_GPU:-0}`，开关默认关，而 `board.toml` 的 `[kernel]` 只有 `defconfig`/`archives` 两个键、没有任何设置它的机制。**item 4 的形状因此清楚**：传输层已通（事实 217/211）、消费者已写好（本事实），缺的是那一个开关加一次重建。**两条仪器发现**：`cpu_ttep` 在交棒时仍为 0（bootloader 的交棒行早于内核装页表格，等 `cpu_ttep` 本身比固定 900 秒好）；virtio-mmio 队列环地址在 **0x80/0x90/0xa0** 而非 0x30-0x44，arrival 那一轮因此读错偏移、`idx_unchanged` 不成立 |
