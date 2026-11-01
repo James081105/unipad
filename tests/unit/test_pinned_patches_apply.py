@@ -297,19 +297,126 @@ def _macro_value(text: str, macro: str) -> str:
     green.  The mutation run found it (`uuid` survived), and the fix is to let
     the patch say what it says and then assert that against the measurement.
 
-    The LAST match wins.  XNU_OWNER_CACHE_MOUNTPOINT is defined twice -- once in
-    the `#if defined(XNU_OWNER_UNION_SYSTEMOS)` arm and once in its `#else` --
-    and the `#else` is the one that applies, because
-    build-xnu-4k-baseline.sh:438 defaults XNU_OWNER_UNION_SYSTEMOS to 0 and
-    nothing in this repository overrides it.  Taking the first match would read
-    the union arm and assert a mount point this board never uses.
+    Only for macros defined ONCE.  XNU_OWNER_CACHE_MOUNTPOINT is defined twice
+    -- once per preprocessor arm -- and which arm applies is decided by the
+    build's config, not by the file's order; use :func:`_expected_mountpoint`
+    for that one.
     """
     import re
 
     hits = re.findall(
         r"^\+#define\s+" + re.escape(macro) + r'\s+"([^"]*)"', text, re.M)
     assert hits, f"{macro} is not #defined in the patch"
-    return hits[-1]
+    assert len(hits) == 1, (
+        f"{macro} is #defined {len(hits)} times; a macro with more than one arm "
+        "must be resolved by the config that selects it, not by taking one"
+    )
+    return hits[0]
+
+
+#: The defconfig whose kernel the guest actually boots.
+#:
+#: Not a guess, and this is the part the first revision of this test got wrong.
+#: build-macos.sh:2590-2596 builds `qemu_defconfig` on the first pass and
+#: `qemu_root_defconfig` on the second (the one with the owner root chain
+#: present), and build-macos.sh:2930-2940 says in those words that the SECOND
+#: pass's kernel is the one the ESP carries: "a second pass that does not
+#: forward them rebuilds the same dead ESP with a kernel that can finally mount
+#: a root volume".  The boot-inputs bundle is collected after the second pass,
+#: so this config -- not the first pass's, and not a build script default --
+#: decides which arm of every XNU_OWNER_* switch the running guest sees.
+#:
+#: The prior revision asserted the `#else` arm because
+#: build-xnu-4k-baseline.sh:438 defaults XNU_OWNER_UNION_SYSTEMOS to 0.  That
+#: default never applies on this board: qemu_root_defconfig:36 sets
+#: CONFIG_XNU_OWNER_UNION_SYSTEMOS=y, so the union arm is the live one and the
+#: mount point is "/", not "/private/preboot".
+BOOTING_KERNEL_DEFCONFIG = (
+    REPO / "vendor" / "UniXNU-qemu" / "configs" / "qemu_root_defconfig"
+)
+
+
+def _union_systemos_enabled() -> bool | None:
+    """CONFIG_XNU_OWNER_UNION_SYSTEMOS as the booting kernel's defconfig sets it.
+
+    None when the defconfig is ABSENT -- a host that has not acquired the device
+    repository cannot know which arm the build selects, and a skip is the honest
+    answer there.
+
+    A defconfig that is present but silent about the switch is a different
+    thing, and it is not tolerated: that config's own header names the union
+    mount as part of what it is, so a config that stops saying so has lost the
+    one fact these assertions depend on.  Failing is louder than silently
+    falling back to a default nobody chose.
+    """
+    if not BOOTING_KERNEL_DEFCONFIG.is_file():
+        return None
+    found = None
+    for line in BOOTING_KERNEL_DEFCONFIG.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("CONFIG_XNU_OWNER_UNION_SYSTEMOS="):
+            found = stripped.split("=", 1)[1].strip().lower() == "y"
+    if found is None:
+        raise AssertionError(
+            f"{BOOTING_KERNEL_DEFCONFIG.name} does not set "
+            "CONFIG_XNU_OWNER_UNION_SYSTEMOS, so which arm of "
+            "XNU_OWNER_CACHE_MOUNTPOINT the booting kernel selects is not "
+            "recorded anywhere this test can read"
+        )
+    return found
+
+
+def _mountpoint_arms(text: str) -> tuple[str, str]:
+    """``(union arm, else arm)`` of XNU_OWNER_CACHE_MOUNTPOINT, by structure.
+
+    The patch carries the pair as
+
+        #if defined(XNU_OWNER_UNION_SYSTEMOS) && XNU_OWNER_UNION_SYSTEMOS
+        #define XNU_OWNER_CACHE_MOUNTPOINT "/"
+        #else
+        #define XNU_OWNER_CACHE_MOUNTPOINT "/private/preboot"
+        #endif
+
+    so the arm is decided by which side of the `#else` a `#define` sits on, and
+    reading them by position is what makes a third `#define` or a deleted
+    `#else` a failure here rather than a silent change of mount point.
+    """
+    import re
+
+    guard = re.search(
+        r"^\+#if\s+defined\(XNU_OWNER_UNION_SYSTEMOS\)\s*&&\s*"
+        r"XNU_OWNER_UNION_SYSTEMOS\s*$", text, re.M)
+    assert guard is not None, (
+        "the patch no longer guards XNU_OWNER_CACHE_MOUNTPOINT on "
+        "XNU_OWNER_UNION_SYSTEMOS; the arms cannot be told apart"
+    )
+    else_at = text.find("\n+#else\n", guard.end())
+    assert else_at != -1, "the mountpoint's #if has no #else arm"
+    endif_at = text.find("\n+#endif\n", else_at)
+    assert endif_at != -1, "the mountpoint's #else has no #endif"
+
+    def _arm(window: str) -> str:
+        hits = re.findall(
+            r"^\+#define\s+XNU_OWNER_CACHE_MOUNTPOINT\s+\"([^\"]*)\"", window, re.M)
+        assert len(hits) == 1, (
+            f"expected exactly one XNU_OWNER_CACHE_MOUNTPOINT #define in one arm, "
+            f"found {len(hits)}"
+        )
+        return hits[0]
+
+    return _arm(text[guard.end():else_at]), _arm(text[else_at:endif_at])
+
+
+def _expected_mountpoint(text: str) -> str:
+    """The mount point the booting kernel's config selects."""
+    union, other = _mountpoint_arms(text)
+    enabled = _union_systemos_enabled()
+    if enabled is None:
+        pytest.skip(
+            "the booting kernel's defconfig is not in this checkout, so which "
+            "arm of XNU_OWNER_CACHE_MOUNTPOINT the build selects is unknown"
+        )
+    return union if enabled else other
 
 
 def _record_payload(text: str, name: str) -> dict:
@@ -318,6 +425,12 @@ def _record_payload(text: str, name: str) -> dict:
     The macros are expanded while they are still bare tokens BETWEEN the
     literals; each expands to a string literal of its own.  Joining the literal
     contents afterwards is exactly what C's concatenation does.
+
+    The mountpoint is expanded with the arm the booting kernel's defconfig
+    selects, not with whichever `#define` the file happens to carry last.  A
+    record naming the wrong mount point is a false statement about where the
+    mount is, and it is invisible on the host: the record parses, the build is
+    green, and nothing but this comparison would notice.
     """
     import json
     import re
@@ -325,8 +438,11 @@ def _record_payload(text: str, name: str) -> dict:
     hit = re.search(r"static char const " + name + r"\[\] =\s*(.*?);", text, re.S)
     assert hit is not None, f"{name} is not defined in the patch"
     body = hit.group(1)
-    for macro in ("XNU_OWNER_CACHE_VOLUME_UUID", "XNU_OWNER_CACHE_MOUNTPOINT"):
-        body = body.replace(macro, '"' + _macro_value(text, macro) + '"')
+    body = body.replace(
+        "XNU_OWNER_CACHE_MOUNTPOINT", '"' + _expected_mountpoint(text) + '"')
+    body = body.replace(
+        "XNU_OWNER_CACHE_VOLUME_UUID",
+        '"' + _macro_value(text, "XNU_OWNER_CACHE_VOLUME_UUID") + '"')
     literals = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
     assert literals, f"{name} holds no string literal"
     joined = "".join(literals)
@@ -391,8 +507,40 @@ def test_the_mount_record_asserts_the_mount_it_is_reporting():
         "the mount is MNT_RDONLY and cache_authorized requires readonly, so a "
         "record that does not say so is describing a different mount"
     )
-    assert payload["mountpoint"] == "/private/preboot", (
-        "the record must name the mount point XNU_OWNER_CACHE_MOUNTPOINT selects"
+    assert payload["mountpoint"] == _expected_mountpoint(
+        patch.read_text(encoding="utf-8")), (
+        "the record must name the mount point XNU_OWNER_CACHE_MOUNTPOINT selects "
+        "for the kernel that actually boots"
+    )
+
+
+def test_the_mountpoints_two_arms_name_two_different_mount_points():
+    """Each arm names the mount point its own branch actually uses.
+
+    The arms are not interchangeable labels.  The union branch overlays the
+    original OS volume, and qemu_root_defconfig's own header says so: "the
+    original iPadOS OS volume mounted as the root, SystemOS as a union over
+    /".  The non-union branch mounts SystemOS on its own at /private/preboot,
+    which is where the DYLD_SHARED_CACHE_DIR environment string points when
+    that branch is live.
+
+    Without this the two `#define`s are two strings in a known order, and
+    swapping them changes nothing any other assertion can see: the record
+    reads the macro, the mount reads the macro, and the two agree whichever
+    way round they are.  What breaks is the mount itself, on a board nobody
+    re-measures until it fails to reach userspace.
+    """
+    patch = _mount_patch()
+    if patch is None:
+        pytest.skip("the offline owner cache mount patch is not in this pinned tree")
+    union, other = _mountpoint_arms(patch.read_text(encoding="utf-8"))
+    assert union == "/", (
+        "the union arm must mount over /, as qemu_root_defconfig's header "
+        f"describes; it names {union!r}"
+    )
+    assert other == "/private/preboot", (
+        "the non-union arm must mount SystemOS on its own at /private/preboot, "
+        f"where the DYLD_SHARED_CACHE_DIR string points; it names {other!r}"
     )
 
 
