@@ -657,27 +657,50 @@ def test_this_patch_keeps_the_lines_the_next_patch_uses_as_context() -> None:
     """The patch set has inter-patch dependencies no per-patch check can see.
 
     ``zzz-boot-progress.patch`` carries a hunk at ``@@ -7389,11 +7393,22 @@``
-    whose CONTEXT is
+    whose PRETEXT -- the whole run of context lines it needs contiguous -- is
+    TEN lines, and nine of them are lines THIS patch adds::
 
-        (void) mach_vm_allocate_kernel(map, &scratch_addr, ...)
-        user_addr_t init_envp = USER_ADDR_NULL;
-        #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
-        int cache_error = native_owner_cache_prepare(...)
+        \t(void) mach_vm_allocate_kernel(map, &scratch_addr, ...)   <- pristine
+        \tuser_addr_t init_envp = USER_ADDR_NULL;                    <- added here
+        #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT   <- added here
+        \tint cache_error = native_owner_cache_prepare(...)          <- added here
+        \tif (cache_error) panic(...)                                <- added here
+        #endif                                                       <- added here
+        #if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT     <- added here
+        \tint data_error = native_owner_data_prepare(...)            <- added here
+        \tif (data_error) panic(...)                                 <- added here
+        #endif                                                       <- added here
+        #if CONFIG_MEMORYSTATUS                                      <- pristine
 
-    and three of those four lines are lines THIS patch adds.  So the set is
-    order-dependent in a way that :func:`test_every_patch_applies_to_its_own_minus_side`
-    structurally cannot catch: that test reconstructs each patch's minus side,
-    which is the PRISTINE file, and applies it there.  A change that keeps a
-    patch self-consistent can still break the patch that follows it.
+    ``git apply`` requires that block contiguous.  So the set is
+    order-dependent in a way that
+    :func:`test_every_patch_applies_to_its_own_minus_side` structurally cannot
+    catch: that test reconstructs each patch's minus side, which is the PRISTINE
+    file, and applies it there.  A change that keeps a patch self-consistent can
+    still break the patch that follows it.
 
-    Measured: build 41346094752 failed at ``build-xnu-4k-baseline.sh:44`` with
-    ``patch failed: bsd/kern/kern_exec.c:7389`` -- a line in
-    ``zzz-boot-progress.patch``, from an edit to THIS patch that inserted a
-    diagnostic between the two shared lines.  The failure named a file nobody
-    had touched.
+    Measured twice.  Build 41346094752 failed at
+    ``build-xnu-4k-baseline.sh:44`` with ``patch failed:
+    bsd/kern/kern_exec.c:7389`` -- a line in ``zzz-boot-progress.patch``, from
+    an edit to THIS patch.  The first fix kept ``mach_vm_allocate_kernel``
+    adjacent to ``user_addr_t init_envp``, which was TRUE and which changed
+    nothing: build 41350610831 failed with the identical error, because the
+    constraint was the ten-line block and not that one adjacency.  The guard
+    written with the first fix asserted the wrong thing and passed while the
+    build failed, which is worse than no guard -- and it is recorded here rather
+    than quietly replaced.
 
-    So the constraint is asserted here, where the edit happens: the two lines
-    ``zzz-boot-progress.patch`` needs adjacent must stay adjacent, in its order.
+    The constraint is asserted as a literal list, because that is the only
+    formulation with no ambiguity: a general cross-patch checker was attempted
+    and reported 18 splits on a tree where real ``git apply`` takes all 56
+    patches, because anchoring on lines like ``#endif`` and ``}`` matches in the
+    wrong place.  An instrument that is red on a green tree is worse than none.
+
+    The instrument that IS validated is
+    ``local-private/tmp/repro-patch-order.py``, which replays the runner's own
+    order with real ``git apply`` against the cloned XNU source.  It needs that
+    source, so it cannot run in CI; this test is the CI-side half, and it is
+    precise rather than general.
     """
     patch = _mount_patch()
     if patch is None:
@@ -685,22 +708,53 @@ def test_this_patch_keeps_the_lines_the_next_patch_uses_as_context() -> None:
     text = patch.read_text(encoding="utf-8")
     lines = text.split("\n")
 
-    # The other patch's context, spelled as the lines this patch must emit.
-    first = "mach_vm_allocate_kernel(map, &scratch_addr"
-    second = "user_addr_t init_envp = USER_ADDR_NULL;"
+    block = [
+        " \t(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);",
+        "+\tuser_addr_t init_envp = USER_ADDR_NULL;",
+        "+#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT",
+        "+\tint cache_error = native_owner_cache_prepare(p, (user_addr_t)scratch_addr, &init_envp);",
+        '+\tif (cache_error) panic("offline owner SystemOS mount failed: %d", cache_error);',
+        "+#endif",
+        "+#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT",
+        "+\tint data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);",
+        '+\tif (data_error) panic("offline scratch Data mount failed: %d", data_error);',
+        "+#endif",
+        " #if CONFIG_MEMORYSTATUS",
+    ]
 
-    for index, line in enumerate(lines):
-        if first not in line:
-            continue
-        # Context lines carry a leading space, added lines a '+'; either way the
-        # NEXT line has to be the shared one, with nothing in between.
-        nxt = lines[index + 1] if index + 1 < len(lines) else ""
-        assert nxt.lstrip("+ ").strip() == second, (
-            "the line after mach_vm_allocate_kernel is "
-            f"{nxt.strip()!r}, not {second!r}. zzz-boot-progress.patch:200-205 "
-            "uses those two lines as its context, so anything between them "
-            "breaks a patch that was not edited (measured: build 41346094752 "
-            "failed at kern_exec.c:7389)"
+    start = next((i for i, ln in enumerate(lines) if ln == block[0]), None)
+    if start is None:
+        pytest.fail(
+            "the mach_vm_allocate_kernel line is not in the patch, so the "
+            "constraint is unchecked"
         )
-        return
-    pytest.fail(f"{first!r} is not in the patch, so the constraint is unchecked")
+    got = lines[start:start + len(block)]
+    if got != block:
+        for offset, (want, have) in enumerate(zip(block, got)):
+            if want != have:
+                raise AssertionError(
+                    f"patch line {start + offset + 1} is {have.strip()[:70]!r} "
+                    f"where zzz-boot-progress.patch needs {want.strip()[:70]!r}. "
+                    "That patch's context is the whole ten-line block above, "
+                    "so anything inserted inside it breaks a patch that was not "
+                    "edited (measured: builds 41346094752 and 41350610831 both "
+                    "failed at kern_exec.c:7389)"
+                )
+        raise AssertionError(
+            f"the block is {len(got)} lines where it must be {len(block)}; "
+            "zzz-boot-progress.patch needs all of them contiguous"
+        )
+
+    # The diagnostic that motivated this constraint must still sit ABOVE the
+    # block, or the measurement it exists for is no longer the one being taken:
+    # it has to fire before the prepare calls.
+    diag = next((i for i, ln in enumerate(lines)
+                 if "DIAGNOSTIC, TEMPORARY" in ln), None)
+    if diag is not None:
+        assert diag < start, (
+            f"the diagnostic is at patch line {diag + 1}, below the allocate "
+            f"line at {start + 1}. It must fire before the prepare calls, and "
+            "the only position that is both before them and outside "
+            "zzz-boot-progress.patch's context block is above the allocate."
+        )
+
