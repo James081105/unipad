@@ -1373,3 +1373,44 @@ send(probe_record,sizeof(probe_record)-1);
 **一条给下次的方法论**：事实 224 的结论「动的是两个 milestone」是**只看被点名的两个 verdict** 得到的，而 blocker 是跨 milestone 共享的。**问「这一个 blocker 还压着谁」比问「这两个 milestone 还缺什么」信息量大得多**，而前者的答案是 `grep` 一下 `_XNU_BLOCKER` 的使用点就有、不需要跑 gate。下次遇到共享 blocker 先数使用点。
 
 | R9av | **`xnu_initialised` 压着七个 milestone 而非两个：`_XNU_BLOCKER` 在 `milestones.py` 有七个使用点（2336/2367/2412/2457/2498/2543/2593 行），按定义顺序落在 M5、M6、M7、M8、M9、M9a、M9b 上，逐跑 verdict 亦各自只缺这一个 blocker（M9b 另缺 `system_volume_mounted`）**（2026-11-01，`M.default_view()` 上 evaluate M3-M12 全量）：事实 224 只量了 M4 与 M5 就下结论，少数了五个。**同三条记录的真实杠杆是「一付八用」**：M4 三项 `evidence_absent` 走完，M5-M9b 七个解除阻塞。**但「解除阻塞」不是「通过」**，M6/M7/M8/M9/M9a/M9b 各自仍缺 `pass_evidence`，要各自的客人侧证据。**后续依赖链**：`xnu_initialised`（本次）→ `system_volume_mounted`（M7 证据走完即满足）→ `guest_install_service`（M10-M12，即缺口 B，独立可并行） |
+
+
+---
+
+**事实 227（三条 XNU 记录**确实在客人实际启动的那颗 kernel 的字节里**——sha256 与 `payload.json` 对得上，五条记录全中，且出现次数与驱动源码的预测逐一相符**）：这一步把「CI 编过了」和「记录在 kernel 里」这两件一直被混着说的事分开量了。仪器是 `local-private/tmp/verify-records-in-kernel.py`，它**在两条 sha256 不一致时拒绝报告任何结果**，所以下面没有一个字是在描述客人不会启动的文件。
+
+| 项 | 值 |
+|---|---|
+| run | 41281382063（结论 success，34/34 步） |
+| artifact | `13074462047`，310,354,885 字节 |
+| ESP kernel | `payload-esp/EFI/UniXNU/Payloads/kernel.macho`，125,480,960 字节 |
+| sha256 磁盘 | `359eba3fba1be16466f745c11888b97acf1a4b1afd6223fdbcf1f942c33bf9a7` |
+| `payload.json` 的 `payload_kernel_sha256` | `359eba3fba1be16466f745c11888b97acf1a4b1afd6223fdbcf1f942c33bf9a7` |
+| 判定 | **一致** |
+
+五条记录在 kernel 里的位置与次数：
+
+| 记录 | 次数 | 首个字节偏移 |
+|---|---|---|
+| `iokit.service_match` | 1 | 242932 |
+| `iokit.driver_probe` | 1 | 243047 |
+| `xnu.page_tables` | 1 | 243159 |
+| `xnu.exception_vectors` | 2 | 243244 |
+| `xnu.interrupts` | 4 | 243439 |
+
+**次数本身就是证据，不是噪声**：驱动源码对每个事实的写法是「两条静态字符串」而非 `snprintf`，所以 `xnu.exception_vectors` 出现 2 次；而 `xnu.interrupts` 出现 4 次，是因为 gate 对每个事件只保留**第一条**记录（`_guest_events` 用 `setdefault`），第二条 `xnu.interrupts` 会被静默丢掉、读日志的人也永远看不到定时器那一半——所以驱动把四种 DAIF × CNTFRQ 组合全发出去。**这五个数是先读源码预测、再去读 kernel 字节核对的**；一颗「碰巧带着这些字符串」的 kernel 不会恰好复现这套次数。
+
+**顺带修掉了一个会一直骗人的仪器陷阱**：探针如果按 C **源码**的写法造 needle——反斜杠加引号（`\"event\":\"xnu.page_tables\"`）——在一颗明明带着其中两条的 kernel 上会报**五条全无**。编译器会把那些转义解析掉，链接后的 kernel 里是**普通引号**。这次用解析后的拼写，五条全中。
+
+**取这颗 kernel 没有花 310 MB 传输**：该成员在本地头偏移 2,354,921 处 DEFLATED 了 78,650,816 字节，压缩流是 `[2,354,995, 81,005,811)`，而断点续传的partial 早就覆盖了整个区间，于是
+
+```
+reused 78,650,816 bytes from the partial download (100% of the stream)
+fetched 0 bytes in 0 attempt(s)
+```
+
+`payload.json`（偏移 173,641,443 处 688 字节）是唯一一次真正的 range 请求。做这件事的 `local-private/tmp/extract-one-member.py` **先离线验证过再用**：对 `bundle14.zip`（一颗 EOCD 正好结束在文件尾的完整 zip，ESP kernel 已在盘上解好）跑，把它已知的那颗 kernel **逐字节复现**了出来。而第一次上真网跑它是**拒绝报告**的——因为当时喂给它的是 bundle14 的字节、配的是另一个 artifact（`13074462047`）的中央目录，两个 zip 把同一成员放在不同偏移。那次拒绝是护栏在干活，不是 bug；如果当时它「成功」了，产出的会是一颗拼错的 kernel。
+
+**这一步证明了什么、没证明什么**：证明了记录在 payload 声明的那颗 kernel 的字节里，偏移与次数都与源码预测一致。**没有**证明驱动会跑、记录会到 agent channel、gate 会读到——那是客人侧抓包（`local-private/tmp/iokit-capture.py`）的事，而它需要 `payload.img` 里的数据 ramdisk。
+
+| R9aw | **三条 XNU 记录在 ESP kernel 里逐字节证实：sha256 `359eba3f…` 与 `payload.json` 的 `payload_kernel_sha256` 一致，五条记录全中（iokit 两条在 242932/243047，xnu 三条在 243159/243244/243439）**（2026-11-01，run 41281382063 / artifact 13074462047）：仪器在 sha256 不符时拒绝报告，故结论不可能在描述别的文件。**出现次数与源码预测逐一相符**：`exception_vectors` 2 次（两条静态字符串）、`interrupts` 4 次（gate 只留每条事件的第一条记录，故四种组合全发）。**仪器陷阱已修**：按 C 源码写法（反斜杠引号）造 needle 会报五条全无，链接后的 kernel 里是普通引号。**取 kernel 零新增传输**：压缩流 `[2,354,995, 81,005,811)` 已被 partial 全覆盖，`fetched 0 bytes`；取数仪器先对 `bundle14.zip` 离线验证、逐字节复现已知 kernel 才上真网 |

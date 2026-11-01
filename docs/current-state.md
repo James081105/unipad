@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 225). Main repo at `51b7e04`.
+Last updated: 2026-11-01 (fact 227). Main repo at `51b7e04`.
 
 ---
 
@@ -26,9 +26,12 @@ defaults to 0.
 **Where the XNU records stand:** pinned at `c3c9ce2`/`2bff001`/`51b7e04`, and
 run 41281382063 concluded **success** — so all ten records survive `-Werror` and
 the ARM64/iOS 17 object audit on the macOS runner, which is the only real
-compiler that has ever seen them (fact 225). The boot-inputs bundle is
-downloading; once it lands, the byte-level ESP-kernel check and the guest
-capture are the only two steps left before M4 and M5 can be re-read.
+compiler that has ever seen them (fact 225). And they are now **byte-proven to
+be inside the kernel the guest boots**: the ESP kernel's sha256 equals
+`payload.json`'s `payload_kernel_sha256` exactly, and all five literals are
+present at offsets and occurrence counts the driver's own source predicts
+(fact 227). The only step left is the guest capture, which is waiting on
+`payload.img` — 47% of that member is already assembled.
 
 ---
 
@@ -51,6 +54,8 @@ capture are the only two steps left before M4 and M5 can be re-read.
 | 13 | **The driver compiles under `-Werror` with all ten records** | fact 225 — run 41281382063, conclusion **success**, 34/34 steps: step 7 pin cross-check, step 14 macOS build, step 17 owner root chain, step 21 the second macOS build. This host has no C compiler, so step 14 is the first real compiler to see the macro, and it is the direct proof the adjacent-string-literal concatenation is right — the same macro that was wrong three times |
 | 14 | The **M4/M5 baseline is unchanged since fact 224** | re-measured just now on `default_view()`: M4 `UNVERIFIED`, `missing=('m4.page_tables','m4.exception_state','m4.interrupt_state')` and nothing else; M5 `BLOCKED` by `xnu_initialised`, `missing=()` with both IOKit requirements satisfied and their witnesses still at `guest.log:17`/`:18`, `scope='onsite'` |
 | 15 | **`xnu_initialised` gates SEVEN milestones, not two — fact 224 undercounted** | fact 226 — `_XNU_BLOCKER` has seven use sites in `milestones.py` (lines 2336/2367/2412/2457/2498/2543/2593), landing on M5, M6, M7, M8, M9, M9a and M9b. Evaluated M3-M12 in full: each of those seven is `BLOCKED` with `unmet_blockers` containing only `xnu_initialised` (M9b also `system_volume_mounted`). So the three records pay once and move **eight** milestones — M4 completes, seven unblock |
+| 16 | **All five records are in the bytes of the kernel the guest boots** | fact 227 — artifact `13074462047`'s ESP kernel, 125,480,960 bytes, sha256 `359eba3f…` **equal** to `payload.json`'s `payload_kernel_sha256`; `iokit.service_match` at 242932 and `iokit.driver_probe` at 243047 (1 each), `xnu.page_tables` at 243159 (1), `xnu.exception_vectors` at 243244 (**2**), `xnu.interrupts` at 243439 (**4**). The instrument refuses to report unless the two hashes agree. The counts were predicted from the source first: two static strings per fact, and four DAIF × CNTFRQ combinations because the gate keeps only the first record per event |
+| 17 | **The kernel was obtained without transferring 310 MB** | fact 227 — the member is 78,650,816 bytes DEFLATED over `[2,354,995, 81,005,811)`, a range the partial straight download already covered, so extraction moved `fetched 0 bytes`. The extractor was validated offline first against `bundle14.zip` (a complete zip whose ESP kernel is already on disk), reproducing that known kernel byte for byte; its first live run **refused**, correctly, because it had been handed one artifact's bytes against another's central directory |
 
 ## What is NOT done, and why
 
@@ -62,17 +67,37 @@ capture are the only two steps left before M4 and M5 can be re-read.
 | D | **No real IPA has been installed, launched or persisted** | Blocked by A and B |
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
-| G | **The three XNU records are pinned, compiled and measured on paper, not yet on a guest** | fact 225 — run 41281382063 is **success** (34/34 steps), so the macro survives `-Werror` and the ARM64/iOS 17 object audit. What is still open is the guest side: byte-level presence in the ESP kernel, then the capture, then the gate |
+| G | **The three XNU records are pinned, compiled and now byte-proven, but not yet seen on a guest** | fact 225 — run 41281382063 is **success** (34/34 steps), so the macro survives `-Werror` and the ARM64/iOS 17 object audit. Fact 227 — the records are in the ESP kernel's bytes, at the offsets and counts the source predicts. What is still open is the guest side only: `payload.img` (47% assembled), then the capture, then the gate |
 | H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True. **Corrected by fact 226**: it is not just M4+M5 — `xnu_initialised` also blocks M6, M7, M8, M9, M9a and M9b, so the same three records move eight milestones |
 
 ## Active work
 
-**The XNU emitter is pinned, compiled and downloading.** Run 41281382063
+**The XNU emitter is pinned, compiled and byte-proven.** Run 41281382063
 concluded **success**, so the driver with all ten records survived `-Werror` on
 the macOS runner — the first real compiler to see the macro, and this host has
-none. The boot-inputs bundle is on disk at ~5% and growing at ~39 KB/s (about
-two hours ten minutes); the pre-signed URL expires mid-transfer, so the
-downloader resumes with a fresh one per attempt.
+none. The records are then **in the kernel the guest boots**: fact 227 ties the
+ESP kernel's sha256 to `payload.json`'s `payload_kernel_sha256` and finds all
+five literals at the offsets and counts the source predicts.
+
+**The 310 MB download was the wrong shape for this job.** The pre-signed URL is
+link-bound at ~26-30 KB/s and dies after ~1.5 MB, so a straight serial download
+is a three-hour job — and the only file needed to prove the records are in the
+kernel is 79 MB DEFLATED at offset 2.35 MB, a range the partial download had
+already covered. `local-private/tmp/extract-one-member.py` pulls one member by
+byte range instead: it cost **zero** new bytes for the kernel and 688 bytes for
+`payload.json`. The same trick is now assembling `payload.img` (92.6 MB
+compressed, 46% reused from the partial), which the guest capture needs for the
+data ramdisk — without it the guest sits in the boot menu repeating
+`cannot read initrd ... scratch-data.img: Not Found` while every liveness signal
+still says "alive" (measured on bundle12).
+
+**A note on the proxy.** The user's proxy at `127.0.0.1:7897` works fine for
+`api.github.com`, `github.com` and `objects.githubusercontent.com`, but its
+upstream **refuses `*.blob.core.windows.net`** — verified three ways: `curl -v`
+shows the CONNECT tunnel establish (200) and then the TLS handshake inside it
+fail; `-k` changes nothing; plain HTTP returns 502. So the proxy cannot be
+applied to this artifact, and the range-extraction method above is what replaced
+it.
 
 The two IOKit records already cleared their own gate (measured on a real guest,
 below), but M5 is still BLOCKED on `xnu_initialised`, which needs three more
@@ -109,22 +134,23 @@ build is the first real compiler to see the macro, and `-Werror` let it through.
 
 ## Next actions, in order
 
-1. **Download `boot-inputs` from run 41281382063** — artifact id `13074462047`,
-   310,354,885 bytes, already running into `local-private/tmp/bundle15.zip` via
-   `local-private/tmp/fetch-artifact.py` (a fresh URL per attempt — the
-   pre-signed one expires mid-transfer and `curl` exits 0 on the truncated
-   result). Expect ~2h10m at ~39 KB/s.
-2. **Verify byte-level** that the three XNU records are in the ESP kernel — the
-   same check that proved the announcement (fact 217) and the two IOKit records
-   (fact 223). `local-private/tmp/verify-records-in-kernel.py` already does this
-   for all five events and refuses to report unless the ESP kernel's sha256
-   equals `payload.json`'s `payload_kernel_sha256`. It was validated against a
-   known answer (bundle14: two present, three correctly absent) after an earlier
-   version reported a false negative.
-3. **Run `local-private/tmp/iokit-capture.py`** against that bundle. It boots,
-   waits for the hand-off, captures the channel into
-   `local-private/boot40/iokit-records/guest.log`, and parses it with the gate's
-   own criterion. Then read the three XNU events, not just the two IOKit ones.
+1. **Finish `payload.img`** — running now via
+   `local-private/tmp/extract-one-member.py` into `local-private/tmp/bundle15/`
+   (92,633,980 bytes compressed over `[81,007,447, 173,641,427)`; 46% reused
+   from the partial, ~48 MB to go). Alongside it, `kernel.macho.gpuaddon`
+   (12,048,506 bytes at offset 173,642,189). Log:
+   `local-private/tmp/extract-payloadimg.log`. The four small members
+   (`UniXNU.efi`, `unixnu.toml`, `kernel.macho.adt`, `DarwinBoot.efi`) are
+   **already staged** and `kernel.macho` is extracted and verified.
+2. **Byte-level presence is DONE** (fact 227). All five records are in the ESP
+   kernel, sha256 tied to `payload.json`, counts matching the source's
+   prediction. Evidence file:
+   `local-private/tmp/xnu-records-in-kernel-evidence.txt`.
+3. **Run `local-private/tmp/iokit-capture.py local-private/tmp/bundle15`** — it
+   boots, waits for the hand-off, captures the channel into
+   `local-private/boot41/xnu-records/guest.log` (a fresh path, deliberately, and
+   it refuses to overwrite), and parses it with the gate's own criterion. Then
+   read the three XNU events, not just the two IOKit ones.
 4. **Re-run the gate** and read M4 together with M5-M9b. Fact 226 corrected the
    baseline: `xnu_initialised` gates **seven** milestones (M5, M6, M7, M8, M9,
    M9a, M9b), not two — so the same capture moves eight. Re-measure rather than
@@ -145,6 +171,16 @@ whose kernel carries the announcement; it is already extracted at
 `local-private/tmp/bundle13`.
 
 ```bash
+# Byte-level proof the records are in the kernel the guest boots.
+python -u local-private/tmp/verify-records-in-kernel.py local-private/tmp/bundle15-check
+
+# Pull ONE member out of the artifact by byte range (no 310 MB download).
+python -u local-private/tmp/extract-one-member.py local-private/tmp/bundle15.zip \
+  "payload-esp/EFI/UniXNU/Payloads/kernel.macho" local-private/tmp/b15-kernel.macho
+
+# ...and validate the extractor offline against a known answer first.
+python -u local-private/tmp/validate-extractor.py
+
 # The XNU records, on the committed (LF) blob -- that is what CI compiles.
 git -C vendor/UniXNU/drivers/NativeVirtioConsole show   c3c9ce2:NativeVirtioConsole.cpp > local-private/tmp/committed-driver.cpp
 python local-private/tmp/verify-xnu-records.py
@@ -210,3 +246,19 @@ Recorded so the next run does not repeat them:
 - **GitHub artifact pre-signed URLs expire mid-download and curl exits 0 on the
   truncated result.** Use `local-private/tmp/fetch-artifact.py`, which resumes
   with a fresh URL per attempt. Measured three times.
+- **A 310 MB artifact does not have to be downloaded to read one member of it.**
+  The pre-signed URL honours Range (measured), the zip's central directory gives
+  every member's exact compressed byte range, and deflate inflates locally with
+  `zlib.decompress(data, -15)`. `local-private/tmp/extract-one-member.py` pulls a
+  single member; the ESP kernel cost **zero** extra bytes because the partial
+  download already covered its stream. **Validate the extractor offline against a
+  complete zip whose answer is already on disk before trusting it on the
+  network** — and read a refusal as the guard working: its first live run refused
+  because it was handed one artifact's bytes with another artifact's central
+  directory, and the two place the same member at different offsets.
+- **The proxy at `127.0.0.1:7897` cannot reach `*.blob.core.windows.net`.**
+  `curl -v` shows the CONNECT tunnel establish and the TLS handshake inside it
+  fail; `-k` does not help; plain HTTP returns 502. It works for
+  `api.github.com`, `github.com` and `objects.githubusercontent.com`. So a
+  suggested proxy is not automatically usable — test it against the actual host
+  before planning around it.
