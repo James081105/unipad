@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 227). Main repo at `51b7e04`.
+Last updated: 2026-11-01 (fact 228). Main repo at `3b6bbd4`.
 
 ---
 
@@ -23,15 +23,31 @@ guest-side *consumer*: `NativeOfflineGPU`, the only code that reads the console
 port, has never been linked into a kernel because `XNU_NATIVE_OFFLINE_GPU`
 defaults to 0.
 
-**Where the XNU records stand:** pinned at `c3c9ce2`/`2bff001`/`51b7e04`, and
-run 41281382063 concluded **success** — so all ten records survive `-Werror` and
-the ARM64/iOS 17 object audit on the macOS runner, which is the only real
-compiler that has ever seen them (fact 225). And they are now **byte-proven to
-be inside the kernel the guest boots**: the ESP kernel's sha256 equals
-`payload.json`'s `payload_kernel_sha256` exactly, and all five literals are
-present at offsets and occurrence counts the driver's own source predicts
-(fact 227). The only step left is the guest capture, which is waiting on
-`payload.img` — 47% of that member is already assembled.
+**Where the XNU records stand — and the defect that was hiding behind them:**
+pinned at `c3c9ce2`/`2bff001`, and run 41281382063 concluded **success**, so all
+ten records survive `-Werror` on the macOS runner (fact 225). Fact 227 then
+proved them byte-level: the ESP kernel's sha256 equals `payload.json`'s
+`payload_kernel_sha256`, and all five literals are in it at the offsets and
+counts the source predicts.
+
+**Then the guest disagreed, and that is fact 228.** The two IOKit records
+arrived complete; all three XNU records arrived **seven bytes** each — the
+capture ends with the literal bytes `{"event{"event{"event`. The record was
+selected by a ternary passed into the emit macro, the two arms are arrays of
+*different* lengths (`true` is 4 chars, `false` is 5), so the conditional
+operator decayed both to `char const *` and `sizeof(arr)` measured the
+**pointer**, 8 on AArch64. `sizeof(arr)-1` was 7.
+
+**The build was green and the kernel grep was green.** The literals really are
+in the kernel. Only the length argument was wrong, and it is computed at run
+time — so the first instrument that could see the defect was the wire. The
+reusable rule: *"the literal is in the kernel" is not "the record is sent
+whole"*.
+
+Fixed by selecting in an `if` so every arm names an array, with
+`NATIVE_CONSOLE_PICK` deleted outright. Re-pinned to driver `a7b7a03` /
+UniXNU `8a223b2`, both read back from api.github.com, and build
+**run 41296027165** is in progress on `3b6bbd4`.
 
 ---
 
@@ -54,8 +70,10 @@ present at offsets and occurrence counts the driver's own source predicts
 | 13 | **The driver compiles under `-Werror` with all ten records** | fact 225 — run 41281382063, conclusion **success**, 34/34 steps: step 7 pin cross-check, step 14 macOS build, step 17 owner root chain, step 21 the second macOS build. This host has no C compiler, so step 14 is the first real compiler to see the macro, and it is the direct proof the adjacent-string-literal concatenation is right — the same macro that was wrong three times |
 | 14 | The **M4/M5 baseline is unchanged since fact 224** | re-measured just now on `default_view()`: M4 `UNVERIFIED`, `missing=('m4.page_tables','m4.exception_state','m4.interrupt_state')` and nothing else; M5 `BLOCKED` by `xnu_initialised`, `missing=()` with both IOKit requirements satisfied and their witnesses still at `guest.log:17`/`:18`, `scope='onsite'` |
 | 15 | **`xnu_initialised` gates SEVEN milestones, not two — fact 224 undercounted** | fact 226 — `_XNU_BLOCKER` has seven use sites in `milestones.py` (lines 2336/2367/2412/2457/2498/2543/2593), landing on M5, M6, M7, M8, M9, M9a and M9b. Evaluated M3-M12 in full: each of those seven is `BLOCKED` with `unmet_blockers` containing only `xnu_initialised` (M9b also `system_volume_mounted`). So the three records pay once and move **eight** milestones — M4 completes, seven unblock |
-| 16 | **All five records are in the bytes of the kernel the guest boots** | fact 227 — artifact `13074462047`'s ESP kernel, 125,480,960 bytes, sha256 `359eba3f…` **equal** to `payload.json`'s `payload_kernel_sha256`; `iokit.service_match` at 242932 and `iokit.driver_probe` at 243047 (1 each), `xnu.page_tables` at 243159 (1), `xnu.exception_vectors` at 243244 (**2**), `xnu.interrupts` at 243439 (**4**). The instrument refuses to report unless the two hashes agree. The counts were predicted from the source first: two static strings per fact, and four DAIF × CNTFRQ combinations because the gate keeps only the first record per event |
+| 16 | **All five records are in the bytes of the kernel the guest boots** | fact 227 — artifact `13074462047`'s ESP kernel, 125,480,960 bytes, sha256 `359eba3f…` **equal** to `payload.json`'s `payload_kernel_sha256`; `iokit.service_match` at 242932 and `iokit.driver_probe` at 243047 (1 each), `xnu.page_tables` at 243159 (1), `xnu.exception_vectors` at 243244 (**2**), `xnu.interrupts` at 243439 (**4**). The instrument refuses to report unless the two hashes agree. The counts were predicted from the source first: two static strings per fact, and four DAIF × CNTFRQ combinations because the gate keeps only the first record per event. **Corrected by fact 228: this proves the literals are in the kernel, NOT that they are sent whole** |
 | 17 | **The kernel was obtained without transferring 310 MB** | fact 227 — the member is 78,650,816 bytes DEFLATED over `[2,354,995, 81,005,811)`, a range the partial straight download already covered, so extraction moved `fetched 0 bytes`. The extractor was validated offline first against `bundle14.zip` (a complete zip whose ESP kernel is already on disk), reproducing that known kernel byte for byte; its first live run **refused**, correctly, because it had been handed one artifact's bytes against another's central directory |
+| 18 | **The `xnu_initialised` records were sent seven bytes long — fact 228** | driver `a7b7a03` / UniXNU `8a223b2` / run 41296027165 — the two IOKit records arrived complete and all three XNU records arrived as the 7 bytes `{"event`, because the record was selected by a ternary whose two arms are arrays of *different* lengths, so the conditional operator decayed both to `char const *` and `sizeof(arr)` measured the pointer. The build was green and a byte-level grep of the kernel was green: the literals really are in the image. Only the length argument was wrong, and it is computed at run time |
+
 
 ## What is NOT done, and why
 
@@ -67,7 +85,7 @@ present at offsets and occurrence counts the driver's own source predicts
 | D | **No real IPA has been installed, launched or persisted** | Blocked by A and B |
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
-| G | **The three XNU records are pinned, compiled and now byte-proven, but not yet seen on a guest** | fact 225 — run 41281382063 is **success** (34/34 steps), so the macro survives `-Werror` and the ARM64/iOS 17 object audit. Fact 227 — the records are in the ESP kernel's bytes, at the offsets and counts the source predicts. What is still open is the guest side only: `payload.img` (47% assembled), then the capture, then the gate |
+| G | **The three XNU records were sent seven bytes long on a real guest — fixed, rebuilding** | fact 228 — the records ARE in the ESP kernel (fact 227) and the build was green, but the emit macro was handed a ternary, so `sizeof` measured the pointer and each record went out 7 bytes. Driver `a7b7a03` fixes it by selecting in an `if`; build **run 41296027165** is in progress on `3b6bbd4`. The bundle for that build has to be re-fetched and the capture re-run before the gate can be read |
 | H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True. **Corrected by fact 226**: it is not just M4+M5 — `xnu_initialised` also blocks M6, M7, M8, M9, M9a and M9b, so the same three records move eight milestones |
 
 ## Active work
@@ -110,11 +128,24 @@ after the IOKit records — inside IOKit, long past XNU's early architecture
 setup. So the three records measure XNU's live state; they are not inferences
 from the fact that this driver is running.
 
-Two static strings per fact and a ternary, not `snprintf`: the driver builds
-with `-Werror` into a kernel, and guessing wrong about which header declares
-`snprintf` costs a 40-minute build to discover. An earlier draft also wrote
-`"vbar_el1":0` into a literal while holding the real value in a variable,
-which would have put a false statement into the very evidence the gate reads.
+**And then the guest refuted the part that looked finished.** Fact 228: the
+two IOKit records arrived complete and all three XNU records arrived seven
+bytes each, because the emit macro was handed a ternary whose two arms are
+arrays of *different* lengths, so the conditional operator decayed both to
+`char const *` and `sizeof(arr)` measured the pointer. The build was green and
+a byte-level grep of the kernel was green, because the literals really are in
+the image -- only the length argument was wrong, and it is computed at run
+time. Fixed by selecting in an `if` so every arm names an array;
+`NATIVE_CONSOLE_PICK` is deleted outright, because both of its arms were the
+same defect waiting to be reintroduced.
+
+Two static strings per fact, not `snprintf`: the driver builds with `-Werror`
+into a kernel, and guessing wrong about which header declares `snprintf` costs
+a 40-minute build to discover. An earlier draft also wrote `"vbar_el1":0` into
+a literal while holding the real value in a variable, which would have put a
+false statement into the very evidence the gate reads. That instinct was
+right, and fact 228 is the same instinct applied one level down: a record that
+is truncated is a false statement too, just not one anybody typed.
 
 Four static combinations for the interrupt fact, not two records, because the
 gate keeps only the FIRST record per event (`_guest_events` uses `setdefault`)
@@ -123,9 +154,9 @@ the log would never see the timer.
 
 | Level | Repo | Branch | Commit |
 |---|---|---|---|
-| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `c3c9ce2` |
-| UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `2bff001` |
-| main repo | `James081105/unipad` | `main` | `51b7e04` — both lock entries moved |
+| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `a7b7a03` |
+| UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `8a223b2` |
+| main repo | `James081105/unipad` | `main` | `3b6bbd4` — both lock entries moved |
 
 Build **run 41281382063** dispatched with experiment
 `exp-2026-11-01-console-xnu-records`, stage M5, system build 21H461, payload
@@ -134,35 +165,42 @@ build is the first real compiler to see the macro, and `-Werror` let it through.
 
 ## Next actions, in order
 
-1. **Finish `payload.img`** — running now via
-   `local-private/tmp/extract-one-member.py` into `local-private/tmp/bundle15/`
-   (92,633,980 bytes compressed over `[81,007,447, 173,641,427)`; 46% reused
-   from the partial, ~48 MB to go). Alongside it, `kernel.macho.gpuaddon`
-   (12,048,506 bytes at offset 173,642,189). Log:
-   `local-private/tmp/extract-payloadimg.log`. The four small members
-   (`UniXNU.efi`, `unixnu.toml`, `kernel.macho.adt`, `DarwinBoot.efi`) are
-   **already staged** and `kernel.macho` is extracted and verified.
-2. **Byte-level presence is DONE** (fact 227). All five records are in the ESP
-   kernel, sha256 tied to `payload.json`, counts matching the source's
-   prediction. Evidence file:
-   `local-private/tmp/xnu-records-in-kernel-evidence.txt`.
-3. **Run `local-private/tmp/iokit-capture.py local-private/tmp/bundle15`** — it
-   boots, waits for the hand-off, captures the channel into
-   `local-private/boot41/xnu-records/guest.log` (a fresh path, deliberately, and
-   it refuses to overwrite), and parses it with the gate's own criterion. Then
-   read the three XNU events, not just the two IOKit ones.
-4. **Re-run the gate** and read M4 together with M5-M9b. Fact 226 corrected the
+1. **Wait for build run 41296027165** — dispatched on `3b6bbd4` with
+   experiment `exp-2026-11-01-console-xnu-records-fix`, stage M5, system build
+   21H461, payload target tcg. It is the first build to compile the
+   seven-byte fix. Expect ~40 minutes for the macOS build.
+2. **Re-fetch that run's `boot-inputs`** with
+   `local-private/tmp/extract-one-member.py`, which pulls one member by byte
+   range instead of 310 MB. The ESP kernel cost **zero** new bytes last time
+   because the partial straight download already covered its stream. Stage into
+   `local-private/tmp/bundle16/` — and note `DarwinBoot.efi` must land at
+   `unixnu-out/qemu/tree/build/darwinboot-efi/build/DarwinBoot/DEBUG_CLANGPDB/
+   AARCH64/DarwinBootPkg/Driver/DarwinBoot/DEBUG/DarwinBoot.efi`, because
+   `ESP_LAYOUT` reads it from there; putting it at the bundle root made the
+   first capture refuse with "missing
+   ['EFI/UniXNU/Payloads/DarwinBoot.efi']".
+3. **Verify the bundle two ways** before booting it:
+   `local-private/tmp/verify-records-in-kernel.py` (sha256 must equal
+   `payload.json`'s `payload_kernel_sha256`) and
+   `local-private/tmp/verify-staged-bundle.py` (every member against both
+   `payload.json` and the artifact's own `manifest.json`). The second one is
+   what makes a member with no `payload.json` key verifiable at all.
+4. **Re-run `local-private/tmp/iokit-capture.py local-private/tmp/bundle16`**.
+   Last time the IOKit records arrived and the three XNU records arrived as
+   7 bytes each. This time all five should arrive whole; the capture writes to
+   `local-private/boot41/xnu-records/guest.log` and refuses to overwrite.
+5. **Re-run the gate** and read M4 together with M5-M9b. Fact 226 corrected the
    baseline: `xnu_initialised` gates **seven** milestones (M5, M6, M7, M8, M9,
    M9a, M9b), not two — so the same capture moves eight. Re-measure rather than
    assume — `evaluate(mid)` on `default_view()` answers in seconds, and
    `unmet_blockers` prints which one is still red. **Unblocked is not passed**:
    M6-M9b each still need their own `pass_evidence` from the guest.
-5. **Then the broker, if the render path is next.** That is the Part A + Part B
+6. **Then the broker, if the render path is next.** That is the Part A + Part B
    + Part C change fact 221 describes, and it is a device-repo re-pin. It is not
    on M5's path.
-6. **In parallel, `guest_install_service`** — the blocker for M10/M11/M12, and
+7. **In parallel, `guest_install_service`** — the blocker for M10/M11/M12, and
    gap B (no guest agent for install/launch/persist). It is independent of
-   `xnu_initialised`, so it does not have to wait for step 4.
+   `xnu_initialised`, so it does not have to wait for step 5.
 
 ## Resume commands
 
@@ -236,6 +274,25 @@ Recorded so the next run does not repeat them:
   occurrence each, and the three XNU records absent — which is correct, because
   bundle14 was built from `d1ebb35`, before `c3c9ce2` added them.
   `local-private/tmp/verify-records-in-kernel.py` is that instrument.
+- **"The literal is in the kernel" is NOT "the record is sent whole."**
+  Measured 2026-11-01, and it is the most expensive lesson here. A byte-level
+  grep of the ESP kernel found all five record literals with the right counts,
+  the sha256 tied to `payload.json`, the build was green under `-Werror` -- and
+  the three XNU records still arrived seven bytes each on the wire, because the
+  length argument was `sizeof` of a decayed pointer. The image cannot answer
+  this question; only the capture can. So a green kernel check is a NECESSARY
+  result, never a sufficient one.
+- **`sizeof` on a ternary over arrays measures the pointer, not the array.**
+  The two arms must be the same length for the conditional operator to keep an
+  array type, and `true`/`false` are not. Passing such an expression to a macro
+  that does `sizeof(arr)-1` silently sends `sizeof(char const*)-1` = 7 on
+  AArch64. Select in an `if` so every arm names an array.
+- **A guard test must not report its own documentation as a defect.** The new
+  records test quotes the old broken line in a comment so the next reader knows
+  what it replaced, and a raw scan reported that quotation as a live call site.
+  `_strip_comments()` (literal-aware, because the records are made of quotes and
+  escapes) is what separates them. A test that goes red on its own prose is
+  worse than no test.
 - **A submodule's worktree is CRLF while its commits are LF.**
   `vendor/UniXNU/drivers/NativeVirtioConsole` has `core.autocrlf=true`, so
   `git ls-files --eol` reports `i/lf w/crlf`: the committed blob is LF and the

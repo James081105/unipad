@@ -1414,3 +1414,50 @@ fetched 0 bytes in 0 attempt(s)
 **这一步证明了什么、没证明什么**：证明了记录在 payload 声明的那颗 kernel 的字节里，偏移与次数都与源码预测一致。**没有**证明驱动会跑、记录会到 agent channel、gate 会读到——那是客人侧抓包（`local-private/tmp/iokit-capture.py`）的事，而它需要 `payload.img` 里的数据 ramdisk。
 
 | R9aw | **三条 XNU 记录在 ESP kernel 里逐字节证实：sha256 `359eba3f…` 与 `payload.json` 的 `payload_kernel_sha256` 一致，五条记录全中（iokit 两条在 242932/243047，xnu 三条在 243159/243244/243439）**（2026-11-01，run 41281382063 / artifact 13074462047）：仪器在 sha256 不符时拒绝报告，故结论不可能在描述别的文件。**出现次数与源码预测逐一相符**：`exception_vectors` 2 次（两条静态字符串）、`interrupts` 4 次（gate 只留每条事件的第一条记录，故四种组合全发）。**仪器陷阱已修**：按 C 源码写法（反斜杠引号）造 needle 会报五条全无，链接后的 kernel 里是普通引号。**取 kernel 零新增传输**：压缩流 `[2,354,995, 81,005,811)` 已被 partial 全覆盖，`fetched 0 bytes`；取数仪器先对 `bundle14.zip` 离线验证、逐字节复现已知 kernel 才上真网 |
+
+
+---
+
+**事实 228（三条 XNU 记录**在 kernel 里、但每条只发出去 7 个字节**——事实 227 的「记录在 kernel 中」是真的，却不足以证明「记录被完整发出」；这是本次最贵的一课，而且是产品缺陷不是测试缺陷**）：事实 227 量完「五条记录都在 ESP kernel 的字节里、sha256 与 `payload.json` 一致」，接着就用同一颗 kernel 启动客人抓包。结果是：
+
+| 事件 | 到达情况 |
+|---|---|
+| `iokit.service_match` | 完整到达（第 18 行） |
+| `iokit.driver_probe` | 完整到达（第 19 行） |
+| `xnu.page_tables` | **只有 7 字节** |
+| `xnu.exception_vectors` | **只有 7 字节** |
+| `xnu.interrupts` | **只有 7 字节** |
+
+抓包文件 `local-private/boot41/xnu-records/guest.log` 共 1224 字节，最后 21 个字节按 repr 打出来是：
+
+```
+b'{"event{"event{"event'
+```
+
+**三条记录各发了 7 字节，一条不差。** 7 = `sizeof(char const *) - 1`，AArch64 上指针是 8 字节。
+
+**根因在 `NativeVirtioConsole::start()`**：记录是用三元表达式选出来、直接喂给 emit 宏的——
+
+```cpp
+NATIVE_CONSOLE_EMIT(NATIVE_CONSOLE_PICK(pt_on,pt_off,mmu_on));
+#define NATIVE_CONSOLE_PICK(on,off,flag) ((flag)?(on):(off))
+#define NATIVE_CONSOLE_EMIT(arr) send(arr,sizeof(arr)-1)
+```
+
+而两个分支是**长度不同的数组**：`true` 是 4 个字符、`false` 是 5 个。于是条件运算符把两边都退化成 `char const *`，`sizeof(arr)` 量到的是**指针大小 8**，不是任一记录的长度，`sizeof(arr)-1` 就是 7。两条 IOKit 记录是**直接按数组名**传的，所以它们完整到达——这正是故障看起来「有选择性」而不是「系统性」的原因。
+
+**没抓住它的东西，才是这件事的价值**：
+
+1. **构建是全绿的**。`-Werror` 下编过，macOS runner 上 34/34 步成功。
+2. **对镜像做字节级 grep 也是绿的**。五条记录的完整字面量**确实在 kernel 里**，ESP kernel 的 sha256 与 `payload.json` 的 `payload_kernel_sha256` 一字不差。事实 227 的结论没有错。
+3. **错的只有长度参数，而它是运行时算出来的**。所以第一个能看见缺陷的仪器是**网线**，不是构建、也不是镜像。
+
+**由此得到一条可复用的判据**：「字面量在 kernel 里」≠「记录被完整发出」。字节级检查分不清这两件事，因为长度不是镜像的属性。
+
+**修法与防线**：驱动改成在 `if` 里选，每个分支都指名一个数组——这是唯一能让 `sizeof(arr)-1` 等于记录自身长度的写法；`NATIVE_CONSOLE_PICK` 整个删掉，因为它的两个分支本来就是等着被再次引入的同一个缺陷。防线是 `tests/unit/test_native_virtio_console_records.py` 新增的 `test_no_record_is_sent_with_a_length_a_pointer_would_give`：它把 emit 调用点从源码里读出来，要求每个参数都是**裸数组名**，并报出每条记录本应是多少字节（pt_on 84 / pt_off 85、ev_on 96 / ev_off 97、ir_tt 109 到 ir_ff 111）。
+
+**测试是先写的**（CLAUDE.md 第 31 条）：先在坏代码上跑红，看到四条问题全部指向合同而不是指向自己的正则，再修驱动。**并且做了对质（变异测试）**，三种改法逐一验证测试会红：把三元表达式原地写回、把一条本来正确的记录的长度硬改成 7、把 emit 宏从 `sizeof` 改走。三种全杀，恢复后全绿。
+
+**这里还修掉一个会反复咬人的仪器陷阱**：测试第一次跑时多报了一条——它把**我自己写在注释里的旧代码**当成了活的调用点。注释里为了向后来的读者说明「原来长什么样」引用了那一行，而扫描器不懂注释。加了一个字面量感知的 `_strip_comments()` 才解决。**一个把自己的文档当成缺陷报出来的测试，比没有测试更糟**，因为它红得没有意义。
+
+| R9ax | **三条 XNU 记录在 kernel 里但每条只发出 7 字节：三元表达式把两个长度不同的数组退化成指针，`sizeof(arr)` 量到指针大小 8 而非记录长度，抓包末尾 21 字节是 `{"event{"event{"event`**（2026-11-01，`local-private/boot41/xnu-records/guest.log`，1224 字节，两条 IOKit 记录完整到达、三条 XNU 记录各 7 字节）：**构建绿、对镜像 grep 也绿**，五条字面量确实在 ESP kernel 里且 sha256 与 `payload.json` 一致——**错的只有运行时算出来的长度参数，所以第一个能看见它的仪器是网线**。**可复用判据：「字面量在 kernel 里」≠「记录被完整发出」**。**修法**：改为在 `if` 里选、每个分支指名数组，删掉 `NATIVE_CONSOLE_PICK`。**防线**：新增 `test_no_record_is_sent_with_a_length_a_pointer_would_give`，先写后修、变异测试三种改法全杀。**仪器陷阱**：测试一度把注释里引用的旧代码当成活调用点，加字面量感知的 `_strip_comments()` 才对——把自己的文档当缺陷报出来的测试比没有测试更糟 |
