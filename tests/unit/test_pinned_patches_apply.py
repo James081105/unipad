@@ -81,7 +81,7 @@ KNOWN_UNREACHABLE = {
     # the four after it are consistent with it and pass.  They are wrong by the
     # same 5-line systematic offset against hunk 2 -- the offset described in the
     # module docstring -- and that offset is deliberately left alone here.
-    ("offline-owner-systemos-mount.patch", 329),
+    ("offline-owner-systemos-mount.patch", 332),
     ("zzz-boot-progress.patch", 223),
     ("zzz-boot-progress.patch", 264),
 }
@@ -552,17 +552,15 @@ def test_the_mountpoints_two_arms_name_two_different_mount_points():
 def test_the_mount_report_is_gated_on_success_and_the_symbol():
     """Emitted only when the mount succeeded AND the console is linked.
 
-    The console archive is behind its own build switch, so the reference is
-    weak_imported (zzy-native-gpu-addon-mount.patch:76's idiom); without the
-    null check a build with no console archive calls address zero.
+    The null check stays even though the reference is now strong, because a
+    strong reference that somehow resolved to null would otherwise be a call
+    through zero.  The linker guarantees it cannot, and the guard costs one
+    dead branch.
     """
     patch = _mount_patch()
     if patch is None:
         pytest.skip("the offline owner cache mount patch is not in this pinned tree")
     code = _code_lines(patch.read_text(encoding="utf-8"))
-    assert any(
-        "native_console_report" in line and "weak_import" in line for line in code
-    ), "native_console_report is not weak-imported; a kernel built without the console archive will not link"
     assert any("if (!error && native_console_report)" in line for line in code), (
         "the emitter is not gated on !error AND the symbol"
     )
@@ -572,6 +570,64 @@ def test_the_mount_report_is_gated_on_success_and_the_symbol():
     assert any(
         line.startswith("native_console_report(identity_record") for line in code
     ), "the identity record is never handed to the port"
+
+
+def test_the_console_reference_is_strong_not_weak():
+    """``native_console_report`` must be a STRONG reference.
+
+    This is the whole reason build 41330622788 existed, and the defect it
+    caught is the most expensive kind: silent, and invisible to every
+    source-level check.
+
+    The reference used to be ``__attribute__((weak_import))``, on the
+    reasoning that the console archive is behind its own build switch and the
+    patch had to link with or without it.  It does not work.  MEASURED: an
+    ungated record at the emitter function's first statement never arrived on a
+    boot where the guest ran to t=1530 s -- twenty-four times past that function
+    -- while five records from the same port on the same boot arrived complete.
+    The records were byte-level in the booting kernel, the mount succeeded, and
+    the call site panics on any non-zero return with no panic in the ring, so
+    ``error`` was 0.  A weak_import does not oblige the linker to keep the
+    definition, so the symbol the call site tests for was simply absent, and
+    the ``if (native_console_report)`` guard made that absence look like a
+    deliberate design decision.
+
+    A strong reference makes the definition load-bearing: if the archive is
+    ever missing while this code is compiled, the link fails naming the symbol
+    instead of dropping the records.
+
+    The switch pairing is what makes the strong reference safe, and it is
+    asserted here too, because "the two switches are always set together" is a
+    claim about a config file that can change independently of this patch:
+
+    * ``XNU_OWNER_CACHE_MOUNT`` is set only by ``qemu_root_defconfig``, which is
+      also the config that sets ``CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y`` -- the
+      switch that puts ``libNativeVirtioConsole.a`` on the kernel link with
+      ``-Wl,-force_load``.
+    """
+    patch = _mount_patch()
+    if patch is None:
+        pytest.skip("the offline owner cache mount patch is not in this pinned tree")
+    text = patch.read_text(encoding="utf-8")
+    code = _code_lines(text)
+
+    declarations = [
+        line for line in code
+        if line.startswith("extern") and "native_console_report" in line
+    ]
+    assert len(declarations) == 1, (
+        f"expected exactly one declaration of native_console_report, found "
+        f"{len(declarations)}: {declarations}"
+    )
+    assert "weak_import" not in declarations[0], (
+        "native_console_report is weak-imported. Measured on build "
+        "41330622788: the symbol then resolves to null and BOTH records are "
+        "dropped silently, with the build green and the records byte-level "
+        "present in the kernel. Use a strong extern."
+    )
+    assert declarations[0].startswith("extern int native_console_report("), (
+        f"the declaration is not the expected strong extern: {declarations[0]!r}"
+    )
 
 
 def test_the_mount_report_is_emitted_after_the_mount_is_authorized():
