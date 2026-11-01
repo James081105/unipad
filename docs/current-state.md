@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 219). Main repo at `824b877`.
+Last updated: 2026-11-01 (fact 224). Main repo at `51b7e04`.
 
 ---
 
@@ -38,6 +38,8 @@ defaults to 0.
 | 7 | The frame→window path **is written and tested** | fact 216 — `framebuffer.py` + `surface_runner.py`; 4 and 7 mutants respectively, all killed |
 | 8 | The **red main is fixed** | commit `7414bad`; preflight run 41262805198 green |
 | 9 | The **pin chain is closed** | fact 215 — unipad `a4648c9` → UniXNU `04466512` → VirtioMmioConsole `61dc680`; the announcement is at lines 221-222 read back from GitHub |
+| 10 | The **IOKit records reach the wire on a real guest** | fact 223 — `local-private/boot40/iokit-records/guest.log`, 1187 bytes, both records at lines 17-18, parsed with the gate's own criterion and scoped ONSITE |
+| 11 | The **pin chain for the XNU records closes on GitHub** | `51b7e04`'s lock → UniXNU `2bff001` (parent `29ed7e9`) → its `drivers/NativeVirtioConsole` gitlink is `c3c9ce2` (parent `d1ebb35`), and the lock's submodule entry agrees with the gitlink, so there is no divergence. All four SHAs read back from api.github.com |
 
 ## What is NOT done, and why
 
@@ -49,47 +51,63 @@ defaults to 0.
 | D | **No real IPA has been installed, launched or persisted** | Blocked by A and B |
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
+| G | **The three XNU records are pinned and building, not yet measured on a guest** | The evidence stops at "CI compiled that tree" — the same level fact 223 stopped at for the IOKit records, before the byte-level ESP-kernel check and the capture |
 
 ## Active work
 
-**The M5 emitter is written, pinned and building.** Fact 222 established that
-M5 does *not* wait on the broker: `_guest_probe` checks only that a record whose
-`event` field matches exists — no payload validation — and the only veto fires
-when the service-match record is present and the driver-probe record is not. And
-the only code in the guest that can put bytes on that port is the console driver
-itself, because `grep -rln native_console_receive vendor/UniXNU/` returns only it
-and `NativeOfflineGPU.cpp`, which is not in any kernel.
+**The XNU emitter is pinned and building.** The two IOKit records cleared their
+own gate (measured on a real guest, below), but M5 is still BLOCKED on
+`xnu_initialised`, which needs three more guest events. The console driver is
+the only code in the guest that can put bytes on that port, so the same fork
+carries them.
 
-So two more `send()` calls in the fork I already control were enough — no new
-builder, no `board.toml` entry, no Part B.
+`start()` already reads `SCTLR_EL1` at its first line, so the page-table fact
+was free. `VBAR_EL1`, `DAIF` and `CNTFRQ_EL0` are read the same way, right
+after the IOKit records — inside IOKit, long past XNU's early architecture
+setup. So the three records measure XNU's live state; they are not inferences
+from the fact that this driver is running.
+
+Two static strings per fact and a ternary, not `snprintf`: the driver builds
+with `-Werror` into a kernel, and guessing wrong about which header declares
+`snprintf` costs a 40-minute build to discover. An earlier draft also wrote
+`"vbar_el1":0` into a literal while holding the real value in a variable,
+which would have put a false statement into the very evidence the gate reads.
+
+Four static combinations for the interrupt fact, not two records, because the
+gate keeps only the FIRST record per event (`_guest_events` uses `setdefault`)
+— a second `xnu.interrupts` record would be silently dropped, and a reader of
+the log would never see the timer.
 
 | Level | Repo | Branch | Commit |
 |---|---|---|---|
-| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `d1ebb35` |
-| UniXNU fork | `James081105/UniXNU` | `unipad/console-announcement` | `29ed7e9` |
-| main repo | `James081105/unipad` | `main` | lock updated, both entries |
+| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `c3c9ce2` |
+| UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `2bff001` |
+| main repo | `James081105/unipad` | `main` | `51b7e04` — both lock entries moved |
 
-263 lock-related unit tests pass. Build **run 41267641749** triggered with
-experiment `exp-2026-11-01-console-iokit-records`.
+Build **run 41281382063** dispatched with experiment
+`exp-2026-11-01-console-xnu-records`, stage M5, system build 21H461, payload
+target tcg.
 
 ## Next actions, in order
 
-1. **When run 41267641749 lands, download its `boot-inputs` and verify
-   byte-level** that the two records are in the ESP kernel — the same check that
-   proved the announcement (fact 217).
-2. **Run `local-private/tmp/iokit-capture.py`** against that bundle. It boots,
-   waits for the hand-off, captures the channel, writes
-   `local-private/boot40/iokit-records/guest.log`, and then parses it with the
-   gate's own criterion — one JSON object per line, `event` field — and reports
-   which of the two are missing. It also applies `_is_simulation_path` to the
-   file it just wrote, because a real record scoped SIMULATION and a missing
-   record look different in a report but cost the same.
-3. **Re-run the gate** and read M5's two probes (`p.iokit_service_match`,
-   `p.iokit_driver_probe`). If both go green, M5 moves off BLOCKED and the
-   firmware route has its first gate-visible guest evidence.
-4. **Then the broker, if the render path is next.** That is the Part A + Part B +
-   Part C change fact 221 describes, and it is a device-repo re-pin. It is not on
-   M5's path.
+1. **When run 41281382063 lands, download its `boot-inputs`** with
+   `local-private/tmp/fetch-artifact.py` (a fresh URL per attempt — the
+   pre-signed one expires mid-transfer and `curl` exits 0 on the truncated
+   result).
+2. **Verify byte-level** that the three XNU records are in the ESP kernel — the
+   same check that proved the announcement (fact 217) and the two IOKit records
+   (fact 223). Extract the kernel, grep it for `xnu.page_tables`,
+   `xnu.exception_vectors` and `xnu.interrupts`, and confirm its sha256 equals
+   `payload.json`'s `payload_kernel_sha256`.
+3. **Run `local-private/tmp/iokit-capture.py`** against that bundle. It boots,
+   waits for the hand-off, captures the channel into
+   `local-private/boot40/iokit-records/guest.log`, and parses it with the gate's
+   own criterion. Then read the three XNU events, not just the two IOKit ones.
+4. **Re-run the gate** and read M5's probes plus `xnu_initialised`. If all
+   clear, M5 moves off BLOCKED.
+5. **Then the broker, if the render path is next.** That is the Part A + Part B
+   + Part C change fact 221 describes, and it is a device-repo re-pin. It is not
+   on M5's path.
 
 ## Resume commands
 
@@ -98,6 +116,10 @@ whose kernel carries the announcement; it is already extracted at
 `local-private/tmp/bundle13`.
 
 ```bash
+# The XNU records, on the committed (LF) blob -- that is what CI compiles.
+git -C vendor/UniXNU/drivers/NativeVirtioConsole show   c3c9ce2:NativeVirtioConsole.cpp > local-private/tmp/committed-driver.cpp
+python local-private/tmp/verify-xnu-records.py
+
 # Re-run the announcement probe (proves guest->host on a fresh guest).
 cd F:/iosvirtual
 rm -rf local-private/boot40/announce
@@ -139,6 +161,13 @@ Recorded so the next run does not repeat them:
   a flat budget. Fact 219.
 - **The virtio-mmio queue rings are at `base+0x80/0x90/0xa0`**, not
   `base+0x30..0x44` (those are QueueSel/QueueNum/QueueSize/QueueReady). Fact 219.
+- **A submodule's worktree is CRLF while its commits are LF.**
+  `vendor/UniXNU/drivers/NativeVirtioConsole` has `core.autocrlf=true`, so
+  `git ls-files --eol` reports `i/lf w/crlf`: the committed blob is LF and the
+  checkout on disk is CRLF, and git normalizes on commit. So a byte-for-byte
+  diff between the worktree and `git show <sha>:<file>` reports every line as
+  different when the content is identical. Verify against the committed blob
+  (`git show <sha>:<file>`), because that is what CI compiles.
 - **GitHub artifact pre-signed URLs expire mid-download and curl exits 0 on the
   truncated result.** Use `local-private/tmp/fetch-artifact.py`, which resumes
   with a fresh URL per attempt. Measured three times.
