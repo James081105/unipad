@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 224). Main repo at `51b7e04`.
+Last updated: 2026-11-01 (fact 224). Main repo at `958dad8`.
 
 ---
 
@@ -39,7 +39,8 @@ defaults to 0.
 | 8 | The **red main is fixed** | commit `7414bad`; preflight run 41262805198 green |
 | 9 | The **pin chain is closed** | fact 215 — unipad `a4648c9` → UniXNU `04466512` → VirtioMmioConsole `61dc680`; the announcement is at lines 221-222 read back from GitHub |
 | 10 | The **IOKit records reach the wire on a real guest** | fact 223 — `local-private/boot40/iokit-records/guest.log`, 1187 bytes, both records at lines 17-18, parsed with the gate's own criterion and scoped ONSITE |
-| 11 | The **pin chain for the XNU records closes on GitHub** | `51b7e04`'s lock → UniXNU `2bff001` (parent `29ed7e9`) → its `drivers/NativeVirtioConsole` gitlink is `c3c9ce2` (parent `d1ebb35`), and the lock's submodule entry agrees with the gitlink, so there is no divergence. All four SHAs read back from api.github.com |
+| 11 | The **gap to M4+M5 is exactly the three XNU records** | fact 224 — the gate's own verdicts: M4 `UNVERIFIED` with `missing` = the three XNU requirements and nothing else; M5 `BLOCKED` by `xnu_initialised` with `missing=()` (its two IOKit requirements already pass, witnesses at `guest.log:17`/`:18`, both `onsite`) |
+| 12 | The **pin chain for the XNU records closes on GitHub** | `51b7e04`'s lock → UniXNU `2bff001` (parent `29ed7e9`) → its `drivers/NativeVirtioConsole` gitlink is `c3c9ce2` (parent `d1ebb35`), and the lock's submodule entry agrees with the gitlink, so there is no divergence. All four SHAs read back from api.github.com |
 
 ## What is NOT done, and why
 
@@ -52,6 +53,7 @@ defaults to 0.
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
 | G | **The three XNU records are pinned and building, not yet measured on a guest** | The evidence stops at "CI compiled that tree" — the same level fact 223 stopped at for the IOKit records, before the byte-level ESP-kernel check and the capture |
+| H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True |
 
 ## Active work
 
@@ -103,8 +105,11 @@ target tcg.
    waits for the hand-off, captures the channel into
    `local-private/boot40/iokit-records/guest.log`, and parses it with the gate's
    own criterion. Then read the three XNU events, not just the two IOKit ones.
-4. **Re-run the gate** and read M5's probes plus `xnu_initialised`. If all
-   clear, M5 moves off BLOCKED.
+4. **Re-run the gate** and read M4 and M5 together. Fact 224 measured the
+   baseline: M5's `missing` is already empty and M4's is exactly these three
+   requirements, so the same capture moves both. Re-measure rather than
+   assume — `evaluate("M4")` and `evaluate("M5")` on `default_view()`
+   answer it in seconds, and the eight probes print which one is still red.
 5. **Then the broker, if the render path is next.** That is the Part A + Part B
    + Part C change fact 221 describes, and it is a device-repo re-pin. It is not
    on M5's path.

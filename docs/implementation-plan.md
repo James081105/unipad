@@ -1291,3 +1291,27 @@ send(probe_record,sizeof(probe_record)-1);
 **一条关于这台机器的实测，记下来免得下次误判**：GitHub artifact 的预签名 URL 这次的寿命明显短于上次——同样的 `fetch-artifact.py` 续传循环，上次单次 attempt 拿到 200 MB，这次每 attempt 只拿到约 2.4 MB，速率 2.4 MB/分钟，310 MB 全程约两小时。**脚本行为没变，是 URL 寿命变了**，所以「下载变慢」不要先怀疑脚本。
 
 | R9as | **M5 的客人侧发射器已钉住并构建成功：驱动 fork `d1ebb35`（GitHub 上已验证含两条记录）→ UniXNU fork `29ed7e9` → 主仓 lock 两条；构建结论 success 意味着 CI 的 HEAD 一致性检查通过（它拒绝不一致的 checkout），驱动以 `-Werror` 编过并过了 ARM64/iOS 17 对象审计，`preflight` 亦绿、263 个 lock 单测通过**（2026-11-01，run 41267641749，experiment `exp-2026-11-01-console-iokit-records`）：改动只有 `start()` 里告白之后两条 `send()`，**没有新 builder、没有 board.toml、没有 Part B**。**但证据到「编了那棵树」为止，不等于「记录在内核里」**——字节级验证要等 boot-inputs（310,350,137 字节）落盘后重复事实 217 那个检查。**实测**：预签名 URL 寿命比上次短，每 attempt 约 2.4 MB、全程约两小时，脚本没变 |
+
+---
+
+**事实 224（三条 XNU 记录不是只解一个 milestone：M4 和 M5 都只差这三条，而 M5 的 `pass_evidence` 现在就已经全绿——它唯一的 blocker 是 `xnu_initialised`，M4 则是三项 `evidence_absent`，其余全部有真人证据；这是直接跑 gate 的探针量到的，不是读代码推的**）：把八个探针在 `M.default_view()` 上逐个跑了一遍，这是量到的基线：
+
+| 探针 | ok | 说明 |
+|---|---|---|
+| `p.source_pins` | **True** | `pins=32 problems=none` |
+| `p.el1_entry` | **True** | `local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log` 的 `CurrentEL=0x4`，配 `trace.log` 的 exception 1 与 `to EL1 PC 0x` |
+| `p.failure_forensics` | **True** | `runs/exp-install-2d711642b726/verification.json`：`passed=False`，理由含 `evidence_incomplete` |
+| `p.unixnu_kernel_image` | **True** | 三个 kernel.macho 在场 |
+| `p.xnu_page_tables` | False | `missing=xnu.page_tables` |
+| `p.xnu_exception_state` | False | `missing=xnu.exception_vectors` |
+| `p.xnu_interrupt_state` | False | `missing=xnu.interrupts` |
+| `p.iokit_service_match` | **True** | witness `local-private/boot40/iokit-records/guest.log:17` |
+| `p.iokit_driver_probe` | **True** | witness 同一文件 `:18` |
+
+**两个 verdict 是 gate 自己算的**：`M4` → `UNVERIFIED`，`reasons=('evidence_absent:m4.page_tables,m4.exception_state,m4.interrupt_state')`，`missing` 正是这三项、**别无其他**；`M5` → `BLOCKED`，`reasons=('blocked_by:xnu_initialised:...')`，而 `missing=()`——它的两条必选项（`m5.service_matching`、`m5.driver_probe`）**已经满足**，两条 EvidenceRef 都是 `scope='onsite'`。
+
+**所以三条记录一落地，动的是一次两个 blocking milestone，不是一个**：M4 从 UNVERIFIED 走完、M5 从 BLOCKED 解除。这条之所以值得单独记，是因为**按事实 222 的说法去做，人只会盯 M5**，而 M4 的三项缺口和 M5 的 blocker 是同一个 `xnu_initialisation`（`_KERNEL_BLOCKER` 的 `satisfied_by` 是 `unixnu_kernel_image`，早已 True）——同一个修复付一次钱拿两个里程碑。
+
+**顺带量到一件对后面有用的事**：`_PRUNE` 里有 `local-private`，但 `default_view()` 的 roots 显式包含 `root.glob("local-private/boot*")`，所以 `local-private/boot40/...` 的取证是有效的、而 `local-private/acceptance-runs/...` 是无效的。M4 的两条老证据（`local-private/out/real-boot/...` 与 `runs/...`）都落在有效 root 上，这就是它们算数的原因。
+
+| R9at | **三条 XNU 记录落地时动的是一次两个 blocking milestone：直接跑 gate 探针量到 M4=`UNVERIFIED` 且 `missing` 恰好只有 `m4.page_tables`/`m4.exception_state`/`m4.interrupt_state` 三项、M5=`BLOCKED` 但 `missing=()`（两条 IOKit 必选项已满足，witness 在 `local-private/boot40/iokit-records/guest.log:17`/`:18`，均 `scope='onsite'`），两者共用同一个 `xnu_initialisation`；`p.el1_entry`/`p.failure_forensics`/`p.unixnu_kernel_image`/`p.source_pins` 四项均已 True**（2026-11-01，experiment `exp-2026-11-01-console-xnu-records`）：驱动 fork `c3c9ce2`、UniXNU fork `2bff001`、主仓 `51b7e04`，build run 41281382063 的第 7 步「Acquire and verify the pinned sources（pin cross-check）」已 success——CI 确实检出了那棵树。**但三条记录本身仍未在一个真客人上量到**，所以这一条是「缺口已经量清、修复已钉住并正在构建」，不是「已验收」
