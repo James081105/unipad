@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 228). Main repo at `3b6bbd4`.
+Last updated: 2026-11-01 (fact 230). Main repo at `f5b498d`.
 
 ---
 
@@ -45,9 +45,19 @@ reusable rule: *"the literal is in the kernel" is not "the record is sent
 whole"*.
 
 Fixed by selecting in an `if` so every arm names an array, with
-`NATIVE_CONSOLE_PICK` deleted outright. Re-pinned to driver `a7b7a03` /
-UniXNU `8a223b2`, both read back from api.github.com, and build
-**run 41296027165** is in progress on `3b6bbd4`.
+`NATIVE_CONSOLE_PICK` deleted outright. Driver `a7b7a03` / UniXNU `8a223b2`,
+both read back from api.github.com. Build **run 41296027165** concluded
+**success** (34/34 steps), the capture landed 1492 bytes with all five records
+complete, and the gate now reads **M4 PASS and M5 PASS** — fact 230, the first
+time either has passed.
+
+**What that did NOT buy, stated plainly:** clearing `xnu_initialised` moved
+M6/M7/M8 to UNVERIFIED (blocker gone, evidence still absent), M9/M9a to
+**FAIL on a PRD veto** (`m9.veto.homescreen_screenshot_only`,
+`m9a.veto.wallpaper_only` — the gate refuses a screenshot as interaction
+evidence), M9b to BLOCKED on a *different* blocker
+(`system_volume_mounted`), and left M10/M10a/M11/M12 BLOCKED on
+`guest_install_service`. Two passes, five different kinds of not-passed.
 
 ---
 
@@ -72,7 +82,9 @@ UniXNU `8a223b2`, both read back from api.github.com, and build
 | 15 | **`xnu_initialised` gates SEVEN milestones, not two — fact 224 undercounted** | fact 226 — `_XNU_BLOCKER` has seven use sites in `milestones.py` (lines 2336/2367/2412/2457/2498/2543/2593), landing on M5, M6, M7, M8, M9, M9a and M9b. Evaluated M3-M12 in full: each of those seven is `BLOCKED` with `unmet_blockers` containing only `xnu_initialised` (M9b also `system_volume_mounted`). So the three records pay once and move **eight** milestones — M4 completes, seven unblock |
 | 16 | **All five records are in the bytes of the kernel the guest boots** | fact 227 — artifact `13074462047`'s ESP kernel, 125,480,960 bytes, sha256 `359eba3f…` **equal** to `payload.json`'s `payload_kernel_sha256`; `iokit.service_match` at 242932 and `iokit.driver_probe` at 243047 (1 each), `xnu.page_tables` at 243159 (1), `xnu.exception_vectors` at 243244 (**2**), `xnu.interrupts` at 243439 (**4**). The instrument refuses to report unless the two hashes agree. The counts were predicted from the source first: two static strings per fact, and four DAIF × CNTFRQ combinations because the gate keeps only the first record per event. **Corrected by fact 228: this proves the literals are in the kernel, NOT that they are sent whole** |
 | 17 | **The kernel was obtained without transferring 310 MB** | fact 227 — the member is 78,650,816 bytes DEFLATED over `[2,354,995, 81,005,811)`, a range the partial straight download already covered, so extraction moved `fetched 0 bytes`. The extractor was validated offline first against `bundle14.zip` (a complete zip whose ESP kernel is already on disk), reproducing that known kernel byte for byte; its first live run **refused**, correctly, because it had been handed one artifact's bytes against another's central directory |
-| 18 | **The `xnu_initialised` records were sent seven bytes long — fact 228** | driver `a7b7a03` / UniXNU `8a223b2` / run 41296027165 — the two IOKit records arrived complete and all three XNU records arrived as the 7 bytes `{"event`, because the record was selected by a ternary whose two arms are arrays of *different* lengths, so the conditional operator decayed both to `char const *` and `sizeof(arr)` measured the pointer. The build was green and a byte-level grep of the kernel was green: the literals really are in the image. Only the length argument was wrong, and it is computed at run time |
+| 18 | **M4 and M5 PASS — the first time either has** | fact 230 — gate on `default_view()`: M4 `PASS` with `satisfied:m4.page_tables/m4.exception_state/m4.interrupt_state/m4.failure_forensics`, M5 `PASS` with `satisfied:m5.service_matching/m5.driver_probe`. Witnesses the gate itself cites: `local-private/boot41/xnu-records/guest.log:20:xnu.page_tables`, `:21:xnu.exception_vectors`, `:22:xnu.interrupts`, all `kind='guest_log'`, `scope='onsite'`. Capture 1492 bytes, sha256 `7fba8ed0…` |
+| 19 | **The fixed kernel is a different kernel from the defective one** | fact 230 — ESP kernel sha256 moved `359eba3f…` → `227fc03b…`, both equal to their own `payload.json`, and all five record literals sit at the **same** offsets and counts in both (242932/243047/243159/243244×2/243439×4), because the fix changed control flow and not the strings |
+| 20 | **The `xnu_initialised` records were sent seven bytes long — fact 228** | driver `a7b7a03` / UniXNU `8a223b2` / run 41296027165 — the two IOKit records arrived complete and all three XNU records arrived as the 7 bytes `{"event`, because the record was selected by a ternary whose two arms are arrays of *different* lengths, so the conditional operator decayed both to `char const *` and `sizeof(arr)` measured the pointer. The build was green and a byte-level grep of the kernel was green: the literals really are in the image. Only the length argument was wrong, and it is computed at run time |
 
 
 ## What is NOT done, and why
@@ -85,122 +97,81 @@ UniXNU `8a223b2`, both read back from api.github.com, and build
 | D | **No real IPA has been installed, launched or persisted** | Blocked by A and B |
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
-| G | **The three XNU records were sent seven bytes long on a real guest — fixed, rebuilding** | fact 228 — the records ARE in the ESP kernel (fact 227) and the build was green, but the emit macro was handed a ternary, so `sizeof` measured the pointer and each record went out 7 bytes. Driver `a7b7a03` fixes it by selecting in an `if`; build **run 41296027165** is in progress on `3b6bbd4`. The bundle for that build has to be re-fetched and the capture re-run before the gate can be read |
-| H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True. **Corrected by fact 226**: it is not just M4+M5 — `xnu_initialised` also blocks M6, M7, M8, M9, M9a and M9b, so the same three records move eight milestones |
+| G | **M4 and M5 now PASS; the rest of the XNU chain is a different problem** | fact 230 — the three XNU records are on the wire whole and M4/M5 read PASS. What remains is NOT this chain: M6/M7/M8 need their own guest evidence, M9/M9a need real interaction evidence (a screenshot is vetoed by name), M9b needs `system_volume_mounted`, and M10/M10a/M11/M12 need `guest_install_service` |
+| H | **CLOSED — the three XNU records moved M4 and M5 to PASS** | fact 230 — fact 224 said nothing else stood between the records and M4+M5, and that held. Fact 226 widened the claim to eight milestones, and fact 230 shows what that widening was worth: **two PASS, three UNVERIFIED, two FAIL-on-veto, one BLOCKED on a different blocker**. The eight-milestone figure was right about the lever and wrong if read as eight passes |
 
 ## Active work
 
-**The XNU emitter is pinned, compiled and byte-proven.** Run 41281382063
-concluded **success**, so the driver with all ten records survived `-Werror` on
-the macOS runner — the first real compiler to see the macro, and this host has
-none. The records are then **in the kernel the guest boots**: fact 227 ties the
-ESP kernel's sha256 to `payload.json`'s `payload_kernel_sha256` and finds all
-five literals at the offsets and counts the source predicts.
+**M4 and M5 PASS.** That is the headline and it is worth being precise about
+what produced it: three XNU records on the agent channel, complete, from a
+kernel whose sha256 ties to its own `payload.json`, with witnesses the gate
+itself cites at `guest.log:20/:21/:22` all scoped `onsite` (fact 230).
 
-**The 310 MB download was the wrong shape for this job.** The pre-signed URL is
-link-bound at ~26-30 KB/s and dies after ~1.5 MB, so a straight serial download
-is a three-hour job — and the only file needed to prove the records are in the
-kernel is 79 MB DEFLATED at offset 2.35 MB, a range the partial download had
-already covered. `local-private/tmp/extract-one-member.py` pulls one member by
-byte range instead: it cost **zero** new bytes for the kernel and 688 bytes for
-`payload.json`. The same trick is now assembling `payload.img` (92.6 MB
-compressed, 46% reused from the partial), which the guest capture needs for the
-data ramdisk — without it the guest sits in the boot menu repeating
-`cannot read initrd ... scratch-data.img: Not Found` while every liveness signal
-still says "alive" (measured on bundle12).
+**And it took a defect to get there.** The records were in the kernel the whole
+time — a byte-level grep found all five, the build was green — and they were
+still sent seven bytes each, because the emit macro was handed a ternary and
+`sizeof` measured the pointer instead of the array (fact 228). The reusable
+rule is in the instrument lessons: *"the literal is in the kernel" is not "the
+record is sent whole."*  A green kernel check is a necessary result, never a
+sufficient one.
 
-**A note on the proxy.** The user's proxy at `127.0.0.1:7897` works fine for
-`api.github.com`, `github.com` and `objects.githubusercontent.com`, but its
-upstream **refuses `*.blob.core.windows.net`** — verified three ways: `curl -v`
-shows the CONNECT tunnel establish (200) and then the TLS handshake inside it
-fail; `-k` changes nothing; plain HTTP returns 502. So the proxy cannot be
-applied to this artifact, and the range-extraction method above is what replaced
-it.
+**What "unblocked" actually bought, since it is easy to over-read:** two PASS,
+three UNVERIFIED (M6/M7/M8 — blocker gone, evidence still absent), two FAIL on
+a PRD veto (M9/M9a — a screenshot is refused by name), one still BLOCKED on a
+*different* blocker (M9b → `system_volume_mounted`), and four still BLOCKED on
+`guest_install_service` (M10/M10a/M11/M12).
 
-The two IOKit records already cleared their own gate (measured on a real guest,
-below), but M5 is still BLOCKED on `xnu_initialised`, which needs three more
-guest events. The console driver is the only code in the guest that can put
-bytes on that port, so the same fork carries them.
-
-`start()` already reads `SCTLR_EL1` at its first line, so the page-table fact
-was free. `VBAR_EL1`, `DAIF` and `CNTFRQ_EL0` are read the same way, right
-after the IOKit records — inside IOKit, long past XNU's early architecture
-setup. So the three records measure XNU's live state; they are not inferences
-from the fact that this driver is running.
-
-**And then the guest refuted the part that looked finished.** Fact 228: the
-two IOKit records arrived complete and all three XNU records arrived seven
-bytes each, because the emit macro was handed a ternary whose two arms are
-arrays of *different* lengths, so the conditional operator decayed both to
-`char const *` and `sizeof(arr)` measured the pointer. The build was green and
-a byte-level grep of the kernel was green, because the literals really are in
-the image -- only the length argument was wrong, and it is computed at run
-time. Fixed by selecting in an `if` so every arm names an array;
-`NATIVE_CONSOLE_PICK` is deleted outright, because both of its arms were the
-same defect waiting to be reintroduced.
-
-Two static strings per fact, not `snprintf`: the driver builds with `-Werror`
-into a kernel, and guessing wrong about which header declares `snprintf` costs
-a 40-minute build to discover. An earlier draft also wrote `"vbar_el1":0` into
-a literal while holding the real value in a variable, which would have put a
-false statement into the very evidence the gate reads. That instinct was
-right, and fact 228 is the same instinct applied one level down: a record that
-is truncated is a false statement too, just not one anybody typed.
-
-Four static combinations for the interrupt fact, not two records, because the
-gate keeps only the FIRST record per event (`_guest_events` uses `setdefault`)
-— a second `xnu.interrupts` record would be silently dropped, and a reader of
-the log would never see the timer.
+**The next real blocker is `system_volume_mounted`, and it is not a driver
+fix.** The gate wants a writable system volume in the guest; this host has no
+APFS read/write implementation. `guest_install_service` (gap B) is independent
+of it and can run in parallel.
 
 | Level | Repo | Branch | Commit |
 |---|---|---|---|
 | driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `a7b7a03` |
 | UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `8a223b2` |
-| main repo | `James081105/unipad` | `main` | `3b6bbd4` — both lock entries moved |
+| main repo | `James081105/unipad` | `main` | `f5b498d` |
 
-Build **run 41281382063** dispatched with experiment
-`exp-2026-11-01-console-xnu-records`, stage M5, system build 21H461, payload
-target tcg. **It concluded success** (34/34 steps; fact 225) — step 14's macOS
-build is the first real compiler to see the macro, and `-Werror` let it through.
+Build **run 41296027165** concluded **success** (34/34 steps) on `3b6bbd4`,
+experiment `exp-2026-11-01-console-xnu-records-fix`, stage M5, system build
+21H461, payload target tcg.
 
 ## Next actions, in order
 
-1. **Wait for build run 41296027165** — dispatched on `3b6bbd4` with
-   experiment `exp-2026-11-01-console-xnu-records-fix`, stage M5, system build
-   21H461, payload target tcg. It is the first build to compile the
-   seven-byte fix. Expect ~40 minutes for the macOS build.
-2. **Re-fetch that run's `boot-inputs`** with
-   `local-private/tmp/extract-one-member.py`, which pulls one member by byte
-   range instead of 310 MB. The ESP kernel cost **zero** new bytes last time
-   because the partial straight download already covered its stream. Stage into
-   `local-private/tmp/bundle16/` — and note `DarwinBoot.efi` must land at
-   `unixnu-out/qemu/tree/build/darwinboot-efi/build/DarwinBoot/DEBUG_CLANGPDB/
-   AARCH64/DarwinBootPkg/Driver/DarwinBoot/DEBUG/DarwinBoot.efi`, because
-   `ESP_LAYOUT` reads it from there; putting it at the bundle root made the
-   first capture refuse with "missing
-   ['EFI/UniXNU/Payloads/DarwinBoot.efi']".
-3. **Verify the bundle two ways** before booting it:
-   `local-private/tmp/verify-records-in-kernel.py` (sha256 must equal
-   `payload.json`'s `payload_kernel_sha256`) and
-   `local-private/tmp/verify-staged-bundle.py` (every member against both
-   `payload.json` and the artifact's own `manifest.json`). The second one is
-   what makes a member with no `payload.json` key verifiable at all.
-4. **Re-run `local-private/tmp/iokit-capture.py local-private/tmp/bundle16`**.
-   Last time the IOKit records arrived and the three XNU records arrived as
-   7 bytes each. This time all five should arrive whole; the capture writes to
-   `local-private/boot41/xnu-records/guest.log` and refuses to overwrite.
-5. **Re-run the gate** and read M4 together with M5-M9b. Fact 226 corrected the
-   baseline: `xnu_initialised` gates **seven** milestones (M5, M6, M7, M8, M9,
-   M9a, M9b), not two — so the same capture moves eight. Re-measure rather than
-   assume — `evaluate(mid)` on `default_view()` answers in seconds, and
-   `unmet_blockers` prints which one is still red. **Unblocked is not passed**:
-   M6-M9b each still need their own `pass_evidence` from the guest.
-6. **Then the broker, if the render path is next.** That is the Part A + Part B
-   + Part C change fact 221 describes, and it is a device-repo re-pin. It is not
-   on M5's path.
-7. **In parallel, `guest_install_service`** — the blocker for M10/M11/M12, and
-   gap B (no guest agent for install/launch/persist). It is independent of
-   `xnu_initialised`, so it does not have to wait for step 5.
+1. **`system_volume_mounted` (M9b) — the next blocker in the chain.** The
+   gate's own words: "no writable system volume is mounted in the guest: this
+   host has no APFS read/write implementation, so the 6.08 GB os-root raw image
+   cannot be produced in the state the guest would see, and Data persistence has
+   nothing to be persisted onto."  This is the largest single piece of work left
+   and it is not a driver fix.
+2. **`guest_install_service` (M10/M10a/M11/M12) — gap B, and independent.** No
+   guest agent reads the host's six install/launch/persist ops. This can be
+   pushed in parallel with step 1 and does not wait on it.
+3. **M9/M9a need real interaction evidence, and the veto names what will not
+   count.** `m9.veto.homescreen_screenshot_only` and
+   `m9a.veto.wallpaper_only` mean a screenshot — however good — can never
+   satisfy them. What they want is input reaching the guest and the guest
+   responding.
+4. **M6/M7/M8 are UNVERIFIED with their blockers gone.** They need their own
+   guest evidence: `m6.known_content_read_back`, `m7.volume_identity`,
+   `m7.mount_relations`, `m7.dyld_cache_read`, `m8.original_launchd`,
+   `m8.later_daemons`. Several of these fall out of step 1 for free.
+5. **The broker, if the render path is next.** That is the Part A + Part B +
+   Part C change fact 221 describes, and it is a device-repo re-pin.
+6. **Not started at all:** audio, network, launcher, performance acceptance
+   (gap F).
+
+### What just finished, for the record
+
+Build run 41296027165 concluded success (34/34 steps) on `3b6bbd4`. The bundle
+was staged by `local-private/tmp/stage-bundle-from-run.py 41296027165
+local-private/tmp/bundle16` — one command, nine members, every one verified
+against both `payload.json` and the artifact's own `manifest.json`. The capture
+wrote 1492 bytes to `local-private/boot41/xnu-records/guest.log` (sha256
+`7fba8ed0…`) with all five records complete, and the gate reads M4 PASS and M5
+PASS. The defective capture is kept beside it as
+`capture-defect-228-seven-byte-records.log`, deliberately named so it matches
+none of the gate's `_GUEST_LOG_GLOBS` — it is evidence, not input.
 
 ## Resume commands
 
@@ -218,6 +189,12 @@ python -u local-private/tmp/extract-one-member.py local-private/tmp/bundle15.zip
 
 # ...and validate the extractor offline against a known answer first.
 python -u local-private/tmp/validate-extractor.py
+
+# Re-read the gate after a capture lands (M3..M12, with the blockers).
+python -u local-private/tmp/reread-gate.py
+
+# Stage a whole verified bundle from a build run, in one command.
+python -u local-private/tmp/stage-bundle-from-run.py 41296027165 local-private/tmp/bundle16
 
 # The XNU records, on the committed (LF) blob -- that is what CI compiles.
 git -C vendor/UniXNU/drivers/NativeVirtioConsole show   c3c9ce2:NativeVirtioConsole.cpp > local-private/tmp/committed-driver.cpp

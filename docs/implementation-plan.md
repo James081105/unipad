@@ -1487,3 +1487,46 @@ NATIVE_CONSOLE_EMIT(NATIVE_CONSOLE_PICK(pt_on,pt_off,mmu_on));
 **还有一条是关于复用的**：partial 文件路径必须是**按 artifact 编号**的（`artifact-<id>.zip`）。extract-one-member.py 第一次上真网就拒绝报告，原因正是喂给了它另一个 artifact 的字节：两个 zip 把同一成员放在不同偏移，拼出来的流不是那个成员的字节，inflate 当场失败。**复用只能复用自己的 bytes**，这条现在写在了脚本里而不是只写在注释里。
 
 | R9ay | **七字节修复版构建成功：run 41296027165 结论 success，34 步全部 success，boot-inputs artifact `13080506671`（310,348,182 字节）**（2026-11-01，`exp-2026-11-01-console-xnu-records-fix` / stage M5 / 21H461 / tcg）：本机无 C 编译器，macOS runner 是第一个真正编译该修复的编译器，`-Werror` 放行。**但本轮只证明「能编过」，不证明「记录被完整发出」**——构建绿与记录完整是两件独立的事（事实 228）。**抓包流程已收敛为一条命令** `stage-bundle-from-run.py RUN_ID`，对已知答案（run 41281382063）验证九个成员全 `ok`。**该命令自身当场犯了两个我已犯过的错并已修**：`DarwinBoot.efi` 目的地写成 bundle 根目录（`ESP_LAYOUT` 读的是深层路径，zip 有四个同名副本）；每成员重取 4 MB 尾部窗口读中央目录（十成员 = 40 MB 浪费）。**partial 必须按 artifact 编号**，复用只能复用自己的 bytes |
+
+
+---
+
+**事实 230（M4 与 M5 第一次 PASS——三条 XNU 记录真机抓包成功，gate 自己引用的见证是 `guest.log:20/:21/:22`，全部 `scope='onsite'`**）：从带修复的 kernel（sha256 `227fc03b…`，与旧版 `359eba3f…` 不同，证明修复确实进了链接）启动客人抓包，1492 字节，五行 JSON 全部完整：
+
+| 行 | 事件 | 内容 |
+|---|---|---|
+| 18 | `iokit.service_match` | `provider_matched=true` |
+| 19 | `iokit.driver_probe` | `result=matched, queue_count=2, online=true` |
+| 20 | `xnu.page_tables` | `mmu_enabled=true` |
+| 21 | `xnu.exception_vectors` | `vectors_installed=true` |
+| 22 | `xnu.interrupts` | `irqs_unmasked=true, timer_configured=true` |
+
+抓包文件 `local-private/boot41/xnu-records/guest.log`，1492 字节，sha256 `7fba8ed0177fe7a0a8a45654338713c84e57e9668651ee024fb424f97386997c`。**这三行是 XNU 的活体状态测量，不是推断**：`mmu_enabled` 读自 `SCTLR_EL1.M`、`vectors_installed` 读自 `VBAR_EL1 != 0`、`irqs_unmasked` 读自 `DAIF.I` 清零、`timer_configured` 读自 `CNTFRQ_EL0 != 0`，全部在 IOKit 内部、XNU 早期架构初始化之后很久的那一刻读的。
+
+**gate 的判定（`default_view()` 上 evaluate，输出在 `local-private/tmp/gate-after-fix.txt`）**：
+
+| milestone | 之前 | 之后 | 之后的原因 |
+|---|---|---|---|
+| M3 | UNVERIFIED | UNVERIFIED | 与本次工作无关 |
+| **M4** | UNVERIFIED | **PASS** | `satisfied:m4.kernel_entry_located` / `m4.page_tables` / `m4.exception_state` / `m4.interrupt_state` / `m4.failure_forensics` |
+| **M5** | BLOCKED | **PASS** | `satisfied:m5.service_matching` / `m5.driver_probe` |
+| M6 | BLOCKED | UNVERIFIED | 只缺 `m6.known_content_read_back` |
+| M7 | BLOCKED | UNVERIFIED | 只缺 `m7.volume_identity` / `m7.mount_relations` / `m7.dyld_cache_read` |
+| M8 | BLOCKED | UNVERIFIED | 只缺 `m8.original_launchd` / `m8.later_daemons` |
+| M9 | BLOCKED | **FAIL** | `refused:m9.veto.homescreen_screenshot_only` |
+| M9a | BLOCKED | **FAIL** | `refused:m9a.veto.wallpaper_only` |
+| M9b | BLOCKED | BLOCKED | 换了一个 blocker：`system_volume_mounted` |
+| M10 / M10a / M11 / M12 | BLOCKED | BLOCKED | `guest_install_service`（缺口 B，与本次独立） |
+
+**「之后」那一列必须逐行读，因为「解除阻塞」买到的不是七个 PASS**。它买到的是**两个 PASS**，加五个各自不同性质的「没通过」：
+
+- M6/M7/M8 是 UNVERIFIED： blocker 没了，但它们**还没有任何证据**。
+- M9/M9a 是 **FAIL，而原因是 PRD 否决而不是缺记录**——gate 明确拒绝把「只展示主屏幕截图」当作 SpringBoard 交互的证据。这是 gate 在干正事：这两条要的是真实交互证据，一张更好看的截图永远不算。
+- M9b 换成 `system_volume_mounted`（本主机没有 APFS 读写实现，产生不了客人视角下的可写系统卷），这正是事实 226 预测的。
+- M10/M10a/M11/M12 仍是 `guest_install_service`。
+
+**事实 226 说的「一付八用」在于杠杆，不在于「八个 PASS」**——把它读成后者就错了，而「解除阻塞不等于通过」这句话本来就是为这个写的。
+
+**按顺序的下一个 blocker**：① `system_volume_mounted`（M9b，要客人侧可写系统卷）；② `guest_install_service`（M10/M10a/M11/M12，缺口 B，与上面全部独立）；③ M9/M9a 的真实交互证据（否决项已经说明什么不算）。
+
+| R9az | **M4 与 M5 第一次 PASS：三条 XNU 记录真机抓包全中，gate 自引见证 `guest.log:20/:21/:22` 均 `scope='onsite'`，抓包 1492 字节 sha256 `7fba8ed0…`**（2026-11-01，修复版 kernel sha256 `227fc03b…` ≠ 旧版 `359eba3f…`，证明修复进了链接）：**gate 逐行读**：M4 `satisfied:m4.page_tables/m4.exception_state/m4.interrupt_state`，M5 `satisfied:m5.service_matching/m5.driver_probe`。**但「解除阻塞」买到的是两个 PASS 加五个不同性质的没通过**：M6/M7/M8 转 UNVERIFIED（blocker 没了、证据还没有）；**M9/M9a 转 FAIL 且原因是 PRD 否决**（`m9.veto.homescreen_screenshot_only`、`m9a.veto.wallpaper_only`——gate 拒绝把截图当交互证据）；M9b 换成 `system_volume_mounted`；M10/M10a/M11/M12 仍 `guest_install_service`。**下一个 blocker 按序**：`system_volume_mounted` → `guest_install_service` → M9/M9a 真实交互证据 |
