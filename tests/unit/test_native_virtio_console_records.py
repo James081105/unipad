@@ -194,6 +194,192 @@ def _expand_irq(source: str, name: str, irq_macro: str, src_macro: str) -> str:
     return "".join(_literals(body))
 
 
+def _strip_comments(source: str) -> str:
+    """The source with ``//`` and ``/* */`` comments blanked out, in place.
+
+    A call site inside a comment is not a call site.  This is not pedantry: the
+    driver's fix for the defect below quotes the OLD broken line in a comment so
+    the next reader knows what it replaced, and a scan that does not strip
+    comments reports that quoted line as a live defect -- the test goes red on
+    its own documentation, which is the same as no test at all.
+
+    Literal-aware, because ``"//"`` inside a string is not a comment and the
+    records here are made of quotes and escapes.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        ch = source[i]
+        if ch != '"':
+            if ch == "/" and i + 1 < n and source[i + 1] == "/":
+                while i < n and source[i] != NEWLINE:
+                    out.append(" ")
+                    i += 1
+                continue
+            if ch == "/" and i + 1 < n and source[i + 1] == "*":
+                end = source.find("*/", i + 2)
+                stop = n if end == -1 else end + 2
+                out.append(" " * (stop - i))
+                i = stop
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+        while i < n:
+            if source[i] == BACKSLASH and i + 1 < n:
+                out.append(source[i:i + 2])
+                i += 2
+                continue
+            out.append(source[i])
+            if source[i] == '"':
+                i += 1
+                break
+            i += 1
+    return "".join(out)
+
+
+def _call_arguments(source: str, opener: str) -> list[tuple[int, str]]:
+    """Every call to ``opener(`` and its argument text, parentheses balanced.
+
+    A regex cannot do this.  The arguments contain nested parentheses and
+    commas, so ``[^)]*`` stops at the first inner close paren and silently
+    reports a shorter argument than the one the compiler sees -- which is how a
+    check ends up green on the code it was written to catch.
+    """
+    out: list[tuple[int, str]] = []
+    for m in re.finditer(re.escape(opener) + r"\s*\(", source):
+        depth, i, start = 1, m.end(), m.end()
+        while i < len(source) and depth:
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            out.append((m.start(), source[start:i - 1]))
+    return out
+
+
+def _record_lengths(source: str, macros: tuple[str, str]) -> dict[str, int]:
+    """Record array name -> the number of bytes its literal occupies.
+
+    This is what ``sizeof(arr) - 1`` evaluates to for a ``char const[]``
+    initialised from string literals: the array is one byte longer than the
+    text, for the NUL.
+    """
+    src_macro, irq_macro = macros
+    out: dict[str, int] = {}
+    for _event, name, _fields in RECORDS:
+        if name.startswith("ir_"):
+            out[name] = len(_expand_irq(source, name, irq_macro, src_macro))
+        else:
+            out[name] = len(_expand_plain(source, name, src_macro))
+    return out
+
+
+#: ``sizeof`` on an expression the arrays have decayed through.  On AArch64 a
+#: pointer is 8 bytes, so ``sizeof(arr) - 1`` becomes 7 -- and a record sent
+#: with length 7 is the seven bytes ``{"event``.
+POINTER_BYTES = 8
+
+
+def test_no_record_is_sent_with_a_length_a_pointer_would_give(source, macros):
+    """No record may be sent with a length ``sizeof`` took from a pointer.
+
+    MEASURED 2026-11-01 on a real guest, and it is why this test exists.  The
+    two IOKit records arrived complete, but all three XNU records arrived
+    truncated to exactly seven bytes: the capture ends with
+    ``b'{"event{"event{"event'``.  The driver sends the first two by name and
+    the last three through a ternary::
+
+        send(match_record, sizeof(match_record)-1);          // an array  -> right
+        NATIVE_CONSOLE_EMIT(NATIVE_CONSOLE_PICK(pt_on,pt_off,mmu_on));
+
+    ``NATIVE_CONSOLE_PICK`` is ``((flag)?(on):(off))``, and the two arms are
+    arrays of DIFFERENT lengths (``true`` is four characters, ``false`` five),
+    so the conditional operator decays both to ``char const *``.  The result is
+    a pointer, and ``sizeof`` of a pointer is 8 on AArch64 -- not the length of
+    either record.  Every one of the three records was therefore sent seven
+    bytes long.
+
+    A byte-level check on the kernel cannot see this.  The full literals ARE in
+    the kernel; only the length argument is wrong, and it is computed at run
+    time.  So this is checked on the source, the same way the adjacent-literal
+    concatenation is.
+
+    The contract is stated as narrowly as the defect: ``sizeof`` must be
+    applied to a plain array name.  That is what makes ``sizeof(arr)-1`` the
+    record's own length, and it is the only thing that does.
+    """
+    lengths = _record_lengths(source, macros)
+    assert lengths, "no record arrays found in the driver"
+
+    # Scan the comment-free text.  The fix for this very defect quotes the old
+    # broken line in a comment, and a scan over the raw source reports that
+    # quotation as a live defect.
+    code = _strip_comments(source)
+
+    emit = re.search(r"#define\s+NATIVE_CONSOLE_EMIT\s*\(\s*arr\s*\)\s+(.+)",
+                     source)
+    assert emit, "NATIVE_CONSOLE_EMIT is not defined in the driver"
+    body = emit.group(1).strip()
+    assert body == "send(arr,sizeof(arr)-1)", (
+        f"the emit macro is {body!r}.  This test models the length sent as "
+        f"sizeof(arr)-1 and cannot reason about any other shape, so it must "
+        f"fail loudly here rather than model it wrongly.")
+
+    problems: list[str] = []
+
+    for at, arg in _call_arguments(code, "NATIVE_CONSOLE_EMIT"):
+        # The macro's own definition line is not a call site.  Skipping it by
+        # line rather than by offset matters: without this the test reports
+        # "is passed 'arr'" and goes red on its own regex, which is the same as
+        # no test at all.
+        line_start = source.rfind(NEWLINE, 0, at) + 1
+        if source[line_start:at].lstrip().startswith("#define"):
+            continue
+        ident = arg.strip()
+        if re.fullmatch(r"[A-Za-z_]\w*", ident):
+            if ident not in lengths:
+                problems.append(
+                    f"byte {at}: NATIVE_CONSOLE_EMIT is passed {ident!r}, "
+                    f"which is not one of the record arrays "
+                    f"{sorted(lengths)}")
+            continue
+        # Not a plain name, so it decays: sizeof gives the pointer size.
+        named = [n for n in sorted(lengths) if n in ident]
+        wanted = " or ".join(f"{n} ({lengths[n]} bytes)" for n in named)
+        problems.append(
+            f"byte {at}: NATIVE_CONSOLE_EMIT is passed {ident!r}.  That is "
+            f"not an array name, so the arrays in it decay to "
+            f"'char const *' and sizeof(arr) is {POINTER_BYTES}, not the "
+            f"record's length -- so send() is given {POINTER_BYTES - 1} bytes "
+            f"and the record arrives as the first "
+            f"{POINTER_BYTES - 1} characters of itself.  It should select "
+            f"between {wanted} OUTSIDE the emit, so that sizeof still sees an "
+            f"array.")
+
+    for at, arg in _call_arguments(code, "send"):
+        line_start = source.rfind(NEWLINE, 0, at) + 1
+        if source[line_start:at].lstrip().startswith("#define"):
+            continue  # the macro's own body, not a call site
+        head, _, tail = arg.partition(",")
+        data = head.strip()
+        if data not in lengths:
+            continue  # not a record; the emitter sends other things too
+        want = f"sizeof({data})-1"
+        if tail.strip() != want:
+            problems.append(
+                f"byte {at}: send({data}, {tail.strip()}) -- the length is "
+                f"not {want}, so it is not the record's own length")
+
+    assert not problems, (
+        "records that would be sent with a length a pointer gives, not the "
+        "record's length:" + NEWLINE + NEWLINE.join(problems))
+
+
 @pytest.mark.parametrize("event,name,_fields", RECORDS,
                          ids=[r[1] for r in RECORDS])
 def test_record_is_one_line_of_valid_json(source, macros, event, name, _fields):
