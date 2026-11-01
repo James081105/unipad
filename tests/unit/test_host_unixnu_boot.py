@@ -1080,7 +1080,7 @@ def test_the_agent_port_is_a_second_device_not_a_second_use_of_the_uart(
     )
     chardev = _flag(argv, "-chardev")
     assert chardev.startswith("socket,id=unipad-agent,host=127.0.0.1,port=14999,"), chardev
-    assert f"logfile={(work / 'agent.log').resolve().as_posix()}" in chardev, chardev
+    assert f"logfile={(work / 'guest-channel.log').resolve().as_posix()}" in chardev, chardev
     assert "logappend=on" in chardev, chardev
     # ``wait=off`` so a run with no agent attached still starts, exactly as the
     # serial chardev does: the guest's output is dropped, not the boot.
@@ -1185,7 +1185,7 @@ def test_no_agent_port_leaves_the_argv_exactly_what_it_was(
     assert not any("virtconsole" in item for item in default), default
     # No stray log file either: a second chardev's log would be a second
     # evidence stream nobody reads.
-    assert not (work / "agent.log").exists(), list(work.iterdir())
+    assert not (work / "guest-channel.log").exists(), list(work.iterdir())
 
 
 def test_the_agent_port_survives_the_systemos_pair_staying_last(
@@ -5768,3 +5768,48 @@ def test_the_gdb_port_survives_the_systemos_pair_staying_last(
     # The agent chardev is still there, and the legacy global is still before it.
     assert "-chardev" in argv and "unipad-agent" in " ".join(argv), argv
     assert argv.index("-global") < argv.index("-chardev"), argv
+
+
+def test_the_agent_channels_log_is_a_name_the_gate_reads(
+    inputs: BootInputs, tmp_path: Path, qemu: Path
+) -> None:
+    """The chardev logfile must match ``milestones``' guest-log globs.
+
+    This is the whole point of the file's name.  QEMU's ``logfile=`` captures
+    everything the guest writes to the virtio-serial port, which is where every
+    guest event record goes -- ``system.mount``, ``iokit.service_match``, and
+    every emitter added since.  It was called ``agent.log``, which named the
+    host's client of the channel rather than the channel, and
+    ``_GUEST_LOG_GLOBS`` does not glob that name.
+
+    The consequence was measured, not theorised: the capture that satisfied
+    M4/M5 came from a manual out-of-tree script calling
+    ``AgentChannelTransport.listen()``, and ``listen()`` has no production
+    caller anywhere in ``src/``.  Meanwhile the records were on disk after
+    every boot under a name nothing read.
+
+    So the assertion is against the GATE's list rather than against a string
+    this test happens to know: rename the logfile and this test says so, and
+    the gate's globs changing is caught here too.
+    """
+    work = tmp_path / "run"
+    work.mkdir()
+    argv = ub.build_argv(
+        qemu, inputs, work / "esp", work, agent_port=14999, display="none"
+    )
+    chardev = _flag(argv, "-chardev")
+    logged = chardev.split("logfile=", 1)[1].split(",", 1)[0]
+    assert logged, chardev
+
+    from unipad.acceptance.milestones import _GUEST_LOG_GLOBS
+
+    # The gate globs by BASENAME against the evidence tree, so the check is on
+    # the name the path ends with.
+    import fnmatch
+
+    name = Path(logged).name
+    assert any(fnmatch.fnmatch(name, pattern[3:]) for pattern in _GUEST_LOG_GLOBS), (
+        f"the agent channel is logged to {name!r}, which no pattern in "
+        f"_GUEST_LOG_GLOBS {_GUEST_LOG_GLOBS} matches; the guest's event "
+        "records would be written to disk and never read by the gate"
+    )

@@ -1869,7 +1869,17 @@ def build_argv(
     # just read as two intentions in an argv that is evidence.
     agent_argv = _agent_argv(
         agent_port,
-        Path(workdir) / "agent.log",
+        # ``guest-channel.log`` and not ``agent.log``.  This file IS the guest
+        # channel: QEMU's chardev logfile captures everything the guest writes
+        # to the virtio-serial port, which is where every guest event record
+        # goes.  It used to be called ``agent.log``, which named the host's
+        # client of the channel rather than the channel, and
+        # ``milestones.py``'s ``_GUEST_LOG_GLOBS`` does not glob that name --
+        # so the records were on disk after every boot and the gate could not
+        # see them.  Measured: the capture that satisfied M4/M5 came from a
+        # manual out-of-tree script, and ``local-private/boot42/ring-boot/
+        # agent.log`` already held all five records, unread.
+        Path(workdir) / "guest-channel.log",
         emit_legacy_global=(root is None and systemos is None),
     )
     gdb_argv = _gdb_argv(gdb_port)
@@ -3236,7 +3246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # connections and stays silent -- and an operator reading "agent channel
         # on 127.0.0.1:14999" would reasonably assume the guest is listening.
         print(f"agent channel on 127.0.0.1:{args.agent_port} (virtio-serial, logged to "
-              f"agent.log); the guest driver for it is not in this board's kernel "
+              f"guest-channel.log); the guest driver for it is not in this board's kernel "
               f"build, so expect the port to accept connections and stay quiet")
     if args.gdb_port is None:
         print("no gdbstub: the host can read the guest through QMP but cannot write "
