@@ -81,7 +81,12 @@ KNOWN_UNREACHABLE = {
     # the four after it are consistent with it and pass.  They are wrong by the
     # same 5-line systematic offset against hunk 2 -- the offset described in the
     # module docstring -- and that offset is deliberately left alone here.
-    ("offline-owner-systemos-mount.patch", 332),
+    #
+    # 329 -> 346 on 2026-11-02: the console-port declaration moved above the
+    # XNU_OWNER_CACHE_MOUNT guard so the load_init_program diagnostic could see
+    # it, and that move added 14 comment lines above this header.  A renumbering,
+    # not a new defect -- the old-side start (7086) is unchanged.
+    ("offline-owner-systemos-mount.patch", 346),
     ("zzz-boot-progress.patch", 223),
     ("zzz-boot-progress.patch", 264),
 }
@@ -1129,4 +1134,517 @@ def test_this_patch_keeps_the_lines_the_next_patch_uses_as_context() -> None:
             "the only position that is both before them and outside "
             "zzz-boot-progress.patch's context block is above the allocate."
         )
+
+
+# ---------------------------------------------------------------------------
+# M8: the original launchd, and the daemons that followed it
+# ---------------------------------------------------------------------------
+
+#: The patch that carries the two M8 emitters.  A NEW file rather than more
+#: hunks in offline-owner-systemos-mount.patch, because that patch's
+#: mach_vm_allocate_kernel / init_envp context is shared with
+#: zzz-boot-progress.patch and a new file cannot shift it.
+M8_PATCH_NAME = "zzz-m8-launchd-daemon-events.patch"
+
+#: The two events the gate asks for (milestones.py:1512-1513).  They are ONE
+#: change, not two: the veto m8.veto.mockfs_pid1_as_launchd fires when
+#: launchd.running arrives WITHOUT daemon.spawned, so landing half the pair
+#: turns M8 from UNVERIFIED into FAIL and makes the release verdict worse.
+M8_EVENTS = ("launchd.running", "daemon.spawned")
+
+#: The build step that decides which CFLAGS kern_exec.o is compiled with.
+XNU_BUILD_SCRIPT = REPO / "vendor" / "UniXNU" / "scripts" / "build-xnu-4k-baseline.sh"
+
+#: The switch this emitter is guarded on, and the reason it is that one:
+#: build-xnu-4k-baseline.sh:466 passes it as kern_exec.o_CFLAGS_ADD, and it is
+#: set only by qemu_root_defconfig:33 -- the same config that sets
+#: CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y at :47, which is what puts
+#: libNativeVirtioConsole.a on the kernel link with -Wl,-force_load (:674-678).
+M8_GUARD = "XNU_OWNER_CACHE_MOUNT"
+
+
+def _m8_patch() -> Path | None:
+    for patch in _patches():
+        if patch.name == M8_PATCH_NAME:
+            return patch
+    return None
+
+
+def _m8_text() -> str:
+    """The M8 patch's text, or a skip when the pinned tree is not acquired."""
+    patch = _m8_patch()
+    if patch is None:
+        pytest.skip(f"{M8_PATCH_NAME} is not in this pinned tree")
+    return patch.read_text(encoding="utf-8")
+
+
+def _added(text: str) -> list[tuple[int, str]]:
+    """``(patch line number, added code line)`` for every added line.
+
+    Code, not prose: the same discriminator :func:`_code_lines` uses, and for
+    the same reason -- in a unified diff every added line starts with '+', so
+    the comment explaining the emitter is a '+ line too, and "the record is
+    emitted" would be satisfied by the explanation of the record.
+    """
+    out: list[tuple[int, str]] = []
+    for index, line in enumerate(text.split("\n")):
+        if not line.startswith("+"):
+            continue
+        body = line[1:].lstrip()
+        if body[:1] in ("*", "/"):
+            continue
+        out.append((index, body))
+    return out
+
+
+def _event_names(text: str) -> set[str]:
+    """Every event name the patch emits, read out of its own record literals."""
+    import re
+
+    return set(re.findall(r'\\"event\\":\\"([A-Za-z0-9_.]+)\\"', text))
+
+
+def _c_strings(body: str) -> list[str]:
+    """The decoded contents of the C string literals in ``body``.
+
+    Adjacent literals are what C concatenates, so the caller joins these and
+    gets the record exactly as the compiler builds it.  The decode is the same
+    one :func:`_record_payload` uses, and for the same reason: at this point the
+    backslash-n is still two characters, and the record only ends a line one
+    step later.
+    """
+    import re
+
+    literals = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+    assert literals, "no string literal found"
+    return [
+        literal.replace('\\"', '"').replace("\\n", "\n")
+        for literal in literals
+    ]
+
+
+def _static_record(text: str, name: str, occurrence: int = 0) -> str:
+    """The joined literal of one ``static char const NAME[] = ...;``.
+
+    ``occurrence`` selects which one: the launchd record is declared twice, once
+    per arm of the index guard, and taking only the first would let the other
+    arm drift unnoticed.
+    """
+    import re
+
+    hits = list(re.finditer(
+        r"static char const " + re.escape(name) + r"\[\] =\s*(.*?);",
+        text, re.S))
+    assert hits, f"{name} is not declared in the patch"
+    assert occurrence < len(hits), (
+        f"{name} is declared {len(hits)} times; occurrence {occurrence} is out "
+        "of range"
+    )
+    return "".join(_c_strings(hits[occurrence].group(1)))
+
+
+def _m8_require_build_script() -> Path:
+    """The kernel build script, failing when the pinned tree is half-acquired."""
+    if not XNU_BUILD_SCRIPT.is_file():
+        pytest.skip(f"{XNU_BUILD_SCRIPT} is not present; the pinned vendor tree "
+                    "is not acquired")
+    return XNU_BUILD_SCRIPT
+
+
+def test_the_m8_patch_is_in_the_pinned_tree_at_all():
+    """The patch is present, and its absence is a failure and not a skip.
+
+    ``_patches()`` skips the whole file when ``vendor/UniXNU/patches`` is
+    absent, which is the honest outcome on a host that never acquired the pin.
+    A host that HAS the pin and does not have this file is a different
+    situation: the two emitters are simply not going to be built, and M8 stays
+    UNVERIFIED while every other check in here reads green.  That is the shape
+    :func:`tests.vendor_paths.require` was written for, and this is the same
+    discriminator applied to a file that did not exist when it was written.
+    """
+    if not (REPO / "vendor" / "UniXNU" / "patches").is_dir():
+        pytest.skip("the pinned vendor tree is not acquired")
+    patch = _m8_patch()
+    assert patch is not None, (
+        f"{M8_PATCH_NAME} is missing from vendor/UniXNU/patches/xnu, so neither "
+        "launchd.running nor daemon.spawned will be in the built kernel and M8 "
+        "stays UNVERIFIED"
+    )
+
+
+def test_the_m8_records_are_valid_json():
+    """Both records parse as JSON, and the daemon one parses with real values.
+
+    Two defects in this repository's emitters compiled clean and read on the
+    host as "the guest never did it": a dropped ``"volume_uuid":`` key, and a
+    macro whose value came out unquoted.  Both are invisible to a grep for the
+    event name, so the assertion is on the PARSED record.
+
+    The daemon record is built at run time, so it is validated by assembling
+    the three literals the way the C does -- prefix, a pid, middle, a comm,
+    suffix -- and parsing the result.  A separator in the wrong place is a
+    record that parses as nothing, and nothing else here would notice.
+    """
+    import json
+
+    text = _m8_text()
+    for occurrence in (0, 1):
+        payload = json.loads(_static_record(text, "launchd_record", occurrence))
+        assert payload["event"] == "launchd.running"
+        assert payload["pid"] == 1
+    prefix = "".join(_c_strings(
+        _added_value(text, "m8_daemon_prefix")))
+    middle = "".join(_c_strings(_added_value(text, "m8_daemon_middle")))
+    suffix = "".join(_c_strings(_added_value(text, "m8_daemon_suffix")))
+    assembled = prefix + "128" + middle + "backboardd" + suffix
+    assert assembled.endswith("\n"), (
+        "the assembled daemon record does not end with a newline, so it runs "
+        "into the next line of the guest log and the host's per-line parse "
+        "drops it"
+    )
+    payload = json.loads(assembled)
+    assert payload == {
+        "event": "daemon.spawned",
+        "pid": 128,
+        "comm": "backboardd",
+        "source": "XNU.__mac_execve",
+    }, f"the assembled daemon record is {payload!r}"
+
+
+def _added_value(text: str, name: str) -> str:
+    """The right-hand side of one ``static char const NAME[] = ...;``."""
+    import re
+
+    hit = re.search(r"static char const " + re.escape(name) + r"\[\] =\s*(.*?);",
+                    text, re.S)
+    assert hit is not None, f"{name} is not declared in the patch"
+    return hit.group(1)
+
+
+def test_the_m8_event_names_are_exactly_the_two_the_gate_asks_for():
+    """The event names, read out of the patch rather than restated here.
+
+    An earlier revision of the mount test substituted its own UUID and every
+    assertion stayed green when the patch changed.  The same trap applies to a
+    name: assert what the patch SAYS, then assert that against the gate.
+    """
+    text = _m8_text()
+    found = _event_names(text)
+    assert found == set(M8_EVENTS), (
+        f"the patch emits {sorted(found)}, not {sorted(M8_EVENTS)}.  A third "
+        "name is a record nobody reads; a missing one is half the pair, and "
+        "half the pair trips the m8.veto.mockfs_pid1_as_launchd veto"
+    )
+
+
+def test_both_m8_events_are_in_the_same_patch_set():
+    """The anti-veto test: one event without the other must be detectable.
+
+    ``_guest_events`` merges with ``setdefault``, so the gate reads the FIRST
+    record for each event name and the veto compares the two probes directly:
+    launchd.running present and daemon.spawned absent is a FAIL, not a
+    UNVERIFIED.  This test asserts the pair is in one patch set, and then
+    asserts that a set carrying only one of them is told apart -- so a
+    discriminator that always answered "both" cannot pass.
+    """
+    text = _m8_text()
+    assert _event_names(text) == set(M8_EVENTS)
+    # ... and both are actually emitted.  A patch that declares the record
+    # literals and never calls the port carries the event name in its source
+    # and nothing on the channel, which is the same outcome as not shipping it
+    # -- so the presence of the name is not the thing being asserted here.
+    assert "native_console_report(launchd_record" in text, (
+        "launchd.running is declared in the patch but never handed to the "
+        "console port"
+    )
+    assert "native_m8_report_daemon(p);" in text, (
+        "daemon.spawned is declared in the patch but never emitted"
+    )
+
+    # Strip the daemon hunk out and ask again.  If the discriminator were
+    # vacuous -- reading the event names out of this test's own constants, say
+    # -- the second assertion would still pass and the first would be the only
+    # thing standing between a half-landed pair and a green build.
+    launchd_only = _without_hunk(text, "native_m8_report_daemon")
+    assert "native_m8_report_daemon" not in launchd_only, (
+        "the daemon hunk was not stripped, so the next assertion proves nothing"
+    )
+    assert _event_names(launchd_only) == {"launchd.running"}, (
+        "stripping the daemon hunk did not remove daemon.spawned, so the "
+        "discriminator cannot tell a whole pair from half of one"
+    )
+    assert "daemon.spawned" in _event_names(text)
+
+
+def _without_hunk(text: str, marker: str) -> str:
+    """``text`` with the hunk carrying ``marker`` removed entirely.
+
+    Used to build the half-landed pair the veto is about, so the anti-veto
+    assertion above can be run against something rather than against a
+    constant.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("@@"):
+            body = []
+            follow = index + 1
+            while follow < len(lines) and not lines[follow].startswith("@@"):
+                body.append(lines[follow])
+                follow += 1
+            if any(marker in item for item in body):
+                index = follow
+                continue
+        out.append(line)
+        index += 1
+    return "\n".join(out)
+
+
+def test_the_launchd_emitter_is_inside_the_success_branch():
+    """The record is emitted AFTER the load succeeded, not before it.
+
+    This is the one that would catch a record claiming a launchd that then
+    failed to load.  load_init_program() tries every entry in
+    ``init_programs[]`` and panics when all of them fail, so an emission placed
+    before ``load_init_program_at_path()`` puts "launchd.running" on the wire
+    for a binary that never ran -- and the panic() four lines below is the only
+    thing that would contradict it, in the ring, on a channel the gate does not
+    read.
+    """
+    text = _m8_text()
+    call = _find(text, "load_init_program_at_path(p, (user_addr_t)scratch_addr, "
+                       "init_programs[i], init_envp);")
+    branch = _find_after(text, "if (!error) {", call)
+    emit = _find(text, "native_console_report(launchd_record")
+    returned = _find_after(text, "return;", emit)
+    assert call < branch < emit < returned, (
+        "the launchd record is not inside the success branch.  Order in the "
+        f"patch: load call {call}, `if (!error)` {branch}, emit {emit}, "
+        f"`return;` {returned}.  An emission before the load call claims a "
+        "launchd that then failed, and the panic() below it is the only "
+        "contradiction -- in the kernel ring, not on the guest channel"
+    )
+
+
+def _find(text: str, needle: str, start: int = 0) -> int:
+    """The patch line index of the first added or context line containing needle."""
+    lines = text.split("\n")
+    for index in range(start, len(lines)):
+        if needle in lines[index].lstrip("+ "):
+            return index
+    pytest.fail(f"{needle!r} is not in the patch, so its position is unchecked")
+
+
+def _find_after(text: str, needle: str, start: int) -> int:
+    return _find(text, needle, start + 1)
+
+
+def _find_close(text: str, start: int) -> int:
+    """The patch line index of the next line that is exactly ``}``.
+
+    A brace, not the character: the hunk's trailing context is full of lines
+    that merely contain one, and matching on the character would put the
+    emitter "inside the block" on the strength of a comment.
+    """
+    lines = text.split("\n")
+    for index in range(start + 1, len(lines)):
+        if lines[index].lstrip("+ ").strip() == "}":
+            return index
+    pytest.fail("no closing brace after the emitter, so its nesting is unchecked")
+
+
+def test_the_daemon_emitter_is_inside_the_error_free_block():
+    """One call, inside ``if (!error)``, and nowhere else.
+
+    The site is the kernel's own definition of a successful exec:
+    ``exec_done = TRUE`` is set in that block, and the NOTE_EXEC notification a
+    few lines below fires on the same flag.  Emitting anywhere earlier in
+    ``__mac_execve`` would report daemons that failed to load; emitting after
+    ``process_signature()`` would report daemons the kernel then refused.
+    """
+    text = _m8_text()
+    branch = _find(text, "if (!error) {")
+    exec_done = _find_after(text, "exec_done = TRUE;", branch)
+    emit = _find(text, "native_m8_report_daemon(p);")
+    close = _find_close(text, emit)
+    assert branch < exec_done < emit < close, (
+        "the daemon emitter is not inside the `if (!error)` block that sets "
+        f"exec_done.  Order in the patch: branch {branch}, exec_done "
+        f"{exec_done}, emit {emit}, close {close}"
+    )
+    # The hunk's own context has to carry both ends of that block.  Without the
+    # closing brace in the trailing context the ordering above would hold for
+    # an emitter placed anywhere in the function, which is the dead-guard
+    # failure mode one level out.
+    assert "}" in text.split("\n")[close], (
+        "the daemon hunk's trailing context does not reach the block's closing "
+        "brace, so 'inside if (!error)' cannot be told from 'after it'"
+    )
+    # Exactly once.  A second emission of the same event is silently dropped by
+    # the host (_guest_events uses setdefault), so a reader of the log would
+    # never see it -- and two emitters is the shape that hides one of them.
+    assert text.count("native_m8_report_daemon(p);") == 1, (
+        "the daemon emitter is called more than once; the host keeps only the "
+        "first record per event name, so the rest are invisible"
+    )
+
+
+def test_the_m8_console_reference_is_strong_not_weak():
+    """``native_console_report`` is a STRONG reference in this patch too.
+
+    The measured defect is in offline-owner-systemos-mount.patch's own
+    docstring: on build 41330622788 a ``__attribute__((weak_import))``
+    reference resolved to null, both records were byte-level in the booting
+    kernel, the mount succeeded, the build was green -- and the records never
+    arrived.  A strong reference makes the definition load-bearing, so the
+    failure is a link error naming the symbol.
+    """
+    text = _m8_text()
+    declarations = [
+        line for _, line in _added(text)
+        if line.startswith("extern") and "native_console_report" in line
+    ]
+    assert len(declarations) == 1, (
+        f"expected exactly one declaration of native_console_report, found "
+        f"{len(declarations)}: {declarations}"
+    )
+    assert "weak_import" not in declarations[0], (
+        "native_console_report is weak-imported. Measured on build "
+        "41330622788: the symbol then resolves to null and the records are "
+        "dropped silently, with the build green. Use a strong extern."
+    )
+    assert declarations[0].startswith("extern int native_console_report("), (
+        f"the declaration is not the expected strong extern: {declarations[0]!r}"
+    )
+    # And the null check is the dead-branch shape: the call sits inside
+    # `if (native_console_report) { ... }`, never as a one-line
+    # `if (native_console_report) native_console_report(...)` whose whole
+    # purpose is to decide whether the record is emitted.  Whether a record is
+    # emitted is decided by the success branches the two ordering tests cover.
+    calls = [line for _, line in _added(text)
+             if line.startswith("native_console_report(")]
+    assert len(calls) == 3, (
+        f"expected three calls to native_console_report (two launchd arms and "
+        f"the runtime daemon buffer), found {len(calls)}: {calls}"
+    )
+    assert sum(1 for line in calls if "launchd_record" in line) == 2
+    assert sum(1 for line in calls if "record, (size_t)at" in line) == 1
+    assert "if (native_console_report) native_console_report" not in text, (
+        "the null check is the gate that decides whether the record is "
+        "emitted; keep it as a dead branch around a call the success branch "
+        "already authorised"
+    )
+
+
+def test_the_record_lengths_come_from_arrays_not_pointers():
+    """``sizeof(record) - 1`` on an array, and the fill count on a buffer.
+
+    The defect this guards is measured and expensive: a ternary selecting
+    between two arrays of different lengths decays both to ``char *``, so
+    ``sizeof(arr)`` becomes 8 and ``sizeof(arr) - 1`` is 7.  Three records were
+    sent seven bytes long on a real guest, the build was green, and a
+    byte-level grep of the image could not see it.
+    """
+    text = _m8_text()
+    code = [line for _, line in _added(text)]
+    assert text.count("sizeof(launchd_record) - 1") == 2, (
+        "both arms of the launchd record must hand the port "
+        "sizeof(launchd_record) - 1; the array form is the only thing that "
+        "makes that the record's own length"
+    )
+    # The runtime buffer is an ARRAY, and the length handed over is its fill
+    # count.  sizeof() there would be the whole 192.
+    assert any(line == "char record[M8_RECORD_MAX];" for line in code), (
+        "the daemon record's buffer is not declared as an array of "
+        "M8_RECORD_MAX; a pointer would make any sizeof of it the word size"
+    )
+    assert any(line.startswith("native_console_report(record, (size_t)at)")
+               for line in code), (
+        "the runtime record must be handed over with its fill count, not "
+        "sizeof(record) -- which would be the whole buffer"
+    )
+    # Only the CODE lines, never the prose: this patch's own comment explains
+    # why sizeof(record) would be wrong, so a whole-text search finds the
+    # explanation and reports a defect that is not there.  That is the fourth
+    # time this shape has bitten this project.
+    assert not any("sizeof(record)" in line for line in code), (
+        "sizeof(record) on the runtime buffer is the whole 192 bytes, not the "
+        "record; use the fill count"
+    )
+
+
+def test_the_m8_guard_is_the_switch_the_build_passes_to_kern_exec():
+    """Guarded, and on the switch that actually reaches this object file.
+
+    Two halves of one fact.  Without a guard the strong extern fails the link
+    on every config that does not build the console archive -- including the
+    first pass's qemu_defconfig -- so the emitter has to be conditional.  And
+    the condition has to be one the kernel build passes to kern_exec.o, or the
+    guard is a no-op that compiles the emitter out everywhere and drops both
+    records behind a green build.
+    """
+    text = _m8_text()
+    assert f"#if defined({M8_GUARD}) && {M8_GUARD}" in text, (
+        f"the emitter is not guarded on {M8_GUARD}, so a config without the "
+        "console archive fails to link -- or, worse, one where the macro is "
+        "never defined compiles it out and drops both records"
+    )
+    # Three guarded regions -- the shared block and the two call sites -- and
+    # the counts have to match.  A call site that loses its `#if` compiles the
+    # emitter out of the file on every config, which is the silent half of the
+    # failure: the records are in the source, byte-level absent from the
+    # kernel, and nothing on the host can tell the difference.
+    assert text.count(f"#if defined({M8_GUARD}) && {M8_GUARD}") == 3, (
+        f"expected three {M8_GUARD} guards (the shared block and the two call "
+        f"sites), found {text.count(f'#if defined({M8_GUARD}) && {M8_GUARD}')}"
+    )
+    assert text.count("+#endif") == 3, (
+        f"expected three #endif to close them, found {text.count('+#endif')}; "
+        "an unclosed guard swallows the rest of the file"
+    )
+    script = _m8_require_build_script()
+    body = script.read_text(encoding="utf-8")
+    assert "kern_exec.o_CFLAGS_ADD" in body and M8_GUARD in body, (
+        f"the build script no longer passes {M8_GUARD} to kern_exec.o, so the "
+        "guard compiles the emitter out of the file that carries it"
+    )
+
+
+def test_the_daemon_record_names_the_process_it_measured():
+    """pid and comm from the proc, and NOT from the freed namei buffer.
+
+    ``imgp->ip_ndp`` is released by ``nameidone()`` inside
+    ``exec_activate_image()``, which has already returned by the time the
+    emitter runs.  Reading it would be a use-after-free that happens to look
+    like a working record on most boots.  ``p_comm`` is the proc's own name, it
+    is what the kernel ring prints as ``name[pid]``, and
+    ``set_proc_name()`` NUL-terminates it.
+    """
+    text = _m8_text()
+    code = "\n".join(line for _, line in _added(text))
+    assert "p->p_pid" in code, "the record does not name the pid it measured"
+    assert "p->p_comm" in code, "the record does not name the comm it measured"
+    assert "ip_ndp" not in code, (
+        "the emitter reads imgp->ip_ndp, which exec_activate_image() has "
+        "already released with nameidone(); use p_comm, which the kernel ring "
+        "prints as name[pid]"
+    )
+
+
+def test_the_m8_patch_applies_to_its_own_minus_side():
+    """The real ``git apply --check``, against a synthetic '-' side.
+
+    The whole-set version of this (:func:`test_every_patch_applies_to_its_own_minus_side`)
+    covers it by glob.  This one names the file, so a failure says which patch
+    rather than counting.
+    """
+    patch = _m8_patch()
+    if patch is None:
+        pytest.skip(f"{M8_PATCH_NAME} is not in this pinned tree")
+    proc = _run("verify_patch_applies.py", str(patch))
+    assert proc.returncode == 0 and "exit: 0" in proc.stdout, (
+        f"{patch.relative_to(REPO)} does not apply:\n{proc.stdout}{proc.stderr}"
+    )
 
