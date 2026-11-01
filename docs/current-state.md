@@ -549,3 +549,50 @@ full-width parenthesis in it (implementation-plan.md's fact 203 measured
 `Could not create '.../agent.log': Invalid argument`). The symptom is
 `connect refused`, identical to "no boot wants this channel". The rename
 does not touch the directory, so it is not newly exposed.
+
+### Run 41316953324 SUCCEEDED — 37/37 steps, both kernel passes
+
+Build `exp-2026-11-01-mount-report-fix`, stage M7, target tcg, dispatched on
+`573697c`. The one-line `friend` fix from run 41313323081's failure was enough.
+
+Both `build-macos.sh` passes ran clean:
+
+| pass | config | ESP kernel | sha256 |
+|---|---|---|---|
+| first (`macos-build.log`) | `qemu_defconfig` | 51,859,456 B | `6082be80…` |
+| second (`macos-build-root.log`) | `qemu_root_defconfig` | 125,480,960 B | `e836fd58…` |
+
+`stages: ran=9 not_run=0 failed=0 skipped=2` on the second pass.
+
+**The second pass's kernel is the one the guest boots**, and its size,
+125,480,960 bytes, is byte-for-byte the size of the kernel already measured
+locally at `local-private/boot42/ring-boot/esp/EFI/UniXNU/Payloads/kernel.macho`
+— the kernel whose ring showed the SystemCryptex mount at t=35.314745 and whose
+`DYLD_SHARED_CACHE_DIR` count is 0. That closes the loop between the config
+evidence, the byte evidence and the build.
+
+**What this proves and what it does not.** It proves the tree compiles and
+links under `-Werror` with the emitter in it. It does not prove the records
+reach the guest channel — that was the previous pin's whole lesson (fact 228:
+the build was green, the kernel grep was green, and three records arrived seven
+bytes long). The boot-inputs bundle is downloading; the capture is what answers.
+
+**A separate blocker surfaced while regenerating the coverage matrix, and it
+gates this work.** `docs/coverage-matrix.md` could not be regenerated at all:
+`_adopt` in `src/unipad/acceptance/probes.py` rebuilt each `EvidenceRef` from
+scratch and hardcoded `scope=SIMULATION`, so `write_bundle` refused every
+on-site PASS — M4 measured `scopes=['simulation']` against
+`required_scope=onsite`. Fixing that exposed a second dropped field
+(`witness`), which raised "on-site evidence requires a witness only the target
+could produce" and turned M4 into `probe_error:M4` → FAIL. Both are fixed and
+guard-tested.
+
+The regenerated matrix reveals the chain this work actually has to clear:
+
+    M6 (virtio_blk.read_back)  ->  M7 (mount records)  ->  M8
+                                    \-> M9b (system_volume_mounted)
+
+So `system.mount` + `system.volume_identity` satisfy M7's two evidence
+requirements, but M7 stays BLOCKED until **M6's `virtio_blk.read_back` event
+also lands** — and M9b needs M7 *and* the mount. That is a requirement the
+previous revision of the plan did not name.
