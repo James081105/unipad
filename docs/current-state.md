@@ -447,3 +447,77 @@ the record carries.
 same silent failure shape as fact 228. It does not: the console's own records
 sit at `guest.log:19-23`, immediately after the EFI hand-off's "Exiting boot
 services", and the mount is 35 seconds later.
+
+### Run 41313323081 FAILED, and the failure is the point
+
+Build `exp-2026-11-01-mount-report`, stage M7, target tcg, dispatched on
+`5778bd4`. Steps 1-13 all succeeded — including step 7's pin cross-check, which
+means the driver fork commit, the UniXNU gitlink and the lock's two pins all
+agreed and the runner fetched exactly what was pinned. Step 14, the first
+`build-macos.sh` pass, failed at archive 6/11:
+
+```
+drivers/NativeVirtioConsole/NativeVirtioConsole.cpp:119:33: error: 'send' is a
+protected member of 'NativeVirtioConsole'
+  119 |     return g_console?g_console->send(bytes,size):kIOReturnNotOpen;
+NativeVirtioConsole.cpp:57:14: note: declared protected here
+   57 |     IOReturn send(const void *,size_t);
+```
+
+`send()` is protected. `native_console_report()` is a free function, so it
+cannot call it; `native_console_send()` and `native_console_receive()` can,
+because lines 37-38 declare them friends of the class. The fix is the same one
+line for the new entry point.
+
+**What this failure proves about the guard tests, and it is the important
+part.** Five assertions guarded `native_console_report` — declared for its
+callers, needs no open client, refuses rather than dereferencing, published
+only after the port is really there, withdrawn when the device is stopped. All
+five passed. All five had been mutation-checked against five separate defects,
+all killed. And the driver did not compile.
+
+They read the function's SHAPE. None of them read the class's ACCESS CONTROL,
+which is the one thing a free function reaching a protected member depends on.
+This is fact 228's lesson in a second costume: *a source-level guard tests the
+source, and a compile error is not in the source.*
+
+The new assertion is deliberately on the class, not the function: for every
+protected member the report path actually calls, the class must declare
+`native_console_report` a friend **with this signature**. Signature, not name —
+a friend naming a different parameter list declares a different overload and
+grants nothing, which the `friend-misspelled` mutation confirmed by surviving
+the first revision of the assertion.
+
+Failure evidence is preserved at
+`local-private/ci-evidence/run-41313323081-step14-failure.log` and
+`...-archive-06.log` (gitignored, per PRD 12).
+
+**Steps 15-21 did not run.** So this build tells us nothing about whether the
+emitter's records reach the guest channel. That question is still open, and
+the next run is what answers it.
+
+### The guest-event evidence path has no production caller — found while mapping M10
+
+`AgentChannelTransport.listen()` (`src/unipad/guest/agent_channel.py:271`) is the
+only thing that reads the virtio-serial port and writes a `guest.log`. **It has
+no caller anywhere in `src/`.** The production path is
+`GuestObserver.kernel_log()` (`src/unipad/host/guestobserve.py:863`), which reads
+`msgbufp`'s ring buffer through QMP and writes `guest-kernel.log`
+(`host/unixnu_boot.py:2719`, `:2976`). That file contains no virtio-serial bytes.
+
+So every guest event this project has ever satisfied a requirement with — the two
+IOKit records that carry M4/M5, and the three XNU records behind them — reached a
+`guest.log` through a **manual, out-of-tree capture script**, not through the
+product. `guest-kernel.log` matches `_GUEST_LOG_GLOBS`'s `**/*guest*.log`, so the
+gate reads it; it is simply the wrong bytes.
+
+Two consequences, and both are load-bearing:
+
+1. **Re-reading the gate is not enough after a build.** The boot-inputs bundle
+   must be pulled, the guest booted, the console port drained by the capture
+   script, and the resulting `guest.log` left where the gate can see it. A green
+   build plus a green preflight says nothing about any milestone.
+2. **This is a product gap, not a measurement shortcut.** M10's
+   `install.registered` and every later guest event would hit the same wall. The
+   fix belongs in `unixnu_boot.py`, not in another capture script, and it is
+   worth doing before the next emitter is written rather than after.
