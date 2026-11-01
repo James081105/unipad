@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 230). Main repo at `f5b498d`.
+Last updated: 2026-11-01 (mount reporter revision). Main repo at `5778bd4`.
 
 ---
 
@@ -128,26 +128,56 @@ of it and can run in parallel.
 
 | Level | Repo | Branch | Commit |
 |---|---|---|---|
-| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `a7b7a03` |
-| UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `8a223b2` |
-| main repo | `James081105/unipad` | `main` | `f5b498d` |
+| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `ddeb315` |
+| UniXNU fork | `James081105/UniXNU` | `unipad/gpu-addon-ngpu-dir` | `c0c6c4d` |
+| main repo | `James081105/unipad` | `main` | `5778bd4` |
 
-Build **run 41296027165** concluded **success** (34/34 steps) on `3b6bbd4`,
-experiment `exp-2026-11-01-console-xnu-records-fix`, stage M5, system build
-21H461, payload target tcg.
+Build **run 41313323081** was dispatched 2026-11-01 on `5778bd4`, experiment
+`exp-2026-11-01-mount-report`, stage M7, payload target tcg. It is the first
+build of the mount reporter; see "What is unverified" below.
+
+### What this revision changed and why the M9b blocker's own words were wrong
+
+The `system_volume_mounted` blocker's reason text is an APFS narrative — "this
+host has no APFS read/write implementation, so the 6.08 GB os-root raw image
+cannot be produced" — but **that is not the condition the gate checks.** The
+blocker's `satisfied_by` is `system_volume_mount`, which is
+`_onsite_ok(snapshot, "p.system_mount")`, which is the guest event
+`system.mount`. So the blocker is cleared by putting a record on the guest
+event channel, not by implementing APFS. The APFS sentence describes a real
+limitation of this host and is not what gates the milestone.
+
+The emitter added in this revision clears **three** requirements with two
+records: M7's `m7.mount_relations` (`system.mount`), M7's
+`m7.volume_identity` (`system.volume_identity`), and the M9b blocker
+(`system.mount` again).
+
+### What is unverified (do not read the commits as evidence)
+
+The emitter is CODE COMPLETE and guard-tested on Windows. It has not been
+built, and nothing has reached the guest channel. In particular:
+
+- Whether the two static strings survive the kernel link at all is unmeasured.
+- The previous pin on this same driver lost three records to a
+  `sizeof`-of-a-decayed-pointer defect that was invisible to the build, to a
+  byte-level grep of the kernel, and to every source-level guard. The same
+  class of defect is possible here. Only the wire answers.
+- `dyld.cache_read` — M7's third requirement — is **not** covered by this
+  emitter and is the remaining piece of M7.
 
 ## Next actions, in order
 
-1. **`system_volume_mounted` (M9b) — the next blocker in the chain.** The
-   gate's own words: "no writable system volume is mounted in the guest: this
-   host has no APFS read/write implementation, so the 6.08 GB os-root raw image
-   cannot be produced in the state the guest would see, and Data persistence has
-   nothing to be persisted onto."  This is the largest single piece of work left
-   and it is not a driver fix.
-2. **`guest_install_service` (M10/M10a/M11/M12) — gap B, and independent.** No
+1. **Read run 41313323081's boot-inputs bundle and re-capture the guest.**
+   `local-private/tmp/root-mount-capture.py` pulls the bundle; the capture is
+   what tells us whether `system.mount` reached the channel whole or not at
+   all. Then re-read the gate. This is the same cycle that produced M4/M5.
+2. **`dyld.cache_read` — M7's third and last requirement.** Not covered by the
+   emitter in this revision. It is the only thing between M7 and a pass, given
+   the other two records land.
+3. **`guest_install_service` (M10/M10a/M11/M12) — gap B, and independent.** No
    guest agent reads the host's six install/launch/persist ops. This can be
-   pushed in parallel with step 1 and does not wait on it.
-3. **M9/M9a need real interaction evidence, and the veto names what will not
+   pushed in parallel and does not wait on anything above.
+4. **M9/M9a need real interaction evidence, and the veto names what will not
    count.** `m9.veto.homescreen_screenshot_only` and
    `m9a.veto.wallpaper_only` mean a screenshot — however good — can never
    satisfy them. What they want is input reaching the guest and the guest
@@ -296,3 +326,52 @@ Recorded so the next run does not repeat them:
   `api.github.com`, `github.com` and `objects.githubusercontent.com`. So a
   suggested proxy is not automatically usable — test it against the actual host
   before planning around it.
+
+## Facts established 2026-11-01 (mount reporter revision)
+
+- **A blocker's reason text is not the blocker's condition.** The
+  `system_volume_mounted` blocker reads as an APFS problem and is actually a
+  missing guest event. Read the `satisfied_by` and follow it to the predicate
+  before planning work against the prose.
+- **A macro that expands to a string literal contributes its CONTENT to
+  adjacent-literal concatenation, not its quotes.** `"\"volume_uuid\":"`
+  followed by a macro holding `8846FE78-...` yields `"volume_uuid":8846FE78-`
+  — an unquoted JSON value. The quotes must be adjacent literals of their own.
+  Both this and a dropped key compiled clean, survived a grep for the event
+  name, and read on the host as "the guest never mounted".
+- **`sizeof`-style escaping bugs are invisible to the compiler and to a grep.**
+  The previous pin lost three records to `sizeof` of a decayed pointer; this
+  revision's two defects were of the same family. Build a parser for the
+  artifact the toolchain will actually produce — here, expanding the macros and
+  `json.loads`-ing the result — before writing the guard test.
+- **`_guest_events` merges across files with `setdefault`.** Only the FIRST
+  record per event name is kept, so a second emission of the same event is
+  silently dropped. Relevant to any emitter that reports more than one instance
+  of a thing.
+- **`weak_import` is the established idiom for an XNU patch referencing a
+  separately-switched driver archive.** `zzy-native-gpu-addon-mount.patch:76`
+  is the precedent; the console archive is behind
+  `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE`. A weak import plus a null check at the
+  call site means the emitter links green with the symbol absent — which is why
+  the driver commit and the emitter commit are pinned together, since the build
+  cannot tell the two apart.
+- **`PERSONALITY_CFLAGS` only reach one translation unit.** They land in
+  `KernelConfigTables.cpo_CFLAGS_ADD`; per-object flags for `kern_exec.o` come
+  from `build-xnu-4k-baseline.sh:466`'s `kern_exec.o_CFLAGS_ADD=...`. So an XNU
+  patch cannot test `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` from `kern_exec.c`.
+- **`OWNER_UNION_SYSTEMOS` defaults to 0** (`build-xnu-4k-baseline.sh:438`), so
+  the `#else` arm is live and the mountpoint is `/private/preboot`. A guard test
+  reading the FIRST of two `#define XNU_OWNER_CACHE_MOUNTPOINT` arms measures
+  the wrong one; take the last.
+- **A hunk count and a hunk start are two different defects.** Growing a `+`
+  side without updating `@@ -a,b +c,d @@`'s `d` fails `git apply`; shifting
+  later hunks' new-side starts fails the unreachable check. Three pre-existing
+  tests went red on one edit for exactly these two reasons, and the diagnosis
+  was a before/after hunk-header comparison, not a guess.
+- **`_call_arguments()` returns only the text BETWEEN the parentheses.** For a
+  function definition that is the parameter list, not the body. Assertions
+  about what a function DOES need a brace-balanced body extractor.
+- **`/f/unipad-tmp` had grown to 45 GB of named scratch across 670 entries**,
+  leaving F: at 6.7 GB free — which is not enough for a 310 MB boot-inputs
+  bundle plus its extraction. Reclaimed to 30 GB by deleting the stale
+  `pytest-*` basetemp dirs, never `shell/` and never `pytest-of-*`.
