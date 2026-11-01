@@ -1267,3 +1267,27 @@ send(probe_record,sizeof(probe_record)-1);
 **宿主侧的捕获也写好了**（`local-private/tmp/iokit-capture.py`）：启动、等交棒、`listen()` 收字节、落成 `local-private/boot40/iokit-records/guest.log`，然后**用 gate 自己的判据解析一遍**——逐行 `json.loads`、取 `event` 字段、报缺失——并顺手对刚落盘的文件跑一次模拟路径检查，因为「一条真的记录被 scoped 成 SIMULATION」和「没有这条记录」在报告上不一样，但后果一样。
 
 | R9ar | **M5 不等 broker：`_guest_probe` 只查事件存在、无 payload 校验，否决项只要求两条都发；而全仓唯一能往这个端口写字节的就是控制台驱动自己（`grep native_console_receive` 只返回它和没进内核的 `NativeOfflineGPU`）——所以把两条记录加进已 fork 已钉住的驱动，一次重建就够，Part B 的 `.late.a` builder 完全不用碰**（2026-11-01，`milestones.py:1427`、`:1712-1716`、`:288-301`、`:487-495`）：记录要落在五种 `guest*.log`/`guest*.json` 文件名之一、每行一个 JSON、路径不含模拟标记，而 `local-private/boot*` 既被扫到又不是模拟路径。**已执行**：驱动 fork `d1ebb35` → UniXNU fork `29ed7e9` → 主仓 lock 两条，263 个 lock 单测通过，构建 run 41267641749 已触发；宿主捕获 `iokit-capture.py` 已写好并用 gate 自己的判据自检 |
+
+
+**事实 223（M5 的客人侧发射器已经钉住并构建成功，而「构建成功」这一步的证据链是闭合的但**不是**字节级的：lock 指向 `d1ebb35`（GitHub 上已验证含两条记录）、构建的 HEAD 一致性检查通过（否则拒绝）、驱动以 `-Werror` 编过并过了 ARM64/iOS 17 对象审计——但「编了那棵树」不等于「记录在内核里」，后者要等 boot-inputs 落盘**）：按事实 222 的路径执行完毕：
+
+| 层 | 仓库 | 分支 | 提交 |
+|---|---|---|---|
+| 驱动 fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `d1ebb35`（父 `61dc680`，即上次的告白） |
+| UniXNU fork | `James081105/UniXNU` | `unipad/console-announcement` | `29ed7e9` |
+| 主仓 | `James081105/unipad` | `main` | lock 两条一起动 |
+
+改动本身小到不该单独记，但**它小得有理由**：`start()` 里告白之后多了两条 `send()`，静态字符串不用 `snprintf`（读者会想要的 `native_console_mmio`、device id 本来就是宿主直接读的全局量，为它们引 libkern 依赖是拿已有的路换新的）。**没有新 builder、没有 board.toml、没有 Part B**——这是事实 221 与事实 222 合起来省掉的一整轮。
+
+**证据链，按强度排**：
+
+1. **`d1ebb35` 在 GitHub 上含那两条记录**——提交是我做的、push 成功、`git show` 可验，这是源码级事实。
+2. **lock 与构建 HEAD 一致性检查通过**——`build-macos.yml` 的交叉检查拒绝 HEAD 与 lock 不一致的 checkout，而构建结论是 **success**，所以 CI 检出的正是 `29ed7e9` 那棵树、其 gitlink 是 `d1ebb35`。这一步把「我推了」变成「CI 用了」。
+3. **驱动以 `-Werror` 编过并过了对象审计**——`archive-06-build-arm-driver.log` 全文只有一行：`NativeVirtioConsole: -Werror build and actual ARM64/iOS 17 object audit passed`；`macos-build.log:97-98` 记录 `kernel: archive 6/11: build-arm-driver.py NativeVirtioConsole` 被调用。**新加的两条 `send()` 没有引入警告**，这排除了「写着但没编进去」的一类原因。
+4. **`preflight` 也绿**（run 41268047867），263 个 lock 相关单测通过。
+
+**但第 4 级证据是「编了那棵树」，不是「记录在内核里」**：强制加载（`-Wl,-force_load`）把档案塞进链接后的内核，与有没有人引用无关（事实 199 量到 59 个符号被这样放进去），所以风险低；**但低不等于量过**。事实 217 对告白做的是字节级验证（ESP 内核里 `grep` 到字面量、sha256 与 `payload.json` 相符、bundle12 为 0 次而 bundle13 为 1 次），那一步还没有对这两条记录做。**boot-inputs（310,350,137 字节）正在下载，落盘后第一件事就是重复事实 217 那个字节级检查。**
+
+**一条关于这台机器的实测，记下来免得下次误判**：GitHub artifact 的预签名 URL 这次的寿命明显短于上次——同样的 `fetch-artifact.py` 续传循环，上次单次 attempt 拿到 200 MB，这次每 attempt 只拿到约 2.4 MB，速率 2.4 MB/分钟，310 MB 全程约两小时。**脚本行为没变，是 URL 寿命变了**，所以「下载变慢」不要先怀疑脚本。
+
+| R9as | **M5 的客人侧发射器已钉住并构建成功：驱动 fork `d1ebb35`（GitHub 上已验证含两条记录）→ UniXNU fork `29ed7e9` → 主仓 lock 两条；构建结论 success 意味着 CI 的 HEAD 一致性检查通过（它拒绝不一致的 checkout），驱动以 `-Werror` 编过并过了 ARM64/iOS 17 对象审计，`preflight` 亦绿、263 个 lock 单测通过**（2026-11-01，run 41267641749，experiment `exp-2026-11-01-console-iokit-records`）：改动只有 `start()` 里告白之后两条 `send()`，**没有新 builder、没有 board.toml、没有 Part B**。**但证据到「编了那棵树」为止，不等于「记录在内核里」**——字节级验证要等 boot-inputs（310,350,137 字节）落盘后重复事实 217 那个检查。**实测**：预签名 URL 寿命比上次短，每 attempt 约 2.4 MB、全程约两小时，脚本没变 |
