@@ -521,3 +521,31 @@ Two consequences, and both are load-bearing:
    `install.registered` and every later guest event would hit the same wall. The
    fix belongs in `unixnu_boot.py`, not in another capture script, and it is
    worth doing before the next emitter is written rather than after.
+
+### The guest channel's log now has a name the gate reads
+
+`unixnu_boot.py` wrote the agent chardev to `agent.log`. QEMU's `logfile=`
+captures everything the guest writes to the virtio-serial port, which is
+where every guest event record goes — so the records were on disk after
+every boot, under a name `_GUEST_LOG_GLOBS` does not match.
+
+The evidence that this mattered is not theoretical. The capture that
+satisfied M4/M5 came from a manual out-of-tree script calling
+`AgentChannelTransport.listen()`, and `listen()` has no production caller
+anywhere in `src/`. Meanwhile
+`local-private/boot42/ring-boot/agent.log` already held all five records,
+unread, at 1476 bytes.
+
+Renamed to `guest-channel.log`, which matches the gate's existing
+`**/guest-*.log` and `**/*guest*.log` — so no acceptance criterion moves and
+no new glob is admitted. The new test asserts against `_GUEST_LOG_GLOBS`
+rather than against a string the test happens to know, and was verified by
+mutating the name back: red on `agent.log`, green on `guest-channel.log`.
+
+**Inherited constraint, restated because it has the same failure shape as a
+missing channel:** QEMU refuses the entire chardev when the logfile path
+contains characters it cannot create, and this host's `%TEMP%` has a
+full-width parenthesis in it (implementation-plan.md's fact 203 measured
+`Could not create '.../agent.log': Invalid argument`). The symptom is
+`connect refused`, identical to "no boot wants this channel". The rename
+does not touch the directory, so it is not newly exposed.
