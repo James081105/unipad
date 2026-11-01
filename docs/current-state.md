@@ -52,29 +52,56 @@ defaults to 0.
 
 ## Active work
 
-**`broker-build` teammate** is finding the exact wiring to set
-`XNU_NATIVE_OFFLINE_GPU=1` on the CI runner — specifically whether a define
-alone is sufficient or whether an archive entry in `board.toml`'s `archives` is
-also needed, whether the `(DEVELOPMENT \|\| DEBUG)` condition is satisfied, and
-whether `patches/xnu/offline-native-gpu-broker.patch` is applied at all. Its
-deliverable is `local-private/tmp/broker-build-wiring.md`.
+**`broker-build` teammate finished** (deliverable:
+`local-private/tmp/broker-build-wiring.md`). Its conclusion, which is the reason
+this is not a one-line change:
+
+- **A define alone makes the build fail, not link.** `build-arm-driver.py
+  NativeOfflineGPU` writes `libNativeOfflineGPU.a`, but the kernel link demands
+  `libNativeOfflineGPU.late.a` **and** a `build-report.json` that
+  `build-arm-driver.py` never writes. No builder for either exists in either
+  pinned tree.
+- **`board.toml` cannot carry the variable.** Its `[kernel]` section is read at
+  three keys only — `defconfig`, `archives`, `prelink`.
+- **The one place that wins is the generated `.config`** (`out/<device>/.config`),
+  appended between `unixnu defconfig` and `unixnu build kernel`, where a
+  divergence block of exactly this shape already lives
+  (`scripts/macos/build-macos.sh:2703-2718`).
+- Cleared: `(DEVELOPMENT || DEBUG)` is satisfied, and
+  `patches/xnu/offline-native-gpu-broker.patch` **is** applied.
+- `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` must be appended in the same breath, because
+  `build-xnu-4k-baseline.sh:311-314` is a hard gate that is **not**
+  BOOTSTRAP-protected.
+
+The minimal change is three parts, and **Part B is not achievable from this
+repo**: Part A appends the two switches in `build-macos.sh` (here), Part B adds a
+`.late.a` builder plus a `board.toml` archives entry (device repo), Part C
+updates `DORMANT_KEYS` in the guard test (here). Part A alone converts a silent
+absence into a build failure.
 
 ## Next actions, in order
 
-1. **Read `broker-build-wiring.md`** and apply the minimal change it proposes.
-   This is the single highest-value step: it moves the guest-side consumer from
-   source-only to in-kernel, which unblocks A, C and D at once.
-2. **Rebuild on the macOS runner** with the broker enabled, then verify
-   byte-level that `native_gpu_broker_stage` is now a defined symbol and that
-   the `NativeOfflineGPU` text occurs in the ESP kernel.
-3. **Boot the new kernel and read `native_gpu_broker_stage`.** A value of 2
-   means `start()` ran and the broker is ready to exchange; anything else says
-   where it stopped.
-4. **Then measure host→guest arrival properly**: read the virtio-mmio queue
-   rings at `mmio_base + 0xa0` (used ring) before and after a host write, now
-   that the offsets are known.
-5. **Then write the guest agent** for install/launch/persist over the console
-   channel — the remaining item-4 code.
+1. **Write the guest-side M5 emitter and the `.late.a` builder together, in one
+   device-repo change.** Fact 220 established that M5 needs
+   `{"event":"iokit.service_match"}` and `{"event":"iokit.driver_probe"}` records
+   on a guest channel, and that **nothing in the guest emits them** — the only
+   references in the repo are in the acceptance harness. Fact 221 established
+   that the broker needs a builder that does not exist. Doing these as one change
+   costs one rebuild instead of two.
+2. **Part A in this repo**: append `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` and
+   `CONFIG_XNU_NATIVE_OFFLINE_GPU` to the generated `.config` divergence block,
+   and to `CONFIG_DIVERGENCE` by appending rather than assigning.
+3. **Part C in this repo**: update `DORMANT_KEYS` in the guard test.
+4. **One macOS build**, then verify byte-level that `native_gpu_broker_stage` is
+   now a defined symbol and that `NativeOfflineGPU` text occurs in the ESP
+   kernel.
+5. **Capture the channel to `guest.log`.** The acceptance harness reads guest
+   events only from `**/guest.log`, `**/guest-*.log`, `**/*guest*.log`,
+   `**/guest.json`, `**/guest-*.json`, one JSON object per line, and marks
+   anything under a simulation path so it can never satisfy an `onsite`
+   requirement. `AgentChannelTransport.listen()` already returns the bytes, so
+   this is a write-to-disk step, not a new mechanism.
+6. **Re-run the gate** and read M5's two probes.
 
 ## Resume commands
 
