@@ -720,3 +720,47 @@ environment action, not a test change.
 
 Build 41338826948 is the one that answers whether the strong reference
 delivers.
+
+### Correction: the strong reference did not deliver, and the diagnostic was wrong
+
+Build 41338826948 ran 37/37 steps with the strong `extern`. The records were
+byte-level in the booting kernel, the guest ran to **t=1514 s**, and the channel
+carried the same five records and neither mount record.
+
+So the previous revision's conclusion was wrong, and the reason is the useful
+part. The diagnostic sat at `native_owner_cache_prepare()`'s first statement —
+and **a function that is never called fails that test exactly as surely as a
+symbol that resolves to null does.** The two causes are indistinguishable from
+inside the function. That is why making the reference strong changed nothing:
+the code was not running at all.
+
+The strong reference is kept. It is the right change regardless — a missing
+archive should be a link error, not a silent null — but it was not the fix, and
+recording it as the fix would have sent the next revision hunting a linker
+problem that does not exist.
+
+The new diagnostic sits at the top of `load_init_program()`, before the prepare
+calls and before the `init_programs[]` loop whose `"attempting to load"` line the
+kernel ring prints at **t=71.8**. That is a site the ring *proves* executes,
+which is the property the last two diagnostics lacked.
+
+Two outcomes, and they point in different directions:
+- **It arrives** → the port works from `kern_exec.c`, and the question moves to
+  why the prepare call below it does not run (a `goto`, an `#if` arm, or the
+  function being called from somewhere the ring's mount is not attributable to).
+- **It does not arrive** → the port is unreachable from this translation unit
+  and the emitter needs a different route entirely — most likely the
+  `native_console_send(provider, owner, …)` entry point, or a driver-side
+  emitter rather than a kernel-side one.
+
+**The generalisable lesson, and it is the third of this shape.** An instrument
+placed inside the thing it is testing cannot distinguish "the thing is broken"
+from "the thing never ran". Both diagnostics so far were inside
+`native_owner_cache_prepare()`. The one that answers has to sit somewhere the
+evidence already proves executes — and for this patch that place is the ring's
+own `load_init_program:` line.
+
+Also worth recording: the escape in the new literal was mangled by the heredoc
+that inserted it (the documented lesson, third time), splitting a C string
+across two source lines. That also stopped the hunk checker at a line that was
+neither context nor added, so one cause produced two red instruments.
