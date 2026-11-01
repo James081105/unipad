@@ -166,6 +166,16 @@ Recorded so the next run does not repeat them:
   a flat budget. Fact 219.
 - **The virtio-mmio queue rings are at `base+0x80/0x90/0xa0`**, not
   `base+0x30..0x44` (those are QueueSel/QueueNum/QueueSize/QueueReady). Fact 219.
+- **The kernel holds the RESOLVED string, so grep it with plain quotes.** The C
+  source spells the quotes inside a string literal as backslash-quote
+  (``\"event\":\"xnu.page_tables\"``); the compiler resolves those escapes.
+  A needle built the way the source spells it reported all five records ABSENT
+  in a kernel that carries two of them. Validated against a known answer first:
+  bundle14's ESP kernel (sha256 `620c1acf…`, equal to `payload.json`) has
+  `iokit.service_match` at byte 242932 and `iokit.driver_probe` at 243047, one
+  occurrence each, and the three XNU records absent — which is correct, because
+  bundle14 was built from `d1ebb35`, before `c3c9ce2` added them.
+  `local-private/tmp/verify-records-in-kernel.py` is that instrument.
 - **A submodule's worktree is CRLF while its commits are LF.**
   `vendor/UniXNU/drivers/NativeVirtioConsole` has `core.autocrlf=true`, so
   `git ls-files --eol` reports `i/lf w/crlf`: the committed blob is LF and the
