@@ -661,3 +661,62 @@ own docstring prescribes the remedy: *"If a real UniXNU kernel and a guest log
 appear, this test is supposed to fail: the field record changed and must be
 re-recorded deliberately rather than quietly."* The earlier "the suite is green"
 reading was `tests/unit` only; `tests/acceptance` had not been run.
+
+### The weak reference resolved to null — measured, not theorised
+
+Build 41330622788 carried an ungated diagnostic record at
+`native_owner_cache_prepare()`'s first statement, asking one binary question.
+It ran the full 1500 s of channel draining, and the ring's own last timestamp
+at loop end was **t=1530.11 s** — the guest ran twenty-four times past that
+function — while five records from the same port on the same boot arrived
+complete.
+
+The diagnostic did not arrive.
+
+That closes the elimination the previous revision opened. The emitter's gate
+is `if (!error && native_console_report)`; the call site is
+`if (cache_error) panic(...)` and the ring shows no panic, so `error` was 0.
+What is left is that the weak reference resolved to null: **a `weak_import`
+does not oblige the linker to keep the definition**, so the symbol the call
+site tested for was simply absent.
+
+And the null check is what made this expensive. `if (native_console_report)`
+read as a deliberate design decision about a switchable archive. It was in
+fact the only reason a silent failure looked like a guarded one — the guard
+and the defect were the same line.
+
+**The fix is one word.** The reference is now a strong `extern`. That makes
+the definition load-bearing: if the archive is ever missing while this code is
+compiled, the link fails naming the symbol instead of dropping both records
+with a green build. The switch pairing makes it safe — `XNU_OWNER_CACHE_MOUNT`
+is set only by `qemu_root_defconfig:33`, which also sets
+`CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y` at `:47`, and that is what puts
+`libNativeVirtioConsole.a` on the kernel link with `-Wl,-force_load`
+(`build-xnu-4k-baseline.sh:666-670`). A config with the mount on and the
+console off does not exist in this tree.
+
+The null check stays, as a dead branch rather than a call through zero.
+
+**The reusable lesson, and it generalises past this patch.** A guard that
+tests whether an optional dependency is present is indistinguishable, from
+the source, from a guard that is hiding the fact that the dependency was
+never linked. The two have opposite remedies — one wants the guard kept, the
+other wants it deleted — and no amount of reading the source tells them
+apart. What tells them apart is emitting something through the path and
+watching whether it arrives, which is what the diagnostic did and what the
+previous three builds could not.
+
+**Also closed this session: the acceptance suite was red.** Ten tests in
+`tests/acceptance/` failed, on the parent commit too — pre-existing, not
+regressions. They encoded "this host has achieved nothing", which stopped
+being true when M4/M5/WP04 passed. `tests/unit` had been run and was green;
+`tests/acceptance` had never been run, which is how a red suite went
+unmeasured for two milestones. Each was rewritten to the invariant that is
+true today and still catches the original defect — see the commit message for
+the per-test mapping. One of the ten was not a stale premise at all:
+`cross_check` reported `vendor/UniXNU` at `3919f6f` where the lock pins
+`ef7d305`, and the pin was not in the clone's object store. That was an
+environment action, not a test change.
+
+Build 41338826948 is the one that answers whether the strong reference
+delivers.
