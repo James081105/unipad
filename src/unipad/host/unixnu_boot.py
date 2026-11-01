@@ -1518,26 +1518,50 @@ def _gdb_argv(port: Optional[int]) -> list[str]:
     ``-S`` boot sits at the reset vector with the MMU off, so guest-physical
     addresses ARE the CPU's current address space and the gdbstub reaches them.
     On a real boot the guest kernel has enabled its MMU, and then BOTH directions
-    fault -- ``m`` and ``M`` answer ``E14`` (EFAULT) at every guest-physical
-    address, including ones ``pmemsave`` reads fine.  Register reads (``g``)
-    still work, which is what pins the cause: the gdbstub addresses the CPU's
-    current VIRTUAL space, and the window is at a guest-PHYSICAL address.  Once
-    the MMU is on those are not the same thing.
+    fault under the gdbstub's DEFAULT addressing -- ``m`` and ``M`` answer
+    ``E14`` (EFAULT) at every guest-physical address, including ones ``pmemsave``
+    reads fine.  Register reads (``g``) still work, which is what pins the cause:
+    the gdbstub addresses the CPU's current VIRTUAL space, and the window is at a
+    guest-PHYSICAL address.  Once the MMU is on those are not the same thing.
+    MEASURED (fact 194), and REPRODUCED against a properly booted guest (fact
+    214).
 
-    Two further measurements rule it out as a serving transport:
+    **Fact 194 is right about the default and wrong about the ceiling.**  This
+    QEMU's gdbstub carries a ``qemu.PhyMemMode`` feature and flipping it changes
+    the addressing mode.  MEASURED 2026-11-01 on a guest that had really booted
+    its kernel (fact 214): the baseline ``m`` at guest-physical ``0x4807c000``
+    answers ``E14``; after ``Qqemu.PhyMemMode:1`` the same address returns the
+    Mach-O header ``pmemsave`` holds, byte for byte; and an ``M`` write of
+    ``deadbeef`` is read back as ``deadbeef`` by ``pmemsave``, a different code
+    path, so the write reached physical memory.  The self-validating part is that
+    the switch CHANGED the answer, which can only happen with the MMU on and
+    virtual != physical.  So "it needs a build with ``memory-backend-file``" is
+    not true of this binary: the addressing half of the gap IS closable with the
+    installed QEMU.
+
+    What is not closable is the serving part, and that is a separate measurement:
 
     * **Attaching pauses the VM, and detaching does not resume it.**  Measured:
       connect and do nothing for 12 s -> ``query-status`` says ``paused``;
       close and wait 5 s -> still ``paused``.  An explicit QMP ``cont`` (or a
-      gdbstub ``c``) is required, and every memory access after that needs a
-      ```` to stop the VM back.  A backend built that way holds the guest
-      stopped during each access, which is a debugger, not a renderer.
-    * So the transport gap on this host is NOT closable with the installed QEMU.
-      It needs a build with ``memory-backend-file``.
+      gdbstub ``c``) is required, and every memory access after that needs an
+      interrupt to stop the VM back.  A backend built that way holds the guest
+      stopped during each access, which is a debugger, not a renderer.  Fact 214
+      puts a number on it: ``vm=paused`` throughout, 15 ms per write.
+    * So the gdbstub is NOT a serving transport for the window, and PhyMemMode
+      does not change that.  It IS a working one-shot write path against a
+      booted, MMU-on guest, which is what makes it useful for injecting a single
+      frame and useless for compositing one.
 
-    What it IS still good for: one-shot diagnostic reads and writes against a
-    guest that has not enabled its MMU, which is a real if narrow use, and the
-    reason the flag exists at all.
+    The two paths that remain for the host side of the window are therefore: the
+    gdbstub with PhyMemMode (no guest-side change, but the guest is stopped for
+    each access), and the agent virtio channel (no pause, but it needs a render
+    op that ``unipad.guest.protocol`` does not carry yet).  See facts 210 and 214
+    in ``docs/implementation-plan.md``.
+
+    What it IS still good for besides that: one-shot diagnostic reads and writes
+    against a guest that has not enabled its MMU, which is a real if narrow use,
+    and the reason the flag exists at all.
 
     Default ``None`` and one byte of difference in the argv, for the same reason
     ``agent_port`` defaults to ``None``: every recorded run on this host was made
