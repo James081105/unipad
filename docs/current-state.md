@@ -6,8 +6,10 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-02 (inter-patch context guard; `dyld.cache_read` and
-`virtio_blk.read_back` emitters in flight). Main repo at `7bc0da9`.
+Last updated: 2026-11-02 (inter-patch constraint corrected; `dyld.cache_read`
+emitter pinned; `virtio_blk.read_back` emitter CODE COMPLETE but its driver
+fork is not pushable; M8 `launchd.running`/`daemon.spawned` pair in flight).
+Main repo at `2e0c593`.
 
 ---
 
@@ -878,3 +880,210 @@ dirty again, and the commit was path-scoped so it stays that way.
 - Status: CODE COMPLETE, compile UNVERIFIED, wire UNVERIFIED. This build tells us
   the tree compiles and whether the diagnostic arrives; nothing more.
 - The two outcomes and what each would mean are unchanged from the section above.
+
+---
+
+## 2026-11-02 — the guest is 49 real daemons ahead of what the gate knows
+
+The gate says M8 has "zero evidence". The guest ring from build 41338826948
+(`local-private/boot-mount-41338826948/root-mount/kernel-ring.log`, guest ran to
+**t=1514.6 s**) carries **49 distinct real iPadOS userspace processes**, PIDs 26
+through 128:
+
+```
+/usr/libexec/runningboardd[26]              /usr/libexec/studentd[31]
+/usr/libexec/routined[32]                   /System/Library/CoreServices/powerd.bundle/powerd[40]
+/usr/sbin/WirelessRadioManagerd[42]         .../BiomeStreams.framework/Support/biomed[43]
+/usr/libexec/nfcd[54]                       .../IDS.framework/identityservicesd.app/identityservicesd[55]
+.../CoreDuetContext.framework/Resources/contextstored[57]
+/usr/libexec/backboardd[58]                 /usr/libexec/sharingd[61]
+/usr/libexec/locationd[63]                  .../IMCore.framework/imagent.app/imagent[64]
+/usr/libexec/dasd[68]                       .../PassKitCore.framework/passd[71]
+/usr/libexec/lockdownd[72]                  /usr/libexec/PerfPowerServices[74]
+... plus 29 more, up to /System/Library/CoreServices/osanalyticshelper[126]
+```
+
+and at t=1085.075614:
+
+```
+MobileGestaltHel[95] triggered unnest of range 0x1f7800000->0x1f7a00000 of DYLD shared region
+```
+
+**`backboardd[58]` is the daemon that launches SpringBoard.** It is running;
+SpringBoard has not started yet.
+
+### Why the gate cannot see this, and why that is correct
+
+`_guest_records` (`milestones.py:1362`) scans only files matching
+`_GUEST_LOG_GLOBS` (`**/guest.log`, `**/guest-*.log`, `**/*guest*.log`,
+`**/guest.json`, `**/guest-*.json`), and its docstring is explicit: *"Only guest
+channels count. A serial log is not a guest channel (PRD 7.4)"*. The ring is
+`kernel-ring.log`, which matches none of those globs.
+
+**This is the right design and it must not be weakened.** The ring is the
+CROSS-CHECK that a record is true, not a substitute for one. What is missing is
+not guest progress — it is a channel.
+
+### The sites, in real source
+
+The pinned XNU source is public (`apple-oss-distributions/xnu`, ref
+`xnu-10063.141.1`, per `vendor/UniXNU/feeds.toml:10`) and is now cloned at
+`local-private/upstream/xnu`. The existing mount patch's line numbers were
+verified against it and match exactly, so this is the tree the runner builds.
+
+- **`launchd.running`** — `bsd/kern/kern_exec.c:7142`, `load_init_program()`. The
+  `init_programs[]` loop at :7187 unconditionally contains `/sbin/launchd`, and
+  its `if (!error) { return; }` branch is exactly "the unmodified launchd binary
+  is running as PID 1". A record emitted *before* `load_init_program_at_path`
+  would claim a launchd that then failed to load, and the `panic()` three lines
+  below is what happens when every entry fails — so the emitter goes inside the
+  success branch.
+- **`daemon.spawned`** — `bsd/kern/kern_exec.c:5165`, `__mac_execve()`, with
+  `exec_done = TRUE;` at :5284 inside `if (!error)`. Every daemon spawn reaches
+  it, because launchd uses `posix_spawn`, which lands here.
+
+### The trap this creates, and it is the same shape as the virtio_blk one
+
+`mockfs_pid1_as_launchd` (`milestones.py:1739`) fires when `p.launchd_running` is
+OK **and** `p.daemon_spawned` is not. M8 is UNVERIFIED today; emitting
+`launchd.running` alone would turn it **FAIL** and make the release verdict
+worse. **The two records must land together or not at all.** Same lesson as
+`device_enumeration_without_readback`, second occurrence.
+
+A second constraint: `_guest_events` (`milestones.py:1422`) merges with
+`setdefault`, so only the FIRST record per event name reaches the gate. That is
+the gate's behaviour and must not be worked around by inventing event names —
+that would be gaming it. Emit one `daemon.spawned` per successful exec; the gate
+reads the first and the full ordered sequence stays in the guest log as
+evidence.
+
+### State
+
+- M8 emitters: in flight (worktree branch `m8-launchd-daemon-emitters`).
+- M7's third requirement, `dyld.cache_read`: in flight. The ring's DYLD
+  shared-region unnest is a better-corroborated site than `cs_native4k_prepare()`,
+  which is XNU's own native-4k signature hash cache and is a different thing from
+  a process reading the dyld shared cache. The agent has been told.
+- M6's `virtio_blk.read_back`: in flight.
+- `guest_install_service` (M10/M10a/M11/M12): mapping in flight.
+- Build 41350610831 (the inter-patch fix): running.
+
+---
+
+## 2026-11-02 — the second correction, and two emitters whose mapped sites were wrong
+
+### The inter-patch constraint is a ten-line block, not one adjacency
+
+Build **41350610831** failed with the *identical* error as 41346094752 —
+`patch failed: bsd/kern/kern_exec.c:7389` — on a pin whose patch contained
+the previous fix. So the previous fix was wrong, and **the guard written with
+it was wrong too**: it asserted that `mach_vm_allocate_kernel` is followed by
+`user_addr_t init_envp`, which was TRUE on the failing tree. A guard that
+passes while the build fails is worse than no guard.
+
+`zzz-boot-progress.patch:200`'s pretext is **ten lines**, nine of which this
+patch ADDS (`mach_vm_allocate_kernel`, `user_addr_t init_envp`, the whole
+CACHE_MOUNT block, the whole DATA_MOUNT block, `#if CONFIG_MEMORYSTATUS`).
+`git apply` requires that block contiguous. The fix (`8b57770`) moves the
+diagnostic ABOVE `mach_vm_allocate_kernel` — the only position that is both
+before the prepare calls and outside the block.
+
+**Proven locally rather than argued.** The pinned XNU source is public
+(`apple-oss-distributions/xnu`, ref `xnu-10063.141.1` per
+`vendor/UniXNU/feeds.toml:10`) and is now cloned at
+`local-private/upstream/xnu`. `local-private/tmp/repro-patch-order.py` replays
+the runner's own order — three named patches reversed first, then
+`patches/xnu/*.patch` and `kits/NativePrelink/patches/*.patch` shell-globbed
+and therefore ALPHABETICAL — with real `git apply`. It failed on
+`zzz-boot-progress.patch` at `kern_exec.c:7389` before the change and takes
+all 56 patches after. **That script is the only validated instrument for this
+class of bug, and it needs the source, so it cannot run in CI.**
+
+A general source-independent cross-patch checker was attempted and
+**DELETED**. It reported 18 splits on a tree where real `git apply` takes all
+56, because anchoring on lines like `#endif` and `}` matches in the wrong
+place. An instrument that is red on a green tree is worse than none — this
+repository's own rule, applied to itself. The CI-side guard is therefore
+precise rather than general: it asserts the ten-line block as a literal list,
+mutation-checked by putting the diagnostic back where it failed.
+
+### The gate reads FAIL, and the reason is the vetoes working correctly
+
+`local-private/tmp/read-gate.py` (there is no `reread-gate.py`; a previous
+revision of this document named one that does not exist):
+
+```
+release verdict: FAIL
+reasons: blocking_fail:M9, blocking_fail:M9a
+M4 PASS   M5 PASS   WP04 PASS
+M9  FAIL  refused:m9.veto.homescreen_screenshot_only  只展示主屏幕截图
+M9a FAIL  refused:m9a.veto.wallpaper_only             只显示桌面壁纸
+M10/M10a/M11/M12 BLOCKED  blocked_by:guest_install_service
+M9b BLOCKED  blocked_by:system_volume_mounted
+WP00 BLOCKED frozen_source_baseline   WP01 BLOCKED frozen_build_inputs
+M0 M1 M2 M3 M6 M7 M8 WP02 WP03 UNVERIFIED
+```
+
+`_homescreen_screenshot_only` is `p.screendump AND NOT
+p.springboard_interaction`, and `_wallpaper_only` is `p.screendump AND NOT
+p.uikit_first_frame`. Screenshots exist and interaction evidence does not, so
+the vetoes fire and the verdict is FAIL. **That is the gate doing its job** —
+it refuses a screenshot as interaction evidence, which is exactly PRD 215/216.
+
+### The guest is 49 real daemons ahead of what the gate knows
+
+The ring from build 41338826948 (guest to t=1514.6 s) carries **49 distinct
+real iPadOS userspace processes**, PIDs 26 through 128 —
+`runningboardd[26]`, `backboardd[58]` (the daemon that launches SpringBoard),
+`lockdownd[72]`, `audiomxd[107]`, `identityservicesd[55]` and ~44 more — and at
+t=1085.075614:
+
+```
+MobileGestaltHel[95] triggered unnest of range 0x1f7800000->0x1f7a00000 of DYLD shared region
+```
+
+`_guest_records` (`milestones.py:1362`) scans only `_GUEST_LOG_GLOBS`
+(`**/guest.log`, `**/guest-*.log`, `**/*guest*.log`, `**/guest.json`,
+`**/guest-*.json`) and its docstring is explicit: *"Only guest channels count.
+A serial log is not a guest channel (PRD 7.4)"*. **That is correct and must not
+be weakened.** The ring is the cross-check that a record is true, not a
+substitute for one.
+
+### Two mapped sites were wrong, and both emitters moved
+
+| emitter | mapped site | why it was wrong | where it went |
+|---|---|---|---|
+| `dyld.cache_read` | `cs_native4k_prepare()` @ `ubc_subr.c:5765` | authenticates the signed region of an ARBITRARY code-signed vnode — every 16K-hashed Mach-O on the board. The record would be false for most calls | `_shared_region_map_and_slide()` @ `vm_unix.c`, where `vm_shared_region_map_file()` has just mapped the shared cache into the process's shared region |
+| `virtio_blk.read_back` | `vr_verify_block()`'s loop @ `NativeVirtioBlock.cpp:435-444` | reachable from `start()` (so it can precede the console's), runs PER BLOCK (thousands of records), and has no success variable | `doAsyncReadWrite()`, gated on `result == kIOReturnSuccess && actual == count * 512`, after `IOLockUnlock` |
+
+The dyld emitter also needs a **load-bearing vendor edit**:
+`build-xnu-4k-baseline.sh` must add `-DXNU_NATIVE_VIRTIO_CONSOLE` to
+`vm_unix.o_CFLAGS_ADD`, or the macro is never defined for that translation unit
+and the emitter is silently not compiled. The gate is
+`XNU_NATIVE_VIRTIO_CONSOLE` rather than `XNU_NATIVE_CS_HASH_CACHE` because the
+former is the switch that force-loads `libNativeVirtioConsole.a`.
+
+Both emitters also sit behind a **veto pairing**: M8's
+`mockfs_pid1_as_launchd` fires when `p.launchd_running` is OK and
+`p.daemon_spawned` is not, so those two must land together or M8 goes from
+UNVERIFIED to FAIL. Same shape as `device_enumeration_without_readback`.
+
+### State
+
+- Build **41359711528** dispatched at `a4d40fb`, pin `8b57770` — the build that
+  answers whether the diagnostic arrives.
+- Main repo at `2e0c593`. UniXNU fork `unipad/gpu-addon-ngpu-dir` at `a549b9a`
+  (mount fix + dyld emitter).
+- **BLOCKED: the block driver's fork is not pushable from this host.**
+  `James081105/VirtioMmioBlock` exists — the API created it and reports it
+  public with push permission — but `git` says "Repository not found" for it
+  while the same command succeeds on `James081105/VirtioMmioConsole`. An
+  explicit URL fails where the named remote succeeds on the console fork;
+  neither works on the block fork; overriding the credential helper with the
+  gh token does not change it. Recorded rather than guessed at. The driver
+  commit is safe in its own repository on branch `unipad/virtio-blk-readback`.
+- `guest_install_service` mapped: `local-private/tmp/install-service-map.md`,
+  939 lines. Five host→guest request types (not six), the RX path IS reachable
+  from kernel code, `NativeOfflineGPU` can never start (its patch calls a
+  function defined nowhere), and the recommended design is one new free
+  function `native_console_poll()` symmetric to `native_console_report`.
