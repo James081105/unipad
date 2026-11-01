@@ -1138,3 +1138,34 @@ b'...ID_AA64PFR0_EL1  0x1201001121110012\r\nNativeVirtioConsole: bound virtio,mm
 **还没量的**：宿主→客人这个方向（`native_console_rx_requests`/`rx_bytes` 仍应是 0，这一轮没有读它们），以及客人侧有没有一个进程去读那个端口。这两件是下一步，而且都不需要再构建内核。
 
 | R9am | **item 4 第一次有客人自己发出来的字节：告白真的出现在 agent 通道上，978 字节里第 924 字节起，紧跟 bootloader 的 `ID_AA64PFR0_EL1` 行（即交棒那一刻，正是 `start()` 的运行时点）**（2026-11-01，bundle13，`answer: announced`）：内核侧字节级证据——告白在 ESP 内核（sha256 `dca5b3bb…` 与 `payload.json` 相符）文件偏移 242876、NUL 结尾，`bundle12` 0 次 / `bundle13` 1 次，差值恰好是这一句；`NativeVirtioConsole` 字样 76→78。**「客人→宿主」端到端实测通，事实 203/204 的 0 字节最终答案是「那句 `send()` 从未进过任何内核」**。**item 3 随之改判**：virtio 通道载客了，缺的只是渲染 op 加客人侧读端，传输层不再是阻断；取帧（事实 213）与送屏幕（事实 216）都已就绪。**未测**：宿主→客人方向、客人侧有没有读端 |
+
+
+**事实 218（RX 那一轮量到 0，而这个 0 **不能**读成「宿主的写没进去」——`native_console_rx_requests` 数的是「有没有用户态客户端来取」，不是「字节有没有到达」；而这个区别是我这轮仪器问错了问题，不是客人的缺陷**）：事实 217 证明了客人→宿主方向。这轮量反方向：启动 bundle13，先读到告白（943 字节），然后往通道写 29 + 25 = 54 字节，两轮之后读驱动自己的计数器：
+
+```
+counters before the write:
+    native_console_ready = 1        native_console_rx_requests = 0
+    native_console_rx_bytes = 0     native_console_tx_requests = 1
+    native_console_tx_bytes = 54    native_console_failures = 0
+wrote 29 bytes ... wrote 25 more bytes
+counters after the second write:
+    native_console_ready = 1        native_console_rx_requests = 0
+    native_console_rx_bytes = 0     native_console_tx_requests = 1
+    native_console_tx_bytes = 54    native_console_failures = 0
+```
+
+**两个读数各自有用，但第一个被我读错了**：
+
+- **TX 那一侧是硬的**：`native_console_tx_requests = 1`、`native_console_tx_bytes = 54`——**54 正是告白的长度**（`"NativeVirtioConsole: bound virtio,mmio console port 0\n"`，53 字符加换行）。所以宿主在通道上看到的 54 字节与驱动自己数的 54 字节**互相独立地对上了**，这不是单一读数的自证。
+- **RX 那一侧我报的是 `written_but_not_received`，而这个结论下重了**。读源码（`NativeVirtioConsole.cpp:183-201`）才看清：`receive()` 只从 `NativeVirtioConsoleClient::receiveAction`（`:269-274`，一个 `IOExternalMethod`）进来，也就是**必须有一个用户态客户端开打 user client 再来取**。`native_console_rx_requests`/`rx_bytes` 是在 `receive()` 里自增的，所以它们数的是**抽取次数**，不是**到达次数**。没有任何用户态客户端存在，这两个计数器必然是 0，**与宿主的字节有没有到达队列完全无关**。
+
+**所以这一轮的真实结论是「未测量」，不是「失败」**：它量到的是「客人侧没有消费者来取」，而这正是本来就知道的事实（还没有 guest agent）。把它记成「宿主写不进去」会是一个假的阻断，而它会让人去找一个不存在的传输层 bug——**与事实 207 那个「把 staging 缺陷读成驱动没枚举」是同族的错误，只是这次错在问计数器问错了问题**。
+
+**要真正量「字节有没有到达」，得问别的东西**，三条路按代价排序：
+1. **读 virtio-mmio 的队列寄存器**（`0xa003e00 + 0x30..0x44` 是 `QueueDesc/Driver/Device` 的 Low/High），拿到队列环的物理地址，再读 used ring 看宿主的写有没有变成 used 描述符。**不需要重建内核，也不需要 guest agent**，是最便宜的决定性一问；
+2. **给驱动加一个「到达」计数器**（在 `post()`/队列 0 的补充路径上自增），重建一次内核（约 40 分钟的 macOS run）；
+3. **把 guest agent 建出来**，让它调 `receive()`——这条同时是 item 4 install/launch/persist 的必经之路，但它证明的是「有消费者」而不是「字节到达」，要答后一个问题仍然需要第 1 或第 2 条。
+
+**下一步**：走第 1 条。同时把 guest agent 作为独立代码任务并行推进（它本来就要做，而且它与这个问题不互斥）。
+
+| R9an | **RX 那一轮的 0 被我读错了，真实结论是「未测量」：`native_console_rx_requests` 数的是「有没有用户态客户端来取」（`receive()` 只从 `NativeVirtioConsoleClient::receiveAction` 这个 externalMethod 进来），不是「字节有没有到达」——没有 guest agent，这两个计数器必然是 0**（2026-11-01，bundle13，写 54 字节两轮后 RX 仍 0/0、failures 0）：报成 `written_but_not_received` 会造出一个假阻断。**TX 侧是硬的**：`tx_requests=1`、`tx_bytes=54`，54 正是告白长度，与宿主在通道上看到的 54 字节互相独立对上。**要真量到达**：读 virtio-mmio 队列寄存器（`0xa003e00+0x30..0x44`）拿队列环物理地址再看 used ring（最便宜，不需重建）；或给驱动加到达计数器重建；或建 guest agent（同时是 item 4 必经路） |
