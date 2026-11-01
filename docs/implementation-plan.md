@@ -1461,3 +1461,29 @@ NATIVE_CONSOLE_EMIT(NATIVE_CONSOLE_PICK(pt_on,pt_off,mmu_on));
 **这里还修掉一个会反复咬人的仪器陷阱**：测试第一次跑时多报了一条——它把**我自己写在注释里的旧代码**当成了活的调用点。注释里为了向后来的读者说明「原来长什么样」引用了那一行，而扫描器不懂注释。加了一个字面量感知的 `_strip_comments()` 才解决。**一个把自己的文档当成缺陷报出来的测试，比没有测试更糟**，因为它红得没有意义。
 
 | R9ax | **三条 XNU 记录在 kernel 里但每条只发出 7 字节：三元表达式把两个长度不同的数组退化成指针，`sizeof(arr)` 量到指针大小 8 而非记录长度，抓包末尾 21 字节是 `{"event{"event{"event`**（2026-11-01，`local-private/boot41/xnu-records/guest.log`，1224 字节，两条 IOKit 记录完整到达、三条 XNU 记录各 7 字节）：**构建绿、对镜像 grep 也绿**，五条字面量确实在 ESP kernel 里且 sha256 与 `payload.json` 一致——**错的只有运行时算出来的长度参数，所以第一个能看见它的仪器是网线**。**可复用判据：「字面量在 kernel 里」≠「记录被完整发出」**。**修法**：改为在 `if` 里选、每个分支指名数组，删掉 `NATIVE_CONSOLE_PICK`。**防线**：新增 `test_no_record_is_sent_with_a_length_a_pointer_would_give`，先写后修、变异测试三种改法全杀。**仪器陷阱**：测试一度把注释里引用的旧代码当成活调用点，加字面量感知的 `_strip_comments()` 才对——把自己的文档当缺陷报出来的测试比没有测试更糟 |
+
+
+---
+
+**事实 229（七字节缺陷的修复版构建成功——run 41296027165 全部 34 步 success；这台主机没有 C 编译器，所以 macOS runner 是第一个真正编译这个修复的编译器，`-Werror` 放它过了**）：这次 dispatch 的是 `exp-2026-11-01-console-xnu-records-fix`，stage M5，system build 21H461，payload target tcg，unixnu commit `8a223b2d907f76bc66022aa9d537f933b386eb9a`，device commit `efa03c981efc1874d380663b396f2d4466ede2ca`。
+
+| 项 | 值 |
+|---|---|
+| run | 41296027165 |
+| 结论 | **success** |
+| 步数 | 34 步全部 success（27/28/29/30/31/32/33/34 与 67/68/69 亦 success） |
+| boot-inputs artifact | `13080506671`，310,348,182 字节 |
+| 起点 commit | `3b6bbd4`（unipad main） |
+
+**这一轮只证明「修复版能编过」**，不证明记录被完整发出——后者要等新的抓包。上一次（事实 225）证明的是「带缺陷的版本能编过」，两次都是同一个结论的不同侧面：**构建绿与记录完整是两件独立的事**，事实 228 已经用一次真机抓包把这件事钉死了。
+
+**同时把上一轮那一小时的手工步骤变成了一条命令**：`local-private/tmp/stage-bundle-from-run.py RUN_ID [BUNDLE_DIR]`，它会自己找 boot-inputs artifact、只取一次中央目录、按字节区间抽出全部九个成员、把每个成员放到 `ESP_LAYOUT` 真正读取的路径上，然后用**两份独立的摘要记录**（`payload.json` 与 artifact 自己的 `manifest.json`）逐成员核对 sha256。已对已知答案验证过：对 run 41281382063 跑一遍，九个成员全部 `ok`。
+
+**这条命令自己也会犯我犯过的错，而且当场就犯了两次**：
+
+1. `DarwinBoot.efi` 的目的地一开始写成了 bundle 根目录——正是上次让抓包在完整启动之后才拒绝的那个错。`ESP_LAYOUT` 读的是 `unixnu-out/qemu/tree/build/darwinboot-efi/build/DarwinBoot/DEBUG_CLANGPDB/AARCH64/DarwinBootPkg/Driver/DarwinBoot/DEBUG/DarwinBoot.efi`，zip 里那份有四个同名副本、只有这一个是对的。已修。
+2. 每个成员都重新取一次 4 MB 的尾部窗口来读中央目录——十个成员就是 40 MB 传输，只为反复读同一个 84 KB。已改成全程只取一次。
+
+**还有一条是关于复用的**：partial 文件路径必须是**按 artifact 编号**的（`artifact-<id>.zip`）。extract-one-member.py 第一次上真网就拒绝报告，原因正是喂给了它另一个 artifact 的字节：两个 zip 把同一成员放在不同偏移，拼出来的流不是那个成员的字节，inflate 当场失败。**复用只能复用自己的 bytes**，这条现在写在了脚本里而不是只写在注释里。
+
+| R9ay | **七字节修复版构建成功：run 41296027165 结论 success，34 步全部 success，boot-inputs artifact `13080506671`（310,348,182 字节）**（2026-11-01，`exp-2026-11-01-console-xnu-records-fix` / stage M5 / 21H461 / tcg）：本机无 C 编译器，macOS runner 是第一个真正编译该修复的编译器，`-Werror` 放行。**但本轮只证明「能编过」，不证明「记录被完整发出」**——构建绿与记录完整是两件独立的事（事实 228）。**抓包流程已收敛为一条命令** `stage-bundle-from-run.py RUN_ID`，对已知答案（run 41281382063）验证九个成员全 `ok`。**该命令自身当场犯了两个我已犯过的错并已修**：`DarwinBoot.efi` 目的地写成 bundle 根目录（`ESP_LAYOUT` 读的是深层路径，zip 有四个同名副本）；每成员重取 4 MB 尾部窗口读中央目录（十成员 = 40 MB 浪费）。**partial 必须按 artifact 编号**，复用只能复用自己的 bytes |
