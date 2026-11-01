@@ -52,56 +52,44 @@ defaults to 0.
 
 ## Active work
 
-**`broker-build` teammate finished** (deliverable:
-`local-private/tmp/broker-build-wiring.md`). Its conclusion, which is the reason
-this is not a one-line change:
+**The M5 emitter is written, pinned and building.** Fact 222 established that
+M5 does *not* wait on the broker: `_guest_probe` checks only that a record whose
+`event` field matches exists — no payload validation — and the only veto fires
+when the service-match record is present and the driver-probe record is not. And
+the only code in the guest that can put bytes on that port is the console driver
+itself, because `grep -rln native_console_receive vendor/UniXNU/` returns only it
+and `NativeOfflineGPU.cpp`, which is not in any kernel.
 
-- **A define alone makes the build fail, not link.** `build-arm-driver.py
-  NativeOfflineGPU` writes `libNativeOfflineGPU.a`, but the kernel link demands
-  `libNativeOfflineGPU.late.a` **and** a `build-report.json` that
-  `build-arm-driver.py` never writes. No builder for either exists in either
-  pinned tree.
-- **`board.toml` cannot carry the variable.** Its `[kernel]` section is read at
-  three keys only — `defconfig`, `archives`, `prelink`.
-- **The one place that wins is the generated `.config`** (`out/<device>/.config`),
-  appended between `unixnu defconfig` and `unixnu build kernel`, where a
-  divergence block of exactly this shape already lives
-  (`scripts/macos/build-macos.sh:2703-2718`).
-- Cleared: `(DEVELOPMENT || DEBUG)` is satisfied, and
-  `patches/xnu/offline-native-gpu-broker.patch` **is** applied.
-- `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` must be appended in the same breath, because
-  `build-xnu-4k-baseline.sh:311-314` is a hard gate that is **not**
-  BOOTSTRAP-protected.
+So two more `send()` calls in the fork I already control were enough — no new
+builder, no `board.toml` entry, no Part B.
 
-The minimal change is three parts, and **Part B is not achievable from this
-repo**: Part A appends the two switches in `build-macos.sh` (here), Part B adds a
-`.late.a` builder plus a `board.toml` archives entry (device repo), Part C
-updates `DORMANT_KEYS` in the guard test (here). Part A alone converts a silent
-absence into a build failure.
+| Level | Repo | Branch | Commit |
+|---|---|---|---|
+| driver fork | `James081105/VirtioMmioConsole` | `unipad/console-announcement` | `d1ebb35` |
+| UniXNU fork | `James081105/UniXNU` | `unipad/console-announcement` | `29ed7e9` |
+| main repo | `James081105/unipad` | `main` | lock updated, both entries |
+
+263 lock-related unit tests pass. Build **run 41267641749** triggered with
+experiment `exp-2026-11-01-console-iokit-records`.
 
 ## Next actions, in order
 
-1. **Write the guest-side M5 emitter and the `.late.a` builder together, in one
-   device-repo change.** Fact 220 established that M5 needs
-   `{"event":"iokit.service_match"}` and `{"event":"iokit.driver_probe"}` records
-   on a guest channel, and that **nothing in the guest emits them** — the only
-   references in the repo are in the acceptance harness. Fact 221 established
-   that the broker needs a builder that does not exist. Doing these as one change
-   costs one rebuild instead of two.
-2. **Part A in this repo**: append `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` and
-   `CONFIG_XNU_NATIVE_OFFLINE_GPU` to the generated `.config` divergence block,
-   and to `CONFIG_DIVERGENCE` by appending rather than assigning.
-3. **Part C in this repo**: update `DORMANT_KEYS` in the guard test.
-4. **One macOS build**, then verify byte-level that `native_gpu_broker_stage` is
-   now a defined symbol and that `NativeOfflineGPU` text occurs in the ESP
-   kernel.
-5. **Capture the channel to `guest.log`.** The acceptance harness reads guest
-   events only from `**/guest.log`, `**/guest-*.log`, `**/*guest*.log`,
-   `**/guest.json`, `**/guest-*.json`, one JSON object per line, and marks
-   anything under a simulation path so it can never satisfy an `onsite`
-   requirement. `AgentChannelTransport.listen()` already returns the bytes, so
-   this is a write-to-disk step, not a new mechanism.
-6. **Re-run the gate** and read M5's two probes.
+1. **When run 41267641749 lands, download its `boot-inputs` and verify
+   byte-level** that the two records are in the ESP kernel — the same check that
+   proved the announcement (fact 217).
+2. **Run `local-private/tmp/iokit-capture.py`** against that bundle. It boots,
+   waits for the hand-off, captures the channel, writes
+   `local-private/boot40/iokit-records/guest.log`, and then parses it with the
+   gate's own criterion — one JSON object per line, `event` field — and reports
+   which of the two are missing. It also applies `_is_simulation_path` to the
+   file it just wrote, because a real record scoped SIMULATION and a missing
+   record look different in a report but cost the same.
+3. **Re-run the gate** and read M5's two probes (`p.iokit_service_match`,
+   `p.iokit_driver_probe`). If both go green, M5 moves off BLOCKED and the
+   firmware route has its first gate-visible guest evidence.
+4. **Then the broker, if the render path is next.** That is the Part A + Part B +
+   Part C change fact 221 describes, and it is a device-repo re-pin. It is not on
+   M5's path.
 
 ## Resume commands
 
