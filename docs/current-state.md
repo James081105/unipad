@@ -402,3 +402,48 @@ test agrees with itself and measures nothing. The `uuid` mutation taught it
 first (the test substituted its own UUID), the mountpoint taught it second,
 and the fix is the same both times — derive the expectation from something the
 value does not control.
+
+### Byte-level verification of the mount reporter's premises (before the build lands)
+
+Measured on the kernel the guest actually boots —
+`local-private/boot42/ring-boot/esp/EFI/UniXNU/Payloads/kernel.macho`,
+125,480,960 bytes, the same size fact 227 recorded — with Python's
+`bytes.count()`, not `grep -c`, because `grep -c` on a binary counts LINES and
+reported `system.mount` as present when it is absent:
+
+| string | count | what it settles |
+|---|---|---|
+| `8846FE78-2910-4297-AF97-D59BB6F8FC16` | **1** @ 808230 | the functional mount's `const char *volume = XNU_OWNER_CACHE_VOLUME_UUID` really is compiled into the booting kernel |
+| `DYLD_SHARED_CACHE_DIR` | **0** | the non-union arm is NOT live, so the mount point is `/` |
+| `system.mount` | **0** | this kernel predates the emitter — the honest baseline |
+| `native_console_report` | **0** | ditto; the symbol is not linked into this kernel |
+
+The `DYLD_SHARED_CACHE_DIR` result is the decisive one for the mountpoint
+question. That literal is compiled **only** inside
+`#if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS`, so its
+absence from the booting kernel is a byte-level proof that the union arm is the
+live one and the mount overlays `/`. The config evidence
+(`qemu_root_defconfig:36`) and the byte evidence now agree.
+
+And the mount the emitter reports is identifiable in the guest's own ring, at
+`ring-after.log:323`:
+
+```
+[   35.314745]: apfs_log_op_with_proc:3091: disk4s1 mounting volume
+  DawnUpdate21H461.J120J121J207J208SystemCryptex, requested by: init (pid 1);
+  parent: kernel_task (pid 0)
+[   35.316584]: handle_mount:817: disk4s1 vol-uuid: 8846FE78-2910-4297-AF97-D59BB6F8FC16
+```
+
+`requested by: init (pid 1); parent: kernel_task (pid 0)` is `bsdinit_task()`,
+which is exactly where the patch puts `native_owner_cache_prepare()`. So the
+log line IS the mount the record reports, and the vol-uuid it names is the one
+the record carries.
+
+**The ordering risk is closed, and it was a real risk.** If
+`native_owner_cache_prepare()` ran before `NativeVirtioConsole::start()`, then
+`g_console` would still be null, `native_console_report` would return
+`kIOReturnNotOpen`, and both records would be dropped with a green build — the
+same silent failure shape as fact 228. It does not: the console's own records
+sit at `guest.log:19-23`, immediately after the EFI hand-off's "Exiting boot
+services", and the mount is 35 seconds later.
