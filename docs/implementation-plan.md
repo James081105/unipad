@@ -1212,3 +1212,26 @@ m5.driver_probe       驱动探测证据: driver probe results, from a guest cha
 **这条发现的价值在于它把 M5 从「零证据」变成一个可执行的任务，而且顺带纠正了一个印象**：覆盖矩阵里 M5/M6/M7/M8/M9/M9a/M9b 的阻断理由都写着「firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction」，读起来像「这些里程碑都在等同一条旧路线」。**不是**：那条免固件路线是 PRD Tier-1 里一个**独立的**条目（`_probe_el1_entry`，`probes.py` 那条探针的文档字符串自己写着「this proves the CPU entered kernel code and does not prove kernel initialisation」），而 M5 要的是另一回事——**从客人通道拿到 IOKit 服务匹配与驱动探测**。我这一路用的固件路线（EDK2 + UNINU + DarwinBoot）已经让 `NativeVirtioConsole::start()` 跑起来了（事实 217），**那本身就是 IOKit 服务匹配加驱动探测成功的一次实例**，只是它还没有以 `guest.log` 的形式交给门禁。
 
 | R9ap | **M5 的形状确定了：它要「IOKit 服务匹配」和「驱动探测结果」两条，且明确 `from a guest channel`（`_ONSITE` 证据域），记录必须落在 `**/guest.log`/`**/guest-*.log`/`**/*guest*.log`/`**/guest.json`/`**/guest-*.json` 之一、每行一个带 `event` 字段的 JSON，模拟路径下的记录一律不算**（2026-11-01，`milestones.py:1427`、`:2306-2332`、`:295-301`）：**全仓只有验收器引用 `iokit.service_match`/`iokit.driver_probe`，客人侧一行都没有**（`grep --include=*.cpp/..h/..mm vendor/` 返回空），所以第 1 件要新写。**第 2、3 件成本很低**：通道已通（事实 217），`listen()` 已能取回字节，落成 `guest.log` 就是宿主侧全部工作。**顺带纠正一个印象**：M5-M9b 的阻断理由都写着免固件路线撞未定义指令，但那是 PRD Tier-1 的**独立**条目；M5 要的是另一回事，而我用的固件路线已经让 `start()` 跑起来，那本身就是服务匹配加探测成功的一次实例，只是没以 `guest.log` 交给门禁 |
+
+
+**事实 221（启用离线 GPU broker 不是一个开关：光加 define 会让构建**失败**而不是链接，光加 archive 条目也不够——缺的是一个 `.late.a` 的 builder，而它和 board.toml 那条目都在**设备仓**里，主仓改不动；`board.toml` 的 `[kernel]` 段也根本没法携带这个变量**）：`broker-build` teammate 追了五跳，结论是这件事比「把开关打开」大一圈，而且**大得有价值**——它省掉了一次 40 分钟的构建失败。
+
+**五个答案，各自有 `path:line`**：
+
+1. **CI 内核步骤的环境是五跳传下来的**，而 `board.toml` 的 `[kernel]` 段只在三个键被读——`defconfig`、`archives`、`prelink`（`scripts/macos/build-macos.sh:1707-1724`）。**没有任何键能携带环境变量**，所以「在 board.toml 里加一行」这条路不存在。
+2. **唯一能赢的地方是生成出来的 `.config`**（`out/<device>/.config`），追加在 `unixnu defconfig`（`:2664`）和 `unixnu build kernel`（`:2720`）之间，而 `:2703-2718` 已经有一个同类的分歧块（`CONFIG_XNU_BUILD_ARCHIVES=y` 就是这么加进去的）。
+3. ** archive 根本没被构建，而它的 builder 根本不存在**——这是决定性的那条。`build-arm-driver.py NativeOfflineGPU` 会写出 `libNativeOfflineGPU.a`，但内核链接要的是 `libNativeOfflineGPU.late.a` **并且**要一份 `build-arm-driver.py` 从来不写的 `build-report.json`。两个 pin 住的树里都没有为这两样存在的 builder。
+4. **`(DEVELOPMENT \|\| DEBUG)` 条件满足，broker 补丁也确实被打上了**（glob 在 `build-xnu-4k-baseline.sh:44`）——所以这两个常见的疑点不是阻断。
+5. **`CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` 必须与 broker 开关同时加**，因为 `build-xnu-4k-baseline.sh:311-314` 是一道硬门（「The private offline GPU broker requires the actual byte transport」），而且它**不受 `BOOTSTRAP` 保护**——少了它，连 `build-macos.sh` 第一次调用（构建 `qemu_defconfig`）的 bootstrap 那一趟都在产出任何编译记录之前 exit 1。
+
+**所以「最小改动」是三部分，而其中一部分主仓做不到**：
+
+- **Part A（主仓，一行 diff）**：在 `scripts/macos/build-macos.sh:2703-2718` 那个已有的分歧块里，把 `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` 和 `CONFIG_XNU_NATIVE_OFFLINE_GPU` 两个开关追加进生成的 `.config`，并同样追加进 `CONFIG_DIVERGENCE`（沿用 `:2717` 的追加方式而不是赋值，否则会抹掉按钮汇自己的分歧记录）。
+- **Part B（设备仓，主仓改不动）**：加一个产出 `.late.a` 的 builder，并在 `board.toml` 的 `[kernel] archives` 里加条目。**Part A 单独上会把「静默缺失」变成「构建失败」**——`qemu_root_defconfig` 那一趟在 `build-xnu-4k-baseline.sh:650` 的 `test -f` 上失败（报了路径没报原因），而且是在完整的 XNU 构建、获取、IPSW 和 GPU addon 链之后。
+- **Part C（主仓，守卫测试）**：更新 `DORMANT_KEYS`。
+
+**七条仍然可能挡路的东西都列了**，其中三条值得单独记住：`CONFIG_DIVERGENCE` 一次运行多两条新条目有没有消费者能容忍**未测**；Part A 会让**两次** `build-macos.sh` 调用都带上 broker，而第一次（`qemu_defconfig`）那颗内核是 `build-os-root.py` 的存储 ABI 子步骤要启动的，**那是一颗没人启动过的新配置**；以及 `.late` 这个命名是否语义上必需本身是未定的（`NativeOfflineGPU.cpp:300-302` 的 `OSDefineMetaClassAndStructors` 与每个普通 `.a` 的 `build-arm-driver.py` 驱动同机制，所以 `.late.a` 可能是构建脚本里一个未兑现的设计要求）——但**构建脚本要这个名字，与语义无关**。
+
+**这一条与事实 219 合起来把 item 4 的真实形状钉住了**：客人侧消费者写好了（219），但把它编进内核要一次跨仓改动加一次重建，而**重建之后还要有新客人代码**——因为 M5 要的 `iokit.service_match`/`iokit.driver_probe` 两个事件，全仓只有验收器在说，客人侧一行都没有（事实 220）。**所以正确的顺序是一次性把「broker 编进去」和「M5 事件发出来」合成同一个设备仓改动加同一次重建，而不是分两轮各等 40 分钟。**
+
+| R9aq | **启用 broker 不是一个开关：光加 define 会让构建失败（内核链接要 `libNativeOfflineGPU.late.a` 而 builder 不存在），光加 archive 条目也不够，而 `board.toml` 的 `[kernel]` 段只读 `defconfig`/`archives`/`prelink`、根本无法携带变量**（2026-11-01，`broker-build` teammate，只读调查）：唯一能赢的地方是生成出来的 `.config`（`build-macos.sh:2703-2718` 已有同类分歧块）。**最小改动三部分**：Part A 主仓追加两个开关（`CONFIG_XNU_NATIVE_VIRTIO_CONSOLE` 必须同时加，`build-xnu-4k-baseline.sh:311-314` 是硬门且不受 BOOTSTRAP 保护）、Part B 设备仓加 `.late.a` builder 与 archives 条目（主仓改不动，**Part A 单独上会把静默缺失变成构建失败**）、Part C 更新 `DORMANT_KEYS`。**七条未决项**：`CONFIG_DIVERGENCE` 多两条是否可容未测、第一次 `qemu_defconfig` 也会带上 broker（一颗没人启动过的新配置）、`.late` 命名是否语义必需未定。**与事实 219/220 合起来**：正确顺序是把「broker 编进去」和「M5 事件发出来」合成同一个设备仓改动加同一次重建 |
