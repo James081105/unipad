@@ -50,6 +50,7 @@ capture are the only two steps left before M4 and M5 can be re-read.
 | 12 | The **pin chain for the XNU records closes on GitHub** | `51b7e04`'s lock → UniXNU `2bff001` (parent `29ed7e9`) → its `drivers/NativeVirtioConsole` gitlink is `c3c9ce2` (parent `d1ebb35`), and the lock's submodule entry agrees with the gitlink, so there is no divergence. All four SHAs read back from api.github.com |
 | 13 | **The driver compiles under `-Werror` with all ten records** | fact 225 — run 41281382063, conclusion **success**, 34/34 steps: step 7 pin cross-check, step 14 macOS build, step 17 owner root chain, step 21 the second macOS build. This host has no C compiler, so step 14 is the first real compiler to see the macro, and it is the direct proof the adjacent-string-literal concatenation is right — the same macro that was wrong three times |
 | 14 | The **M4/M5 baseline is unchanged since fact 224** | re-measured just now on `default_view()`: M4 `UNVERIFIED`, `missing=('m4.page_tables','m4.exception_state','m4.interrupt_state')` and nothing else; M5 `BLOCKED` by `xnu_initialised`, `missing=()` with both IOKit requirements satisfied and their witnesses still at `guest.log:17`/`:18`, `scope='onsite'` |
+| 15 | **`xnu_initialised` gates SEVEN milestones, not two — fact 224 undercounted** | fact 226 — `_XNU_BLOCKER` has seven use sites in `milestones.py` (lines 2336/2367/2412/2457/2498/2543/2593), landing on M5, M6, M7, M8, M9, M9a and M9b. Evaluated M3-M12 in full: each of those seven is `BLOCKED` with `unmet_blockers` containing only `xnu_initialised` (M9b also `system_volume_mounted`). So the three records pay once and move **eight** milestones — M4 completes, seven unblock |
 
 ## What is NOT done, and why
 
@@ -62,7 +63,7 @@ capture are the only two steps left before M4 and M5 can be re-read.
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
 | G | **The three XNU records are pinned, compiled and measured on paper, not yet on a guest** | fact 225 — run 41281382063 is **success** (34/34 steps), so the macro survives `-Werror` and the ARM64/iOS 17 object audit. What is still open is the guest side: byte-level presence in the ESP kernel, then the capture, then the gate |
-| H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True |
+| H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True. **Corrected by fact 226**: it is not just M4+M5 — `xnu_initialised` also blocks M6, M7, M8, M9, M9a and M9b, so the same three records move eight milestones |
 
 ## Active work
 
@@ -124,14 +125,18 @@ build is the first real compiler to see the macro, and `-Werror` let it through.
    waits for the hand-off, captures the channel into
    `local-private/boot40/iokit-records/guest.log`, and parses it with the gate's
    own criterion. Then read the three XNU events, not just the two IOKit ones.
-4. **Re-run the gate** and read M4 and M5 together. Fact 224 measured the
-   baseline: M5's `missing` is already empty and M4's is exactly these three
-   requirements, so the same capture moves both. Re-measure rather than
-   assume — `evaluate("M4")` and `evaluate("M5")` on `default_view()`
-   answer it in seconds, and the eight probes print which one is still red.
+4. **Re-run the gate** and read M4 together with M5-M9b. Fact 226 corrected the
+   baseline: `xnu_initialised` gates **seven** milestones (M5, M6, M7, M8, M9,
+   M9a, M9b), not two — so the same capture moves eight. Re-measure rather than
+   assume — `evaluate(mid)` on `default_view()` answers in seconds, and
+   `unmet_blockers` prints which one is still red. **Unblocked is not passed**:
+   M6-M9b each still need their own `pass_evidence` from the guest.
 5. **Then the broker, if the render path is next.** That is the Part A + Part B
    + Part C change fact 221 describes, and it is a device-repo re-pin. It is not
    on M5's path.
+6. **In parallel, `guest_install_service`** — the blocker for M10/M11/M12, and
+   gap B (no guest agent for install/launch/persist). It is independent of
+   `xnu_initialised`, so it does not have to wait for step 4.
 
 ## Resume commands
 

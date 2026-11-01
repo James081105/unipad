@@ -1339,3 +1339,37 @@ send(probe_record,sizeof(probe_record)-1);
 **产出的 boot-inputs 是 `13074462047`，310,354,885 字节**，另有一个 `owner-data-material`（126,644,844）与 `unipad-build-exp-...`（1,162,083,475）。下载用的是 `local-private/tmp/fetch-artifact.py` 续传循环（每次 attempt 要一个新的预签名 URL，`curl` 在截断结果上退 0），实测约 39 KB/s、全程约两小时十分钟——**和上次的 2.4 MB/attempt 同量级，脚本行为没变，是 URL 寿命短**。
 
 | R9au | **run 41281382063 结论 success，34 步全过：第 7 步 pin 交叉检查、第 14 步 macOS build、第 17 步 owner root chain、第 21 步第二次 macOS build 均 success——这是真编译器与 ARM64/iOS 17 对象审计第一次见到三条 XNU 记录的那段宏，`-Werror` 全绿，所以「相邻字符串字面量拼接写对了」从「本地模拟器说对」升级为「真编译放过」**（2026-11-01，experiment `exp-2026-11-01-console-xnu-records`）：本机无 C 编译器，单测只能模拟预处理，所以这一级证据此前拿不到。**但「编进内核」仍不等于「记录在客人侧被观测到」**——boot-inputs（`13074462047`，310,354,885 字节）下载中，落盘后先做事实 217 式字节级 ESP 内核检查，再跑 `iokit-capture.py` 捕获，最后重跑 gate 读 M4 与 M5 |
+
+
+---
+
+**事实 226（`xnu_initialised` 这一个 blocker 压着**七个** milestone，不是两个——事实 224 少数了；同三条记录付一次钱，动的是 M4 走完加 M5/M6/M7/M8/M9/M9a/M9b 七个解除阻塞**）：上一轮只量了 M4 与 M5 两个 verdict 就下了结论。这次把 M3 到 M12 全跑了一遍，量到的是：
+
+| milestone | verdict | missing | unmet blockers |
+|---|---|---|---|
+| M3 | UNVERIFIED | `m3.input_validation`, `m3.load_info`, `m3.handoff_location` | — |
+| M4 | UNVERIFIED | `m4.page_tables`, `m4.exception_state`, `m4.interrupt_state` | — |
+| M5 | BLOCKED | *(空)* | `xnu_initialised` |
+| M6 | BLOCKED | `m6.known_content_read_back` | `xnu_initialised` |
+| M7 | BLOCKED | `m7.volume_identity`, `m7.mount_relations`, `m7.dyld_cache_read` | `xnu_initialised` |
+| M8 | BLOCKED | `m8.original_launchd`, `m8.later_daemons` | `xnu_initialised` |
+| M9 | BLOCKED | `m9.springboard_running`, `m9.screen_and_interaction` | `xnu_initialised` |
+| M9a | BLOCKED | `m9a.first_frame`, `m9a.update`, `m9a.input_feedback` | `xnu_initialised` |
+| M9b | BLOCKED | `m9b.written`, `m9b.normal_shutdown`, `m9b.read_back` | `xnu_initialised`, `system_volume_mounted` |
+| M10 | BLOCKED | `m10.archived_samples`, `m10.registered`, `m10.trust`, `m10.icon` | `guest_install_service` |
+| M11 | BLOCKED | `m11.dyld`, `m11.process`, `m11.window`, `m11.challenge` | `guest_install_service` |
+| M12 | BLOCKED | `m12.tap`, `m12.drag`, `m12.home`, `m12.text` | `guest_install_service` |
+
+**这不是从 verdict 文本读的，是源码里数出来的**：`_XNU_BLOCKER` 在 `milestones.py` 里出现在 1961 行定义、2336 / 2367 / 2412 / 2457 / 2498 / 2543 / 2593 行使用，按 milestone 定义顺序（M5=2307, M6=2343, M7=2377, M8=2426, M9=2468, M9a=2508, M9b=2558）正好落在 M5、M6、M7、M8、M9、M9a、M9b 上，七个。`_VOLUME_BLOCKER` 只在 M9b 与它并列（2593 行），`guest_install_service` 单独压 M10/M11/M12 三个。
+
+**所以三条 XNU 记录的真实杠杆是「一付八用」**：M4 的三项 `evidence_absent` 直接走完（`p.xnu_page_tables` / `p.xnu_exception_state` / `p.xnu_interrupt_state` 三个探针各要一个事件，而这三个事件正是驱动要发的），同时 M5 到 M9b 七个从 BLOCKED 转为只缺自己的 `pass_evidence`。**注意「解除阻塞」不等于「通过」**：M6 仍缺 `m6.known_content_read_back`、M9 仍缺 `m9.springboard_running`，那些要各自的客人侧证据；但 blocker 一除，这些 milestone 就从「结构上不可能」变成「缺证据」，这是不同性质的两件事，不能混着报。
+
+**顺带把后面的依赖链量清了**，这决定了记录落地之后的下一步该做什么：
+
+1. `xnu_initialised`（M5-M9b 七个）← **就是这次要除的**
+2. `system_volume_mounted`（M9b）← M7 的客人侧证据（volume identity / mount / dyld cache）走完，它自然满足
+3. `guest_install_service`（M10-M12 三个）← 要客人侧安装服务，即缺口 B 那条；这条独立于前两条，可以并行推
+
+**一条给下次的方法论**：事实 224 的结论「动的是两个 milestone」是**只看被点名的两个 verdict** 得到的，而 blocker 是跨 milestone 共享的。**问「这一个 blocker 还压着谁」比问「这两个 milestone 还缺什么」信息量大得多**，而前者的答案是 `grep` 一下 `_XNU_BLOCKER` 的使用点就有、不需要跑 gate。下次遇到共享 blocker 先数使用点。
+
+| R9av | **`xnu_initialised` 压着七个 milestone 而非两个：`_XNU_BLOCKER` 在 `milestones.py` 有七个使用点（2336/2367/2412/2457/2498/2543/2593 行），按定义顺序落在 M5、M6、M7、M8、M9、M9a、M9b 上，逐跑 verdict 亦各自只缺这一个 blocker（M9b 另缺 `system_volume_mounted`）**（2026-11-01，`M.default_view()` 上 evaluate M3-M12 全量）：事实 224 只量了 M4 与 M5 就下结论，少数了五个。**同三条记录的真实杠杆是「一付八用」**：M4 三项 `evidence_absent` 走完，M5-M9b 七个解除阻塞。**但「解除阻塞」不是「通过」**，M6/M7/M8/M9/M9a/M9b 各自仍缺 `pass_evidence`，要各自的客人侧证据。**后续依赖链**：`xnu_initialised`（本次）→ `system_volume_mounted`（M7 证据走完即满足）→ `guest_install_service`（M10-M12，即缺口 B，独立可并行） |
