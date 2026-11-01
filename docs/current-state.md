@@ -6,10 +6,10 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-02 (inter-patch constraint corrected; `dyld.cache_read`
-emitter pinned; `virtio_blk.read_back` emitter CODE COMPLETE but its driver
-fork is not pushable; M8 `launchd.running`/`daemon.spawned` pair in flight).
-Main repo at `2e0c593`.
+Last updated: 2026-11-02 (inter-patch constraint corrected; the console
+declaration moved out of the mount's guard; `dyld.cache_read`,
+`virtio_blk.read_back` and the M8 pair all CODE COMPLETE but unpinned, pending
+the drain measurement). Main repo at `3bf6fe9`.
 
 ---
 
@@ -1087,3 +1087,107 @@ UNVERIFIED to FAIL. Same shape as `device_enumeration_without_readback`.
   from kernel code, `NativeOfflineGPU` can never start (its patch calls a
   function defined nowhere), and the recommended design is one new free
   function `native_console_poll()` symmetric to `native_console_report`.
+
+---
+
+## 2026-11-02 — the patches apply, and then the declaration was behind the wrong guard
+
+Build **41359711528** (pin `8b57770`) got **4.5 minutes into the XNU compile**
+before failing. That is the answer to the question the previous two builds could
+not reach: **the inter-patch fix works.** The patches apply, and both kernel
+passes start.
+
+It then failed with:
+
+```
+bsd/kern/kern_exec.c:8120:2: error: call to undeclared function
+'native_console_report'; ISO C99 and later do not support implicit function
+declarations [-Wimplicit-function-declaration]
+ 8120 |         native_console_report(diag_record, sizeof(diag_record) - 1);
+```
+
+Line 8120 is the `load_init_program` DIAGNOSTIC — the record whose entire
+purpose is to ask whether this port is reachable from `kern_exec.c` at all. It
+is emitted **outside** the `#if defined(XNU_OWNER_CACHE_MOUNT)` block, and the
+`extern` declaring `native_console_report` was **inside** it. The build log
+names the configuration: *"kernel: no owner root chain on disk, so building
+qemu_defconfig"* — the first pass, which does not define that macro for this
+translation unit. So the call compiled and the declaration did not.
+
+### The generalisable lesson, and it is the fifth of this shape
+
+This is the **exact inverse** of the defect the dyld emitter was warned about.
+There the macro gated the EMITTER, so it was silently not compiled — a no-op
+rather than a failure. Here the macro gates the DECLARATION, so the caller is
+compiled and the build fails. **Same root cause both times: a caller and its
+declaration behind different conditionals.** The first is invisible until a
+boot; the second is invisible until a compile; and neither is visible to any
+source-level check, because nothing on this host preprocesses.
+
+`8e492f5` moves the declaration above the guard, unconditionally, with both
+callers — the emitter inside the conditional and the diagnostic outside it —
+seeing one declaration whatever the configuration.
+
+### What is deliberately NOT in that commit
+
+The three new emitter patches sitting in the working tree. The M8 agent
+measured the reason:
+
+> `send()` is a synchronous round trip with a two-second deadline, and a
+> descriptor the device never consumes stays pending — so every `send()` after
+> the first timeout pays another two seconds. On a boot with hundreds of execs
+> that is a hang.
+
+Measured volume: the ring's retained window names **49 distinct PIDs (26–128)**
+and PIDs 1–25 happened before it, so **≥75 successful execs on a boot that
+stops before SpringBoard**, several hundred on a full boot. The agent looked
+for measured evidence of the stall, **disproved its own first theory** (the
+6.35 s gap between the Data mount at t=58.524 and `load_init_program` at
+t=64.879 sits *after* the mount records are emitted, so it is not console
+timeouts), and added no speculative backoff. **The drain is the first thing to
+measure on the next boot.**
+
+### M8: both events land, and the veto is respected
+
+`zzz-m8-launchd-daemon-events.patch` — 3 hunks, 161 added lines, 11 guard
+tests, 13 mutations all red, no survivors.
+
+- **`launchd.running`** inside `load_init_program()`'s `init_programs[]` loop's
+  `if (!error)` branch (post-patch line 8344). The `panic()` four lines below is
+  the all-entries-failed path, so the branch is success-only.
+- **`daemon.spawned`** inside `__mac_execve()`, at `exec_done = TRUE` (post-patch
+  5411) — the kernel's own "the exec occurred" flag.
+- `test_both_m8_events_are_in_the_same_patch_set` asserts the pair travels
+  together, and that stripping the daemon hunk makes a set carrying only
+  `launchd.running` — so a discriminator that always answers "both" cannot pass.
+- **`DEVELOPMENT` is set; `DEBUG` is not** — settled by measurement, not by
+  reading a config: the ring reads `attempting to load
+  /usr/appleinternal/sbin/launchd.development` at t=64.879, then
+  `attempting to load /sbin/launchd` at t=65.008, then `[1(launchd)]` at t=66.579.
+  The `.debug` entry was never attempted, so `DEBUG` is 0.
+- **`imgp->ip_ndp` is freed by the time site 2 runs** — `exec_activate_image()`
+  calls `nameidone()` before returning. Reading it would be a use-after-free
+  that looks like a working record. The name comes from `p->p_comm`.
+- The first `daemon.spawned` on a real boot will be **launchd itself (pid 1)**,
+  because `load_init_program_at_path()` ends in `execve()`.
+
+### A CRLF risk, checked and cleared
+
+The M8 agent flagged that `offline-owner-systemos-mount.patch` is CRLF in the
+Windows worktree (418 CRLF, 0 bare LF) while the other 52 patches are LF, and
+that if that reached the commit the runner's `git apply` would refuse it.
+Checked: the committed blob is **LF** (`git ls-files --eol` reports
+`i/lf w/crlf attr/text eol=lf`). The working tree is CRLF because of
+`core.autocrlf`; git normalises on commit. The runner gets clean LF.
+
+### State
+
+- Build **41364602699** dispatched at `3bf6fe9`, pin `8e492f5` — the build that
+  should compile and should finally run the diagnostic.
+- Main repo at `3bf6fe9`. Fork branch at `8e492f5` (`8b57770` → `8e492f5`).
+- `a549b9a` (the dyld emitter) was force-pushed off the branch and is **not
+  pinned**; its patch is preserved at
+  `local-private/tmp/parked-patches/native-dyld-cache-read.patch`.
+- Three emitters CODE COMPLETE but unpinned: `dyld.cache_read`,
+  `virtio_blk.read_back`, and the M8 pair. `guest_install_service` mapping is
+  done and its emitter is in flight.
