@@ -1315,3 +1315,27 @@ send(probe_record,sizeof(probe_record)-1);
 **顺带量到一件对后面有用的事**：`_PRUNE` 里有 `local-private`，但 `default_view()` 的 roots 显式包含 `root.glob("local-private/boot*")`，所以 `local-private/boot40/...` 的取证是有效的、而 `local-private/acceptance-runs/...` 是无效的。M4 的两条老证据（`local-private/out/real-boot/...` 与 `runs/...`）都落在有效 root 上，这就是它们算数的原因。
 
 | R9at | **三条 XNU 记录落地时动的是一次两个 blocking milestone：直接跑 gate 探针量到 M4=`UNVERIFIED` 且 `missing` 恰好只有 `m4.page_tables`/`m4.exception_state`/`m4.interrupt_state` 三项、M5=`BLOCKED` 但 `missing=()`（两条 IOKit 必选项已满足，witness 在 `local-private/boot40/iokit-records/guest.log:17`/`:18`，均 `scope='onsite'`），两者共用同一个 `xnu_initialisation`；`p.el1_entry`/`p.failure_forensics`/`p.unixnu_kernel_image`/`p.source_pins` 四项均已 True**（2026-11-01，experiment `exp-2026-11-01-console-xnu-records`）：驱动 fork `c3c9ce2`、UniXNU fork `2bff001`、主仓 `51b7e04`，build run 41281382063 的第 7 步「Acquire and verify the pinned sources（pin cross-check）」已 success——CI 确实检出了那棵树。**但三条记录本身仍未在一个真客人上量到**，所以这一条是「缺口已经量清、修复已钉住并正在构建」，不是「已验收」
+
+
+---
+
+**事实 225（`-Werror` 全绿这件事本身就是宏修复的证明：CI 是真编译这段代码的第一样东西，而这台机器上没有 C 编译器，所以「构建 success」与「宏没错」在这里是同一句话**）：run 41281382063（experiment `exp-2026-11-01-console-xnu-records`，stage M5，system build 21H461，payload target tcg）**结论 success**，34 步全部通过。关键几步：
+
+| 步 | 名称 | 结论 |
+|---|---|---|
+| 7 | Acquire and verify the pinned sources（pin cross-check） | success |
+| 14 | Run macOS build（`scripts/macos/build-macos.sh`） | success |
+| 17 | Build the owner root chain | success |
+| 20 | Build the QemuMetal userspace plugin | success |
+| 21 | Run macOS build again | success |
+| 25-27 | Upload build artifact / collect + upload the boot inputs | success |
+
+第 7 步把「我推了那棵树」变成「CI 检出的正是那棵树」——`build-macos.yml` 的 HEAD 与 lock 交叉检查拒绝不一致的 checkout。第 14 步把「源码看起来对」变成「**真编译过了**」。
+
+**为什么这一条值得单独记，而不是并进事实 224**：这个宏修了三次才对，而三次都是同一个错误——C 只拼接**相邻的字符串字面量**。`:` 后接裸标识符 `true` 再接 `,`，是三个 token、中间那个不是字面量，C 拒绝拼接，这是编译错误，不是值。前两次草稿（`":"a","` 与 `":" a "`）都踩这个。**这台机器上没有 C 编译器**，所以单测只能用正则模拟预处理；而一个模拟器绿了不代表真编译器绿了。**run 41281382063 的第 14 步是真编译器第一次见到这段代码，它绿了**，所以「三条记录写对了」这句话从「我的模拟器说对」升级为「真编译器和 ARM64/iOS 17 对象审计都放过」。
+
+**同时这也修掉了本地那条唯一能发现此问题的路**：`tests/unit/test_native_virtio_console_records.py`（`958dad8`，23 个测试）现在用**字面量感知的扫描器**（`_bare_outside_literals`）而不是正则来问「展开后两个字符串字面量之间有没有裸 token」——正则做不到，因为字面量内部的 `"` 对 `[^ 	"]` 就是裸的。它还有一条反向的测试（`test_the_gate_still_reads_what_the_driver_emits`）从驱动里取事件名、要求 gate 命名每一个，因为反方向（gate 的名字出现在 milestones.py）在驱动改名时照样为真。
+
+**产出的 boot-inputs 是 `13074462047`，310,354,885 字节**，另有一个 `owner-data-material`（126,644,844）与 `unipad-build-exp-...`（1,162,083,475）。下载用的是 `local-private/tmp/fetch-artifact.py` 续传循环（每次 attempt 要一个新的预签名 URL，`curl` 在截断结果上退 0），实测约 39 KB/s、全程约两小时十分钟——**和上次的 2.4 MB/attempt 同量级，脚本行为没变，是 URL 寿命短**。
+
+| R9au | **run 41281382063 结论 success，34 步全过：第 7 步 pin 交叉检查、第 14 步 macOS build、第 17 步 owner root chain、第 21 步第二次 macOS build 均 success——这是真编译器与 ARM64/iOS 17 对象审计第一次见到三条 XNU 记录的那段宏，`-Werror` 全绿，所以「相邻字符串字面量拼接写对了」从「本地模拟器说对」升级为「真编译放过」**（2026-11-01，experiment `exp-2026-11-01-console-xnu-records`）：本机无 C 编译器，单测只能模拟预处理，所以这一级证据此前拿不到。**但「编进内核」仍不等于「记录在客人侧被观测到」**——boot-inputs（`13074462047`，310,354,885 字节）下载中，落盘后先做事实 217 式字节级 ESP 内核检查，再跑 `iokit-capture.py` 捕获，最后重跑 gate 读 M4 与 M5 |

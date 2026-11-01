@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-01 (fact 224). Main repo at `958dad8`.
+Last updated: 2026-11-01 (fact 225). Main repo at `51b7e04`.
 
 ---
 
@@ -22,6 +22,13 @@ path is now written and mutation-verified. What is not yet done is the
 guest-side *consumer*: `NativeOfflineGPU`, the only code that reads the console
 port, has never been linked into a kernel because `XNU_NATIVE_OFFLINE_GPU`
 defaults to 0.
+
+**Where the XNU records stand:** pinned at `c3c9ce2`/`2bff001`/`51b7e04`, and
+run 41281382063 concluded **success** — so all ten records survive `-Werror` and
+the ARM64/iOS 17 object audit on the macOS runner, which is the only real
+compiler that has ever seen them (fact 225). The boot-inputs bundle is
+downloading; once it lands, the byte-level ESP-kernel check and the guest
+capture are the only two steps left before M4 and M5 can be re-read.
 
 ---
 
@@ -41,6 +48,8 @@ defaults to 0.
 | 10 | The **IOKit records reach the wire on a real guest** | fact 223 — `local-private/boot40/iokit-records/guest.log`, 1187 bytes, both records at lines 17-18, parsed with the gate's own criterion and scoped ONSITE |
 | 11 | The **gap to M4+M5 is exactly the three XNU records** | fact 224 — the gate's own verdicts: M4 `UNVERIFIED` with `missing` = the three XNU requirements and nothing else; M5 `BLOCKED` by `xnu_initialised` with `missing=()` (its two IOKit requirements already pass, witnesses at `guest.log:17`/`:18`, both `onsite`) |
 | 12 | The **pin chain for the XNU records closes on GitHub** | `51b7e04`'s lock → UniXNU `2bff001` (parent `29ed7e9`) → its `drivers/NativeVirtioConsole` gitlink is `c3c9ce2` (parent `d1ebb35`), and the lock's submodule entry agrees with the gitlink, so there is no divergence. All four SHAs read back from api.github.com |
+| 13 | **The driver compiles under `-Werror` with all ten records** | fact 225 — run 41281382063, conclusion **success**, 34/34 steps: step 7 pin cross-check, step 14 macOS build, step 17 owner root chain, step 21 the second macOS build. This host has no C compiler, so step 14 is the first real compiler to see the macro, and it is the direct proof the adjacent-string-literal concatenation is right — the same macro that was wrong three times |
+| 14 | The **M4/M5 baseline is unchanged since fact 224** | re-measured just now on `default_view()`: M4 `UNVERIFIED`, `missing=('m4.page_tables','m4.exception_state','m4.interrupt_state')` and nothing else; M5 `BLOCKED` by `xnu_initialised`, `missing=()` with both IOKit requirements satisfied and their witnesses still at `guest.log:17`/`:18`, `scope='onsite'` |
 
 ## What is NOT done, and why
 
@@ -52,16 +61,22 @@ defaults to 0.
 | D | **No real IPA has been installed, launched or persisted** | Blocked by A and B |
 | E | **No SpringBoard interaction evidence** | Blocked by D |
 | F | **No audio, network, launcher or performance acceptance** | Not started |
-| G | **The three XNU records are pinned and building, not yet measured on a guest** | The evidence stops at "CI compiled that tree" — the same level fact 223 stopped at for the IOKit records, before the byte-level ESP-kernel check and the capture |
+| G | **The three XNU records are pinned, compiled and measured on paper, not yet on a guest** | fact 225 — run 41281382063 is **success** (34/34 steps), so the macro survives `-Werror` and the ARM64/iOS 17 object audit. What is still open is the guest side: byte-level presence in the ESP kernel, then the capture, then the gate |
 | H | **Nothing else stands between these records and M4+M5** | fact 224 — measured by running the gate's own probes: M5's `missing` is empty, M4's `missing` is exactly the three XNU requirements, and `p.el1_entry` / `p.failure_forensics` / `p.unixnu_kernel_image` / `p.source_pins` are all already True |
 
 ## Active work
 
-**The XNU emitter is pinned and building.** The two IOKit records cleared their
-own gate (measured on a real guest, below), but M5 is still BLOCKED on
-`xnu_initialised`, which needs three more guest events. The console driver is
-the only code in the guest that can put bytes on that port, so the same fork
-carries them.
+**The XNU emitter is pinned, compiled and downloading.** Run 41281382063
+concluded **success**, so the driver with all ten records survived `-Werror` on
+the macOS runner — the first real compiler to see the macro, and this host has
+none. The boot-inputs bundle is on disk at ~5% and growing at ~39 KB/s (about
+two hours ten minutes); the pre-signed URL expires mid-transfer, so the
+downloader resumes with a fresh one per attempt.
+
+The two IOKit records already cleared their own gate (measured on a real guest,
+below), but M5 is still BLOCKED on `xnu_initialised`, which needs three more
+guest events. The console driver is the only code in the guest that can put
+bytes on that port, so the same fork carries them.
 
 `start()` already reads `SCTLR_EL1` at its first line, so the page-table fact
 was free. `VBAR_EL1`, `DAIF` and `CNTFRQ_EL0` are read the same way, right
@@ -88,19 +103,23 @@ the log would never see the timer.
 
 Build **run 41281382063** dispatched with experiment
 `exp-2026-11-01-console-xnu-records`, stage M5, system build 21H461, payload
-target tcg.
+target tcg. **It concluded success** (34/34 steps; fact 225) — step 14's macOS
+build is the first real compiler to see the macro, and `-Werror` let it through.
 
 ## Next actions, in order
 
-1. **When run 41281382063 lands, download its `boot-inputs`** with
+1. **Download `boot-inputs` from run 41281382063** — artifact id `13074462047`,
+   310,354,885 bytes, already running into `local-private/tmp/bundle15.zip` via
    `local-private/tmp/fetch-artifact.py` (a fresh URL per attempt — the
    pre-signed one expires mid-transfer and `curl` exits 0 on the truncated
-   result).
+   result). Expect ~2h10m at ~39 KB/s.
 2. **Verify byte-level** that the three XNU records are in the ESP kernel — the
    same check that proved the announcement (fact 217) and the two IOKit records
-   (fact 223). Extract the kernel, grep it for `xnu.page_tables`,
-   `xnu.exception_vectors` and `xnu.interrupts`, and confirm its sha256 equals
-   `payload.json`'s `payload_kernel_sha256`.
+   (fact 223). `local-private/tmp/verify-records-in-kernel.py` already does this
+   for all five events and refuses to report unless the ESP kernel's sha256
+   equals `payload.json`'s `payload_kernel_sha256`. It was validated against a
+   known answer (bundle14: two present, three correctly absent) after an earlier
+   version reported a false negative.
 3. **Run `local-private/tmp/iokit-capture.py`** against that bundle. It boots,
    waits for the hand-off, captures the channel into
    `local-private/boot40/iokit-records/guest.log`, and parses it with the gate's
