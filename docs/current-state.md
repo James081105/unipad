@@ -596,3 +596,68 @@ So `system.mount` + `system.volume_identity` satisfy M7's two evidence
 requirements, but M7 stays BLOCKED until **M6's `virtio_blk.read_back` event
 also lands** — and M9b needs M7 *and* the mount. That is a requirement the
 previous revision of the plan did not name.
+
+### The records are in the kernel and the port works — and they still did not arrive
+
+This is the most important measurement of the revision, and it is a
+non-result. Run 41316953324's boot-inputs bundle was pulled (310,344,859
+bytes), its `payload.img` digest `a9ff378c…` matched `macos-build-root.log:125`'s
+own record, and the ESP kernel extracted from it hashed to
+`e836fd58…` — the digest the build log records. So the bytes measured are the
+bytes the build produced.
+
+**Byte-level, the emitter is there and it is right:**
+
+| string | count | offset |
+|---|---|---|
+| `"event":"system.mount",…}` + `\n` | 1 | 113341, 187 bytes |
+| `"event":"system.volume_identity",…}` + `\n` | 1 | 113530, 149 bytes |
+| `"mountpoint":"/"` | 1 | inside record 1 |
+| `8846FE78-2910-4297-AF97-D59BB6F8FC16` | 3 | 113394, 113578, 808582 |
+| `DYLD_SHARED_CACHE_DIR` | **0** | — |
+| `native_console_report` | 1 | 90716496 (exported symbol table) |
+
+`"mountpoint":"/"` is the union arm, confirmed in the booting kernel — the
+mountpoint fix is not just config-consistent, it is what the guest will say.
+
+**And the capture came back with neither record.** 1455 bytes, five events —
+the two IOKit records and the three XNU ones — and `system.mount` /
+`system.volume_identity` sourced from NOWHERE. The ring, read on the same boot
+through the production `_guest_log_probe` path, says why this is not a timing
+problem:
+
+```
+[   64.077490] disk3s1 mounting volume …SystemCryptex, requested by: init (pid 1)
+[   64.080551] disk3s1 vol-uuid: 8846FE78-2910-4297-AF97-D59BB6F8FC16
+[   64.109681] disk3s1 mount-complete volume …SystemCryptex
+[   71.809687] load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+```
+
+The mount succeeded, carrying the exact vol-uuid the record names, and
+`load_init_program` ran afterwards.
+
+**So the elimination is short.** The emitter's gate is
+`if (!error && native_console_report)`. The call site is
+`if (cache_error) panic(...)` and the ring shows no panic, so `error` was 0.
+Which leaves `native_console_report` resolving to null in `kern_exec.o` — and
+that is invisible to every source-level check here, because the symbol *is*
+exported (it sits in the kernel's string table between `native_console_receive`
+and `native_console_rx_bytes`). A weak reference either binds or it does not,
+and nothing in the source says which. Only the wire answers.
+
+Build 41330622788 carries an ungated diagnostic record at the function's first
+statement. If it arrives, the symbol binds and the gate failed; if it does not,
+the weak import is not binding and the emitter needs a different way onto the
+port. **Do not read the previous build as "the emitter is broken" — it is "one
+of two causes, and the diagnostic separates them".**
+
+**A second, unrelated finding: the acceptance suite has been red.** 10 tests in
+`tests/acceptance/` fail, and they fail on `HEAD~1` too — before any change this
+session. They encode "this host has achieved nothing" (`test_no_check_passes_on_this_host`,
+`test_no_onsite_evidence_exists_on_this_host`,
+`test_the_release_verdict_is_blocked_on_this_host`, and seven more), which stopped
+being true when M4/M5 passed. `test_guest_dependent_milestones_are_blocked_on_this_host`'s
+own docstring prescribes the remedy: *"If a real UniXNU kernel and a guest log
+appear, this test is supposed to fail: the field record changed and must be
+re-recorded deliberately rather than quietly."* The earlier "the suite is green"
+reading was `tests/unit` only; `tests/acceptance` had not been run.
