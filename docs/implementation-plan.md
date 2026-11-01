@@ -1093,3 +1093,22 @@ $ git ls-remote https://github.com/James081105/VirtioMmioConsole.git
 **已触发 macOS 构建**（run 41257576606，分支 `unipad/console-announcement-pin`，`unixnu_commit=04466512`，`device_commit=efa03c98`，experiment `exp-2026-11-01-console-announcement`）。这是 item 4「macOS 构建」那一步：告白进了源码和 pin，但**还没有进任何一颗内核**，而这个 run 就是让它进内核的那一次。
 
 | R9ak | **任务 #31 的 pin 链闭合，证明从 GitHub 读回：告白在 `61dc680` 的 `NativeVirtioConsole.cpp` 221-222 行，四层各自钉住（unipad `a4648c98` → UniXNU `04466512` → VirtioMmioConsole `61dc680` → lock 两条）**（2026-11-01，9 步全执行、三处偏离有证据）：仓库真名是 `VirtioMmioConsole`（`NativeVirtioConsole` 只是重定向别名）；**审计第 6 步的 `.gitmodules` URL 会让 CI 连驱动都 clone 不到**（`git ls-remote` 对 fork 的别名返回 Repository not found），是硬失败而非审计预测的静默丢弃；嵌套子模块需要自己的 git 身份。**审计提的真实缺陷已修**：lock 里被否掉的「内核 sha256 会动」预测已改正，且保留原句附 `REFUTED` 标记。**macOS 构建已触发**（run 41257576606）——告白进了 pin，还没进任何内核 |
+
+
+**事实 216（item 3 的「取帧→送屏幕」这一段代码补齐了，而补齐的方式暴露了它一直缺的不是能力是接线：`framebuffer.py` 能读、`SurfaceWindow.present` 能画，两者都已验证，却从来没有任何代码把它们接起来——所以那个 145/145 像素的后端只被测试和一个临时仪器调用**）：事实 213 量到取帧 PASS（一条 `pmemsave`，480,000/480,000 像素与 `screendump` 逐字节相同），事实 210 的可达性审计量到 `SurfaceWindow` 在全仓只出现四处（定义、`host/__init__.py` 再导出、`test_host_winsurface.py`、`surface-fidelity.py`）。**两半都好，中间是空的。** 现在补上了：
+
+- **`src/unipad/host/framebuffer.py`**（`f936e4d`）：`read_guest_frame` / `bgra_to_ppm` / `FrameGeometry` / `GuestFrameSource`。通道序是量出来的不是猜的（BGRA 100%，次优 30%），第四字节**不当颜色**——450,000 个像素是 `0x00`、绿条那 30,000 个是 `0xFF`，当颜色会同时以两种方式错。
+- **`src/unipad/host/surface_runner.py`**（`502a12a`）：`GuestSurfacePresenter.run` 播 N 帧，每帧之后泵一次窗口消息循环；`RunReport` 带逐帧 grab/blit 计时和 min/median/max。
+- 两个模块都从 `unipad.host` 导出。
+
+**交到我手上时有一个真缺陷，而抓到它的正是它自己的测试**：`_report()` 把 geometry 局部量算出来，然后硬编码传 `None`——于是每一份报告都声称「帧缓未知」。`test_the_report_names_the_geometry_it_read_and_is_json_shapable` 因此红。**这正是那个测试唯一该做的事**，也再次印证本条簿反复出现的那条：一个测试只有在它能在缺陷所在处变红时才值钱。
+
+**拒绝纪律是这一段真正值得记的部分**，因为它和事实 198/213 的量测直接相关：读不到一帧、窗口没有报告自己 blit 了、消息循环泵不动——每一种都以 `RunRefused` 结束，并带上失败前**真实呈现过**的帧数，而不是以一张静止图像结束。其中「窗口报告没 blit」按失败处理而不是跳过，理由是量出来的：跳过去会让上一帧留在屏幕上，**看起来与「客人没在画」完全同形**——而事实 198 恰好量到帧是静止的，所以这个混淆是真的会发生，不是理论上的。
+
+**几何形状从客人自己的串口日志来**（`video_geometry_from_serial`）：行不在就拒绝，**打印了两个不同帧缓几何形状就拒绝而不是取第一个**。后者是与事实 208 同族的仪器纪律——一个「取第一个」的解析器会在日志多余时安静地给出错的几何形状。
+
+**两个模块各自过了对质检查**：`framebuffer` 4 个变异体全部击杀（交换红蓝、第四字节当颜色、按行宽而非 stride 走、去掉短缓冲拒绝）；`surface_runner` 7 个全部击杀（报告不带几何、不泵消息循环、吞掉捕获失败、把拒绝的 blit 当成功、允许零帧运行、忽略停止谓词、用「取第一个」消解歧义）。第七个变异体第一版写成 `if False:` 造成语法错误而非断言失败——**语法杀是比断言杀更弱的证据**，已改成语义变异（`> 1` → `> 99`）后重跑，由它自己的测试以断言击杀。
+
+**全量单测 3320 个通过、0 失败**，其中包含本次修掉的 `test_qemu_metal_counters.py` 那个绕过自己守卫的缺陷（CI run 41250241181 的红）。
+
+| R9al | **item 3 的「取帧→送屏幕」补齐，而它缺的一直是接线不是能力：`framebuffer.py` 能读、`SurfaceWindow.present` 能画、两者都已验证，却从未被接起来**（2026-11-01，`f936e4d` + `502a12a`）：通道序 BGRA 100% 是量的，第四字节不当颜色（450,000 个 `0x00` / 绿条 30,000 个 `0xFF`）。**交到时有一个真缺陷并被自己的测试抓到**：`_report()` 算完 geometry 硬编码传 `None`。**拒绝纪律**：读不到/没 blit/泵不动都以 `RunRefused` 结束并带真实呈现帧数——「窗口没 blit」按失败而非跳过，因为跳过去会让上一帧留在屏幕上，与「客人没在画」完全同形，而事实 198 恰好量到帧静止。两个模块 4+7 个变异体全部击杀；全量单测 3320 通过 0 失败 |
