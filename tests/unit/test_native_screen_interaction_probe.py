@@ -69,6 +69,7 @@ The two invariants that are one edit away from silent
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -95,6 +96,38 @@ INPUT = "NativeHidInput/NativeHidInput.cpp"
 # build.
 PUBLISHER = "native_console_report"
 
+# A C string literal's body.  Raw, so the backslashes survive the trip through
+# this file -- and so that a future edit does not quietly change what matches.
+_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+# The only escapes the kernel record vocabulary uses.  Anything else in a record
+# is a mistake loud enough to fail here rather than silently emit different bytes.
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "'": "'"}
+
+
+def _decode(body: str) -> str:
+    """Decode one C string literal body into the bytes the compiler will emit."""
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        if body[i] != "\\":
+            out.append(body[i])
+            i += 1
+            continue
+        nxt = body[i + 1] if i + 1 < len(body) else ""
+        if nxt not in _ESCAPES:
+            raise AssertionError(
+                f"unsupported escape \\{nxt!r} in a record literal; the vocabulary "
+                "does not need it and guessing produces a different record")
+        out.append(_ESCAPES[nxt])
+        i += 2
+    return "".join(out)
+
+
+def _added(patch: Path) -> list[str]:
+    return [line[1:] for line in patch.read_text(encoding="utf-8").splitlines()
+            if line.startswith("+") and not line.startswith("+++")]
+
 
 def _vendor_tree() -> list[Path]:
     if not DRIVERS.is_dir():
@@ -119,7 +152,31 @@ def _added_lines(patch: Path) -> list[str]:
 
 
 def _all_text() -> dict[Path, str]:
-    return {p: p.read_text(encoding="utf-8") for p in _vendor_tree()}
+    """Every source file's text, with each patch's ADDED lines decoded.
+
+    THE DECODING IS LOAD-BEARING.  A patch carries the C source it will produce,
+    so its added lines contain ``\\"event\\":\\"springboard.running\\"`` -- with the
+    backslashes.  A raw search for ``"event":"springboard.running"`` therefore
+    never matches, and the first revision of this test reported "no emitter
+    exists" against a patch that had one.  So a patch contributes its raw added
+    lines AND the decoded concatenation of its string literals, which is what the
+    preprocessor will actually hand the port.
+    """
+    out: dict[Path, str] = {}
+    for path in _vendor_tree():
+        raw = path.read_text(encoding="utf-8")
+        if path.suffix == ".patch":
+            added = _added(path)
+            decoded: list[str] = []
+            for body in _LITERAL.findall("\n".join(added)):
+                try:
+                    decoded.append(_decode(body))
+                except AssertionError:
+                    pass          # a literal with an odd escape is not a record
+            out[path] = raw + "\n" + "\n".join(decoded)
+        else:
+            out[path] = raw
+    return out
 
 
 def _interaction_sources(tree: dict[Path, str]) -> dict[Path, str]:
@@ -332,4 +389,61 @@ def test_the_rule_catches_the_defect_it_names():
     assert gated(honest), (
         "the honest shape failed: the rule rejects an emitter that IS gated on a "
         "screen change, which would make the test wrong rather than the code"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The record must parse.  Two drafts of the mount emitter did not.
+# ---------------------------------------------------------------------------
+
+
+def _literals(patch: Path) -> list[str]:
+    return [_decode(body) for body in _LITERAL.findall("\n".join(_added(patch)))]
+
+
+def _assemble(patch: Path, event: str) -> tuple[str, str]:
+    """The two literals the pid is spliced between, as the preprocessor joins them."""
+    lits = _literals(patch)
+    prefix = next((t for t in lits if event in t), None)
+    tail = next((t for t in lits if t.endswith("}\n")), None)
+    assert prefix is not None, (
+        f"{patch.name}: no added literal contains {event!r}; the literals present "
+        f"are {[t[:40] for t in lits]}"
+    )
+    assert tail is not None, f"{patch.name}: no added literal ends with a newline-terminated object"
+    return prefix, tail
+
+
+SPRINGBOARD_PATCH = PATCHES / "xnu" / "zzz-native-springboard-events.patch"
+
+
+@pytest.mark.parametrize("pid", [0, 1, 42, 9999999])
+def test_the_springboard_running_record_assembles_to_json(pid):
+    """Two drafts of the mount emitter carried ``system.mount``.  Both compiled clean.
+
+    Adjacent-string-literal concatenation is invisible to the compiler, so a
+    malformed record costs a build-and-boot cycle to discover and produces no
+    error when it does -- just a missing event, which reads exactly like a guest
+    that never did the thing.  So the record is reassembled here, the way the
+    preprocessor will, and parsed.  pid=0 is in the list on purpose: it is the one
+    value that takes the ``if (!pid) text[digits++] = '0'`` branch.
+    """
+    if not SPRINGBOARD_PATCH.is_file():
+        pytest.skip(f"{SPRINGBOARD_PATCH.name} is not in the pinned vendor tree")
+    prefix, tail = _assemble(SPRINGBOARD_PATCH, "springboard.running")
+    record = prefix + str(pid) + tail
+    obj = json.loads(record)          # raises with the record in the message
+    assert obj["event"] == "springboard.running"
+    assert obj["comm"] == "SpringBoard"
+    assert obj["pid"] == pid
+    assert obj["source"] == "XNU.__mac_execve"
+
+
+def test_the_record_defect_this_names_is_caught():
+    """The teeth: a literal that parses as nothing must not pass."""
+    defective = '{"event":"springboard.running" system.mount }\n'
+    with pytest.raises(Exception):
+        json.loads(defective)
+    assert json.loads('{"event":"springboard.running"}\n')["event"] == "springboard.running", (
+        "the honest shape failed: the JSON check rejects a record that IS well formed"
     )
