@@ -1357,3 +1357,37 @@ forward-declaring it.
 - Three emitters remain CODE COMPLETE but **unpinned**, all for the drain reason:
   `dyld.cache_read`, `virtio_blk.read_back` (also blocked on its fork), and the M8
   `launchd.running`/`daemon.spawned` pair.
+
+---
+
+## 2026-11-02 — the first fully green build, and the diagnostic is in the booting kernel
+
+Build **41369829766** concluded **success**, 34/34 steps. That is the first build
+to get past all three of the failures the previous three revisions hit in
+sequence: the patch application, the compile, and the link.
+
+The boot inputs are downloaded and verified against the bundle's **own**
+`payload.json` — `payload_sha256: c38b7ed6bef94111ab8f5935d4769fdc0c65344df7ee5329d959006228a671b7`,
+which is exactly what the 310,343,023-byte download hashes to. The fetcher's
+hardcoded expectation (`62587de9…`) is from an old build and is simply stale; the
+bundle's own manifest is the authority, as it was the last time this came up.
+
+**Byte-level, in the kernel the guest boots** (ESP `kernel.macho`, 125,480,960
+bytes, sha256 `7cac83e5…` = `payload.json`'s `payload_kernel_sha256`):
+
+| literal | count |
+|---|---|
+| `diag.load_init_program_entered` | **1** |
+| `XNU.load_init_program` | 1 |
+| `system.mount` | 1 |
+| `system.volume_identity` | 1 |
+| `XNU_OWNER_CACHE_MOUNT` | 0 — correct, it is a macro and is compiled away |
+
+So all four records are in the image. **The wire is the only instrument left**, and
+the capture is running.
+
+`REQUIRED_EVENTS` in `root-mount-capture.py` now includes
+`diag.load_init_program_entered`, because that record — not the mount records — is
+what this build was dispatched to measure, and a capture that ended early would
+otherwise report "missing system.mount" and say nothing about the question actually
+asked.
