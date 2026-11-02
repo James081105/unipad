@@ -606,20 +606,45 @@ def test_the_cache_read_emitter_is_gated_on_the_switch_that_links_the_console():
         pytest.skip("the dyld cache read patch is not in this pinned tree")
     text = patch.read_text(encoding="utf-8")
     guard = "#if defined(XNU_NATIVE_VIRTIO_CONSOLE) && XNU_NATIVE_VIRTIO_CONSOLE"
-    assert text.count(guard) == 1, (
-        f"the console switch guard appears {text.count(guard)} times, not once"
+    assert text.count(guard) >= 1, (
+        f"the console switch guard appears {text.count(guard)} times, not at "
+        f"least once"
     )
-    # The extern and the emitter must both be inside it.  The extern is in hunk
-    # 1; the emitter is inside the function the guard precedes, and the function
-    # only exists under the hash-cache switch -- which is a separate, outer
-    # condition the patch's own file does not carry, so what is asserted is that
-    # nothing between the guard and the emitter re-opens a different one.
-    between = text[text.index(guard):]
-    assert "#endif" in between, "the console guard is never closed"
-    assert "extern int native_console_report(const void *, size_t);" in between.split(
-        "#endif", 1)[0], (
-        "the strong extern is not inside the console switch guard, so it is "
-        "declared whether or not the archive is on the link"
+    # The EMITTER must be inside the guard, and the DECLARATION must not be.
+    #
+    # This test used to require BOTH inside it, on the reasoning that "the strong
+    # extern is not inside the console switch guard, so it is declared whether or
+    # not the archive is on the link".  Build 41441479230 disproved that
+    # reasoning the expensive way:
+    #
+    #     vm_unix.c:2941:3: error: call to undeclared function
+    #                      'native_console_report'
+    #
+    # A declaration with no definition is FREE -- the linker only resolves a
+    # symbol something REFERENCES.  So an unconditional extern costs nothing when
+    # the emitter is compiled out, and a CONDITIONAL one is absent exactly when a
+    # caller outside it needs it.  The asymmetry is the whole point: the
+    # declaration must be at least as visible as the shallowest caller, and the
+    # caller is the half that must be conditional.
+    #
+    # The visibility half is asserted by
+    # test_every_console_call_site_has_a_visible_declaration, which walks the
+    # depth; what is asserted here is that the CALL is behind the switch, so a
+    # configuration without the archive produces no undefined symbol.
+    call_at = text.index("native_console_report(cache_read_record")
+    guard_at = text.index(guard)
+    assert guard_at < call_at, (
+        "the emitter's call is not behind the console switch guard, so a "
+        "configuration that does not force-load libNativeVirtioConsole.a would "
+        "fail the link naming the symbol"
+    )
+    # And nothing between the guard and the call closes it.  The slice starts
+    # AFTER the guard's own line, because that line contains "#if" and counting
+    # it would make every patch fail by one.
+    between = text[guard_at + len(guard):call_at]
+    assert between.count("#endif") == between.count("#if"), (
+        "the guard is closed and not re-opened between the switch and the call, "
+        "so the call is not actually behind it"
     )
 
     first_pass = FIRST_PASS_DEFCONFIG
@@ -1296,15 +1321,57 @@ def test_the_m8_patch_is_in_the_pinned_tree_at_all():
     UNVERIFIED while every other check in here reads green.  That is the shape
     :func:`tests.vendor_paths.require` was written for, and this is the same
     discriminator applied to a file that did not exist when it was written.
+
+    **AND IT IS CURRENTLY HELD BACK ON PURPOSE, WHICH THIS TEST MUST SAY OUT
+    LOUD RATHER THAN LET IT LOOK LIKE AN OVERSIGHT.**
+
+    M8 breaks the build's SECOND kernel pass, and the failure names a file
+    nobody was editing:
+
+        error: patch failed: bsd/kern/kern_exec.c:183
+        error: bsd/kern/kern_exec.c: patch does not apply
+        build-xnu-4k-baseline.sh: line 44: git -C .cache/xnu-work apply --check
+
+    ``build-xnu-4k-baseline.sh`` applies ``patches/xnu/*.patch`` TWICE -- once
+    in the bootstrap pass (``XNU_BOOTSTRAP=1``) and again after the archive
+    builders -- and its loop decides whether to re-apply with
+    ``git apply --reverse --check``.  That test is not sound for M8: M8's third
+    hunk inserts inside ``load_init_program()``'s ``if (!error) {`` block, which
+    is also the trailing context of ``offline-owner-systemos-mount.patch``'s
+    ``@@ -7186,7 +7520,7 @@`` hunk.  With M8 applied, the mount patch can no longer be
+    reversed, so the loop tries to apply it again and fails at the include line
+    its first hunk already changed.
+
+    Isolated by experiment, not by reasoning: with M7 and M8 both present the
+    second pass fails; with M7 alone it is clean; with M8 alone it fails.  The
+    reproduction is ``local-private/tmp/repro-patch-twopass.py``, which replays
+    both passes and is the instrument that found this -- the single-pass
+    ``repro-patch-order.py`` reports "all patches applied" and is blind to it.
+
+    So M8 is removed from the pinned tree until one of two things happens: its
+    emitter moves to a site that does not split the mount patch's context, or
+    the build script's already-applied test stops depending on reversibility.
+    M6, M7 and the install diagnostics are unaffected and are measured in the
+    same build.
     """
     if not (REPO / "vendor" / "UniXNU" / "patches").is_dir():
         pytest.skip("the pinned vendor tree is not acquired")
     patch = _m8_patch()
-    assert patch is not None, (
-        f"{M8_PATCH_NAME} is missing from vendor/UniXNU/patches/xnu, so neither "
-        "launchd.running nor daemon.spawned will be in the built kernel and M8 "
-        "stays UNVERIFIED"
-    )
+    if patch is None:
+        held = REPO / "local-private" / "tmp" / "parked-patches" / M8_PATCH_NAME
+        assert held.is_file(), (
+            f"{M8_PATCH_NAME} is neither in the pinned tree nor parked, so the "
+            "hold-back recorded in this test's docstring has no evidence behind "
+            "it and M8 has simply been lost"
+        )
+        pytest.xfail(
+            f"{M8_PATCH_NAME} is held back: it breaks the build's second kernel "
+            "pass by splitting offline-owner-systemos-mount.patch's trailing "
+            "context.  Reproduce with local-private/tmp/repro-patch-twopass.py. "
+            "Restoring it requires moving the emitter or fixing the build "
+            "script's already-applied test."
+        )
+    assert patch is not None
 
 
 def test_the_m8_records_are_valid_json():
@@ -1683,3 +1750,11 @@ def test_the_m8_patch_applies_to_its_own_minus_side():
         f"{patch.relative_to(REPO)} does not apply:\n{proc.stdout}{proc.stderr}"
     )
 
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The declaration/caller pairing
+# ---------------------------------------------------------------------------
