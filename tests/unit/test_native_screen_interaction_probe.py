@@ -47,13 +47,39 @@ What is NOT claimed, and must not be
 ------------------------------------
 * that a digest changing proves the user's intent was honoured.  It proves the
   screen changed after input.  A clock redraw would also change it.  The record
-  therefore carries both digests and the changed-byte count, so a reader can
-  see HOW MUCH changed rather than trusting a boolean.
+  therefore carries BOTH digests rather than a boolean, so a reader can see
+  exactly which two states were compared instead of trusting a claim.  There is
+  deliberately no changed-byte count: computing one would mean holding a second
+  copy of a ~24 MB frame, and a number that could not be produced would be worse
+  than a number that is not there.
 * that ``springboard.running`` means SpringBoard is usable.  It means the exec
   of a process named SpringBoard succeeded.  The site is ``__mac_execve()``'s
   ``if (!error)`` block -- the same site ``zzz-m8-launchd-daemon-events.patch``
   uses for ``daemon.spawned``, where ``p_comm`` has just been written by
   ``set_proc_name()``.
+
+Where the two halves live, and why there and not in the drivers
+---------------------------------------------------------------
+The emitter is in ``vendor/UniXNU-qemu/package/HidInputProbe.cpp`` -- the DEVICE
+repository, not the UniXNU fork.  Three reasons, all measured:
+
+* that file already owns ``native_hid_input_observed()``, the hook every
+  delivered report passes through (``NativeHidInput.cpp:190,206,236,240,246``),
+  so arming needs no new driver code;
+* it already includes ``<pexpert/pexpert.h>``, which ``PE_current_console()``
+  needs, and the presenter exports ``native_gop_ready`` / ``native_gop_virtual``
+  / ``native_gop_physical`` as ``extern "C"`` globals -- so the digest reads a
+  verified scanout without touching ``NativeMobileDisplay`` at all;
+* ``NativeHidInput`` and ``NativeMobileDisplay`` are SEPARATE pinned submodules
+  (``28f9b463b48e`` and ``eb9c94916482``), so putting the emitter in either would
+  have bumped two more pins for no gain.
+
+The linkage is safe by configuration rather than by luck, and that is asserted in
+the source rather than assumed: the only defconfig that sets
+``CONFIG_XNU_NATIVE_LEGACY_DISPLAY`` -- whose archive force-loads this object --
+is ``qemu_root_defconfig``, and that same config sets
+``CONFIG_XNU_NATIVE_VIRTIO_CONSOLE``, which is what puts the console archive on
+the kernel link.  ``qemu_defconfig`` sets NEITHER.
 
 The two invariants that are one edit away from silent
 -----------------------------------------------------
@@ -79,6 +105,15 @@ REPO = Path(__file__).resolve().parents[2]
 VENDOR = REPO / "vendor" / "UniXNU"
 DRIVERS = VENDOR / "drivers"
 PATCHES = VENDOR / "patches"
+# The device repository.  `board.toml:11` -- `kit = "qemu"  # package/ of this
+# repository appears as kits/qemu in the build tree` -- so package/ is the source
+# of truth the build tree stages, and it is where the interaction emitter lives:
+# HidInputProbe.cpp already owns native_hid_input_observed(), the hook every
+# delivered report passes through, and already includes <pexpert/pexpert.h>, which
+# is what PE_current_console() needs.  Scanning only vendor/UniXNU would report
+# "no emitter exists" against a file that has one -- the same class of mistake as
+# the escaped-literal one below.
+DEVICE = REPO / "vendor" / "UniXNU-qemu" / "package"
 
 RUNNING_EVENT = '"event":"springboard.running"'
 INTERACTION_EVENT = '"event":"springboard.interaction"'
@@ -136,6 +171,8 @@ def _vendor_tree() -> list[Path]:
     found += [p for p in DRIVERS.rglob("*.h") if "Original" not in p.name]
     if PATCHES.is_dir():
         found += sorted(PATCHES.rglob("*.patch"))
+    if DEVICE.is_dir():
+        found += sorted(DEVICE.rglob("*.cpp"))
     assert found, f"no source anywhere under {DRIVERS}"
     return found
 
@@ -165,10 +202,13 @@ def _all_text() -> dict[Path, str]:
     out: dict[Path, str] = {}
     for path in _vendor_tree():
         raw = path.read_text(encoding="utf-8")
-        if path.suffix == ".patch":
-            added = _added(path)
+        # C sources carry the same escaped form as patches do, so they need the
+        # same treatment.  The first revision decoded only .patch files and then
+        # reported "no emitter exists" against HidInputProbe.cpp, which has one.
+        if path.suffix in (".patch", ".cpp", ".c", ".h", ".mm"):
+            bodies = _LITERAL.findall(raw)
             decoded: list[str] = []
-            for body in _LITERAL.findall("\n".join(added)):
+            for body in bodies:
                 try:
                     decoded.append(_decode(body))
                 except AssertionError:
@@ -282,48 +322,76 @@ def test_the_interaction_record_is_gated_on_a_screen_change():
 def test_the_digest_reads_the_scanout_not_a_report_buffer():
     """Digesting the input report would prove the input happened, not that the screen moved.
 
-    ``NativeGOPPresenter::start()`` (NativeGOPPresenter.cpp:82-98) validates the
-    mapping against ``PE_current_console()`` -- ``v_baseAddr``, ``v_width``,
-    ``v_height``, ``v_rowBytes`` -- so the digest has to be taken over that
-    mapping for the record to be about the screen.
+    ``NativeGOPPresenter::start()`` (NativeGOPPresenter.cpp:82-98) maps the scanout
+    writable and validates the mapping against ``PE_current_console()`` --
+    ``v_baseAddr``, ``v_width``, ``v_height``, ``v_rowBytes`` -- then publishes
+    ``native_gop_ready`` and ``native_gop_virtual`` as ``extern "C"`` globals
+    (:14, :96-97).  So the digest does not need to reach into the driver's private
+    ``IOMemoryMap``; it needs to read those exported values and prove they still
+    describe the screen it is about to hash.
     """
     tree = _all_text()
     digests = _digest_sources(tree)
     assert digests, "no screen digest function exists"
-    offenders = []
     for path, text in digests.items():
-        if path.suffix == ".patch":
-            continue          # a patch that adds the definition is checked by its target's own file
-        if "getVirtualAddress" not in text and "mapping" not in text:
-            offenders.append(f"{path.name}: the digest does not read the presenter's mapping")
-    assert not offenders, (
-        "the screen digest is not reading the verified scanout:\n  " + "\n  ".join(offenders)
-    )
+        assert "native_gop_virtual" in text, (
+            f"{path.name} claims a screen digest but never reads the presenter's "
+            "exported scanout address"
+        )
+        assert "PE_current_console" in text, (
+            f"{path.name} hashes an address without cross-checking it against "
+            "PE_current_console(), so nothing proves the bytes are the screen"
+        )
 
 
-def test_the_input_driver_and_the_display_driver_are_coupled():
-    """The two halves must be in the two files that hold them, or neither works.
+def test_the_input_hook_and_the_digest_are_in_the_file_that_owns_them():
+    """The emit must live where the input hook is, and the digest must read the scanout.
 
-    ``NativeHidInput`` is the only thing that delivers input to the guest and
-    ``NativeGOPPresenter`` is the only thing that holds the scanout.  If the
-    emit lives in the input driver while the digest lives nowhere, or the digest
-    lives in the display driver while nothing calls it, the record cannot
-    arrive -- and it would be absent, which reads exactly like a guest that
+    THE ARCHITECTURE CHANGED WHILE THIS TEST WAS BEING WRITTEN, and the first
+    version named the wrong file.  It demanded that `NativeHidInput.cpp` emit the
+    record, on the theory that the input driver is where input is delivered.  That
+    is true of the delivery, but the emitter belongs one level up:
+    `HidInputProbe.cpp` already owns `native_hid_input_observed()` -- the hook
+    every delivered report passes through, called from `touchSend()` (:188),
+    `buttonsAction()` (:204) and `tick()` (:244) -- and it already includes
+    `<pexpert/pexpert.h>`, which `PE_current_console()` needs.  Putting the digest
+    in `NativeHidInput` would have meant bumping two more submodule pins for no
+    gain, and reaching into a mapping that driver does not own.
+
+    What is actually asserted is the coupling, not the filename: the file that
+    receives the input must be the file that emits, and the digest must read the
+    presenter's verified scanout.  If either half moves on its own the record
+    cannot arrive, and it would be absent -- which reads exactly like a guest that
     never moved.
     """
     tree = _all_text()
     by_name = {p.name: p for p in tree if p.suffix == ".cpp"}
-    presenter = by_name.get("NativeGOPPresenter.cpp")
-    inp = by_name.get("NativeHidInput.cpp")
-    assert presenter is not None, f"{PRESENTER} is not in the pinned vendor tree"
-    assert inp is not None, f"{INPUT} is not in the pinned vendor tree"
-    assert INTERACTION_EVENT in tree[inp], (
-        f"{inp.name} delivers the input but does not emit {INTERACTION_EVENT}; "
-        "the record can only be built where the input is delivered."
+    probe = by_name.get("HidInputProbe.cpp")
+    assert probe is not None, (
+        "HidInputProbe.cpp is not in the pinned device tree; it owns "
+        "native_hid_input_observed(), the hook every delivered report passes through"
     )
-    assert "screen_digest" in tree[presenter], (
-        f"{presenter.name} holds the scanout but exposes no digest; the input "
-        "driver would have to reach into its private mapping."
+    text = tree[probe]
+    assert INTERACTION_EVENT in text, (
+        f"{probe.name} receives every input report but does not emit {INTERACTION_EVENT}"
+    )
+    # The digest must read the presenter's mapping AND prove it is the one the
+    # presenter validated.  Both halves: a digest over an address nobody checked
+    # is a digest of whatever happens to be there.
+    assert "native_gop_virtual" in text, (
+        f"{probe.name} does not read the presenter's exported scanout address"
+    )
+    assert "PE_current_console" in text, (
+        f"{probe.name} does not cross-check the scanout against PE_current_console()"
+    )
+    assert "native_gop_physical" in text and "v_baseAddr" in text, (
+        f"{probe.name} does not prove the mapping it reads is the one the presenter "
+        "validated (native_gop_physical == video.v_baseAddr)"
+    )
+    # The input hook must actually be armed by a delivery, not by probe lifecycle.
+    assert re.search(r"event==4\|\|event==5\|\|event==6", text), (
+        f"{probe.name} does not arm on a delivered report (events 4/5/6); arming on "
+        "lifecycle events would make the record about the driver's own bookkeeping"
     )
 
 

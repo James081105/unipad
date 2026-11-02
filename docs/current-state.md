@@ -2397,3 +2397,94 @@ actually asks for.
   on: `homescreen_screenshot_only` fires on the ABSENCE of
   `springboard.interaction`, so `springboard.running` alone moves M9 from FAIL to
   still-FAIL.
+
+---
+
+# Interval 2026-11-03 (third): a predicted build failure, confirmed line for line
+
+## The prediction
+
+`test_console_declaration_visibility.py` reported, BEFORE build 41497938605
+finished:
+
+    native-install-service-dispatcher.patch: call at #if depth 1 with the
+    declaration retired          (x2)
+
+Traced it by hand: the install patch's first hunk opens
+`#if defined(XNU_OWNER_ROOT_TRUST) && ...`, calls `native_console_report` twice
+inside it for `diag.install_thread_start`, CLOSES it, and only then declares the
+symbol at unconditional file scope.  The comment above that declaration read
+"declared at UNCONDITIONAL FILE SCOPE -- above the guard below, not inside it" --
+and that is true of the SECOND guard.  The first guard came earlier.
+
+Checked it could not be rescued by a header: `native_console_report` is declared
+only in `.c` files' own externs, never in a header, and the pristine
+`bsd_init.c` has no declaration.
+
+## The confirmation
+
+Build 41497938605 failed at step 21, and `kernel.log` (from the build-logs
+artifact, because the step log does not echo it) says:
+
+    bsd/kern/bsd_init.c:1348:5: error: call to undeclared function
+    'native_console_report'; ISO C99 and later do not support implicit function
+    declarations [-Wimplicit-function-declaration]
+    bsd/kern/bsd_init.c:1351:5: error: (same)
+
+The predicted error, at the predicted lines, for the predicted reason.
+
+## One wrong read along the way, recorded because it is the recurring shape
+
+I first read a backgrounded `grep`'s truncated output and reported
+`native_hid_input_observed` as "declared and called 5 times, defined nowhere".
+It is defined, at `vendor/UniXNU-qemu/package/HidInputProbe.cpp:141`.  Same
+failure shape as the QMP `pmemsave` episode: an instrument limitation read as a
+result.  The declaration-order analysis, by contrast, was checked against the
+applied tree and against the test before the build finished, and it held.
+
+## What was fixed, and verified by two instruments
+
+`vendor/UniXNU/patches/xnu/native-install-service-dispatcher.patch` -- the two
+externs moved above the FIRST guard, the hunk header recounted from the body
+rather than typed.  Verified:
+
+* `test_console_declaration_visibility.py` -- 3 passed, was 1 failed
+* `repro-patch-twopass.py` -- three passes clean, 58 applied on pass 1
+* the three complete record literals still assemble to JSON (the two
+  `diag.install_thread_start` records and `install.registered`)
+* the applied tree shows the declaration at line 1313, before the calls at 1362
+  and 1365
+
+AN INSTRUMENT BUG WORTH REMEMBERING: `repro-patch-twopass.py`'s `stage()` reads
+`git show HEAD:<path>` and falls back to the working tree, so my first
+"three passes clean" run validated the OLD patch -- HEAD had not moved yet.  The
+declaration still sat after the calls in that work tree.  Re-run after the commit,
+it is correct.  An instrument that reads a different source than you think it
+does agrees with you either way.
+
+## A red commit, caught and fixed
+
+`ee8bf29` (the pin bump) was pushed with two test files still holding
+pre-compaction edits in the working tree.  Measured by stashing: HEAD's versions
+fail three tests against the patch they cover.  Fixed in `31a0afc`, pushed, tree
+clean.  The lesson is the one the project already records -- an uncommitted
+working tree is not a smaller problem than a wrong commit, it is the same problem
+one push later.
+
+## Dispatched
+
+Build **41506272367**, `exp-2026-11-03-decl-fix-and-springboard-M10`, stage M10,
+target tcg, `unixnu_commit=2f574a96`, `device_commit=efa03c98`.  It carries the
+declaration fix AND the `diag.install_thread_start` diagnostic, so it is the
+first build that can answer whether `kernel_thread_start` succeeds.  It also
+carries `springboard.running`, which will be the first compile of that emitter.
+
+## Still unmeasured
+
+* `diag.install_thread_start`'s status.  The build it was dispatched for never
+  compiled the kernel, so the question is still open.
+* `springboard.running` on the wire.
+* `springboard.interaction` is not written.  It is the half the M9 veto actually
+  turns on: `homescreen_screenshot_only` fires on the ABSENCE of
+  `springboard.interaction`, so `springboard.running` alone moves M9 from FAIL to
+  still-FAIL.
