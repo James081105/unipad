@@ -51,6 +51,14 @@ on:
         required: false
         default: ''
         type: string
+      gpu_broker:
+        description: 'XNU_NATIVE_OFFLINE_GPU. 0 (default) compiles the install dispatcher and compiles the GPU broker OUT; 1 does the reverse. The two guards are exact complements (native-install-service-dispatcher.patch:8 vs offline-native-gpu-broker.patch:7), so M14/M15 cannot be proved by the kernel that proves M10-M12. 1 also requires the console transport, which only qemu_root_defconfig provides (build-xnu-4k-baseline.sh:311-313).'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
       payload_target:
         description: 'Payload target. tcg for the Intel Windows host; hvf only as a comparison experiment and never published as tcg.'
         required: false
@@ -149,6 +157,7 @@ jobs:
           STAGE: ${{ inputs.stage }}
           SYSTEM_BUILD: ${{ inputs.system_build }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          GPU_BROKER: ${{ inputs.gpu_broker }}
         run: |
           mkdir -p build
           python3 - <<'PY'
@@ -196,6 +205,24 @@ jobs:
               problems.append(f"stage must be one of {','.join(MILESTONES)} (got '{stage}')")
           if payload_target not in ("tcg", "hvf"):
               problems.append("payload_target must be tcg or hvf")
+          gpu_broker = os.environ.get("GPU_BROKER", "0").strip()
+          if gpu_broker not in ("0", "1"):
+            problems.append(f"gpu_broker must be 0 or 1 (got '{gpu_broker}')")
+          if gpu_broker == "1":
+            # A WARNING and not a problem, deliberately. The vendor script
+            # refuses the pairing outright (build-xnu-4k-baseline.sh:311-313,
+            # 'The private offline GPU broker requires the actual byte
+            # transport'), so the hard failure already exists and this step
+            # cannot see whether the root chain is on disk -- that is decided at
+            # run time by build-macos.sh, not by the lock. Adding a false
+            # problem here would fail runs that are actually fine.
+            warnings.append(
+              "gpu_broker=1 compiles the GPU broker and compiles the install "
+              "dispatcher OUT (the two guards are exact complements), and it "
+              "requires the owner root chain: only qemu_root_defconfig provides "
+              "the console transport the broker needs. A run with no root chain "
+              "will be refused by the vendor script at the kernel step."
+            )
           if payload_target == "hvf":
               warnings.append("payload_target=hvf: comparison build only. HVF payloads must never be fetched to the Intel Windows host or published as tcg (PRD 8.3).")
 
@@ -1482,6 +1509,13 @@ jobs:
           STAGE: ${{ inputs.stage }}
           SYSTEM_BUILD: ${{ inputs.system_build }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          # XNU_NATIVE_OFFLINE_GPU, read directly by
+          # vendor/UniXNU/scripts/build-xnu-4k-baseline.sh:306. It flows because
+          # unixnu/kernel.py:79 starts from dict(os.environ) and the defconfig
+          # does not set it, so xnu_env() cannot override it -- and if a defconfig
+          # ever does set it, that defconfig wins, which is the documented
+          # precedence. 0 is today's value for every build so far.
+          XNU_NATIVE_OFFLINE_GPU: ${{ inputs.gpu_broker }}
           BUILD_OUTPUT_DIR: build-output
           STAGE_DIR: staged
           BUILD_LOG: macos-build.log
@@ -2289,6 +2323,13 @@ jobs:
           STAGE: ${{ inputs.stage }}
           SYSTEM_BUILD: ${{ inputs.system_build }}
           PAYLOAD_TARGET: ${{ inputs.payload_target }}
+          # XNU_NATIVE_OFFLINE_GPU, read directly by
+          # vendor/UniXNU/scripts/build-xnu-4k-baseline.sh:306. It flows because
+          # unixnu/kernel.py:79 starts from dict(os.environ) and the defconfig
+          # does not set it, so xnu_env() cannot override it -- and if a defconfig
+          # ever does set it, that defconfig wins, which is the documented
+          # precedence. 0 is today's value for every build so far.
+          XNU_NATIVE_OFFLINE_GPU: ${{ inputs.gpu_broker }}
           BUILD_OUTPUT_DIR: build-output
           STAGE_DIR: staged
           BUILD_LOG: macos-build-root.log
