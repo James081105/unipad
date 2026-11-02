@@ -730,25 +730,51 @@ def test_every_function_the_call_block_uses_is_declared_before_it():
     ``kern_exec.c:8120: error: call to undeclared function`` for the same
     reason, and neither defect is visible to any source-level check.
 
-    AND THIS TEST WAS WRONG ABOUT WHERE THE DECLARATION GOES.  It required the
-    forward declaration INSIDE the call block, immediately above the call.
+    AND THIS TEST HAS NOW BEEN WRONG ABOUT WHERE THE DECLARATION GOES TWICE.
+
+    Round one demanded it INSIDE the call block, immediately above the call.
     Build 41376479360's second pass -- the first compiler to see the dispatcher
     -- rejected exactly that:
 
         bsd_init.c:1309:2: error: function declared in block scope cannot have
                           'static' storage class
 
-    A block-scope declaration cannot carry `static`, and dropping the keyword
-    then fails against the definition with "static declaration follows
-    non-static declaration".  So the declaration has to be at FILE scope, inside
-    the same guard as the definition, which is where it now is.  A test written
-    from reasoning about C rather than from a compiler demanded something the
-    compiler refuses -- the same shape as the inter-patch guard that passed
-    while the build failed.
+    Round two demanded FILE scope, on the reasoning that a block-scope
+    declaration cannot carry `static` and dropping the keyword then fails
+    against the definition with "static declaration follows non-static
+    declaration".  Build 41382433090 rejected that too:
+
+        bsd_init.c:1325:27: error: use of undeclared identifier
+                           'native_install_service_thread'
+
+    The file-scope declaration sat at applied line 1377 -- AFTER the call at
+    1325, because the whole added block begins INSIDE ``bsdinit_task()``
+    (pristine line 1096, five lines into a function opening at 1073) and the
+    definitions were deliberately placed after it.  And there is no file-scope
+    position that is both before the call and free of another patch's context:
+    the region between ``bsd_init()``'s closing brace and ``bsdinit_task()`` is
+    claimed by ``offline-owner-root-binding-audit.patch``'s second hunk, whose
+    pretext ends at ``void bsdinit_task(void)``.
+
+    Round three -- what is here now -- is block scope WITHOUT `static`.  The
+    keyword is what is illegal in block scope, not the declaration, and the
+    definition drops `static` to match.  The cost is one symbol with external
+    linkage in the kernel's table: namespace pollution rather than a correctness
+    problem, and the only option that does not fight another patch for the same
+    lines.
+
+    A test written from reasoning about C rather than from a compiler demanded
+    something the compiler refuses -- twice -- the same shape as the inter-patch
+    guard that passed while the build failed.  What the compiler actually
+    settles is the scope, and it settles it as a consequence of a placement
+    constraint this file cannot see, so the only durable form of this test is
+    the one that names all three: the declaration exists, it is in block scope
+    because that is the only position before the call, and it does not carry
+    `static`.
 
     It also checked only the thread function.  The declaration that actually
     failed to compile was ``native_console_report``, and this test's own name
-    says "every function the call block uses".  So it now walks them all.
+    says "every function the call block uses".  So it walks them all.
     """
     text = _patch_text()
     code = _added_source(text)
@@ -757,44 +783,98 @@ def test_every_function_the_call_block_uses_is_declared_before_it():
     call = code.find("kernel_thread_start(native_install_service_thread")
     assert call != -1, "the patch never starts the install service"
 
-    # The thread's forward declaration: file scope (no leading tab), `static`,
-    # and above the definition rather than above the call.
+    # The thread's forward declaration: block scope, NO `static`, and ABOVE THE
+    # CALL.  All three, because each one was a build failure:
+    #
+    #   absent                      -> 41359711528, call to undeclared function
+    #   block scope WITH `static`   -> 41376479360, block scope cannot be static
+    #   file scope (after the call) -> 41382433090, undeclared identifier
     #
     # Indentation is read from the RAW diff lines, because _code_lines strips
     # it -- and stripped, a file-scope declaration and a block-scope one are
-    # the same string.  That is precisely the distinction build 41376479360
+    # the same string.  That is precisely the distinction the last two builds
     # turned on, so it cannot be read through a helper that erases it.
-    declaration = "static void native_install_service_thread(void *, wait_result_t);"
+    #
+    # The anchor is deliberately LOOSE -- any added line whose stripped text
+    # ends with the thread's signature-and-semicolon -- so that each defect
+    # below fails on the assertion that names it.  Matching the exact final
+    # string instead makes all three collapse into "no declaration at all",
+    # which is a lie on a tree where one plainly exists and sends the next
+    # reader looking in the wrong place.
+    signature = "native_install_service_thread(void *, wait_result_t);"
     raw = [ln for ln in text.splitlines() if ln.startswith("+")]
-    decl_raw = [ln for ln in raw if ln[1:].lstrip() == declaration]
+    decl_raw = [ln for ln in raw if ln[1:].rstrip().endswith(signature)]
     assert decl_raw, (
         "the call block starts native_install_service_thread without declaring "
         "it.  The definitions live below bsdinit_task(), so this is a call to "
         "an undeclared function -- measured as build 41359711528 at "
-        "kern_exec.c:8120, and invisible to every check in this file that does "
-        "not look for the declaration."
+        "kern_exec.c:8120 and again as 41382433090 at bsd_init.c:1325, and "
+        "invisible to every check in this file that does not look for the "
+        "declaration."
     )
     assert len(decl_raw) == 1, f"declared {len(decl_raw)} times: {decl_raw}"
-    assert not decl_raw[0][1:2].isspace(), (
-        "the forward declaration is indented, so it is in block scope, where "
-        "`static` is illegal: build 41376479360 failed with 'function declared "
-        "in block scope cannot have static storage class'"
+    line = decl_raw[0]
+    assert "static" not in line, (
+        f"the block-scope declaration carries `static`: {line!r}.  Build "
+        f"41376479360 failed with 'function declared in block scope cannot "
+        f"have static storage class' at bsd_init.c:1309."
     )
+    assert line[1:2].isspace(), (
+        f"the forward declaration is NOT indented, so it is at file scope: "
+        f"{line!r} -- which puts it after the call.  Build 41382433090 failed "
+        f"with 'use of undeclared identifier native_install_service_thread' at "
+        f"bsd_init.c:1325 for exactly that reason.  Block scope is not a style "
+        f"choice here: it is the only position that is before the call, because "
+        f"the file-scope region above it is claimed by "
+        f"offline-owner-root-binding-audit.patch's second hunk."
+    )
+    assert line[1:].strip() == "void " + signature, (
+        f"the declaration's type is not the expected `void`: {line!r}"
+    )
+    declaration = line[1:].strip()
     assert declaration in lines, "the declaration is not in the added code"
     decl_at = lines.index(declaration)
+    assert decl_at < call, (
+        "the forward declaration sits after the call, which is the same as "
+        "having none"
+    )
     definition = next(i for i, ln in enumerate(lines)
                       if ln.startswith("native_install_service_thread("))
     assert decl_at < definition, (
         "the forward declaration sits after the definition, which is the same "
         "as having none"
     )
+    # The pair must agree on linkage.  Round two's failure was the mismatch:
+    # "static declaration follows non-static declaration".  The declaration is
+    # non-static, so the definition must be too.  The sibling function
+    # native_install_service keeps `static` -- that one is correct, because it
+    # has no block-scope declaration to agree with.
+    def_lines = lines[max(0, definition - 2):definition]
+    assert not any(ln == "static void" for ln in def_lines), (
+        f"the definition still spells `static`, so it disagrees with the "
+        f"non-static forward declaration: {def_lines!r}.  Build 41376479360 "
+        f"failed with 'static declaration follows non-static declaration' at "
+        f"bsd_init.c:1649."
+    )
 
     # Every function the added code CALLS must be declared somewhere in it.  The
     # first revision of this test named only the thread and missed
     # native_console_report, which is the one that failed to compile.
-    declared = {ln.split("(")[0].split()[-1]
+    #
+    # Block-scope declarations count too: they start with a type, not with
+    # `extern` or `static`, and the thread's is exactly such a line.  Without
+    # this the test would report the declaration it just required as missing.
+    #
+    # The matcher is a declaration SHAPE, not a substring test: a type, a name,
+    # a parameter list, a semicolon, end of line.  A CALL has the same shape
+    # minus the type, and counting calls as declarations would let a missing
+    # declaration hide behind the very call that needs it -- the test passing
+    # because of the defect it exists to catch.
+    declared = {m.group(1)
                 for ln in lines
-                if ln.startswith(("extern ", "static ")) and "(" in ln}
+                for m in [re.match(r"^[A-Za-z_]\w*(?:[\w \t]+\**)?\s+"
+                                   r"(\w+)\s*\(.*\)\s*;\s*$", ln)]
+                if m}
     called = set()
     for ln in lines:
         if ln.startswith(("extern ", "static ", "#")):
