@@ -2748,3 +2748,85 @@ The live-HID mailbox path (`vendor/UniXNU/scripts/qemu-entry/live-hid.py`) was
 checked and set aside: it resolves kernel symbols with `xcrun nm`, which is
 macOS-only, and this host is Windows.  The virtio-input route above needs no such
 tooling, so it is the one to use.
+
+---
+
+# Interval 2026-11-03 (seventh): the five reviews found four defects, one of them mine
+
+## What the reviews found in my own emitter
+
+Ran the project's five reviews against `springboard.interaction` and four of them
+found something real.  All four are fixed in `0efab237`.
+
+**反向审查 -- a memory-ordering hole.**  `NativeGOPPresenter::start()` publishes
+`native_gop_physical` and `native_gop_virtual` and THEN raises `native_gop_ready`
+(`NativeGOPPresenter.cpp:96-97`), with no barrier on the writer's side and no way
+for `HidInputProbe.cpp` to add one there.  On weakly-ordered ARM a reader can
+observe `ready=1` with a stale virtual address.  The read side now takes a `dmb
+ish` after seeing the flag and before reading the data; the existing
+`native_gop_physical == video.v_baseAddr` cross-check is the second line of
+defence, because a stale address almost certainly comes with a stale physical one
+and the check fails closed rather than hashing the wrong memory.
+
+**性能审查 -- an unbounded work-loop cost.**  Each arm hashes the whole ~24 MB
+frame, and a held key delivers a report every 100 ms, so ten reports inside one
+compare window were ten hashes on the work loop's timer thread.  `interaction_arm()`
+now returns early if already armed, bounding it to at most two hashes per second --
+one arm and one compare -- the same order as the registry walk the checkpoint
+already does every second.
+
+**规范审查 -- `memcpy` for one aligned copy.**  Replaced with a direct volatile
+64-bit load, so the translation unit has no reason to pull in `<string.h>` for it.
+ARM64 handles the unaligned tail through the byte loop.
+
+**对质 -- and this one caught a defect I introduced WHILE fixing the others.**  The
+first revision of the bounded-copy rewrite carried a `parts[]` loop that copied all
+three literals up front and then copied `middle` and `suffix` again after the hex,
+producing `{"event":...,"before":"","after":"<hex><middle><hex><suffix>` -- a record
+that compiles clean and parses as nothing.  **The exact defect two drafts of the
+mount emitter had.**  Caught by reassembling the literals the way the preprocessor
+will and parsing the result (`local-private/tmp/check-interaction-emitter.py`),
+which is the only thing that can see it.
+
+That last one is the reason this record exists: the emitter's record was ALREADY
+VALID when the previous revision was pinned, and the defect appeared in the act of
+making the copies safer.  A change that improves one property can break another,
+and the only detector is the one that reassembles and parses.
+
+## A red push, and what caused it
+
+The previous revision was committed and pushed with two failing tests.  The cause
+was not the tests:
+
+    python -m pytest tests/... -q 2>&1 | tail -2
+
+A pipeline's exit status is the LAST command's -- `tail`'s -- which is 0 whether or
+not pytest failed.  The tests were correct; the invocation was not, and the
+invocation is what I trusted.  Fixed by redirecting to a file and echoing `$?` on
+its own line, and saved to memory as
+[[pipe-to-tail-masks-the-exit-code]].  It is the third time this interval an
+instrument has told me what I wanted to hear.
+
+## A second instrument defect, found by the same review
+
+`_LITERAL` pairs quote characters and has no idea what a comment is.  A comment
+carrying an odd number of double quotes therefore shifts the pairing for every
+literal after it, and the record silently stops being found.  **This is not
+hypothetical: it happened the moment I added a code comment quoting a malformed
+record to explain what NOT to write.**  The explanation disabled the check that
+would have caught it.  Comments are now stripped before the scan, while the raw
+text is still returned for the structural checks.
+
+## Dispatched
+
+Build **41514522108**, `exp-2026-11-03-m9-final-M10`, stage M10, target tcg,
+`unixnu_commit=757e46b1`, `device_commit=0efab237`.  Build 41512218642 was
+cancelled at step 13 to carry the reviewed emitter instead.
+
+## Still unmeasured
+
+* Whether the kernel compiles with both emitters -- the question three builds have
+  died on, and the one this build is primarily sent to answer.
+* `diag.install_thread_start`'s status.
+* `springboard.running` and `springboard.interaction` on the wire.
+* M9 remains FAIL at the gate until both records arrive from a guest channel.
