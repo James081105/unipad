@@ -188,25 +188,43 @@ def _added_lines(patch: Path) -> list[str]:
             if line.startswith(("+", "@@")) and not line.startswith(("+++", "+diff"))]
 
 
-def _all_text() -> dict[Path, str]:
-    """Every source file's text, with each patch's ADDED lines decoded.
+def _strip_comments(text: str) -> str:
+    """Remove C/C++ comments before scanning for string literals.
 
-    THE DECODING IS LOAD-BEARING.  A patch carries the C source it will produce,
-    so its added lines contain ``\\"event\\":\\"springboard.running\\"`` -- with the
+    WHY THIS EXISTS.  ``_LITERAL`` pairs up quote characters, and it has no idea
+    what a comment is.  A comment carrying an odd number of double quotes
+    therefore shifts the pairing for every literal after it, and the record
+    silently stops being found -- the test then reports "no interaction emitter
+    exists" against a file that has one, three lines below the comment that broke
+    the scan.  That is exactly what happened when a code comment quoted a
+    malformed record to explain what NOT to write: the explanation disabled the
+    check.
+
+    So comments come out first.  The raw text is still returned alongside the
+    decoded literals, because the structural checks (the gate, the arm condition)
+    read code and comments alike.
+    """
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
+def _all_text() -> dict[Path, str]:
+    """Every source file's text, with each C source's literals decoded.
+
+    THE DECODING IS LOAD-BEARING.  A source carries the C it will produce, so its
+    string literals contain ``\\"event\\":\\"springboard.running\\"`` -- with the
     backslashes.  A raw search for ``"event":"springboard.running"`` therefore
     never matches, and the first revision of this test reported "no emitter
-    exists" against a patch that had one.  So a patch contributes its raw added
-    lines AND the decoded concatenation of its string literals, which is what the
+    exists" against a patch that had one.  So a file contributes its raw text AND
+    the decoded concatenation of its string literals, which is what the
     preprocessor will actually hand the port.
     """
     out: dict[Path, str] = {}
     for path in _vendor_tree():
         raw = path.read_text(encoding="utf-8")
-        # C sources carry the same escaped form as patches do, so they need the
-        # same treatment.  The first revision decoded only .patch files and then
-        # reported "no emitter exists" against HidInputProbe.cpp, which has one.
         if path.suffix in (".patch", ".cpp", ".c", ".h", ".mm"):
-            bodies = _LITERAL.findall(raw)
+            bodies = _LITERAL.findall(_strip_comments(raw))
             decoded: list[str] = []
             for body in bodies:
                 try:
