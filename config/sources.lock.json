@@ -137,8 +137,9 @@
       "path": "drivers/NativeUfs"
     },
     {
-      "commit": "98909eb9198a4360d7a43be831887cb8b74d814d",
-      "path": "drivers/NativeVirtioBlock"
+      "commit": "3d0535187266d89ac4d43dcf51354f61ee738f63",
+      "path": "drivers/NativeVirtioBlock",
+      "commit_note": "Moved 2026-11-02 from 98909eb. This is the commit that carries virtio_blk.read_back -- the one event milestones.py's p.virtio_blk_read_back asks for. Nothing in either pinned tree emitted any virtio_blk.* event, so the probe could only ever report missing. THE PUSH BLOCKER IS CLOSED, and it was never permissions: the driver's fork remote read James081505/VirtioMmioBlock while the account is James081105 -- one transposed digit, ~75 minutes of retrying it. THE REST OF THE CHAIN WAS ALREADY IN PLACE: qemu_root_defconfig already carries CONFIG_XNU_NATIVE_AES=y (which build-xnu-4k-baseline.sh:170-176 requires before it will accept XNU_NATIVE_VIRTIO_BLOCK=1), CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y and the verified-bundle archive path; build-arm-driver.py:33-37 routes --verified_root_bundle to build/native-virtio-block-verified-bundle and passes -DNATIVE_VERIFIED_BLOCK=1 at :72, so the emitter's own guard is satisfied on exactly the path the booting config names. AND THE EMITTER IS BOUNDED the same way the install service is: readBackReported is a class member set BEFORE the call, so the cost is one record per driver instance on the first successful verified read, against the thousands of verified reads a boot performs. That structural bound is what makes it safe to pin. PINNED ALONE, deliberately: M7 and M8 are being bounded in the same change set and one build should measure one thing. Status: CODE COMPLETE, compile UNVERIFIED, wire UNVERIFIED. "
     },
     {
       "commit": "3ca09c93adad160905420ced37b9c90847fc64b3",
