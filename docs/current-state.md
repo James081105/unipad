@@ -2887,3 +2887,78 @@ returns a FAILED observation naming that, rather than a pass with it guessed.
 Build **41514522108** (`exp-2026-11-03-m9-final-M10`) is queued for a runner.  It
 carries the both-scopes declaration fix, `springboard.running`, and the reviewed
 `springboard.interaction` emitter.
+
+---
+
+# Interval 2026-11-03 (ninth): M10-M12 and M14-M15 cannot share a kernel
+
+## The mutual exclusion, measured from the sources
+
+The install patch's guard is
+(`native-install-service-dispatcher.patch:8` and `:129`):
+
+    #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST && \
+        !(defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU)
+
+and the GPU broker's is (`offline-native-gpu-broker.patch:7`):
+
+    #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU
+
+So the two are exact complements:
+
+| `XNU_NATIVE_OFFLINE_GPU` | install dispatcher | GPU broker |
+|---|---|---|
+| 0 (the default) | compiled | compiled out |
+| 1 | compiled out | compiled |
+
+`build-xnu-4k-baseline.sh:306` reads it as
+`NATIVE_OFFLINE_GPU=${XNU_NATIVE_OFFLINE_GPU:-0}`, and **neither defconfig nor
+`scripts/macos/build-macos.sh` sets it**, so every build so far has been the
+install configuration.  That is the right default for the current critical path,
+and it means the build in flight does carry the install dispatcher.
+
+The reason is the one the install test file records as its first invariant:
+`NativeOfflineGPU::readExact()` drains RX in a lock-step loop and treats ANY short
+read as `kIOReturnIOError`, so a second consumer's line buffering would take bytes
+the broker was counting on.  The exclusion is deliberate, not an oversight.
+
+**Consequence for planning: M10-M12 and M14/M15 need at least two builds, and the
+GPU one cannot be the same kernel that proves install.**
+
+## The GPU build path does not exist yet
+
+`.github/workflows/build-macos.yml` exposes exactly six inputs --
+`experiment_id`, `unixnu_commit`, `device_commit`, `stage`, `system_build`,
+`payload_target`.  **There is no input for `XNU_NATIVE_OFFLINE_GPU`**, and nothing
+in the host script exports it either.  So a GPU configuration cannot be requested
+from the workflow at all today; it needs one of:
+
+1. a new workflow input plumbed through to the environment the build script reads, or
+2. a defconfig in `vendor/UniXNU-qemu/configs/` that sets it, pinned by a
+   `device_repo.commit` bump.
+
+Either is a code change, and until one lands M14 and M15 are BLOCKED on the build
+path rather than on the driver.  Recorded as such rather than as "not started",
+because the distinction changes what the next action is.
+
+## Why the CI is not settling, and what I changed about my own behaviour
+
+`preflight.yml:37-39` sets `concurrency: group unipad-preflight-${{github.ref}},
+cancel-in-progress: true`.  Every push to `main` therefore CANCELS the preflight
+already running for `main`.  I pushed eight times in quick succession, so the
+preflight was cancelled and restarted eight times and never completed once --
+run 41514599784 finished as `cancelled` for exactly that reason.
+
+`build-macos.yml:72-74` uses a different group keyed on `inputs.experiment_id`
+with `cancel-in-progress: false`, so the build is not cancelled by the pushes --
+but it is queued behind them for the runner.
+
+The fix is behavioural, not a workflow change: stop pushing to `main` until the
+in-flight preflight completes, so there is a green CI result to point at.  "Necessary
+CI passes" is a completion requirement, and a perpetually-cancelled preflight is
+not a passing one.
+
+## In flight
+
+* `41515022936` -- preflight for `2f4828d`, in progress.
+* `41514522108` -- build-macos, `exp-2026-11-03-m9-final-M10`, queued.
