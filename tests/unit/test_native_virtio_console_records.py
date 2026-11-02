@@ -83,6 +83,14 @@ RECORDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("xnu.interrupts", "ir_tf", ("irqs_unmasked", "timer_configured")),
     ("xnu.interrupts", "ir_ft", ("irqs_unmasked", "timer_configured")),
     ("xnu.interrupts", "ir_ff", ("irqs_unmasked", "timer_configured")),
+    # Build 41369829766's isolating experiment.  These are NOT requirements and
+    # no probe names them; they exist to answer one binary question -- whether
+    # native_console_report(), the free function every kernel-side emitter in
+    # this project routes through, delivers at all.  They are listed here so the
+    # same one-line-valid-JSON and sizeof-of-an-array machinery covers them, and
+    # they come out of both this list and the driver when the measurement lands.
+    ("diag.free_fn_from_driver", "free_fn_record", ()),
+    ("diag.control_from_driver", "control_record", ()),
 )
 
 
@@ -479,10 +487,27 @@ def test_the_gate_still_reads_what_the_driver_emits(source):
 
     So the driver is the source of truth here: pull the event names out of its
     own records and require the gate to name each one.
+
+    The one exception is a record that exists to diagnose rather than to satisfy
+    a requirement, and it has to be named explicitly rather than inferred: build
+    41369829766 measured that ``native_console_report()`` called from kern_exec.c
+    delivered nothing while ``send()`` called from inside this class delivered
+    five records, and the two diagnostic records below isolate which of those two
+    variables is the cause.  A diagnostic is temporary by construction, so it is
+    listed here and removed here when the measurement it exists for is taken.
+    Inferring "this one is only a diagnostic" from the name would let any
+    ungated record exempt itself.
     """
     milestones = REPO / "src" / "unipad" / "acceptance" / "milestones.py"
     require(milestones)
     gate = milestones.read_text(encoding="utf-8", errors="replace")
+
+    #: Events the driver emits to measure the port, not to satisfy a requirement.
+    #: Each must carry the reason it exists; an empty set is the normal state.
+    DIAGNOSTIC_EVENTS = {
+        "diag.free_fn_from_driver",
+        "diag.control_from_driver",
+    }
 
     emitted: set[str] = set()
     # The C source spells the quotes inside a string literal as backslash-quote,
@@ -497,10 +522,17 @@ def test_the_gate_still_reads_what_the_driver_emits(source):
         emitted.add(m.group(1))
     assert emitted, "no event names found in the driver's records"
 
-    for event in sorted(emitted):
+    unexplained = sorted(emitted - DIAGNOSTIC_EVENTS)
+    for event in unexplained:
         assert f'"{event}"' in gate, (
             f"the driver emits {event} but no probe in milestones.py names it; "
             f"the record can never satisfy anything")
+    # And the allowlist must not become a place to park a real requirement: a
+    # diagnostic the gate actually names is a mislabelled requirement.
+    for event in sorted(DIAGNOSTIC_EVENTS & emitted):
+        assert f'"{event}"' not in gate, (
+            f"{event} is listed as a diagnostic but milestones.py names it; "
+            f"it is a requirement, not a diagnostic")
 
 
 # ---------------------------------------------------------------------------
