@@ -1391,3 +1391,80 @@ the capture is running.
 what this build was dispatched to measure, and a capture that ended early would
 otherwise report "missing system.mount" and say nothing about the question actually
 asked.
+
+---
+
+## 2026-11-02 — the first fully green build, and the measurement that changes the route
+
+Build **41369829766** concluded **success**, 34/34 steps — the first build to get
+past the patch application, the compile and the link, which the previous three
+revisions hit in sequence.
+
+**And the diagnostic did not arrive.**
+
+The capture ran the guest to **t=1527.8 s** (1500 s of draining), wrote 1476 bytes,
+and found:
+
+```
+events found: iokit.driver_probe, iokit.service_match, xnu.exception_vectors,
+               xnu.interrupts, xnu.page_tables
+missing:      system.mount, system.volume_identity, diag.load_init_program_entered
+emitter_missing_from_kernel: []      <- every record IS in the ESP kernel
+```
+
+The records are byte-level in the kernel the guest boots (ESP `kernel.macho`,
+125,480,960 bytes, sha256 `7cac83e5…` = `payload.json`'s `payload_kernel_sha256`),
+and `offline owner SystemOS mount failed` — a string that sits inside the *same*
+`#if defined(XNU_OWNER_CACHE_MOUNT)` as the diagnostic — is present, which proves
+the macro was 1 and the block was compiled. The link resolved. IOKit matching had
+finished by **t=63.1** (ring: `Got boot device =
+IOService:/ArmDTPlatform/virtio-mmio-31@2003E00/NativeVirtioBlock/…`), and
+`g_console` is published in `start()`, so it was set eight seconds before
+`load_init_program` ran at t=71.8. Ordering is not the cause.
+
+### Two variables changed at once, and that is the defect in the conclusion
+
+The five records that arrived go through **`this->send()` directly**, from inside
+the class. The diagnostic goes through **`native_console_report()`**, the free
+function, from BSD kernel code. So the entry point changed *and* the caller's
+context changed — and **nothing in this repository had ever proven the free
+function delivers at all.** Every record that ever satisfied a requirement went
+through `send()` from inside `NativeVirtioConsole`.
+
+`native_console_report()` is `g_console?g_console->send(bytes,size):kIOReturnNotOpen`
+— a null `g_console` drops silently, which is the same shape as the `weak_import`
+defect this project already spent a month on.
+
+### The experiment that isolates it (build 41376479360, dispatched)
+
+Two records added to the console driver, at the same point in the boot as the five
+that are known to work:
+
+- `diag.free_fn_from_driver` — emitted through `native_console_report()`.
+- `diag.control_from_driver` — emitted through `send()`, the way the others go.
+
+| result | meaning |
+|---|---|
+| free_fn absent, control present | the free function is broken, and **every** kernel-side emitter — the M8 pair, the dyld emitter, the install dispatcher's reply — is routed through a dead path |
+| both present | the free function works, and the defect is specific to `kern_exec.c`: `g_console` null by then, or `send()`'s synchronous `complete()` wait behaving differently outside the driver's context |
+
+`send()` ends with `complete(1,&consumed)` — a synchronous wait for the device to
+consume the descriptor, which is the two-second deadline the M8 agent measured.
+
+Both records are added to the test's `RECORDS` list so the existing
+one-line-valid-JSON and `sizeof`-of-an-array machinery covers them, and to an
+explicit `DIAGNOSTIC_EVENTS` allowlist in
+`test_the_gate_still_reads_what_the_driver_emits` — **named explicitly rather than
+inferred**, because inferring "this one is only a diagnostic" from the name would
+let any ungated record exempt itself. That test also asserts the reverse: a
+diagnostic the gate actually names is a mislabelled requirement.
+
+### State
+
+- Main repo at `1ceae14`. Fork `unipad/gpu-addon-ngpu-dir` at `1625c84`; console
+  fork `unipad/console-announcement` at `d25974c`.
+- Lock: `unixnu.commit` = `1625c84c`, `submodules[drivers/NativeVirtioConsole]` =
+  `d25974c3`.
+- Gate unchanged: 3 PASS (M4, M5, WP04), 9 UNVERIFIED, 2 FAIL (M9/M9a on the PRD
+  vetoes), 7 BLOCKED.
+- `tests/unit`: 3404 passed, 10 skipped, 0 failed.
