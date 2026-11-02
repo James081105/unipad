@@ -3052,3 +3052,63 @@ rather than on the driver, which is a different next action.
 
 * `41521813113` -- build-macos, `exp-2026-11-03-m9-final-M10`, re-dispatched.
 * `41520170003` -- preflight, **success**.
+
+---
+
+# Interval 2026-11-03 (eleventh): the GPU configuration can now be requested
+
+## What was missing
+
+M14/M15 were recorded as "not started", which was the wrong label.  The right one
+is **blocked on the build path**: the configuration could not be requested at all.
+
+`XNU_NATIVE_OFFLINE_GPU` is read directly by
+`vendor/UniXNU/scripts/build-xnu-4k-baseline.sh:306`
+(`NATIVE_OFFLINE_GPU=${XNU_NATIVE_OFFLINE_GPU:-0}`), and:
+
+* neither `qemu_defconfig` nor `qemu_root_defconfig` sets it,
+* `scripts/macos/build-macos.sh` never exports it,
+* `.github/workflows/build-macos.yml` exposed no input for it.
+
+So every build so far has been `XNU_NATIVE_OFFLINE_GPU=0` -- the install
+configuration -- and there was no lever to ask for the other one.
+
+## What landed
+
+A `gpu_broker` input (choice 0/1, default 0), plumbed as `XNU_NATIVE_OFFLINE_GPU`
+into **both** build steps.  There are two -- "Run macOS build" and "Run macOS build
+again (qemu_root_defconfig, PRD 8.1 root chain)" -- and the second is the one that
+builds the root chain, so it needed the variable at least as much as the first.
+
+**The plumbing works, and the reason is worth recording**: `unixnu/kernel.py:79`
+starts from `dict(os.environ)` and then `env.update(xnu_env(ctx))`.  `xnu_env`
+builds `XNU_*` from the defconfig's `CONFIG_XNU_*`, and the defconfig does not set
+this one -- so the inherited value survives.  If a defconfig ever DOES set it, the
+defconfig wins, which is the documented precedence and is now in the comment so the
+next person does not have to re-derive it.
+
+**`gpu_broker=1` raises a warning, not a problem, and the asymmetry is
+deliberate.**  The vendor script already refuses the pairing outright
+(`build-xnu-4k-baseline.sh:311-313`: "The private offline GPU broker requires the
+actual byte transport"), and the validate step cannot see whether the root chain
+is on disk -- that is decided at run time by `build-macos.sh`, not by the lock.  A
+validation rule that fails runs which are actually fine is worse than no rule.
+
+## What this does and does not do
+
+**Does**: makes the GPU configuration buildable at all.
+
+**Does not**: pass M14 or M15.  And it cannot be the same kernel that proves
+M10-M12 -- with the broker on, the install dispatcher is compiled out, so
+`install.registered` cannot be emitted.  Two builds minimum, and the GPU one
+cannot be cited as install evidence.
+
+Verified: the YAML parses, the input list is as expected, both build steps carry
+the variable, and `tests/unit -k 'workflow or build_macos or dispatch or inputs'`
+passes.
+
+## In flight
+
+* `41521813113` -- build-macos, `exp-2026-11-03-m9-final-M10`, at the GPU addon
+  chain step.
+* preflight -- green at `715d25c`; the pushes since then each start a new one.
