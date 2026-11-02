@@ -1468,3 +1468,67 @@ diagnostic the gate actually names is a mislabelled requirement.
 - Gate unchanged: 3 PASS (M4, M5, WP04), 9 UNVERIFIED, 2 FAIL (M9/M9a on the PRD
   vetoes), 7 BLOCKED.
 - `tests/unit`: 3404 passed, 10 skipped, 0 failed.
+
+---
+
+## 2026-11-02 — a trap in the boot inputs, and three more compile errors
+
+**The boot inputs are collected even when the second kernel pass fails, and they
+then carry the FIRST-pass kernel.** Build 41376479360 failed at step 21, yet
+steps 26–27 still collected and uploaded the boot inputs. Its ESP
+`kernel.macho` is **51,859,456 bytes** — the first-pass size — against the
+125,480,960 bytes the second pass produces, and it contains **zero** occurrences
+of `diag.free_fn_from_driver`, `diag.control_from_driver`,
+`diag.load_init_program_entered` and `install.registered`. A capture against
+those inputs would boot a kernel without the experiment and report the records
+"missing" — which reads exactly like the measurement the experiment exists to
+take. **Check the kernel's size and the record counts before trusting a capture.**
+
+### Three compile errors in the install dispatcher, found by the second pass
+
+41376479360's first pass compiled and linked — so the isolating experiment for
+`native_console_report()` is sound — but its **second** pass,
+`qemu_root_defconfig`, sets `XNU_OWNER_ROOT_TRUST=1` and is the **first compiler
+to see the dispatcher at all**:
+
+```
+bsd_init.c:1309:2: error: function declared in block scope cannot have 'static' storage class
+bsd_init.c:1633:2: error: call to undeclared function 'native_console_report'
+bsd_init.c:1649:1: error: static declaration of 'native_install_service_thread' follows non-static declaration
+```
+
+The first and third are one defect: the forward declaration sat inside
+`bsd_do_post()`'s body, where `static` is illegal, and dropping the keyword alone
+then fails against the definition. It now sits at **file scope**, inside the same
+`#if` as the definition. The second is the caller/declaration rule one layer out
+— the patch declared `native_console_poll` and called `native_console_report`;
+clang named the fix itself (*"did you mean 'native_console_poll'?"*).
+
+### Two tests were wrong, and both are fixed rather than deleted
+
+`test_every_function_the_call_block_uses_is_declared_before_it` **required the
+forward declaration inside the call block** — which is exactly what the compiler
+rejects. A test written from reasoning about C rather than from a compiler
+demanded something C refuses: the same shape as the inter-patch guard that passed
+while the build failed. It now requires file scope, read from the **raw diff
+lines**, because `_code_lines` strips indentation and stripped, a file-scope and
+a block-scope declaration are the same string — which is precisely the
+distinction this turned on.
+
+It also named only the thread function. The declaration that actually failed to
+compile was `native_console_report`, and the test's own name says "every function
+the call block uses". It now walks them all.
+
+The two write-counting tests needed the `extern` exclusion the sibling test at
+the null-check guard already had: without it, adding the declaration made them
+count it as a second write of the same event — **a test going red on the fix for
+the defect it was written to catch.**
+
+### State
+
+- Main repo at `9618b86`. Fork at `d645589`. Lock: `unixnu.commit` = `d6455896`,
+  `submodules[drivers/NativeVirtioConsole]` = `d25974c3` (unchanged — this
+  revision changes only the XNU patch).
+- Build **41382433090** dispatched: the isolating experiment **and** the install
+  fix together. One build answers both questions.
+- 78 guard tests green across the console, install and patch suites.
