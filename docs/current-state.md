@@ -2962,3 +2962,93 @@ not a passing one.
 
 * `41515022936` -- preflight for `2f4828d`, in progress.
 * `41514522108` -- build-macos, `exp-2026-11-03-m9-final-M10`, queued.
+
+---
+
+# Interval 2026-11-03 (tenth): the preflight is green for the first time
+
+## What was wrong
+
+`vendor/` is gitignored and untracked (`.gitignore:39`), and the preflight job does
+a plain `actions/checkout` with no acquisition step -- so its unit stage runs
+against a checkout that has **no vendor tree at all**.  Three tests failed there:
+
+    test_clean_checkout_selfsufficiency.py::test_the_guarded_modules_skip_
+        rather_than_error_when_the_vendor_root_is_absent
+    test_native_virtio_block_records.py::test_no_second_virtio_blk_event_name_
+        exists_anywhere_in_the_fork
+    test_native_virtio_console_install_service.py::test_the_install_patch_
+        applies_to_its_own_minus_side
+
+Two of them read `vendor/UniXNU` directly and failed with
+`"no driver fork files to scan"` and a missing-file error.  The third failed as the
+**cascade**: it asserts that the guarded modules skip, so one unguarded read turns
+into two red stages.
+
+## Attribution, done before fixing
+
+Run `41497905806` is commit **`c1d8782d`** -- the commit this session started from
+-- and it has **exactly the same three failures**.  So this is pre-existing, not
+caused by anything here.  Fixed anyway, because "necessary CI passes" is a
+completion requirement and a stage that has never been green cannot be cited as
+one.
+
+## The fix, verified in both directions
+
+Both tests now call `tests.vendor_paths.require`, which skips when the owning
+checkout is absent and fails when it is present and a file is not -- the split the
+module's docstring already describes, and the one the 2026-10-24 defect it records
+was about.
+
+    with the vendor tree present:                2 passed
+    with UNIPAD_VENDOR_ROOT pointing nowhere:    2 skipped, naming why
+
+The skip message is the honest one -- "not verified here" -- and it records that
+`tests/integration` is where the check actually runs, because that CI job refuses
+to read green when everything in it skips.  A skip is not a pass; it is the
+truthful answer to a question this checkout cannot ask.
+
+**Result: preflight run `41520170003` completed `success`.**  First green preflight
+of the session.
+
+## A false lead worth recording
+
+My first attempt to add the install test's guard was rejected by my own script with
+"the guard is already there".  It was wrong: the check was
+`if "require(PATCH)" in text`, and that string already appears in **two other
+tests** in the same file (lines 118 and 1234), so it matched whether or not the
+target test was guarded.  The site-identifying check has to be the anchor, not a
+substring that occurs elsewhere.  Same family as the declaration-visibility false
+positive earlier: a check that matches the wrong thing agrees with you either way.
+
+## The build was cancelled, not failed
+
+`41514522108` reported `failure` at the run level, but the job shows
+**`cancelled` with 0 steps** -- it never got a runner.  It sat `queued` behind the
+preflight runs my own rapid pushes kept starting, and was cancelled before
+starting.  Not a build failure, and no kernel.log exists to read.
+
+Re-dispatched as **`41521813113`**, same pins (`unixnu=757e46b1`,
+`device=0efab237`).
+
+## Also recorded this interval
+
+**M10-M12 and M14-M15 cannot share a kernel.**  The install patch's guard
+(`native-install-service-dispatcher.patch:8`, `:129`) is the exact complement of
+the GPU broker's (`offline-native-gpu-broker.patch:7`):
+
+    #if defined(XNU_OWNER_ROOT_TRUST) && XNU_OWNER_ROOT_TRUST && \
+        !(defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU)
+    #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU
+
+`build-xnu-4k-baseline.sh:306` defaults it to 0 and **neither defconfig nor
+`scripts/macos/build-macos.sh` sets it**, so every build so far has been the
+install configuration.  The GPU milestone therefore needs a second build, and
+**that build path does not exist**: `build-macos.yml` exposes six inputs and none
+of them is `XNU_NATIVE_OFFLINE_GPU`.  That makes M14/M15 blocked on the build path
+rather than on the driver, which is a different next action.
+
+## In flight
+
+* `41521813113` -- build-macos, `exp-2026-11-03-m9-final-M10`, re-dispatched.
+* `41520170003` -- preflight, **success**.
