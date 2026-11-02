@@ -1296,3 +1296,64 @@ A small one, twice: the added comment paragraph carried its own `*/` while the
 comment's original close stayed, so the comment had **two** closes — in two
 consecutive revisions. Caught both times by *looking at the file* rather than
 trusting the script's exit code.
+
+---
+
+## 2026-11-02 — the install service lands, and it answers the drain question by construction
+
+`install.registered` is the single event that clears `_INSTALL_SERVICE_BLOCKER`
+(`milestones.py:1983-1991`), which is named by **four** milestones — M10, M10a,
+M11, M12. Nothing in either pinned tree produced it, so all four could only ever
+read BLOCKED.
+
+**The dispatcher lives in `bsd/kern/bsd_init.c`, not `kern_exec.c`, for a measured
+reason**: `build-xnu-4k-baseline.sh:329` passes `-DXNU_NATIVE_OFFLINE_GPU` to
+`bsd_init.o` and **not** to `kern_exec.o`. A `kern_exec.c` home would make the GPU
+half of the switch coupling vacuously true — a guard that reads as protective and
+protects nothing. That is the same shape as the caller/declaration mismatch three
+revisions up, one level out.
+
+**The driver half** is `native_console_poll(void *, size_t *)` in the console fork
+(`5693c68`), the RX twin of `native_console_report()`. It needs the same friend
+grant `receive()` needs, for the same measured reason `send()` needed it on run
+41313323081. The header's first two lines are unchanged and it carries no
+install-JSON knowledge — it is a byte transport, and the protocol lives in the
+patch.
+
+**ONE RECORD PER BOOT, and that bound is structural, not an unmeasured rate
+limit.** `native_install_registered` is never cleared and the port is written
+exactly once, so the worst this can add to a stalling TX drain is **one**
+two-second deadline — against the daemon emitter's measured **≥75** sends per
+boot. That is what makes it safe to pin while the M8 and dyld emitters are not.
+
+**The dispatcher is disabled by the same switch that enables the GPU**
+(`XNU_OWNER_ROOT_TRUST && !XNU_NATIVE_OFFLINE_GPU`), because the moment the GPU
+broker is revived the two share one RX byte stream under a lock-step protocol and
+`readExact` treats any short read as `kIOReturnIOError`. The coupling is asserted
+by a test that checks the guard appears exactly twice **and** that the build
+script really passes both macros — the second half is what makes it real rather
+than decoration.
+
+**It deliberately does not answer the host.** The map's recommended
+reply-through-`native_console_report` is a **trap**: every available reply either
+fabricates a success or arms the `copy_only_install` veto, so replying would trade
+one blocker for a worse one. A test asserts none of the three reply types appears.
+
+21 guard tests, **26 mutations, every one killed**. Two of them were real defects
+the tests found before a build: the patch called `native_console_poll` without
+declaring it, and the call block started the reader thread without
+forward-declaring it.
+
+### State
+
+- Main repo at `cbb82aa`. Fork `unipad/gpu-addon-ngpu-dir` at `3ff2f7f`; console
+  fork `unipad/console-announcement` at `5693c68`.
+- Lock: `unixnu.commit` = `3ff2f7fa`, `submodules[drivers/NativeVirtioConsole]` =
+  `5693c68d`. Both bumped together, because a patch calling a symbol the gitlink
+  does not carry fails the link naming it.
+- `repro-patch-order.py`: **all 58 patches apply**, the install patch at position
+  21, contributing zero unreachable hunks.
+- Build **41369829766** (the own-guard fix) is still running.
+- Three emitters remain CODE COMPLETE but **unpinned**, all for the drain reason:
+  `dyld.cache_read`, `virtio_blk.read_back` (also blocked on its fork), and the M8
+  `launchd.running`/`daemon.spawned` pair.
