@@ -1239,3 +1239,60 @@ committed in the main repo. What is missing is only the push and the two pin
 bumps. **Recorded as a blocker rather than guessed at** — the next session
 should either push from a host whose credential can see the fork, or change the
 `.gitmodules` URL for `drivers/NativeVirtioBlock` to a fork that resolves.
+
+---
+
+## 2026-11-02 — three corrections in a row, each exposing the next
+
+The chain, because each step's failure named the next step's defect:
+
+1. **41346094752** — patch failed at `kern_exec.c:7389`. The diagnostic sat
+   between two lines of `zzz-boot-progress.patch`'s context.
+2. **41350610831** — the *identical* error, on a pin containing the fix. The
+   constraint was the whole **ten-line** block, not the one adjacency the first
+   fix kept. The guard written with that fix asserted the adjacency — which was
+   TRUE on the failing tree — so it passed while the build failed.
+3. **41359711528** — the patches applied, the build got **4.5 minutes into the
+   compile**, then `kern_exec.c:8120: error: call to undeclared function
+   'native_console_report'`. The diagnostic is emitted *outside*
+   `#if defined(XNU_OWNER_CACHE_MOUNT)`; the `extern` was *inside* it.
+4. **41364602699** — the compile passed, the build reached the **LINK**, and
+   failed with `"_native_console_report", referenced from: _load_init_program in
+   kern_exec.o` / `ld: symbol(s) not found`. That is the strong extern doing its
+   job. The archive is force-loaded only when `NATIVE_VIRTIO_CONSOLE=1`, and the
+   switch that is both passed to this translation unit *and* paired with the
+   archive is `XNU_OWNER_CACHE_MOUNT`.
+5. **41369829766** — dispatched.
+
+### The lesson that generalises, and it is the sixth of this shape
+
+**A caller and its definition must share one guard.** Step 3 was the macro
+gating the *declaration*; step 4 was the caller outside the guard that pairs with
+the *definition*. Both are the same rule one layer apart, and **neither is visible
+to any source-level check, because nothing on this host preprocesses or links.**
+
+### And there is no single position satisfying both constraints
+
+The diagnostic must be inside `XNU_OWNER_CACHE_MOUNT` to link. `zzz-boot-progress`
+needs ten lines contiguous, nine of which this patch adds, with the guard's region
+in the middle. Moving the guard above the whole hunk — the previous revision —
+satisfied the first and broke the second, and
+`test_this_patch_keeps_the_lines_the_next_patch_uses_as_context` **caught it red**.
+The guard works; the placement was wrong.
+
+`ebd8769` gives the diagnostic its **own** self-contained `#if` block above
+`mach_vm_allocate_kernel` and restores the emitter's guard between `init_envp`
+and the prepare call. Verified by replaying the runner's own patch order with
+real `git apply` against the cloned XNU source: **all 58 patches apply.**
+
+This costs nothing in diagnostic power, and that is worth stating exactly: the
+diagnostic fires at the **top** of `load_init_program()`, before the prepare
+calls; the emitter fires at the **end** of `native_owner_cache_prepare()` gated on
+`!error`. Different points, different gates. Diagnostic arrives and emitter does
+not → the prepare call did not run, or `error` was non-zero. Neither arrives → the
+port is unreachable from `kern_exec.c`.
+
+A small one, twice: the added comment paragraph carried its own `*/` while the
+comment's original close stayed, so the comment had **two** closes — in two
+consecutive revisions. Caught both times by *looking at the file* rather than
+trusting the script's exit code.
