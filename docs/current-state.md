@@ -3302,3 +3302,78 @@ to try first for a capture.  Routes 1 and 2 are for the deliverable.
 -- that is a different question from whether the read-only OS volumes can be
 produced, and this measurement says nothing about it.  It must be re-measured, not
 inherited from a conclusion I have just withdrawn.
+
+---
+
+# Interval 2026-11-03 (thirteenth): route 3 is running -- the volumes are being
+# decoded to raw
+
+## What is in flight
+
+`local-private/tmp/decode-udif-volumes.py` is decoding both UDIF volumes to raw
+disk images QEMU can attach, one at a time, deleting each UDIF only after its raw
+image passes the GPT check.
+
+Measured progress on the OS volume: 328/3814 chunks in 244 s, so ~47 minutes for
+it and ~30 more for SystemOS.  The raw image is 6,077,580,800 bytes, pre-allocated
+at full size because `udif.py:520-528` records that NTFS does not honour a sparse
+request from `open("wb")` or `truncate` -- "a 256 MiB all-zero-fill image costs
+256 MiB of free space", and an earlier version of that docstring claimed
+otherwise and was wrong.
+
+Disk: F: is at 13 GB free with the OS raw pre-allocated.  The arithmetic works
+only because each UDIF is deleted as soon as its raw image passes the GPT check:
+13 GB now, +5.16 GB when the OS UDIF goes, -~4 GB for the SystemOS raw, +3.3 GB
+when its UDIF goes.
+
+## Why this is the right route
+
+The volumes the runner produced are byte-identical to what this host can
+re-extract from the local IPSW:
+
+    os_root_image    local sha256 == manifest sha256   3f99b859...
+    systemos_image   local sha256 == manifest sha256   b4908cde...
+
+So a capture does not need the runner's copy at all -- only the IPSW, which is
+already local at `local-private/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw`
+(6.84 GB).  That is route 3, and it touches neither the workflow nor PRD 12.
+
+## The stale caveat this run overturns
+
+`unixnu_boot.build_argv:1682-1696` warns that attaching a root volume "needs a
+kernel carrying `CONFIG_XNU_NATIVE_VIRTIO_BLOCK`; without one the device is
+attached and never enumerated at all, which is the state of every kernel on this
+host (measured 2026-10-25)".
+
+**That measurement is now out of date and must not be inherited.**  The kernel
+build 41521813113 produced sets `CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y`
+(`qemu_root_defconfig:29`), names the verified bundle archive at `:50`, and
+carries `NativeVirtioBlock` 66 times plus `virtio_blk.read_back` once --
+verified byte-level in the payload kernel.  So this run is the first on this host
+for which the root volume can actually be enumerated.
+
+## What the capture will measure, and in what order
+
+With the volumes attached, `build_argv` also adds `virtio-tablet-device` and
+`virtio-keyboard-device` (`unixnu_boot.py:1985`), which is what makes the input
+path exist at all.  So this one boot can answer, in order of how early they fire:
+
+1. **`diag.install_thread_start`** -- `bsd_init()`, before launchd.  The question
+   three builds were sent to answer.
+2. **`install.registered`** -- after a host install frame reaches the RX queue.
+3. **`springboard.running`** -- if SpringBoard execs at all.
+4. **`springboard.interaction`** -- the guest's screen digest around a Home press,
+   with the host's QMP screendump sha256 as an independent twin.
+
+Records 1 and 2 need only a root mount.  Records 3 and 4 need a booted userspace,
+which needs the root mount AND the display AND the input path.  Each is a
+strictly later failure than the last, so a capture that stops early still tells
+us something.
+
+## Not claimed
+
+* The decode has not finished.  No boot with the volumes has run.
+* Nothing here says the guest reaches SpringBoard.  The display path
+  (`offline-legacy-*` boot args) and the AMFI/PMGR chain are separate gates that
+  have never been passed on this host.
+* M9 remains FAIL; M9a and M9b remain blocked.
