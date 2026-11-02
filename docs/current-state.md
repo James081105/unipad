@@ -2050,3 +2050,68 @@ only a diagnostic" from a prefix would let any record exempt itself; and its
 null-check scan became escape-aware, because the first version tested the parity
 of raw quote characters -- which is EVEN inside a C string holding an escaped
 quote, so it skipped nothing.
+
+## 2026-11-02 — build 41441479230 failed, and the guard test earned its keep
+
+**It named a file nobody was editing:**
+
+```
+vm_unix.c:2941:3: error: call to undeclared function 'native_console_report'
+```
+
+Three defects, all one shape.
+
+**1. M7's extern was inside the guard its call was outside.** The declaration sat
+in `#if defined(XNU_NATIVE_VIRTIO_CONSOLE)` and the emitter's call in a second
+hunk, outside it. This is the third build on this one placement -- 41359711528
+found it in `kern_exec.c:8120`, 41364602699 found the caller/definition variant,
+and this one found it in `vm_unix.c:2941`.
+
+**The rule is asymmetric and that is the whole point: the declaration must be
+unconditional, the call may be conditional.** A declaration with no definition is
+free -- the linker only resolves a symbol something REFERENCES -- so an
+unconditional `extern` costs nothing when the emitter is compiled out. A
+conditional one is absent exactly when a caller outside it needs it.
+
+**2. M7's emitter was dead code, and its own comment claimed otherwise.** The
+patch said `vm_unix.o` receives the macro from `build-xnu-4k-baseline.sh:484`'s
+"companion edit". Line 484 passes only `-DXNU_OWNER_CACHE_CARRIER`. So the emitter
+would have compiled to nothing even with the declaration fixed -- a false "CODE
+COMPLETE". The console macro now rides on that line, and the owner-cache-carrier
+stamp is extended to carry it so a change forces `vm_unix.o` to be rebuilt rather
+than reusing a stale object. (It rides on the SAME line rather than a second
+`EXTRA_MAKE_ARGS` entry because make takes the last `vm_unix.o_CFLAGS_ADD`, and a
+second entry would silently discard the carrier one.)
+
+**3. M8 had the same defect, and the new guard test found it before any build
+could.** M8's extern was inside the FIRST of its three `#if` blocks and the
+`launchd.running` emitter is in the THIRD. It compiled only because
+`offline-owner-systemos-mount.patch` happens to carry its own file-scope
+declaration -- a coupling nobody asked for and nothing asserts.
+
+### The guard test, and why it is proven three ways
+
+`tests/unit/test_console_declaration_visibility.py` walks every patch's added
+lines tracking `#if`/`#endif` depth, remembers the depth at which a declaration
+became active, retires it when an `#endif` closes past it, and asserts every call
+site has one still active at a depth no greater than its own.
+
+It is proven against the real patches, against the exact shape this build failed
+on (which MUST go red), and against the pairing that is CORRECT -- a declaration
+and its callers inside the same conditional, which the rule's first revision
+wrongly flagged by demanding depth zero unconditionally. **A guard that goes red
+on correct code is the same as no guard at all**, and this one nearly did.
+
+Two existing tests were wrong and are fixed rather than deleted: one required the
+extern INSIDE the console guard, on the reasoning this build disproved; the other
+anchored on the old gate text.
+
+**That is now three tests in this change set written from reasoning about C
+rather than from a compiler**, each of which would have let the defect through or
+blocked the fix. The pattern is worth naming: the reasoning was *plausible* in
+every case ("a call through zero would be worse", "declared whether or not the
+archive is on the link"), and it was wrong every time.
+
+Verified by replaying the runner's patch order against the committed tree: all 58
+patches apply, and both `kern_exec.c` and `vm_unix.c` now report **zero** call
+sites without a visible declaration. Build **41451414922** dispatched on `eece438`.
