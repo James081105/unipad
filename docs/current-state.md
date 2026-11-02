@@ -1707,3 +1707,80 @@ event name exactly `virtio_blk.read_back`.
 
 So M6's remaining work is the pin bump and nothing else:
 `submodules[drivers/NativeVirtioBlock]` `98909eb` -> `3d05351`.
+
+## 2026-11-02 — the free function is DEAD, and that re-routes every kernel-side emitter
+
+**Measured, not inferred.** Build 41390547018 produced the matched kernel, its
+sha256 `73dbc9598885` verified against `payload.json`'s `payload_kernel_sha256`,
+and all three experiment literals byte-level in it at **one occurrence each**.
+The boot captured **1531 bytes** and ended with:
+
+```
+{"event":"iokit.service_match",...}
+{"event":"iokit.driver_probe",...}
+{"event":"xnu.page_tables",...}
+{"event":"xnu.exception_vectors",...}
+{"event":"xnu.interrupts",...}
+{"event":"diag.control_from_driver","source":"NativeVirtioConsole.start"}
+```
+
+`diag.free_fn_from_driver` is **absent**. The two calls are adjacent lines in
+`start()` -- line 432 the free function, line 433 the member -- with
+`g_console=this` published 143 lines earlier at :289, after five successful
+`send()` calls.
+
+**An independent replication, which is what makes this a fact rather than an
+anecdote:** the mount patch's own `native_console_report()` records
+(`system.mount` and the identity record, called from a *different translation
+unit* entirely) have **never arrived in any capture, across every boot this
+project has taken**. Zero occurrences in every guest log on disk. Meanwhile
+every `send()`-based record lands.
+
+So: two translation units, multiple boots, the free function delivering nothing.
+
+### What is ruled out, and how
+
+* **A competing definition.** No patch defines the symbol -- every occurrence in
+  `patches/` is a call. The driver's archive carries exactly one
+  `native_console_report` and no mangled variant (`_Z21native_console_report`
+  occurs zero times), so the friend declaration at
+  `NativeVirtioConsole.cpp:46` did not fork a second C++-linkage symbol.
+* **`send()` behaving differently between two adjacent calls.** It has no state
+  that could differ: `online` is true, `gate` is held by nobody, and the control
+  record on the next line goes through the identical path.
+* **The host dropping it.** The capture is one 1531-byte chunk parsed line by
+  line; the control record immediately after the free-function call is present.
+
+### What this re-routes
+
+**Every kernel-side emitter in this project routes through this dead path**: the
+M8 `launchd.running`/`daemon.spawned` pair, M7's `dyld.cache_read`, the install
+dispatcher's `install.registered`, and the mount emitter's records. None of them
+can deliver until this is fixed, however correct their source is. That is the
+real reason M7 and M8 were "unpinned for the drain risk" -- the drain risk was
+never the binding constraint.
+
+**And it does NOT touch what already passes.** M4 and M5 pass on
+`iokit.service_match`, `iokit.driver_probe`, `xnu.page_tables`,
+`xnu.exception_vectors` and `xnu.interrupts` -- all five emitted by the driver's
+own `send()`. The gate's current PASSes stand.
+
+### Round two, dispatched, and why round one could not answer it
+
+A record that reports only **absence** cannot distinguish the three surviving
+causes, and they have different remedies:
+
+| status | meaning | remedy |
+|---|---|---|
+| `not_open` | `g_console` is null, so the ternary drops silently | publish it earlier, or find what clears it |
+| `success` | `send()` reports success and the record is still lost | the loss is **downstream of `send()`** -- no entry-point fix will help |
+| `other` | a third failure nothing has named | worth a third round |
+
+So the driver now emits the **return status** as its own record, selected by an
+if-chain so every arm still names an array and `sizeof(arr)-1` stays the record's
+own length. The length-checking test caught the first draft of it for writing
+`sizeof(X) - 1` with spaces, where the driver's style and that test both require
+`sizeof(X)-1` -- a test going red on the fix for the defect it was written to
+catch, in the good sense.
+
+Build **41400938438** dispatched on `120ee05`, console fork at `d2bdce2`.
