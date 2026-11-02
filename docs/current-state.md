@@ -1532,3 +1532,96 @@ the defect it was written to catch.**
 - Build **41382433090** dispatched: the isolating experiment **and** the install
   fix together. One build answers both questions.
 - 78 guard tests green across the console, install and patch suites.
+
+## 2026-11-02 — the declaration goes at block scope, and the block fork was a typo
+
+**Build 41382433090's second pass got past the three errors 41376479360 found and
+stopped on a fourth:**
+
+```
+bsd_init.c:1325:27: error: use of undeclared identifier 'native_install_service_thread'
+```
+
+The file-scope declaration that fixed the *previous* round sits at applied line
+**1377 -- after the call at 1325**. The whole added block begins **inside
+`bsdinit_task()`** (pristine line 1096, five lines into a function opening at
+1073) and the definitions were deliberately placed below it. And there is no
+file-scope position that is both before the call and free of another patch's
+context: the region between `bsd_init()`'s closing brace and `bsdinit_task()` is
+claimed by `offline-owner-root-binding-audit.patch`'s second hunk, whose pretext
+ends at `void bsdinit_task(void)`.
+
+The fix drops `static` from the pair and puts the declaration at **block scope,
+above the call**. The keyword is what is illegal in block scope, not the
+declaration, and the definition drops it to match. The cost is one symbol with
+external linkage in the kernel's table -- namespace pollution rather than a
+correctness problem, and the only option that does not fight another patch for
+the same lines.
+
+### The declaration test has now been wrong about where the declaration goes TWICE
+
+Round one demanded block scope **with** `static` (41376479360 rejected it). Round
+two demanded **file** scope (41382433090 rejected that). Both were written from
+reasoning about C rather than from a compiler -- the same shape as the inter-patch
+guard that passed while the build failed. Both rounds are now recorded in the
+test's docstring.
+
+The durable form names all three constraints the compiler actually settles: the
+declaration **exists**, it is at **block scope** because that is the only position
+before the call, and it does **not** carry `static`.
+
+### It is verified by a five-mutation teeth check, not by agreement
+
+Remove it / add `static` / unindent it / put `static` on the definition / move it
+after the call. **Each mutation must fail on the assertion that names its build
+failure.** The first version of that check matched the exact final declaration
+string, which made three of the five collapse into *"no declaration at all"* -- a
+lie on a tree where one plainly exists, and it would have sent the next reader
+looking in the wrong place. The anchor is now deliberately loose and the
+properties are asserted one at a time.
+
+Two bugs in the check itself were found and fixed: `DECL.lstrip("+")` strips the
+leading `+` too, so the mutated line left the diff entirely and the test failed
+for *absent* rather than for *file scope*; and the `declared` set was originally a
+substring test, which counts a **call** as a declaration and lets a missing
+declaration hide behind the call that needs it. It is now a declaration-**shape**
+matcher: a type, a name, a parameter list, a semicolon.
+
+### The M6 blocker was never permissions -- it was a transposed digit
+
+`git push` to the block fork said *"Repository not found"* for ~75 minutes across
+retries, URL changes and credential-helper overrides. The remote read
+`https://github.com/James081505/VirtioMmioBlock.git`; the authenticated account
+is **`James081105`**. A `gh api` call to the account's own repo list showed
+`James081105/VirtioMmioBlock` sitting there with `push=true`, last pushed
+2026-10-31.
+
+**The rule this time:** when a push to a repo you created says *"not found"*,
+query the account's own repo list before concluding anything about permissions.
+"Not found" from GitHub means *does not exist **or** you cannot see it* -- the two
+are indistinguishable from the client, and one of them is a typo.
+
+The console driver's remote was checked for the same defect and is correct. The
+read-back commit `3d05351` is now pushed to `unipad/virtio-blk-readback` on the
+fork. **M6's `virtio_blk.read_back` is therefore no longer blocked on
+pushability** -- it remains unpinned by choice, so one build measures one thing.
+
+### State
+
+- Main repo at `267f866`. UniXNU fork `unipad/gpu-addon-ngpu-dir` at `0906997`
+  (two commits: the decl-order fix, then a one-line cosmetic follow-up removing a
+  blank line it left between the variable and the declaration).
+- Console fork unchanged at `d25974c` -- nothing in this revision touches it.
+- Lock: `unixnu.commit` = `0906997`, `submodules[drivers/NativeVirtioConsole]` =
+  `d25974c3` (unchanged).
+- Verified by replaying the runner's patch order against the **committed** tree:
+  all 58 patches apply, and the applied `bsd_init.c` carries the declaration at
+  1325, the call at 1326, and the definition at 1643 with no `static` on it.
+- `tests/unit`: 3441 collected, exit code 0 (3431 passed / 10 skipped, unchanged
+  -- this revision edits the install test rather than adding one). The
+  declaration test is 5/5 on the teeth check.
+- Build **41388754631** dispatched on `267f866`: the install fix **and** the
+  isolating experiment, one build. **Check the ESP kernel's byte size before
+  trusting any capture from it** -- the boot inputs are uploaded even when the
+  second kernel pass fails, and they then carry the FIRST-pass kernel
+  (51,859,456 bytes) rather than the second pass's (125,480,960).
