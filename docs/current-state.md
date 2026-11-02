@@ -1667,3 +1667,43 @@ Build **41390547018** dispatched on `ad5bd1f` with
 `unixnu_commit=09069974` and `stage=M10` — this is the first
 `qemu_root_defconfig` build since `9618b868`, which is where the
 `bsd_init.c:1325` failure came from. That is the build that answers it.
+
+## 2026-11-02 — M6's blocker was one of three, and the other two were already solved
+
+The fork push was only the FIRST of M6's blockers, and it turned out to be the
+only one that was actually broken.  The rest of the chain was already in place,
+which is worth recording because it changes the estimate from "a multi-step
+integration" to "a pin bump".
+
+`qemu_root_defconfig` already carries all three:
+
+```
+CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a"
+```
+
+`build-xnu-4k-baseline.sh:170-176` refuses `XNU_NATIVE_VIRTIO_BLOCK=1` unless
+`XNU_NATIVE_AES=1` -- so the AES dependency that looked like extra work is
+already satisfied by the booting config, not something to add.
+
+The archive path is built by
+`vendor/UniXNU-qemu/scripts/build-arm-driver.py:33-37`, which routes
+`--verified_root_bundle` to `build/native-virtio-block-verified-bundle` and
+passes `-DNATIVE_VERIFIED_BLOCK=1` at `:72`.  So the emitter's own guard
+`#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK` is satisfied on
+exactly the path the booting config names -- not on a path nothing takes.
+
+**And the emitter is bounded the same way the install service is.** `3d05351`
+carries `bool readBackReported` as a class member and sets it BEFORE the call, so
+the cost is one record per driver instance on the first successful verified read
+-- against the "thousands of verified reads during a boot" its own comment names.
+That is the structural bound that makes the install service safe to pin while M8
+is not, and M6 now has it too.
+
+The record itself is a static string, not `snprintf`, with `sizeof` applied to the
+ARRAY and a comment naming the fact-228 ternary defect.  One line of valid JSON,
+event name exactly `virtio_blk.read_back`.
+
+So M6's remaining work is the pin bump and nothing else:
+`submodules[drivers/NativeVirtioBlock]` `98909eb` -> `3d05351`.
