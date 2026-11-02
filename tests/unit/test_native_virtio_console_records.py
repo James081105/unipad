@@ -91,6 +91,17 @@ RECORDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     # they come out of both this list and the driver when the measurement lands.
     ("diag.free_fn_from_driver", "free_fn_record", ()),
     ("diag.control_from_driver", "control_record", ()),
+    # Round two of the same experiment.  Round one established the FACT and not
+    # the cause: the free function's record did not arrive on build 41390547018's
+    # matched kernel while the control record on the next line did.  A record
+    # that reports only absence cannot say WHY, and three causes have different
+    # remedies -- g_console null (fix the publication), send() reporting success
+    # with the record still lost (fix the transport, not the entry point), or a
+    # third failure nothing has named yet.  So the status is emitted as its own
+    # record, selected by an if-chain on the return value.
+    ("diag.free_fn_status", "free_fn_ok", ()),
+    ("diag.free_fn_status", "free_fn_notopen", ()),
+    ("diag.free_fn_status", "free_fn_other", ()),
 )
 
 
@@ -507,6 +518,7 @@ def test_the_gate_still_reads_what_the_driver_emits(source):
     DIAGNOSTIC_EVENTS = {
         "diag.free_fn_from_driver",
         "diag.control_from_driver",
+        "diag.free_fn_status",
     }
 
     emitted: set[str] = set()
@@ -707,31 +719,66 @@ def test_the_port_is_published_only_after_the_port_is_really_there(source):
 
 
 def test_the_port_is_withdrawn_when_the_device_is_stopped(source):
-    """g_console=nullptr in cleanup(), and only when the port was stopped.
+    """``g_console`` is withdrawn in ``cleanup()``, and only by its publisher.
 
-    The pointer is written under the same IOLock send() takes, which is what
-    makes the teardown race safe: a reporter that read a non-null g_console
-    just before cleanup() blocks on the lock, and by the time it gets in,
-    online is false and send() refuses without touching freed memory.
+    THREE conditions, and each one was a defect or a near-miss:
+
+    1. **Only when the port was stopped.** ``reset()`` reports that, and the
+       withdrawal must come after it -- a failed reset leaves the device
+       reachable and the pointer must survive it.  The pointer is written under
+       the same ``IOLock`` ``send()`` takes, which is what makes the teardown
+       race safe: a reporter that read a non-null ``g_console`` just before
+       ``cleanup()`` blocks on the lock, and by the time it gets in, ``online``
+       is false and ``send()`` refuses without touching freed memory.
+
+    2. **Only by the instance that published it.** ``reset()`` returns true for
+       an instance that never started -- ``if(!registers || !ownsDevice)return
+       true`` -- so an unguarded withdrawal lets ANY instance's teardown
+       unpublish a different, live instance's port.
+
+    3. **Exactly one withdrawal.** The declaration also initialises the pointer,
+       and counting it as a withdrawal would make this assertion require zero
+       -- i.e. that the port is never published at all.
+
+    Condition 2 is measured, not defensive.  Build 41400938438's capture carried
+    ``diag.free_fn_status`` as ``"not_open"`` while the control record on the
+    next line arrived -- from inside ``start()``, with ``g_console=this``
+    published 143 lines earlier and nothing between the two that assigns it.
+    ``g_console`` had been cleared by another instance's teardown, and
+    ``native_console_report()`` -- the entry point every kernel-side emitter in
+    this project routes through -- had been dropping records silently for
+    exactly that reason, on every boot, since the port was first published.
     """
     body = _strip_comments(source)
     cleanup = body.find("void NativeVirtioConsole::cleanup")
     assert cleanup != -1, "cleanup() is gone"
     stop = body.find("bool stopped=reset()", cleanup)
-    withdraw = body.find("g_console=nullptr", cleanup)
     assert stop != -1, "cleanup() no longer calls reset()"
-    assert withdraw != -1, "cleanup() no longer withdraws g_console"
+    withdraw = body.find("g_console = nullptr", cleanup)
+    assert withdraw != -1, (
+        "cleanup() no longer withdraws g_console.  The pointer is written under "
+        "the same IOLock send() takes, which is what makes the teardown race "
+        "safe; without the withdrawal a stopped driver leaves a pointer to "
+        "freed queue buffers."
+    )
     assert withdraw > stop, (
         "g_console is withdrawn before reset() reports whether the port was "
         "stopped; a failed reset leaves the device reachable and the pointer "
         "must survive it"
     )
-    body = _strip_comments(source)
+    guard = body.rfind("g_console == this", 0, withdraw)
+    assert guard != -1 and guard > stop, (
+        "the withdrawal is not guarded by `g_console == this`, so ANY "
+        "instance's cleanup() unpublishes the port -- including an instance "
+        "that never started, because reset() returns true when there are no "
+        "registers and no device.  Measured as build 41400938438's "
+        "diag.free_fn_status == \"not_open\"."
+    )
     # The declaration initialises the pointer too, and counting it as a
     # withdrawal would make this assertion require zero -- i.e. that the port is
     # never published at all.  Remove the declaration, then count.
     without_declaration = body.replace(
         "static NativeVirtioConsole *g_console=nullptr;", "")
-    assert without_declaration.count("g_console=nullptr") == 1, (
+    assert without_declaration.count("g_console = nullptr") == 1, (
         "g_console is withdrawn in more than one place"
     )

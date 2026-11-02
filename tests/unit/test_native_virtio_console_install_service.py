@@ -370,9 +370,32 @@ def test_the_records_only_route_to_disk_is_the_port_the_gate_reads():
     emitter could be repointed at another sink, the capture could be renamed to
     something the gate does not glob (``agent.log`` was, and the records sat on
     disk unread after every boot), or the gate's globs could move.
+
+    DIAGNOSTIC RECORDS ARE ALLOWED, AND NAMED EXPLICITLY.  Two of them exist to
+    answer why ``install.registered`` never arrives: a host put fifty
+    well-formed frames on the channel (MEASURED, 50 successful sendall calls,
+    zero errors) and the record did not come back, with ``diag.free_fn_status``
+    reporting ``success``.  That leaves three causes with different remedies --
+    the thread never started, ``native_console_poll()`` never returns data, or
+    the recogniser rejects the frame -- and nothing outside the guest can tell
+    them apart.  One record at the top of the thread and one on the first
+    non-empty poll split the first two.
+
+    They are listed by name rather than inferred from a prefix, because
+    inferring "this one is only a diagnostic" from the name would let any
+    record exempt itself from the one-write rule.
     """
     text = _patch_text()
     code = _code_lines(text)
+
+    #: Records that measure the route rather than satisfy a requirement.
+    #: No probe names any of them, and they come out when the question closes.
+    DIAGNOSTIC_RECORDS = ("diag.install_thread_started", "diag.install_rx_bytes")
+    #: The C variable each diagnostic record is built into.  The WRITE line
+    #: names the variable, not the event, so matching on the event name alone
+    #: matches nothing and every diagnostic write reads as unexplained.
+    DIAGNOSTIC_VARS = ("thread_started_record", "rx_bytes_record",
+                      "install_start_ok", "install_start_failed")
 
     # The declaration names the symbol once and is not a write.  Without
     # this filter, adding the declaration build 41376479360 demanded made
@@ -382,12 +405,25 @@ def test_the_records_only_route_to_disk_is_the_port_the_gate_reads():
                 if "native_console_report(" in line
                 and not line.startswith("extern")]
     assert emitters, "the patch never hands a record to the console port"
-    assert all(
-        line.startswith("native_console_report(native_install_record,") for line in emitters
-    ), (
-        f"the patch writes to the port with something other than the record: "
-        f"{emitters}.  A record that reaches disk by another route is not the "
-        f"record this test can see."
+    requirement_writes = [
+        line for line in emitters
+        if "native_install_record" in line]
+    diagnostic_writes = [
+        line for line in emitters
+        if any(name in line for name in DIAGNOSTIC_VARS)]
+    assert requirement_writes, (
+        "the patch no longer writes install.registered itself, so the one "
+        "record that clears a four-milestone blocker is gone")
+    assert len(requirement_writes) == 1, (
+        f"install.registered is written {len(requirement_writes)} times, not "
+        f"once: {requirement_writes}")
+    unexplained = [line for line in emitters
+                   if line not in requirement_writes
+                   and line not in diagnostic_writes]
+    assert not unexplained, (
+        f"the patch writes to the port with something other than the record "
+        f"or a named diagnostic: {unexplained}.  A record that reaches disk by "
+        f"another route is not the record this test can see."
     )
     # No other sink.  printf/kprintf would put the record in the kernel ring,
     # which the gate does not read, and would look like success locally.  The
@@ -635,11 +671,29 @@ def test_the_dispatcher_does_not_answer_the_host():
     writes = [line for line in code
               if "native_console_report(" in line
               and not line.startswith("extern")]
-    assert len(writes) == 1, (
-        f"the port is written {len(writes)} times, not once: {writes}.  A "
-        f"second write of the same event is silently dropped by the host "
-        f"(_guest_events uses setdefault), so a reader of the log would never "
-        f"see it -- and a write of a DIFFERENT event arms one of the vetoes."
+    #: Records that measure the route rather than satisfy a requirement.  No
+    #: probe names any of them, and they come out when the question closes.
+    DIAGNOSTIC_RECORDS = ("diag.install_thread_started", "diag.install_rx_bytes")
+    #: The C variable each diagnostic record is built into.  The WRITE line
+    #: names the variable, not the event, so matching on the event name alone
+    #: matches nothing and every diagnostic write reads as unexplained.
+    DIAGNOSTIC_VARS = ("thread_started_record", "rx_bytes_record",
+                      "install_start_ok", "install_start_failed")
+    requirement_writes = [line for line in writes
+                          if "native_install_record" in line]
+    assert len(requirement_writes) == 1, (
+        f"install.registered is written {len(requirement_writes)} times, not "
+        f"once: {requirement_writes}.  A second write of the same event is "
+        f"silently dropped by the host (_guest_events uses setdefault), so a "
+        f"reader of the log would never see it.")
+    unexplained = [line for line in writes
+                   if line not in requirement_writes
+                   and not any(name in line for name in DIAGNOSTIC_VARS)]
+    assert not unexplained, (
+        f"the port is written with something other than install.registered or "
+        f"a named diagnostic: {unexplained}.  A write of a DIFFERENT event arms "
+        f"one of the vetoes -- see this test's docstring for the three ways a "
+        f"reply turns a cleared blocker into a failed milestone."
     )
 
 
@@ -957,19 +1011,41 @@ def test_no_null_check_decides_whether_a_record_is_emitted():
             continue
         if line.startswith("extern"):
             continue                    # the declaration, which names it once
+        # A symbol name inside a STRING LITERAL is text, not code.  The
+        # diagnostics below name the entry point in their own "source" field,
+        # and without this skip the test reads that as a use of the symbol as a
+        # value -- the same shape as the kprintf scan matching this patch's own
+        # pretext, and the fourth time that shape has bitten this project.
+        #
+        # The scan is ESCAPE-AWARE, because the parity of raw quote characters
+        # is the wrong test here: a C string holding an escaped quote reads
+        # `"\"source\":\"XNU.native_console_poll\"...`, and by the time the
+        # symbol is reached the count of `"` characters is EVEN even though the
+        # scanner is inside the literal.  The first version of this skip used
+        # that parity and did not skip anything.
         for symbol in ("native_console_poll", "native_console_report"):
-            start = line.find(symbol)
-            while start != -1:
-                after = line[start + len(symbol):].lstrip()
-                assert after.startswith("("), (
-                    f"the patch uses {symbol} as a value rather than calling it: "
-                    f"{line!r}.  A null check or a conditional on the symbol "
-                    f"would make a linker that dropped the definition look like "
-                    f"a deliberate design decision.  Test the RETURN STATUS "
-                    f"instead: native_console_poll() returns kIOReturnNotOpen "
-                    f"while no console is live, which the reader waits out."
-                )
-                start = line.find(symbol, start + len(symbol))
+            if symbol not in line:
+                continue
+            inside = False
+            escaped = False
+            for index, char in enumerate(line):
+                if escaped:
+                    escaped = False
+                elif char == BACKSLASH:
+                    escaped = True
+                elif char == '"':
+                    inside = not inside
+                elif not inside and line.startswith(symbol, index):
+                    after = line[index + len(symbol):].lstrip()
+                    assert after.startswith("("), (
+                        f"the patch uses {symbol} as a value rather than "
+                        f"calling it: {line!r}.  A null check or a conditional "
+                        f"on the symbol would make a linker that dropped the "
+                        f"definition look like a deliberate design decision.  "
+                        f"Test the RETURN STATUS instead: "
+                        f"native_console_poll() returns kIOReturnNotOpen while "
+                        f"no console is live, which the reader waits out."
+                    )
 
 
 def test_the_record_is_an_array_whose_sizeof_is_of_the_array():
