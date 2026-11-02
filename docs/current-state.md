@@ -170,15 +170,23 @@ built, and nothing has reached the guest channel. In particular:
 
 ## Next actions, in order
 
-1. **Read build 41350610831.** It is the one that answers the diagnostic
-   question. Fetch the boot inputs with
-   `python -u local-private/tmp/fetch-boot-inputs-run.py 41350610831` and run
-   `python -u local-private/tmp/root-mount-capture.py`, whose `REQUIRED_EVENTS`
-   already includes `system.mount` and `system.volume_identity`. Then re-read the
-   gate with `python -u local-private/tmp/reread-gate.py`. **Look for
+1. **Read build 41364602699** (pin `8e492f5`, the declaration fix). It is the
+   one that should finally compile AND run the diagnostic. Fetch the boot inputs
+   with `python -u local-private/tmp/fetch-boot-inputs-run.py 41364602699` and run
+   `UNIPAD_RUN_ID=41364602699 python -u local-private/tmp/root-mount-capture.py`,
+   whose `REQUIRED_EVENTS` already includes `system.mount` and
+   `system.volume_identity`. Then read the gate with
+   `python -u local-private/tmp/read-gate.py`. **Look for
    `diag.load_init_program_entered` first** — that record, not the mount records,
-   is what this build was dispatched to measure. If it is absent, stop and read
-   the two outcomes in the 2026-11-02 section below before touching anything.
+   is what this build was dispatched to measure.
+   - **It arrives** → the port works from `kern_exec.c`, and the question moves
+     to why the prepare call below it does not run.
+   - **It does not** → the port is unreachable from this translation unit and the
+     emitter needs a different route entirely.
+   - **The guest hangs, or the log is far shorter than t=1500 s** → that is the
+     DRAIN. `send()` is a synchronous round trip with a two-second deadline, so
+     measure how many records arrived before it stalled rather than treating it
+     as a boot failure. This is the risk the three unpinned emitters carry.
 2. **`dyld.cache_read` — M7's third requirement. IN FLIGHT** (worktree branch
    `dyld-cache-read-emitter`). Mapped site: `cs_native4k_prepare()` at
    `bsd/kern/ubc_subr.c:5765`, the read at `:5818`, `error = 0` at `:5858`.
@@ -233,13 +241,19 @@ whose kernel carries the announcement; it is already extracted at
 `local-private/tmp/bundle13`.
 
 ```bash
-# The current run: 41350610831 (inter-patch fix at 94a131e). The scripts are
-# parameterised, but not the same way: the fetcher takes the run id as argv[1],
-# the capture reads UNIPAD_RUN_ID from the environment and defaults its bundle
-# to local-private/tmp/bundle-<run-id>.
-python -u local-private/tmp/fetch-boot-inputs-run.py 41350610831
-UNIPAD_RUN_ID=41350610831 python -u local-private/tmp/root-mount-capture.py
-python -u local-private/tmp/reread-gate.py
+# The current run: 41364602699 (pin 8e492f5, the declaration fix). The scripts
+# are parameterised, but not the same way: the fetcher takes the run id as
+# argv[1], the capture reads UNIPAD_RUN_ID from the environment and defaults its
+# bundle to local-private/tmp/bundle-<run-id>.
+python -u local-private/tmp/fetch-boot-inputs-run.py 41364602699
+UNIPAD_RUN_ID=41364602699 python -u local-private/tmp/root-mount-capture.py
+python -u local-private/tmp/read-gate.py
+
+# Prove the patch SET applies, in the runner's own order, against the real XNU
+# source.  This is the only validated instrument for the inter-patch class of
+# defect; it needs local-private/upstream/xnu, so it cannot run in CI.
+rm -rf local-private/tmp/xnu-work-repro local-private/tmp/staged-patches
+python -u local-private/tmp/repro-patch-order.py
 
 # Byte-level proof the records are in the kernel the guest boots.
 python -u local-private/tmp/verify-records-in-kernel.py local-private/tmp/bundle15-check
@@ -251,8 +265,8 @@ python -u local-private/tmp/extract-one-member.py local-private/tmp/bundle15.zip
 # ...and validate the extractor offline against a known answer first.
 python -u local-private/tmp/validate-extractor.py
 
-# Re-read the gate after a capture lands (M3..M12, with the blockers).
-python -u local-private/tmp/reread-gate.py
+# Read the gate (M0..M12 and WP00..WP04, with the blockers and the vetoes).
+python -u local-private/tmp/read-gate.py
 
 # Stage a whole verified bundle from a build run, in one command.
 python -u local-private/tmp/stage-bundle-from-run.py 41296027165 local-private/tmp/bundle16
