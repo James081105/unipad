@@ -2488,3 +2488,108 @@ carries `springboard.running`, which will be the first compile of that emitter.
   turns on: `homescreen_screenshot_only` fires on the ABSENCE of
   `springboard.interaction`, so `springboard.running` alone moves M9 from FAIL to
   still-FAIL.
+
+---
+
+# Interval 2026-11-03 (fourth): M9 is code-complete on both halves
+
+## What landed
+
+`springboard.interaction`, the record the PRD veto actually turns on, in
+`vendor/UniXNU-qemu/package/HidInputProbe.cpp`, pushed as `068f440` on
+`unipad/qemu-metal-bridge-stubs` and pinned as `device_repo.commit`.
+
+The design, and why it is not the obvious one:
+
+* **digest, deliver, digest again, report only if the two differ.**  The veto
+  (`milestones.py:1745-1752`) refuses a homescreen screenshot plus a mouse click,
+  so the record cannot mean "input was delivered".  An emitter that fires when the
+  report reaches the HID stack would clear `p.springboard_interaction` AND clear
+  the veto, and the release verdict would improve while the guest stood still.
+* **the digest reads `PE_current_console()` plus the presenter's exported
+  `native_gop_ready` / `native_gop_virtual` / `native_gop_physical`.**  It does not
+  reach into `NativeMobileDisplay`'s private `IOMemoryMap`, and it cross-checks
+  `native_gop_physical == video.v_baseAddr` -- the presenter's own proof that the
+  mapping being read is the one it validated.
+* **armed on events 4, 5 and 6 only** -- the reports actually delivered.  0, 1, 2,
+  3 and 7 are probe lifecycle and liveness; arming on those would make the record
+  about this driver's own bookkeeping.
+* **compared on the timer's own 1-second cadence** (`tick()` at
+  `NativeHidInput.cpp:233` calls `native_hid_live_checkpoint()`), which is long
+  enough for SpringBoard to have drawn and short enough that the guest has not
+  moved on.
+* **FNV-1a, eight bytes at a time** where the row allows it, because a
+  3048x2032x32 frame is ~24 MB and a byte-wise pass on the work loop's timer
+  thread is long enough to delay the next input report.  The tail is byte-wise
+  because `v_rowBytes` is only guaranteed to be a multiple of 4.
+
+## The linkage question, answered BEFORE writing the code
+
+The risk was that `HidInputProbe.o` is force-loaded in a configuration whose link
+does not carry the console archive, which would make a strong
+`extern native_console_report` a link error.  Established from the sources rather
+than assumed:
+
+| fact | evidence |
+|---|---|
+| `HidInputProbe.o` is on the kernel link | `build-native-legacy-display.py:252-254` puts it in `libNativeLegacyDisplay.late.a` |
+| that archive is force-loaded | `build-xnu-4k-baseline.sh:625-627` |
+| the console archive is force-loaded separately | `build-xnu-4k-baseline.sh:672-677`, gated on `NATIVE_VIRTIO_CONSOLE = 1` |
+| the legacy archive is gated on `NATIVE_LEGACY_DISPLAY = 1` | `build-xnu-4k-baseline.sh:625-627` |
+| only `qemu_root_defconfig` sets `NATIVE_LEGACY_DISPLAY` | `configs/qemu_root_defconfig:39` |
+| that same config sets `NATIVE_VIRTIO_CONSOLE` | `configs/qemu_root_defconfig:47` |
+| `qemu_defconfig` sets NEITHER | `configs/qemu_defconfig:8` says it is left out |
+
+So there is no configuration in which the reference is unresolved.  That is what
+allows it to be STRONG, and a strong reference is what makes a missing archive
+fail the link naming the symbol instead of silently dropping the record -- the
+defect that cost build 41330622788 two records behind a green build.
+
+`package/HidInputProbe.cpp` is the source of truth even though the build script
+names `kits/qemu/HidInputProbe.cpp`: `board.toml:11` -- `kit = "qemu"  #
+package/ of this repository appears as kits/qemu in the build tree`.
+
+## Three of my own wrong assumptions, corrected in the tests
+
+Each was a wrong guess about the architecture, not a defect in the code, and each
+would have left a test asserting something false:
+
+1. **`_vendor_tree()` scanned only `vendor/UniXNU`** and reported "no emitter
+   exists" against a file in the device repository that has one.  Same class of
+   mistake as the escaped-literal one.
+2. **The coupling test demanded `NativeHidInput.cpp` emit the record**, on the
+   theory that the input driver is where input is delivered.  True of the
+   delivery; the emitter belongs one level up, in the file that owns the hook.
+3. **The digest test looked for the presenter's private `IOMemoryMap`.**  The
+   digest reads its exported globals plus `PE_current_console()`, which is the
+   better idiom and needs no driver change.
+
+The escaped-literal decoding now covers C sources as well as patches, for the
+same reason it was added for patches.
+
+## What is NOT claimed
+
+* **No changed-byte count in the record.**  Computing one means holding a second
+  copy of a ~24 MB frame.  The docstring claimed one before it was written; that
+  is corrected rather than left standing.
+* **A digest changing does not prove the user's intent was honoured.**  A clock
+  redraw would also change it.  The record carries BOTH digests so a reader can
+  see which two states were compared.
+* **Compile UNVERIFIED, wire UNMEASURED.**  This host has no C compiler.  No
+  kernel carrying either emitter has compiled.
+* **M9 is still FAIL at the gate.**  Code-complete is not passing: the veto fires
+  on wire evidence, not on source.
+
+## Housekeeping
+
+`local-private/tmp` held 30 GB against 14 GB free on F:.  Reclaimed 11 GB by name
+(`build-logs-413*`, `bundle-*`, `bundle1x`) -- never `shell/`, never
+`pytest-of-*`.  F: is now at 25 GB free.
+
+## In flight
+
+Build **41506272367** (`exp-2026-11-03-decl-fix-and-springboard-M10`) carries the
+declaration fix and `springboard.running` and the install diagnostic, but NOT the
+interaction emitter -- it was dispatched before the device pin moved.  It is the
+build that answers whether `kernel_thread_start` succeeds.  A further build is
+needed afterwards to compile the interaction emitter at all.
