@@ -1625,3 +1625,45 @@ pushability** -- it remains unpinned by choice, so one build measures one thing.
   trusting any capture from it** -- the boot inputs are uploaded even when the
   second kernel pass fails, and they then carry the FIRST-pass kernel
   (51,859,456 bytes) rather than the second pass's (125,480,960).
+
+## 2026-11-02 — a green build that verified nothing, and the workflow that can
+
+**Build 41388754631 concluded success, and it does NOT verify the install
+dispatcher.** Both of its jobs select `qemu_defconfig`:
+
+```
+python3 "$VENDOR_DIR/UniXNU/unixnu" defconfig qemu_defconfig ...
+== configuration qemu_defconfig -> .../unixnu-out/qemu/.config
+```
+
+`qemu_defconfig` does not set `XNU_OWNER_ROOT_TRUST`, so the dispatcher's guard
+`XNU_OWNER_ROOT_TRUST && !XNU_NATIVE_OFFLINE_GPU` is **false and the whole block
+is compiled out**. The kernel compiled and linked (`LD
+mach.development.bcm2837.unstripped.noctf`, `LDFILELIST bsd`, zero error lines)
+and the driver archive is on disk — all true, and all orthogonal to the
+dispatcher.
+
+**The compiler diagnostics confirm which file layout it used, but they cannot
+confirm the macro.** The reported `bsd_init.c` line numbers (241, 242, 260, ...
+1295, 1860) match the WITH-install source exactly — 1295 is the `-Wformat`
+`panic("bsd_do_post: ...")`, 1860 is the `-Wcast-function-type-strict`
+`STARTUP(TUNABLES, ...)`. That proves the compiler read this file version; it
+does **not** prove the `#if` was true, because the inactive lines still occupy
+those line numbers.
+
+### The rule, and it is the seventh of this shape
+
+**A green build only verifies the configuration it actually selected.** The four
+dispatcher defects were all found by the SECOND pass, `qemu_root_defconfig`,
+which lives in `build-macos` — not in `build-kernel-console`. Reading a
+`build-kernel-console` success as "the dispatcher compiles" is the same error as
+reading a passing guard test as "the constraint holds": the instrument never
+exercised the thing.
+
+The install dispatcher has therefore **still never been compiled by any
+compiler**. Every error so far came from the one configuration that includes it.
+
+Build **41390547018** dispatched on `ad5bd1f` with
+`unixnu_commit=09069974` and `stage=M10` — this is the first
+`qemu_root_defconfig` build since `9618b868`, which is where the
+`bsd_init.c:1325` failure came from. That is the build that answers it.

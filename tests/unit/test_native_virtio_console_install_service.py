@@ -1378,3 +1378,54 @@ def test_the_poll_entry_point_is_a_byte_transport_and_nothing_more(source):
             f"magic, so 'not GPU magic therefore install' would silently "
             f"reclassify every future protocol."
         )
+
+
+def test_the_workflow_that_can_verify_the_dispatcher_is_named():
+    """``build-kernel-console`` cannot verify the dispatcher, and this says so.
+
+    Build 41388754631 concluded **success** on the decl-order fix, and it
+    verified nothing about the dispatcher.  Both of its jobs select
+    ``qemu_defconfig``:
+
+        python3 "$VENDOR_DIR/UniXNU/unixnu" defconfig qemu_defconfig ...
+
+    ``qemu_defconfig`` does not set ``CONFIG_XNU_OWNER_ROOT_TRUST``, so the
+    dispatcher's guard is false and the whole block is compiled out.  The kernel
+    compiled and linked, the driver archive is on disk, and none of it touched
+    the dispatcher.  Every one of the four defects so far came from the SECOND
+    pass, ``qemu_root_defconfig``, which lives in ``build-macos``.
+
+    **A green build only verifies the configuration it actually selected.**  The
+    tests above already pin which defconfig enables the guard; what was missing
+    is which WORKFLOW builds it, and that is the one that has to be dispatched.
+    Reading a ``build-kernel-console`` success as "the dispatcher compiles" is
+    the same shape as reading a passing guard test as "the constraint holds":
+    the instrument never exercised the thing.
+
+    The dispatcher has still never been compiled by any compiler.
+    """
+    console_wf = REPO / ".github" / "workflows" / "build-kernel-console.yml"
+    macos_wf = REPO / ".github" / "workflows" / "build-macos.yml"
+    require(console_wf, macos_wf)
+
+    console = console_wf.read_text(encoding="utf-8")
+    assert "defconfig qemu_root_defconfig" not in console, (
+        "build-kernel-console now builds qemu_root_defconfig.  That workflow "
+        "does not force-load the console archive on the link "
+        "(-Wl,-force_load,<archive> is qemu_root_defconfig's, per its own "
+        "comment), so a dispatcher compiled here would fail to link rather "
+        "than being compiled out -- and the workflow's own stated reason for "
+        "using qemu_defconfig no longer applies."
+    )
+    assert "defconfig qemu_defconfig" in console, (
+        "build-kernel-console no longer builds qemu_defconfig, so the assertion "
+        "above is measuring nothing"
+    )
+
+    macos = macos_wf.read_text(encoding="utf-8")
+    assert "qemu_root_defconfig" in macos, (
+        "build-macos no longer mentions qemu_root_defconfig, so NO workflow "
+        "builds the config that compiles the dispatcher -- which means the "
+        "dispatcher is compiled by nobody and install.registered can never be "
+        "emitted, however correct its source is."
+    )
