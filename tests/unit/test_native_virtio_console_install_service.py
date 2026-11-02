@@ -1256,6 +1256,15 @@ def test_the_install_patch_applies_to_its_own_minus_side():
     headers are checked for reachability, which is the defect that cost run
     40981242194 a patch whose every count was correct.
     """
+    # The patch lives in the pinned UniXNU checkout, which a clean checkout
+    # (every CI run, and `git archive HEAD`) does not have.  Measured on run
+    # 41497905806: this test failed on such a checkout with a missing-file
+    # error, and the guarded-modules test above it failed for the same reason
+    # -- one unguarded read turns into two red stages.  `require` skips when the
+    # owning checkout is absent and fails when it is present and the file is
+    # not, which is the split the project wants.
+    require(PATCH)
+
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(

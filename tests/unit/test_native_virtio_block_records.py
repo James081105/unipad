@@ -378,6 +378,13 @@ def test_no_second_virtio_blk_event_name_exists_anywhere_in_the_fork():
     quoted in a comment is not an emitted event, and a scan that does not strip
     comments goes red on its own documentation.
     """
+    # The fork is a pinned checkout this host acquires separately, and a clean
+    # checkout (every CI run, and `git archive HEAD`) has none.  Without it there
+    # is nothing to scan, and the honest answer is "not verified here" -- which is
+    # what `require` records.  Measured: on run 41497905806 this test failed with
+    # "no driver fork files to scan" on a checkout that had never acquired one,
+    # which is a red stage for a reason no code change can fix.
+    require(PINNED)
     files = _fork_files()
     assert files, "no driver fork files to scan"
     offenders: list[str] = []
