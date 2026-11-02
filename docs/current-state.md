@@ -2178,3 +2178,54 @@ demanded.
 
 **M6, M7 and the install diagnostics are unaffected** and are measured in build
 **41461647339**, dispatched on `9e96302`.
+
+## 2026-11-02 — M7 compiles for the first time; the install thread does not run
+
+**Build 41461647339 concluded success, step 21 included.** Its kernel (sha256
+verified against `payload.json`) carries, at one occurrence each:
+
+```
+dyld.cache_read                1     <- M7, compiled for the first time
+virtio_blk.read_back           1     <- M6
+install.registered             1     <- the install dispatcher
+diag.install_thread_started    1     <- the new thread diagnostic
+diag.install_rx_bytes          1     <- the new RX diagnostic
+diag.free_fn_status            3
+launchd.running                0     <- M8, correctly held back
+```
+
+The capture (1654 bytes, 1500-second window) put **50 install frames on the
+channel with zero send errors**, and `diag.free_fn_status` arrived as `success`.
+None of `dyld.cache_read`, `virtio_blk.read_back` or `install.registered` arrived
+-- and **neither did `diag.install_thread_started`**.
+
+### What that last absence means
+
+`diag.install_thread_started` is the FIRST statement of
+`native_install_service_thread()`, emitted through the same
+`native_console_report()` that delivered `diag.free_fn_status` three lines later
+in the same capture. So the entry point works and the record is byte-level in the
+kernel. **The thread is not reaching its first statement.**
+
+The `kernel_thread_start(native_install_service_thread, ...)` call is in the
+applied `bsd_init.c` at :1325, inside the `XNU_OWNER_ROOT_TRUST && !GPU` guard
+whose macro is provably set (the record is in the kernel). So the code is compiled
+and the call is there. Whether `kernel_thread_start` returns non-KERN_SUCCESS, or
+the thread is created and dies before its first statement, is the next question --
+and it is a narrower one than "does the host write reach the guest", which the 50
+clean sends have now answered: **it does.**
+
+### The other two are UNMEASURED, and the reason is the window
+
+M7's site is per-process and M6's sits behind a SHA-256 verification of every
+4096-byte block against the owner-signed manifest. Both happen later in the boot
+than 1500 seconds reaches -- the same instrument limitation the 5x window
+extension exonerated rather than confirmed. **Compile VERIFIED, wire UNMEASURED**
+for both, and the distinction is the whole point: nothing here says either emitter
+is wrong.
+
+### Where the four-milestone blocker stands
+
+M10, M10a, M11 and M12 stay BLOCKED. The dispatcher compiles, the record is in the
+booting kernel, the host write is measured working, and the console entry point is
+measured working. What is left is that the reader thread does not run.
