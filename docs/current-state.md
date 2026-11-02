@@ -1759,7 +1759,7 @@ So: two translation units, multiple boots, the free function delivering nothing.
 emitter's records. None of them can deliver until this is fixed, however correct
 their source is.
 
-**So the drain risk was never the binding constraint on M7 and M8 -- this was.**
+**So the drain risk was never the binding constraint on M7 and M8.**
 Both were held back as "CODE COMPLETE but unpinned, pending the drain
 measurement", which read as a prudence about a hang. The real reason they could
 not have delivered is a dead entry point. And **M6 must NOT be pinned now**: its
@@ -1850,3 +1850,141 @@ the guard turns it red.
 Build **41407044961** dispatched on `8a3e5cd`, console fork at `3ca09c9`. Its
 capture should show `diag.free_fn_status` as `success` and
 `diag.free_fn_from_driver` arriving for the first time.
+
+## 2026-11-02 — the fix is measured: `diag.free_fn_from_driver` arrives for the first time
+
+**Build 41407044961, capture 1675 bytes, kernel sha256 `f9f2cc5c5c17` verified
+against `payload.json`:**
+
+```
+{"event":"iokit.service_match",...}
+{"event":"iokit.driver_probe",...}
+{"event":"xnu.page_tables",...}
+{"event":"xnu.exception_vectors",...}
+{"event":"xnu.interrupts",...}
+{"event":"diag.free_fn_from_driver","source":"NativeVirtioConsole.start"}
+{"event":"diag.free_fn_status","status":"success"}
+{"event":"diag.control_from_driver","source":"NativeVirtioConsole.start"}
+```
+
+**`diag.free_fn_from_driver` has NEVER appeared in any capture before this boot.**
+The publisher guard at `cleanup()` — `if (g_console == this)` — is what delivered
+it, and `diag.free_fn_status` reports `success`, which is `send()`'s own verdict
+rather than an inference from the record's presence.
+
+So `native_console_report()` works. **Every kernel-side emitter in this project is
+now viable**: M6's `virtio_blk.read_back`, the M8 `launchd.running`/`daemon.spawned`
+pair, M7's `dyld.cache_read`, the install dispatcher's `install.registered`, and
+the mount emitter's records.
+
+`install.registered` is still absent, and that is expected rather than a failure:
+the dispatcher emits it only after a host install frame reaches the guest's RX
+virtqueue, and no host client exists that sends one.
+
+**One defect in the instrument, recorded because it produced a wrong sentence on a
+right measurement.** The capture script's conclusion branch treated
+`status == "success"` as *"the record is still absent, so the loss is downstream"*
+— correct for round two, where a success with an absent record would have meant
+exactly that. Round three got a success WITH the record present, so the script
+printed that sentence anyway. The raw data is unambiguous; the prose was written
+for a state that did not occur. **A conclusion template that does not enumerate
+the state it is actually in will describe the wrong one.**
+
+### And a correction to what "unpinned" meant for M7 and M8
+
+Both patches were described as **"CODE COMPLETE but unpinned, pending the drain
+measurement"**. The mechanical fact is stronger and simpler: **they were never in
+the build at all.**
+
+`vendor/UniXNU/patches/xnu/native-dyld-cache-read.patch` and
+`zzz-m8-launchd-daemon-events.patch` exist in the working tree and are
+byte-identical to their copies under `local-private/tmp/parked-patches/`, but
+`git status` in the UniXNU submodule reports both as `??` -- untracked. The pinned
+commit `0906997` carries 54 tracked patches and neither of these. `patches/xnu/
+*.patch` is globbed from the assembled tree, so an untracked file in a working
+tree the build never sees is applied by nobody.
+
+That is why their records were absent from every kernel measured: not compiled
+out, not switched off, **not compiled**. The drain risk was a real reason to be
+careful, but it was not what was holding them back.
+
+The rule this time: **"CODE COMPLETE but unpinned" has two very different
+meanings** -- a file that is applied and switched off by a guard, and a file that
+is not in the pinned commit at all. They look identical in a state document and
+they have different remedies. `git ls-tree HEAD` on the directory settles it in
+one command.
+
+### What is now unblocked, and in what order
+
+M6, M7 and M8 are all CODE COMPLETE and all route through the entry point that now
+works. Two things stand between here and measuring them:
+
+1. **M7 and M8 carry defects that predate this fix** and must be corrected first —
+   both have `if (native_console_report)` null checks, which is the exact shape of
+   the defect that dropped records behind a green build on 41330622788, and M8's
+   `daemon.spawned` emits with a computed length `(size_t)at` rather than
+   `sizeof(array)-1`.
+2. **The drain question is now the only open risk for M8**, whose emitter fires per
+   successful exec (measured at ≥75 per boot) against the install service's
+   structural bound of one.
+
+The diagnostic records stay in the driver until M6/M7/M8 have been measured — they
+are the instrument that just earned its keep, and they come out of both lists
+after.
+
+## 2026-11-02 — M6 pinned and measured INCONCLUSIVE, because the capture window was too short
+
+**Build 41416745307, kernel sha256 verified, `virtio_blk.read_back` byte-level in it
+at one occurrence.** The boot captured 1675 bytes and the record did **not**
+arrive — with `diag.free_fn_status` reporting `success`, so the entry point works
+and the emitter simply never ran.
+
+**That is an inconclusive measurement, not a negative one, and the reason is the
+instrument.** Every capture this project has taken listens for **300 seconds**
+after the kernel handoff. The block driver's emitter sits behind
+`result == kIOReturnSuccess && actual == count * 512`, and `result` is success only
+after `readSectors()`'s `vr_verify_block()` loop has compared the SHA-256 of every
+4096-byte block in the DMA span against the owner-signed manifest. That happens
+when the guest actually reads known content — which implementation-plan fact 98
+puts late: the same configuration saw 2 processes at t=32 s, 2 at t=170 s, and 116
+at t=700 s wall clock, with SpringBoard exec'd at guest t=423 s.
+
+**So a 300-second window cannot see any record that depends on the userland being
+up.** That is not specific to M6: `install.registered` needs a host install frame,
+M7's `dyld.cache_read` is per-process, M8's pair is per-exec — every one of them
+fires later than the window reaches. The three records that DID arrive in every
+capture (the IOKit pair and the three `xnu.*`) are all emitted from
+`NativeVirtioConsole::start()`, which is early.
+
+### The long window changed nothing, so the window was not the constraint
+
+A 1500-second capture against the same bundle produced **1656 bytes and the same
+eight records**. Extending the window 5x did not add a single event. QEMU had
+burned 2142 CPU-seconds over that run and was still executing, so the guest is not
+hung -- it is running and not reaching M6's emit point.
+
+So the honest M6 verdict is:
+
+> `virtio_blk.read_back` is byte-level in the sha256-verified booting kernel, the
+> console entry point it routes through is proven working, and the record did not
+> arrive in a 1500-second window on an actively-executing guest. **The emitter's
+> condition never held.**
+
+That is UNMEASURED, not FAIL, and the distinction matters: nothing here says the
+driver is wrong, only that this boot did not exercise it. The emitter sits behind
+`result == kIOReturnSuccess && actual == count * 512`, and `result` is success only
+after `readSectors()`'s `vr_verify_block()` loop has compared every 4096-byte
+block against the owner-signed manifest. Whether the guest's filesystem reads
+reach `doAsyncReadWrite` at all, and whether they reach it with a span that
+satisfies the condition, is the next question -- and it needs a diagnostic at the
+top of `doAsyncReadWrite`, not another capture window.
+
+**The generalisable lesson, and it is the eighth of this shape: an instrument
+limitation and a negative result look identical from the outside.** The 300-second
+window produced "no late records"; so did the 1500-second one. The first reading
+was "the window is too short" and the second disproved it. Extending the window
+was the right diagnostic precisely BECAUSE it could have failed -- and it did, so
+the window was exonerated rather than assumed.
+
+An install-frame capture is running against the same kernel, which asks a
+different question the same boot can answer.
