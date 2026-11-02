@@ -3214,3 +3214,91 @@ problem from the one the last three builds were fighting.
 * preflight -- green.
 * A further capture cannot answer the install question until the boot carries a
   root volume; the material manifest is the evidence for that, not a guess.
+
+---
+
+# CORRECTION, same interval: the root volumes ARE produced.  I had it backwards.
+
+## What I recorded, and why it was wrong
+
+The previous section says the OS root and SystemOS volumes are 0 bytes and "were
+never produced", and reads that as confirming `_VOLUME_BLOCKER`'s "no APFS
+read/write implementation".  **That is wrong, and it is the kind of wrong that
+would have sent the next three builds at a problem that does not exist.**
+
+The material manifest's 0 bytes is the **deletion**, not a failure.
+
+## The measurement
+
+From run 41521813113's own log, the chain step:
+
+    2026-11-02T21:14:05Z chain: placed 044-76034-038.dmg (3303014400 bytes)
+                                        at vendor/UniXNU-qemu/.cache/firmware/target-volumes
+    2026-11-02T21:14:05Z chain: placed 044-76040-038.dmg (5157406069 bytes)
+                                        at vendor/UniXNU-qemu/.cache/firmware/target-volumes
+
+3,303,014,400 + 5,157,406,069 = 8.46 GB, matching the script's own "7.88 GiB of
+volumes".  They are **moved, not copied** ("7.88 GiB renamed within one filesystem
+is free, and a copy would need 7.88 GiB that is not there").
+
+And then step 19, "Remove the root chain's disk volumes", runs:
+
+    rm -f "$volumes"/*.dmg
+    echo "removed the OS and SystemOS volumes from $volumes (Apple firmware material, PRD ...)"
+
+**The deletion is deliberate and correct** -- Apple firmware material must not
+survive the job (PRD 12).  The manifest is collected after it, so it honestly
+records 0 bytes.
+
+## So what actually stopped the boot
+
+Not a capability gap.  **A packaging gap**: the boot inputs are collected after the
+volumes are deleted, so they carry the kernel, devicetree, DarwinBoot, a 4.8 MB
+`scratch-data.img` Data ramdisk and the trust cache -- and no root volume.  The
+guest therefore has nothing to mount and stops, which is exactly what
+`build-macos.sh` predicts: "the guest either mounts the owner-signed OS volume as
+its root or stops at 'Failed to mount root device'".
+
+## What this changes about the plan
+
+The critical path is **not** "implement APFS read/write".  It is "get the volumes
+that are already being produced, correctly, to the boot".  Three candidate routes,
+in the order I would try them:
+
+1. **Deliver them through the channel that already exists.**  Step 29 is "Deliver
+   the encrypted material (private channel)".  The `owner-data-material` artifact
+   carries `kernelcache.decompressed.enc`, so the encrypted-delivery mechanism
+   works; it simply is not being asked to carry the volumes.
+2. **Have the boot-inputs collection run before step 19.**  The volumes exist at
+   21:14 and are deleted at 21:16; the boot inputs are collected later.  This is a
+   step-ordering change in the workflow, and it is the cheapest of the three --
+   but it puts 8.46 GB of Apple firmware material into a GitHub artifact, which
+   PRD 12 may not permit.  That has to be checked before doing it.
+3. **Re-extract them locally for the capture.**  `extract-target-volume.py` reads
+   the IPSW, and this host has the IPSW pinned under `local-private/`.  The
+   volumes are reproducible from it, so a capture does not need the runner's copy
+   at all -- only the IPSW, which is already local.
+
+Route 3 is the one that does not touch the workflow or PRD 12, and it is the one
+to try first for a capture.  Routes 1 and 2 are for the deliverable.
+
+## What is still true, and what is not
+
+**Still true:**
+* Build 41521813113 succeeded -- first kernel to compile with both emitters.
+* The payload kernel's sha256 matches `payload.json`; every record literal is
+  byte-level in it.
+* `diag.free_fn_status` reports `success` on a real boot, so
+  `native_console_report()` reaches the host.  MEASURED.
+* `diag.install_thread_start` did not arrive, because the boot stopped before
+  `bsd_init()`'s install block.
+* M9, M9a, M9b and M10-M12 all need a guest past root mount.
+
+**Not true, and withdrawn:**
+* "the OS root and SystemOS volumes are 0 bytes / were never produced".
+* "the blocker is the APFS read/write implementation".
+
+`_VOLUME_BLOCKER`'s wording may still be right about M9b's *writable Data volume*
+-- that is a different question from whether the read-only OS volumes can be
+produced, and this measurement says nothing about it.  It must be re-measured, not
+inherited from a conclusion I have just withdrawn.
