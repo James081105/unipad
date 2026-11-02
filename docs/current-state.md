@@ -2593,3 +2593,85 @@ declaration fix and `springboard.running` and the install diagnostic, but NOT th
 interaction emitter -- it was dispatched before the device pin moved.  It is the
 build that answers whether `kernel_thread_start` succeeds.  A further build is
 needed afterwards to compile the interaction emitter at all.
+
+---
+
+# Interval 2026-11-03 (fifth): three builds, one pairing, and the middle fix was wrong
+
+## The shape of the mistake
+
+The install patch calls `native_console_report` in **two functions**, and they need
+declarations at **two different scopes**:
+
+| call site | function | scope needed |
+|---|---|---|
+| `diag.install_thread_start` (x2) | `bsd_init()` | visible inside `bsd_init()` |
+| `install.registered`, `diag.install_thread_started`, `diag.install_rx_bytes`, `native_console_poll` | `native_install_service_thread()` | file scope |
+
+**Build 41497938605** failed on the first group -- `bsd_init.c:1348` and `:1351` --
+because the only declaration sat at file scope *after* `bsd_init()`'s closing
+brace.  A file-scope declaration is not visible inside a function compiled before
+it; it is visible in the functions that follow, which is exactly why the thread
+never had a problem.
+
+**My first fix moved that pair up to just before the first guard**, on the theory
+that "before the guard" meant "outside the function".  It does not: **the first
+guard is INSIDE `bsd_init()`**, so the pair landed inside `bsd_init()` and the
+thread lost its declaration.  **Build 41506272367** then failed on the second
+group -- `bsd_init.c:1665`, `:1699`, and `:1717` (the last of those
+`native_console_poll`).
+
+**So it is an ADD, not a MOVE.**  The file-scope pair stays where it was, correct
+for the thread; the two calls inside `bsd_init()` get a block-scoped `extern`
+beside them, the same pattern `zzz-native-springboard-events.patch` uses for
+`kern_exec.c`.  A declaration with no definition is free -- the linker only
+resolves a symbol something REFERENCES -- so the duplicate costs nothing.
+
+## What actually answered the question
+
+**The applied tree, not the patch text.**  The patch text made the first fix look
+correct: the declaration sat before the guard, the guard sat before the call, and
+the declaration-visibility test agreed.  It was only by applying every patch and
+reading the resulting `bsd_init.c` that the scope error became visible -- the
+externs were at line 1312, inside a function whose closing brace was at 1372,
+while the calls that needed them were at 1665+.
+
+That is the third build failure on this one pairing, and the transferable lesson
+is not "move the declaration".  It is: **a patch that calls a symbol from two
+functions at two scopes needs a declaration at each, and the applied tree is what
+answers the question.**
+
+## Verified, in the order that matters
+
+1. `test_console_declaration_visibility.py` -- passes
+2. `repro-patch-twopass.py` -- three passes clean, 58 applied on pass 1
+3. **the applied tree** -- block-scoped extern at 1368 precedes the two diag calls
+   at 1374/1377; `bsd_init()`'s `}` precedes the file-scope pair at 1419-1420; the
+   pair precedes `native_install_service_thread()` at 1695 and all four of its
+   calls at 1679, 1713, 1731, 1739
+4. the three complete record literals still assemble to JSON
+
+## Also this interval
+
+* The full `tests/unit` suite passes: exit 0, zero FAILED/ERROR, 100% reached.
+* `local-private/tmp` held 30 GB against **14 GB free** on F:.  Reclaimed 11 GB by
+  name (`build-logs-413*`, `bundle-*`, `bundle1x`) -- never `shell/`, never
+  `pytest-of-*`.  F: is now at 25 GB free.
+* A push to the device repo's `main` was rejected because `main` is the upstream
+  tracking branch (`97b75b1`); the working branch is
+  `unipad/qemu-metal-bridge-stubs`.  Corrected, and `main` is untouched.
+
+## Dispatched
+
+Build **41512218642**, `exp-2026-11-03-m9-both-halves-M10`, stage M10, target tcg,
+`unixnu_commit=757e46b1`, `device_commit=068f440a`.  It is the first build that
+carries BOTH M9 emitters and the install diagnostic, and therefore the first that
+can answer three open questions at once: does the kernel compile with both, does
+`kernel_thread_start` succeed, and do the two M9 records arrive on the wire.
+
+## Still unmeasured
+
+* `diag.install_thread_start`'s status -- the question the last three builds were
+  sent to answer, still open because none of them compiled the kernel.
+* `springboard.running` and `springboard.interaction` on the wire.
+* M9 remains FAIL at the gate until both records arrive from a guest channel.
