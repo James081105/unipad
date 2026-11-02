@@ -1988,3 +1988,65 @@ the window was exonerated rather than assumed.
 
 An install-frame capture is running against the same kernel, which asks a
 different question the same boot can answer.
+
+## 2026-11-02 — the host write IS delivered; the unknown is now guest-side
+
+**Measured.** A host client put **50 well-formed install frames** on the channel
+-- 50 successful `sendall` calls, zero errors, across a 1500-second window -- and
+`install.registered` did not arrive.
+
+Two things were wrong with the first attempt, and both are worth recording
+because each produced a misleading sentence:
+
+1. **`request()` was the wrong API.** It sends the line correctly and then blocks
+   reading a reply the dispatcher deliberately never sends; `_read_line()` returns
+   the EDK2/DarwinBoot chatter already sitting in the channel, so it raises
+   *"the agent channel returned a line that is not JSON"*. That reads as a failed
+   write. It is not one -- `sendall()` had already succeeded. The transport's own
+   `listen()` docstring records the same trap ("a caller that sends
+   `status.request` first and reads second collects those 1015 bytes as its
+   reply"). The frame now goes out on the socket directly.
+2. **One send was not enough to conclude anything.** The dispatcher's reader is a
+   kernel thread that polls `native_console_poll()`, which returns
+   `kIOReturnNotOpen` until the console driver publishes the port. A frame sent
+   before that is either dropped or sits in the queue, and nothing outside the
+   guest can tell which. The frame is now re-sent every 20 s, and the
+   dispatcher's own `if (native_install_registered) return;` makes duplicates
+   harmless.
+
+So the host's write path works and the unknown has moved inside the guest. Three
+causes remain, with different remedies: the thread never started,
+`native_console_poll()` never returns data, or the recogniser rejects the frame.
+**Two diagnostics split the first two** -- one at the top of the thread, one on
+the first non-empty poll -- and build **41441479230** carries them.
+
+### M7 and M8 are bounded, un-nulled, and finally tracked
+
+**They were never in the build at all.** Both files existed in the working tree
+and were byte-identical to their copies under `local-private/tmp/parked-patches/`,
+but `git status` reported them **untracked** and the pinned commit carried
+neither. `patches/xnu/*.patch` is globbed from the assembled tree, so an
+untracked file in a working tree the build never sees is applied by nobody. The
+drain risk was a real reason to be careful; it was not what was holding them
+back.
+
+**Both are now bounded to one record per boot**, by a file-scope flag set BEFORE
+the emit and never cleared -- the same structural bound the install dispatcher
+has. M7's site is per-process ("dyld calls this path in every process that uses
+the shared cache"); M8's `daemon.spawned` fires per exec, measured at ≥75 per
+boot. `launchd.running` needed no flag: `load_init_program()` runs once per boot
+and the loop returns on the first entry that loads.
+
+**Both null checks are gone.** `if (native_console_report)` is the exact shape
+build 41330622788 paid for. M7's `!error` stays because it is about the event's
+truth, not the dependency's.
+
+**Three tests were wrong and are fixed rather than deleted.** Two required the
+null check on the reasoning that "a strong reference that somehow resolved to null
+would otherwise be a call through zero" -- which is the reasoning 41330622788
+disproved. The third anchored on the old gate text. The install test's one-write
+rule now names the diagnostic variables explicitly, because inferring "this one is
+only a diagnostic" from a prefix would let any record exempt itself; and its
+null-check scan became escape-aware, because the first version tested the parity
+of raw quote characters -- which is EVEN inside a C string holding an escaped
+quote, so it skipped nothing.
