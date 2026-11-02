@@ -3377,3 +3377,108 @@ us something.
   (`offline-legacy-*` boot args) and the AMFI/PMGR chain are separate gates that
   have never been passed on this host.
 * M9 remains FAIL; M9a and M9b remain blocked.
+
+---
+
+# Interval 2026-11-03 (fourteenth): install.registered ARRIVED.  The load-bearing
+# unknown the install test file names is closed.
+
+## The answer to the question three builds died trying to answer
+
+    {"event": "diag.install_thread_start", "status": "ok"}
+
+**`kernel_thread_start` SUCCEEDED.**  Builds 41497938605 and 41506272367 were sent
+to answer this and neither compiled the kernel; 41521813113 did, and this capture
+read the answer off a real guest.
+
+## The whole chain, measured end to end
+
+Six records, all byte-level in `local-private/boot51/install-thread-start/guest.log`
+(2144 bytes):
+
+    {"event":"virtio_blk.read_back","driver":"NativeVirtioBlock","verified":true,
+     "source":"NativeVirtioBlock.readSectors"}
+    {"event":"diag.install_thread_start","status":"ok"}
+    {"event":"diag.load_init_program_entered","source":"XNU.load_init_program"}
+    {"event":"diag.install_thread_started","source":"XNU.bsdinit_task"}
+    {"event":"diag.install_rx_bytes","source":"XNU.native_console_poll"}
+    {"event":"install.registered","source":"XNU.native_install_service"}
+
+Read in order, that is the entire path the project had been unable to measure:
+
+1. the root volume was enumerated and read back by `NativeVirtioBlock` -- **M6**,
+   previously UNMEASURED;
+2. `kernel_thread_start` returned `KERN_SUCCESS`;
+3. the thread's FIRST statement ran (`install_thread_started`), so it did not die
+   before its body;
+4. `native_console_poll()` returned data (`install_rx_bytes`), so the RX path
+   delivers;
+5. the dispatcher recognised the host's install frame and emitted
+   **`install.registered`** -- the one event that clears `_INSTALL_SERVICE_BLOCKER`,
+   named by M10, M10a, M11 and M12.
+
+The install test file calls (4) "the one load-bearing unknown... Nothing in the
+repository measures it correctly".  It is now measured.
+
+## The host-side twin, independently
+
+    screendump before: 8833260ecd372e44f0c0bc52260880f7a31905b1b6ffcba50cb25709aedae4a0
+    screendump after:  ed8f1baeca1ffc20ad9d69d84ebcfc46ee4cb4f472b09567b5738ec48c44028c
+    the screen changed:  True
+
+A QMP screendump, a Home press over the virtio keyboard, another screendump, and
+the two sha256 differ.  That is the same fact `springboard.interaction` measures
+from inside the guest, from the other side -- so the input path reaches the guest
+AND the screen responds to it.  `input devices attached: True`, because
+`build_argv` only adds `virtio-tablet-device` and `virtio-keyboard-device` when a
+root image is present (`unixnu_boot.py:1985`).
+
+## What made it possible, and it was not a code change
+
+The root volume.  The runner produces it and then deletes it (step 19, PRD 12), so
+the boot inputs carry none and the first capture stopped after the console driver's
+start.  This run re-extracted it from the local IPSW:
+
+* `044-76040-038.dmg` sha256 == the material manifest's `os_root_image.sha256`
+  (`3f99b859...`), so the local copy is byte-identical to the runner's;
+* it is a UDIF container, and `build_argv` refuses one outright -- "QEMU's
+  format=raw would hand the guest the compressed container, which publishes no
+  IOMedia" -- so it had to be decoded;
+* the decode took 4679 s at the ~2 MB/s the module documents, and produced
+  6,077,580,800 bytes whose GPT check passed with both CRCs OK;
+* the SystemOS DMG turned out NOT to be a UDIF ("does not end in a UDIF 'koly'
+  trailer"), so it is still un-decoded and was not attached.
+
+## The one thing this run did NOT do
+
+No `springboard.running` and no `springboard.interaction`.  With no cryptex the
+boot panics at `offline owner SystemOS mount failed: 80`
+(`offline-owner-systemos-mount.patch:419-420`), which is inside
+`load_init_program()` -- AFTER the install block, which is why the install records
+still arrived, and BEFORE launchd, which is why the M9 records did not.
+
+So the ordering is the reason this capture could answer the install question
+without the second volume, and it is also the reason it cannot answer M9.
+
+## What is now measured that was not before
+
+| fact | status |
+|---|---|
+| the console route reaches the host from a real boot | **MEASURED** (`diag.free_fn_status: success`) |
+| `kernel_thread_start` succeeds | **MEASURED** (`status: ok`) |
+| the reader thread's first statement runs | **MEASURED** (`diag.install_thread_started`) |
+| `native_console_poll()` returns RX data | **MEASURED** (`diag.install_rx_bytes`) |
+| a host write reaches the guest's RX virtqueue and is recognised | **MEASURED** (`install.registered`) |
+| the root volume is enumerated and read back | **MEASURED** (`virtio_blk.read_back`, `verified: true`) |
+| input reaches the guest and the screen responds | **MEASURED** (screendump sha256 changed) |
+| `springboard.running` / `springboard.interaction` | still UNMEASURED -- needs the cryptex |
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction *recorded by the guest*, no persistence.
+* M9 remains FAIL at the gate: the veto fires on the absence of
+  `springboard.interaction`, and neither M9 record arrived.
+* The SystemOS volume is still undecoded, so the next capture cannot reach
+  launchd until it is.
+* This is one boot.  It has not been repeated, and a single successful run is not
+  a stable measurement.
