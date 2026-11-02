@@ -2115,3 +2115,66 @@ archive is on the link"), and it was wrong every time.
 Verified by replaying the runner's patch order against the committed tree: all 58
 patches apply, and both `kern_exec.c` and `vm_unix.c` now report **zero** call
 sites without a visible declaration. Build **41451414922** dispatched on `eece438`.
+
+## 2026-11-02 — M8 is held back: it breaks the SECOND kernel pass
+
+**Build 41451414922 fixed the `vm_unix.c` compile error and then failed on
+something the single-pass patch repro could not see:**
+
+```
+error: patch failed: bsd/kern/kern_exec.c:183
+error: bsd/kern/kern_exec.c: patch does not apply
+build-xnu-4k-baseline.sh: line 44: git -C .cache/xnu-work apply --check "$PATCH" failed
+```
+
+`build-xnu-4k-baseline.sh` applies `patches/xnu/*.patch` **TWICE** -- once in the
+bootstrap pass (`XNU_BOOTSTRAP=1`, which only has to leave the compile records
+and `link.filelist` behind) and again after the archive builders. Its loop decides
+whether to re-apply with:
+
+```bash
+if ! git apply --reverse --check "$PATCH"; then
+    git apply --check "$PATCH"; git apply "$PATCH"
+fi
+```
+
+**That test is not sound.** It assumes a patch that is applied can be reversed.
+M8's third hunk inserts inside `load_init_program()`'s `if (!error) {` block --
+which is *also* the trailing context of
+`offline-owner-systemos-mount.patch`'s `@@ -7186,7 +7520,7 @@` hunk. With M8
+applied, the mount patch can no longer be reversed; the loop then tries to apply
+it again and fails at the include line its first hunk already changed.
+
+### Isolated by experiment, not by reasoning
+
+`repro-patch-order.py` replays **one** pass and reported "all patches applied" --
+it is blind to this, which is how it reached a runner cycle. A new instrument,
+`local-private/tmp/repro-patch-twopass.py`, replays both:
+
+| patches present | second pass |
+|---|---|
+| M7 + M8 | **fails** on the mount patch |
+| M7 only | clean |
+| M8 only | **fails** |
+
+That names M8 and not M7, and not the extern fix build 41451414922 was dispatched
+to verify. **The instrument, not the reasoning, is what attributed this** -- and
+the single-pass instrument would have said the tree was fine.
+
+### What ships and what waits
+
+**M8 is removed from the pinned tree.** Its file is preserved under
+`local-private/tmp/parked-patches/`, and
+`test_the_m8_patch_is_in_the_pinned_tree_at_all` now **XFAILs** with the reason,
+the reproduction command, and the two things that would unblock it: move the
+emitter to a site that does not split the mount patch's context, or make the
+build script's already-applied test stop depending on reversibility. A test that
+demands a file be present must say why it is absent, or the absence reads as an
+oversight on the next pass.
+
+**M7's extern fix and the `vm_unix.o` CFLAGS edit stay** -- M7 alone passes both
+passes, and those two changes are exactly what build 41441479230's compile error
+demanded.
+
+**M6, M7 and the install diagnostics are unaffected** and are measured in build
+**41461647339**, dispatched on `9e96302`.
