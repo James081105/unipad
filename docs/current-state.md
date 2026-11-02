@@ -2830,3 +2830,60 @@ cancelled at step 13 to carry the reviewed emitter instead.
 * `diag.install_thread_start`'s status.
 * `springboard.running` and `springboard.interaction` on the wire.
 * M9 remains FAIL at the gate until both records arrive from a guest channel.
+
+---
+
+# Interval 2026-11-03 (eighth): the M9a/M11/M12 sample gap is closed on this host
+
+## What was missing, and why it mattered
+
+`observe_samples` (`e2e.py:775-790`) reports a sample as **BLOCKED** with
+`sample_ipa_not_found:<name>` when it is absent -- "never a pass, and never a
+silent omission (PRD 5.1, appendix A line 480)".  `SAMPLE_SPECS` names two:
+
+| sample | used by |
+|---|---|
+| `HelloUniPad.ipa` | case 3 -- import and record the input SHA-256 (M9a, M11, M12) |
+| `UniPadNotes.ipa` | case 7 -- the persistence test that rewrites and reads back the container marker |
+
+Neither existed under any sample root.  The only copies on disk were pytest
+fixtures in `.tmp-bt` temp directories, which are not sample roots and are not
+archived.
+
+## Closed, without a third-party IPA
+
+`tests/fixtures/ipa_builder.py` builds both samples ON THE HOST -- `hello_ipa()`
+and `notes_ipa()` at `:258` and `:267`, plus `valid_device_ipa()` at `:254` for a
+"complete, acceptable iOS Device IPA (arm64 slice, clear binary)".  Built into
+`local-private/ipa`, which is a `DEFAULT_SAMPLE_ROOT` (`e2e.py:547`) and is
+gitignored, so no Apple or third-party material enters the tree and the
+"unauthorized third-party IPAs must never enter the compatibility matrix"
+constraint is satisfied by construction -- these are our own artifacts.
+
+Verified after building:
+
+    HelloUniPad.ipa:  896 bytes, 3 members, zip integrity OK
+      Payload/HelloUniPad.app/{Info.plist, HelloUniPad, PkgInfo}
+    UniPadNotes.ipa: 1108 bytes, 4 members, zip integrity OK
+      Payload/UniPadNotes.app/{..., Documents/container-data.txt}
+
+and `_locate_sample` now finds both under `local-private\ipa`.
+
+## What this does and does not unblock
+
+**Does**: the `sample_ipa_not_found` BLOCKED reason is gone for case 3 and case 7.
+A capture that reaches those cases will now get past the sample gate and fail (or
+pass) on the guest-side question instead.
+
+**Does not**: M9a still needs `uikit.first_frame` from a guest channel, which needs
+the app to be installed and launched, which needs M10-M12's install path to work
+first.  The sample is a prerequisite, not the milestone.  And `e2e.py:1200` is
+explicit that `installed_before` "asks the guest what it already has, and the
+guest-side status transport is the piece that does not exist yet" -- so case 3
+returns a FAILED observation naming that, rather than a pass with it guessed.
+
+## In flight
+
+Build **41514522108** (`exp-2026-11-03-m9-final-M10`) is queued for a runner.  It
+carries the both-scopes declaration fix, `springboard.running`, and the reviewed
+`springboard.interaction` emitter.
