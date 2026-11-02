@@ -374,7 +374,13 @@ def test_the_records_only_route_to_disk_is_the_port_the_gate_reads():
     text = _patch_text()
     code = _code_lines(text)
 
-    emitters = [line for line in code if "native_console_report(" in line]
+    # The declaration names the symbol once and is not a write.  Without
+    # this filter, adding the declaration build 41376479360 demanded made
+    # this test count it as a second write of the same event -- a test going
+    # red on the fix for the defect it was written to catch.
+    emitters = [line for line in code
+                if "native_console_report(" in line
+                and not line.startswith("extern")]
     assert emitters, "the patch never hands a record to the console port"
     assert all(
         line.startswith("native_console_report(native_install_record,") for line in emitters
@@ -626,7 +632,9 @@ def test_the_dispatcher_does_not_answer_the_host():
             f"is not free: see this test's docstring for the three ways one of "
             f"them turns a cleared blocker into a failed milestone."
         )
-    writes = [line for line in code if "native_console_report(" in line]
+    writes = [line for line in code
+              if "native_console_report(" in line
+              and not line.startswith("extern")]
     assert len(writes) == 1, (
         f"the port is written {len(writes)} times, not once: {writes}.  A "
         f"second write of the same event is silently dropped by the host "
@@ -721,31 +729,87 @@ def test_every_function_the_call_block_uses_is_declared_before_it():
     found it is a compiler this host does not have.  Build 41359711528 failed at
     ``kern_exec.c:8120: error: call to undeclared function`` for the same
     reason, and neither defect is visible to any source-level check.
+
+    AND THIS TEST WAS WRONG ABOUT WHERE THE DECLARATION GOES.  It required the
+    forward declaration INSIDE the call block, immediately above the call.
+    Build 41376479360's second pass -- the first compiler to see the dispatcher
+    -- rejected exactly that:
+
+        bsd_init.c:1309:2: error: function declared in block scope cannot have
+                          'static' storage class
+
+    A block-scope declaration cannot carry `static`, and dropping the keyword
+    then fails against the definition with "static declaration follows
+    non-static declaration".  So the declaration has to be at FILE scope, inside
+    the same guard as the definition, which is where it now is.  A test written
+    from reasoning about C rather than from a compiler demanded something the
+    compiler refuses -- the same shape as the inter-patch guard that passed
+    while the build failed.
+
+    It also checked only the thread function.  The declaration that actually
+    failed to compile was ``native_console_report``, and this test's own name
+    says "every function the call block uses".  So it now walks them all.
     """
     text = _patch_text()
     code = _added_source(text)
+    lines = _code_lines(text)
 
     call = code.find("kernel_thread_start(native_install_service_thread")
     assert call != -1, "the patch never starts the install service"
-    declaration = code.find(
-        "static void native_install_service_thread(void *, wait_result_t);"
-    )
-    assert declaration != -1, (
+
+    # The thread's forward declaration: file scope (no leading tab), `static`,
+    # and above the definition rather than above the call.
+    #
+    # Indentation is read from the RAW diff lines, because _code_lines strips
+    # it -- and stripped, a file-scope declaration and a block-scope one are
+    # the same string.  That is precisely the distinction build 41376479360
+    # turned on, so it cannot be read through a helper that erases it.
+    declaration = "static void native_install_service_thread(void *, wait_result_t);"
+    raw = [ln for ln in text.splitlines() if ln.startswith("+")]
+    decl_raw = [ln for ln in raw if ln[1:].lstrip() == declaration]
+    assert decl_raw, (
         "the call block starts native_install_service_thread without declaring "
-        "it first.  The definitions live below bsdinit_task(), so this is a "
-        "call to an undeclared function -- measured as build 41359711528 at "
+        "it.  The definitions live below bsdinit_task(), so this is a call to "
+        "an undeclared function -- measured as build 41359711528 at "
         "kern_exec.c:8120, and invisible to every check in this file that does "
         "not look for the declaration."
     )
-    assert declaration < call, (
-        "the forward declaration sits AFTER the call that needs it, which is "
-        "the same as having none"
+    assert len(decl_raw) == 1, f"declared {len(decl_raw)} times: {decl_raw}"
+    assert not decl_raw[0][1:2].isspace(), (
+        "the forward declaration is indented, so it is in block scope, where "
+        "`static` is illegal: build 41376479360 failed with 'function declared "
+        "in block scope cannot have static storage class'"
     )
-    # And it must be a `static` forward declaration: a non-static one would give
-    # the function external linkage and put a second symbol in the kernel.
-    assert "static void native_install_service_thread(void *, wait_result_t);" in code, (
-        "the forward declaration is not static, so the internal-linkage reader "
-        "would acquire external linkage"
+    assert declaration in lines, "the declaration is not in the added code"
+    decl_at = lines.index(declaration)
+    definition = next(i for i, ln in enumerate(lines)
+                      if ln.startswith("native_install_service_thread("))
+    assert decl_at < definition, (
+        "the forward declaration sits after the definition, which is the same "
+        "as having none"
+    )
+
+    # Every function the added code CALLS must be declared somewhere in it.  The
+    # first revision of this test named only the thread and missed
+    # native_console_report, which is the one that failed to compile.
+    declared = {ln.split("(")[0].split()[-1]
+                for ln in lines
+                if ln.startswith(("extern ", "static ")) and "(" in ln}
+    called = set()
+    for ln in lines:
+        if ln.startswith(("extern ", "static ", "#")):
+            continue
+        for name in ("kernel_thread_start", "native_console_poll",
+                     "native_console_report", "native_install_service_thread",
+                     "native_install_recognise"):
+            if name + "(" in ln:
+                called.add(name)
+    missing = sorted(called - declared - {"kernel_thread_start"})
+    assert not missing, (
+        f"the patch calls {missing} without declaring it in this patch.  A "
+        f"declaration the patch does not carry is a call to an undeclared "
+        f"function -- build 41376479360 failed at bsd_init.c:1633 for exactly "
+        f"that reason, and no source-level check sees it."
     )
 
 
