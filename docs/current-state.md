@@ -1753,12 +1753,21 @@ So: two translation units, multiple boots, the free function delivering nothing.
 
 ### What this re-routes
 
-**Every kernel-side emitter in this project routes through this dead path**: the
-M8 `launchd.running`/`daemon.spawned` pair, M7's `dyld.cache_read`, the install
-dispatcher's `install.registered`, and the mount emitter's records. None of them
-can deliver until this is fixed, however correct their source is. That is the
-real reason M7 and M8 were "unpinned for the drain risk" -- the drain risk was
-never the binding constraint.
+**Every kernel-side emitter in this project routes through this dead path**: M6's
+`virtio_blk.read_back`, the M8 `launchd.running`/`daemon.spawned` pair, M7's
+`dyld.cache_read`, the install dispatcher's `install.registered`, and the mount
+emitter's records. None of them can deliver until this is fixed, however correct
+their source is.
+
+**So the drain risk was never the binding constraint on M7 and M8 -- this was.**
+Both were held back as "CODE COMPLETE but unpinned, pending the drain
+measurement", which read as a prudence about a hang. The real reason they could
+not have delivered is a dead entry point. And **M6 must NOT be pinned now**: its
+integration is complete (the config, the archive path, the macro and the
+one-record bound are all already in place) and its only remaining step is the
+pin bump, but pinning it would put a second emitter on a dead path and measure
+nothing. Sequencing: fix the free function, then pin M6, M7 and M8 in one build
+and measure all three.
 
 **And it does NOT touch what already passes.** M4 and M5 pass on
 `iokit.service_match`, `iokit.driver_probe`, `xnu.page_tables`,
@@ -1784,3 +1793,60 @@ own length. The length-checking test caught the first draft of it for writing
 catch, in the good sense.
 
 Build **41400938438** dispatched on `120ee05`, console fork at `d2bdce2`.
+
+## 2026-11-02 — the root cause: ANY instance's teardown withdrew the live port
+
+**Round two answered it.** Build 41400938438's capture (1662 bytes, kernel sha256
+`a93e59781d8c`, verified against `payload.json`) carried:
+
+```
+{"event":"diag.free_fn_status","status":"not_open"}
+{"event":"diag.control_from_driver","source":"NativeVirtioConsole.start"}
+```
+
+`kIOReturnNotOpen` is the ternary's FALSE arm in
+`native_console_report()` -- `g_console ? g_console->send(...) :
+kIOReturnNotOpen`. `send()` itself returns only BadArgument, NotReady or Success,
+so the pointer was null. Published 143 lines earlier, at `:289`, with nothing
+between the two that assigns it.
+
+**And `reset()` is why:**
+
+```cpp
+bool NativeVirtioConsole::reset() {
+    online=false;if(ownsDevice)native_console_ready=0;
+    if(!registers || !ownsDevice)return true;     // :183 -- TRUE for a
+                                                  //     never-started instance
+```
+
+`cleanup()` cleared `g_console` whenever `reset()` returned true, and **never
+checked `g_console == this`**. So an instance that was merely constructed and then
+stopped withdrew the port belonging to a different, live instance. The live
+instance's own `this->send()` kept working -- that path never reads the pointer --
+which is exactly why five records landed and the sixth did not, on adjacent lines.
+
+The fix is `if (g_console == this)`. **Only the publisher may unpublish.**
+
+### The blast radius, and it is larger than the diagnostic
+
+`native_console_report()` is the entry point **every kernel-side emitter in this
+project routes through**, and it has been dropping records silently **since the
+port was first published, on every boot**. This is the same reason the mount
+patch's `native_console_report()` records have never arrived in any capture, across
+every boot taken. Two independent translation units, multiple boots, one cause.
+
+It also explains a measurement that had been read as a *context* problem: the
+`kern_exec.c` diagnostic that "did not arrive from BSD kernel code" was never a
+context failure at all. The entry point was dead by then, for this reason.
+
+### The test was checking a weaker property than the bug required
+
+`test_the_port_is_withdrawn_when_the_device_is_stopped` required that
+`g_console=nullptr` appear in `cleanup()` and follow `reset()`. Both still hold
+after the fix, and **neither was sufficient** -- the guard it was missing is the
+one that would have caught this. It now requires `g_console == this`, and removing
+the guard turns it red.
+
+Build **41407044961** dispatched on `8a3e5cd`, console fork at `3ca09c9`. Its
+capture should show `diag.free_fn_status` as `success` and
+`diag.free_fn_from_driver` arriving for the first time.
