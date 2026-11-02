@@ -1205,3 +1205,37 @@ Checked: the committed blob is **LF** (`git ls-files --eol` reports
 - Three emitters CODE COMPLETE but unpinned: `dyld.cache_read`,
   `virtio_blk.read_back`, and the M8 pair. `guest_install_service` mapping is
   done and its emitter is in flight.
+
+---
+
+## 2026-11-02 — the suite is green, and the block fork is a hard blocker
+
+**`tests/unit`: 3404 passed, 10 skipped, 0 failed** (exit 0). Read from the dot
+output rather than the summary line, which the Bash tool eats — the documented
+lesson, applied again.
+
+**The block driver's fork is a hard blocker, not a propagation delay.**
+`James081505/VirtioMmioBlock` was created through the API and is reported
+public with push permission (`"fork":true`, parent `UniXNU/VirtioMmioBlock`).
+Every one of these fails against it with `remote: Repository not found`:
+
+- `git ls-remote <url> HEAD` and `git push <url>` — from the driver repo's cwd,
+  from `/tmp`, and from `vendor/UniXNU`.
+- `git ls-remote fork HEAD` via the named remote, which SUCCEEDS on
+  `James081505/VirtioMmioConsole` from its own repo.
+- `git -c credential.https://github.com.helper='!gh auth git-credential'` —
+  overriding the credential helper with the gh token changes nothing.
+- `gh repo view James081505/VirtioMmioBlock` and `gh api repos/James081505/…`
+  both 404, while `gh api` on `UniXNU/…` repos works.
+
+And the decisive asymmetry: **the explicit URL fails where the named remote
+succeeds**, on the console fork, from the console repo's own cwd. So the
+credential is resolved per-remote-name, and the block fork has no such entry.
+Retried over ~75 minutes; not a delay.
+
+The emitter is safe: its commit is in `vendor/UniXNU/drivers/NativeVirtioBlock`
+on branch `unipad/virtio-blk-readback` (`3d05351`), and the 18 guard tests are
+committed in the main repo. What is missing is only the push and the two pin
+bumps. **Recorded as a blocker rather than guessed at** — the next session
+should either push from a host whose credential can see the fork, or change the
+`.gitmodules` URL for `drivers/NativeVirtioBlock` to a fork that resolves.
