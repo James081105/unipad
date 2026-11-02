@@ -2675,3 +2675,76 @@ can answer three open questions at once: does the kernel compile with both, does
   sent to answer, still open because none of them compiled the kernel.
 * `springboard.running` and `springboard.interaction` on the wire.
 * M9 remains FAIL at the gate until both records arrive from a guest channel.
+
+---
+
+# Interval 2026-11-03 (sixth): the M9 capture needs no new code, and has two instruments
+
+## The path, end to end, all of it already in the repository
+
+The question this interval answered was "if the kernel compiles, how does
+`springboard.interaction` actually get produced?"  The answer is that nothing has
+to be written:
+
+1. **QEMU carries the input devices.**  `src/unipad/host/unixnu_boot.py:1985` adds
+   `virtio-tablet-device` and `virtio-keyboard-device` whenever the boot has a root
+   image -- which is the `qemu_root_defconfig` build that was dispatched.
+2. **The guest has a driver for them.**  `package/VirtioInput.cpp` reaches
+   `DRIVER_OK` ("QEMU routes its input here"), maps evdev Home (102) and F1 (59) as
+   keys and ABS X/Y plus BTN_LEFT/BTN_TOUCH as touch, and on `EV_SYN` with the
+   button down calls `publish()` -- which writes the SAME published finger set
+   (`native_touch_seq/count/xs/ys/ids`) that the hardware touch driver writes.
+3. **`publish()` reaches my emitter.**  `native_touch_published()` ->
+   `NativeHidInput::touchNotify` -> `touchSend()` (`NativeHidInput.cpp:188`) ->
+   `handleReport()` -> `native_hid_input_observed(6, result)` ->
+   **`interaction_arm()`**.
+4. **The compare runs on the timer's own cadence.**  `tick()` calls
+   `native_hid_live_checkpoint()` as its FIRST statement, before any early return,
+   so the 1-second compare cannot be skipped.  That is where
+   **`interaction_compare()`** sits.
+5. **The host measures the same thing, independently.**
+   `guest_runtime.py:378-395` (`reach_springboard`, PRD 5.2 case 2) sends Home over
+   QMP, takes `case2-before.ppm` and `case2-after.ppm`, and compares their sha256.
+   `e2e.py:1160-1179` fails the case with `case2_springboard_not_operable` /
+   "mouse input did not change the guest framebuffer" when they are equal, citing
+   PRD 7.4 line 294 -- "a screenshot that does not change proves nothing about
+   input".
+
+So there are THREE instruments on one fact, and they can disagree usefully:
+
+| host screendump sha256 | guest screen digest | what it means |
+|---|---|---|
+| changes | changes | the record is confirmed by two independent measurements |
+| changes | does not | my emitter has a defect -- most likely `native_gop_ready` is 0, i.e. the presenter never came online, so `screen_digest()` returns unreadable and the arm never fires |
+| does not change | does not | the input did not reach the guest at all, which is an earlier failure than either emitter |
+| does not change | changes | one of the two is reading the wrong memory |
+
+The third row is the one worth naming, because "the record is absent" looks
+identical from outside for all four rows.  If it happens, the next thing to add is
+a one-shot diagnostic at the arm site reporting whether the digest was readable --
+not a guess about which row it was.
+
+## What this means for the gate
+
+`_guest_events` (`milestones.py:1408-1424`) keeps only the FIRST record per event
+name (`setdefault`), so my four-record bound is more than enough.  The records
+travel the identical route as the ones that already pass -- M4 `xnu.*` and M5
+`iokit.*` are both PASS -- through `native_console_report` into a file matching
+`_GUEST_LOG_GLOBS`.  `_guest_records` (`:1362`) is explicit that a serial log is
+NOT a guest channel (PRD 7.4), which is why the emitter goes through the console
+port and not the kernel ring.
+
+## Live in flight
+
+Build **41512218642** (`exp-2026-11-03-m9-both-halves-M10`) is the first that
+carries both M9 emitters AND the install diagnostic.  Three questions at once:
+
+* does the kernel compile with both (the question the last three builds died on)?
+* does `kernel_thread_start` succeed -- `diag.install_thread_start` reports `ok`
+  or `failed`?
+* do `springboard.running` and `springboard.interaction` arrive?
+
+The live-HID mailbox path (`vendor/UniXNU/scripts/qemu-entry/live-hid.py`) was
+checked and set aside: it resolves kernel symbols with `xcrun nm`, which is
+macOS-only, and this host is Windows.  The virtio-input route above needs no such
+tooling, so it is the one to use.
