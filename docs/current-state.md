@@ -3112,3 +3112,105 @@ passes.
 * `41521813113` -- build-macos, `exp-2026-11-03-m9-final-M10`, at the GPU addon
   chain step.
 * preflight -- green at `715d25c`; the pushes since then each start a new one.
+
+---
+
+# Interval 2026-11-03 (twelfth): the kernel compiles, the console route is
+# MEASURED, and the blocker is the root volume -- not the emitters
+
+## Build 41521813113 succeeded
+
+First kernel to compile with the both-scopes declaration fix, `springboard.running`,
+the reviewed `springboard.interaction` emitter, and the install dispatcher's
+call-site diagnostic.  Three builds died on the declaration pairing; this one did
+not.
+
+Verified before booting:
+
+* `payload-esp/EFI/UniXNU/Payloads/kernel.macho` sha256 =
+  `9a930370f56ee7dff81dfaa4ad6e74e2317283b80a2e1df6397157010852d49c`, equal to
+  `payload.json`'s `payload_kernel_sha256`.
+* every record literal is byte-level in that kernel:
+  `springboard.running` x1, `springboard.interaction` x1,
+  `diag.install_thread_start` x3, `install.registered` x1,
+  `diag.install_thread_started` x1, `diag.install_rx_bytes` x1.
+
+## The console route is MEASURED on a real guest
+
+Booted it.  Eight records arrived, and the last three are the control:
+
+    {"event":"diag.free_fn_from_driver","source":"NativeVirtioConsole.start"}
+    {"event":"diag.free_fn_status","status":"success"}
+    {"event":"diag.control_from_driver","source":"NativeVirtioConsole.start"}
+
+plus `xnu.page_tables`, `xnu.exception_vectors`, `xnu.interrupts`,
+`iokit.service_match`, `iokit.driver_probe` -- all emitted from
+`NativeVirtioConsole.start()`.
+
+**So `native_console_report()` reaches the host from a real boot.**  That was the
+premise under every emitter in this project and it had never been measured end to
+end on a guest carrying them.  It now is.
+
+## And then the boot stopped
+
+Nothing after the console driver's start.  `diag.install_thread_start` did not
+arrive, and neither did `install.registered`, `diag.install_thread_started` or
+`diag.install_rx_bytes`.
+
+**The cause is not the code.**  The install block sits in `bsd_init()` immediately
+before `load_init_program(p)`, and the guest never got there.
+
+## The blocker, measured rather than inferred
+
+`owner-data-material-41521813113`'s `material-manifest.json`:
+
+    os_root_image    bytes=           0  044-76040-038.dmg
+    systemos_image   bytes=           0  044-76034-038.dmg
+    volume_uuid      bytes=           0  (empty)
+    data_seed        bytes=     1499280  owner-data-1g.dbr
+    trust_cache      bytes=       61356  original-static-system.bundle
+
+**The OS root and SystemOS volumes are ZERO BYTES.**  They were never produced.
+The boot inputs carry only the kernel, devicetree, DarwinBoot, a 4.8 MB
+`scratch-data.img` Data ramdisk, and the trust cache -- so the guest has no root
+volume to mount and stops, which is exactly what the build script predicts:
+"the guest either mounts the owner-signed OS volume as its root or stops at
+'Failed to mount root device'".
+
+This is the same fact `_VOLUME_BLOCKER` records
+(`milestones.py:1972-1981`): "this host has no APFS read/write implementation, so
+the 6.08 GB os-root raw image cannot be produced in the state the guest would
+see".  It is now MEASURED rather than merely asserted -- the manifest says 0 bytes.
+
+## What this reframes
+
+**M9, M9a, M9b and M10-M12 are all blocked on the root volume, not on their
+emitters.**  Every one of them needs a guest that gets past root mount:
+
+| record | needs |
+|---|---|
+| `springboard.running` | SpringBoard to exec, which needs launchd, which needs a root |
+| `springboard.interaction` | a screen and input, which needs a booted userspace |
+| `data.written` / `data.shutdown` | a writable Data volume and a running guest |
+| `install.registered` | the install block in `bsd_init()`, past root mount |
+| `diag.install_thread_start` | the same |
+
+So the emitters being code-complete is necessary but not close to sufficient, and
+the next action is the root volume, not another emitter.  That is a different
+problem from the one the last three builds were fighting.
+
+## What is NOT claimed
+
+* `diag.install_thread_start`'s status is still UNMEASURED.  The record did not
+  arrive, and the reason is the boot stopping early -- not the answer the
+  diagnostic was built to give.
+* No SpringBoard, no IPA, no interaction, no persistence.
+* M9 remains FAIL at the gate; M9a and M9b remain blocked.
+* The APFS read/write gap is not closed by anything here.
+
+## In flight
+
+* `41521813113` -- build-macos, **success**.
+* preflight -- green.
+* A further capture cannot answer the install question until the boot carries a
+  root volume; the material manifest is the evidence for that, not a guess.
