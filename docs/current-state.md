@@ -2229,3 +2229,171 @@ is wrong.
 M10, M10a, M11 and M12 stay BLOCKED. The dispatcher compiles, the record is in the
 booting kernel, the host write is measured working, and the console entry point is
 measured working. What is left is that the reader thread does not run.
+
+---
+
+# Coverage table — every PRD requirement, its evidence, and its gap
+
+Read this before reusing any conclusion below it. Each row's "latest evidence" is
+the most recent MEASUREMENT, not the most recent code change, and the two are
+different columns on purpose.
+
+## The gate, as it stands (measured 2026-11-03, `read-gate.py`)
+
+| gate | verdict | what is missing |
+|---|---|---|
+| M0 | UNVERIFIED | clean-build artifacts |
+| M1 | UNVERIFIED | guest display evidence |
+| M2 | UNVERIFIED | config read, boot entry, load evidence |
+| M3 | UNVERIFIED | input validation, load info, handoff location |
+| **M4** | **PASS** | — |
+| **M5** | **PASS** | — |
+| M6 | UNVERIFIED | `virtio_blk.read_back` on the wire |
+| M7 | UNVERIFIED | volume identity, mount relations, `dyld.cache_read` |
+| M8 | UNVERIFIED | `launchd.running`, `daemon.spawned` (patch held back) |
+| M9 | **FAIL** | veto: screenshot is not interaction evidence |
+| M9a | **FAIL** | veto: wallpaper is not a UIKit frame |
+| M9b | BLOCKED | no writable system volume |
+| **M10–M12** | **BLOCKED** | the install reader thread does not run |
+| WP00 | BLOCKED | `sources.lock.json` declares `frozen=false` |
+| WP01 | BLOCKED | unfrozen lock; no Windows cross-build |
+| WP02 | UNVERIFIED | run directory, control port |
+| WP03 | UNVERIFIED | UniXNU run evidence, DarwinBoot handoff |
+| **WP04** | **PASS** | — |
+
+Release verdict: **FAIL**, on `blocking_fail:M9, blocking_fail:M9a`.
+
+## The four states, and which one each row is in
+
+The PRD forbids conflating these. Every claim below carries one.
+
+| requirement | code | compiles | on the wire | notes |
+|---|---|---|---|---|
+| M4 `xnu.*` | yes | yes | **PASS** | 3 records, every boot |
+| M5 `iokit.*` | yes | yes | **PASS** | 2 records, every boot |
+| M6 `virtio_blk.read_back` | yes | **yes** | UNMEASURED | site is later than the capture window |
+| M7 `dyld.cache_read` | yes | **yes** | UNMEASURED | per-process site; window too short |
+| M8 `launchd.running` / `daemon.spawned` | yes | **no** | — | patch held back, see below |
+| M10–M12 `install.registered` | yes | **yes** | BLOCKED | reader thread does not run |
+| M9 `springboard.running` | **no** | — | — | no emitter exists |
+| M9 `springboard.interaction` | **no** | — | — | needs a guest userspace console client |
+| M13 network | **no** | — | — | no emitter, no probe evidence |
+| M14 GPU/Metal | **no** | — | — | `XNU_NATIVE_OFFLINE_GPU` defaults to 0 |
+| M15 Metal IPA | **no** | — | — | downstream of M14 |
+
+## The three gaps that are architectural, not incremental
+
+1. **The guest userspace has no console client.** Every record that has ever
+   arrived was emitted by the kernel or by `NativeVirtioConsole` itself. The guest
+   has an `IOUserClient` for the port (`NativeVirtioConsoleClient`) and nothing
+   opens it. `springboard.interaction`, `uikit.*`, `data.*` and `install.trust`
+   all need a userspace agent that does not exist.
+2. **`XNU_NATIVE_OFFLINE_GPU` defaults to 0**, so `NativeOfflineGPU` -- the only
+   code that reads the console port from userspace's side of the broker -- has
+   never been linked into a kernel.
+3. **The capture window is 1500 s and the interesting sites are later than that.**
+   M6's emitter sits behind a SHA-256 verification of every 4096-byte block; M7's
+   is per-process. Extending the window 5x added nothing, so the window is
+   exonerated rather than assumed -- which means the gap is the window's LENGTH,
+   not its existence.
+
+## What is deliberately NOT claimed
+
+* No IPA has been installed, launched or interacted with. No `.ipa` is in any
+  tree.
+* No audio, network, launcher or performance measurement exists. The gate has no
+  gate for them; the PRD's M13–M15 rows are "not default-blocking for the first
+  release unless already a P0 dependency".
+* M9/M9a FAIL on the PRD's own vetoes. That is the gate working, not a defect.
+* `sources.lock.json` is `frozen=false`. WP00 and half of WP01 are blocked on
+  that, and freezing it is a delivery decision, not a code one.
+
+---
+
+# Interval 2026-11-03 (second): M9 is architectural, and the first half of it is now code
+
+## The M8 failure is reproduced, attributed, and controlled
+
+`repro-patch-twopass.py` was BROKEN when I picked it up: `main()` never called
+`one_pass()`, so it printed "both passes clean" unconditionally.  An instrument
+that always agrees is not evidence.  Fixed to run three passes, and with M8
+restored it reproduces build 41451414922 exactly:
+
+    pass 1: applied 58, skipped 0
+    *** pass 2: FIRST FAILURE: offline-owner-systemos-mount.patch
+    error: patch failed: bsd/kern/kern_exec.c:183
+
+Control, M8 removed: `pass 1: applied 57`, then three clean passes.  So the
+coupling is real, it is M8's, and it is the SECOND pass that catches it -- which
+is why the single-pass instrument was blind to it.
+
+## M9 is not blocked on a build. It is blocked on an architecture decision.
+
+The PRD veto (`milestones.py:1745-1752`) refuses a homescreen screenshot plus a
+mouse click.  Both records it wants must come from a guest channel, and the
+guest userspace is Apple's real code and cannot be modified to emit anything.
+So the question was: what can the KERNEL measure?
+
+Both halves exist, and this is the first interval that establishes it with
+file:line evidence rather than by assumption:
+
+* **the screen.**  `NativeGOPPresenter::start()`
+  (`vendor/UniXNU/drivers/NativeMobileDisplay/NativeGOPPresenter.cpp:82-98`) maps
+  the scanout writable and cross-checks the mapping against `PE_current_console()`
+  -- same `v_baseAddr`, `v_width`, `v_height`, `v_rowBytes`, depth 32, no rotate.
+  It also exports `native_gop_ready` and `native_gop_virtual` as `extern "C"`
+  globals (`:14`, `:96-97`).  A digest over that mapping is a measurement.
+* **the input.**  `NativeHidInput` reaches `handleReport()` from `touchSend()`
+  (`:188`), `buttonsAction()` (`:204`) and `tick()` (`:244`), on a 1-second timer
+  armed at `:290`.  The attach is default-off in
+  `vendor/UniXNU-qemu/package/HidInputProbe.cpp:147` and the staged kernel args
+  turn it on -- `offline-hid-input=1 offline-hid-home=1 sheng-touch-hid=1`,
+  asserted by `tests/unit/test_staged_kernel_args_provenance.py`.
+
+Digest, deliver, digest again, report only if they differ.  That is a measurement
+of "mouse input changed the guest interface", which is the sentence the milestone
+actually asks for.
+
+## Two corrections to my own earlier reads
+
+* **`native_hid_input_observed` IS wired.**  I reported it undefined earlier this
+  interval.  The grep that produced that was backgrounded mid-run and I read its
+  truncated output as a negative.  It is called in five places
+  (`NativeHidInput.cpp:190,206,236,240,246`) and DEFINED at
+  `vendor/UniXNU-qemu/package/HidInputProbe.cpp:141`.  Same failure shape as the
+  QMP `pmemsave` episode: an instrument limitation read as a result.
+* **`NativeHidInput` and `NativeMobileDisplay` are separate pinned submodules**
+  (`config/sources.lock.json`: `28f9b463b48e` and `eb9c94916482`), not part of the
+  `unixnu.commit` pin.  Editing either is its own pin bump.  The interaction
+  emitter therefore goes in the DEVICE repo
+  (`vendor/UniXNU-qemu`, pinned as `device_repo.commit = efa03c981efc`), where
+  `HidInputProbe.cpp` already owns the input hook and already includes
+  `<pexpert/pexpert.h>` -- so it can take the digest from `PE_current_console()`
+  without touching a single driver.
+
+## What landed
+
+* `vendor/UniXNU/patches/xnu/zzz-native-springboard-events.patch`, pushed as
+  `cfeef91` on `unipad/gpu-addon-ngpu-dir`.  Emits `springboard.running` from
+  `__mac_execve()`'s `if (!error)` block, where `p` is the switched proc and
+  `p_comm` has just been written by `set_proc_name()`.  THE EXTERN IS
+  BLOCK-SCOPED: a file-scope declaration would need a second hunk in the include
+  block, and that is precisely M8's failure.  Keeping it beside its only caller
+  adds no hunk near `kern_exec.c:183` at all, and three passes stay clean.
+* `tests/unit/test_native_screen_interaction_probe.py`, committed `7e44d6b`.
+  Six tests fail -- neither emitter exists.  That is the contract, not a broken
+  test.  The teeth check (`test_the_rule_catches_the_defect_it_names`) PASSES,
+  and writing it caught a real bug in the rule itself: the first version matched
+  only `!=`/`<`/`>`, which rejected the honest `before == after -> return` gate.
+  A test that only ever fails is not evidence it can pass.
+
+## Still unmeasured, and not claimed
+
+* No kernel carrying `zzz-native-springboard-events.patch` has compiled.  CI is
+  the first thing that compiles it; this host has no C compiler.
+* No kernel carrying it has booted.  `springboard.running` is code COMPLETE and
+  wire UNMEASURED.
+* The interaction emitter is not written.  It is the half the veto actually turns
+  on: `homescreen_screenshot_only` fires on the ABSENCE of
+  `springboard.interaction`, so `springboard.running` alone moves M9 from FAIL to
+  still-FAIL.
