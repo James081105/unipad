@@ -385,27 +385,62 @@ def test_the_cache_read_record_is_valid_json_naming_the_gates_event():
 
 
 def test_the_cache_read_report_is_gated_on_success():
-    """Emitted only when the shared-region mapping succeeded AND the port exists.
+    """Emitted only when the shared-region mapping succeeded, and only once.
 
-    The null check stays even though the reference is strong, for the reason the
-    mount emitter gives: a strong reference that somehow resolved to null would
-    otherwise be a call through zero, and the linker's guarantee costs one dead
-    branch to keep visible.
+    The gate is ``!error`` and NOTHING ELSE, and that is a change with a
+    measurement behind it.  This test used to require
+    ``if (!error && native_console_report)`` on the mount emitter's reasoning
+    that "a strong reference that somehow resolved to null would otherwise be a
+    call through zero, and the linker's guarantee costs one dead branch to keep
+    visible".
+
+    That reasoning is wrong, and build 41330622788 is why.  A
+    ``__attribute__((weak_import))`` reference resolved to null on a real guest
+    and dropped both records behind a green build with the records byte-level in
+    the booting kernel -- and the null check made that absence look like a
+    deliberate design decision.  **A guard that tests whether an optional
+    dependency is present is indistinguishable, from the source, from a guard
+    hiding that the dependency was never linked.**  The two have opposite
+    remedies, and the guard picks the wrong one.
+
+    Liveness is answered by the return status instead.  ``native_console_report()``
+    returns ``kIOReturnNotOpen`` when there is no live console, so a caller that
+    cares can tell; the emitter here does not need to, because a strong reference
+    means a missing archive fails the LINK naming the symbol.
+
+    ``!error`` stays because it is about the EVENT's truth, not the
+    dependency's: the cleanup above has already released the file mappings and
+    the shared-region reference, so an earlier emission would put "read" on the
+    wire for a mapping a later failure then abandoned.
     """
     patch = _cache_read_patch()
     if patch is None:
         pytest.skip("the dyld cache read patch is not in this pinned tree")
-    code = _code_lines(patch.read_text(encoding="utf-8"))
-    assert any("if (!error && native_console_report)" in line for line in code), (
-        "the emitter is not gated on !error AND the symbol"
+    text = patch.read_text(encoding="utf-8")
+    code = _code_lines(text)
+    assert any("if (!error && !native_dyld_cache_read_reported)" in line
+               for line in code), (
+        "the emitter is not gated on !error AND the one-record bound.  The "
+        "second half is what keeps a per-process site from flooding the "
+        "channel: dyld calls _shared_region_map_and_slide() in every process "
+        "that uses the shared cache."
     )
     assert any(
         line.startswith("native_console_report(cache_read_record") for line in code
     ), "the cache read record is never handed to the port"
     # And only once: a second emission of the same event is silently dropped by
     # the host (_guest_events uses setdefault), so a reader would never see it.
-    assert patch.read_text(encoding="utf-8").count(
-        "native_console_report(cache_read_record") == 1
+    assert text.count("native_console_report(cache_read_record") == 1
+    # The bound is a flag that is never cleared, and it is set BEFORE the call
+    # rather than after: a record that is in flight is a record that has been
+    # reported, and a re-entrant path must not put a second one on the wire.
+    assert "native_dyld_cache_read_reported = 1;" in text, (
+        "the one-record bound is never set"
+    )
+    assert "static int native_dyld_cache_read_reported = 0;" in text, (
+        "the one-record bound is not declared at file scope, so it does not "
+        "survive between calls"
+    )
 
 
 def test_the_cache_read_reference_is_strong_not_weak():
@@ -483,8 +518,8 @@ def test_the_cache_read_record_is_an_array_whose_sizeof_is_of_the_array():
     # No conditional operator anywhere in the emitter: the ternary that decayed
     # two arrays to one pointer is the shape being excluded.
     start = next(i for i, line in enumerate(code)
-                 if "if (!error && native_console_report)" in line)
-    block = code[start:start + 8]
+                 if "if (!error && !native_dyld_cache_read_reported)" in line)
+    block = code[start:start + 10]
     assert not any("?" in line for line in block), (
         f"the emitter block carries a conditional operator: {block}"
     )
@@ -536,7 +571,7 @@ def test_the_cache_read_site_is_the_shared_cache_mapping_function():
     )
     gate_at = next(
         (i for i, line in enumerate(second_body)
-         if "if (!error && native_console_report)" in line), None
+         if "if (!error && !native_dyld_cache_read_reported)" in line), None
     )
     assert trace_at is not None and return_at is not None and gate_at is not None, (
         f"the second hunk ({second_header}) does not carry the trace, the return "
