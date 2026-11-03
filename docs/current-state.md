@@ -5530,3 +5530,83 @@ now catches the stale header it was written to catch.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The screen: thirteen identical screendumps and six Home presses, none of which
   changed anything.
+
+---
+
+# Interval 2026-11-04 (thirty-seventh): the exit codes.  `fairplayd.A2` is not
+# failing.  Four processes are, and one of them is `launchd`.
+
+## The sequence, with statuses
+
+Build **41708386711**, kernel sha256 `9dd7a370...` verified against
+`payload.json` before the boot.  5601 bytes, 50 records:
+
+    exec.seen  n=1  launchd
+    exit.seen  n=1  fsck               code=0
+    exit.seen  n=2  mount              code=0
+    exit.seen  n=3  seputil            code=0
+    exit.seen  n=4  mobile_obliterat   code=0
+    exit.seen  n=5  launchd            code=1     <-- NON-ZERO
+    exec.seen  n=2  apfs_boot_util
+    exit.seen  n=6  apfs_boot_util     code=0
+    exit.seen  n=7  MSUEarlyBootTask   code=1     <-- NON-ZERO
+    exit.seen  n=8  MSUEarlyBootTask   code=0
+    exit.seen  n=9  cc_fips_test       code=0
+    exit.seen  n=10 keybagd            code=0
+    exit.seen  n=11 usermanagerd       code=0
+    exit.seen  n=12 dirs_cleaner       code=0
+    exit.seen  n=13 xpcroleaccountd    code=0
+    exit.seen  n=14 init_featureflag   code=0
+    exit.seen  n=15 auearlyboot        code=0
+    exit.seen  n=16 tzinit             code=0
+    exit.seen  n=17 FinishRestoreFro   code=0
+    exit.seen  n=18 finish_demo_rest   code=0
+    exit.seen  n=19 sysstatuscheck     code=256   <-- wait status 1
+    exit.seen  n=20 prng_seedctl       code=3328  <-- wait status 13
+    exit.seen  n=21 launchd_cache_lo   code=0
+    exit.seen  n=22 init_exclavekit    code=0
+    exit.seen  n=23 mtmergeprops       code=0
+    exit.seen  n=24 watchdogd          code=0
+    exit.seen  n=25 fairplayd.A2       code=0
+    exit.seen  n=26 fairplayd.A2       code=0
+    exit.seen  n=27 fairplayd.A2       code=0
+    exit.seen  n=28 DumpPanic          code=0
+
+Both display records reproduced for a SIXTH time with identical values.
+
+## `fairplayd.A2` is NOT failing -- interval 35's hypothesis is refuted
+
+Interval 35 read three runs of `fairplayd.A2` as "a daemon that failed and was
+relaunched".  **All three exited with code 0.**  It runs three times because it
+is supposed to, and the measurement says so.  That is the second hypothesis this
+session's own records have killed -- the first was the Data mount as the cause of
+the userspace stall, killed by `diag.owner_data_status` stage 4.
+
+## The four that did not succeed
+
+`rv` is the wait status the kernel hands the parent, so the exit code is in the
+high byte: 256 is exit code 1, 3328 is exit code 13.
+
+* **`launchd` code 1** (n=5).  The interesting one.  If this were pid 1 the
+  kernel would panic and the boot would stop; it did not, so this is a process
+  whose `p_comm` was still `launchd` -- which on XNU is what a `posix_spawn`
+  child carries until `execve` calls `set_proc_name()`.  A child that exits
+  before its exec reports the PARENT's name.  That reading fits a spawn that
+  failed, and it is UNMEASURED which of the two it is.
+* **`MSUEarlyBootTask` code 1** (n=7) then **code 0** (n=8).  The same shape as
+  the `launchd` one, and here the retry is visible: attempt one failed, attempt
+  two succeeded.
+* **`sysstatuscheck` code 256** -- exit code 1.
+* **`prng_seedctl` code 3328** -- exit code 13.
+
+## What is still not measured
+
+* Whether the `launchd` code-1 exit is a failed spawn or pid 1 itself.  A pid
+  field would settle it and the record does not carry one, for the reason
+  `native-dyld-cache-read.patch` gives: a formatted pid puts a formatting path in
+  front of a record whose only job is to arrive whole.
+* Whether `DumpPanic` at n=28 dumped a panic from THIS boot or found an older
+  one.  `IOMFB_FDR_Loader`, which preceded it last build, did not run this build.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The screen: thirteen identical screendumps and six Home presses, none of which
+  changed anything.
