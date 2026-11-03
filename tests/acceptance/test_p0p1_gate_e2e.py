@@ -1091,9 +1091,26 @@ def test_an_incomplete_run_is_never_a_pass(tmp_path):
 
 
 def test_a_missing_sample_is_blocked_not_passed(tmp_path):
-    """PRD 5.1: a sample that does not exist is a BLOCKED with a reason."""
-    env = e2e.E2EEnvironment.create(
-        tmp_path / "runs" / "exp-no-samples", verify_qemu_version=False
+    """PRD 5.1: a sample that does not exist is a BLOCKED with a reason.
+
+    ``sample_roots`` is pinned to an empty directory under ``tmp_path``, and that
+    is load-bearing.  ``E2EEnvironment.create`` defaults ``repo_root`` to THIS
+    repository, so without the override the roots resolve to the real
+    ``local-private/ipa/`` -- where the archived samples live.  The test then
+    finds them and asserts ``exists is False`` against a sample it just measured.
+
+    MEASURED 2026-11-03: this test is red on this host and green everywhere else,
+    because ``local-private/`` is gitignored and therefore absent from a clean
+    checkout, a worktree and the CI runner.  Same shape as the ``trace_log``
+    defect in ``test_evidence_kind_vocabulary.py``: a test whose premise holds
+    only where a file happens not to be.  The sibling test below already pins its
+    own roots explicitly; this one now does too.
+    """
+    env = e2e.E2EEnvironment(
+        repo_root=tmp_path,
+        run_dir=tmp_path / "runs" / "exp-no-samples",
+        sample_roots=(tmp_path / "no-samples-here",),
+        verify_qemu_version=False,
     )
     observed = observe_samples(
         env, tmp_path / "runs" / "exp-no-samples" / e2e.EVIDENCE_DIRNAME, STAMP

@@ -816,12 +816,25 @@ def _observe_one_sample(
 
     digest = _sha256_file(found)
     digest_name = f"{spec.name}.sha256"
-    (evidence_dir / digest_name).write_text(digest + "\n", encoding="utf-8")
+    # newline="" is load-bearing, and the reason is a measured Windows defect.
+    # Path.write_text opens in TEXT mode, and on Windows a lone "\n" is
+    # translated to "\r\n" on the way out.  The ref below hashes the bytes the
+    # caller MEANT to write -- 65 of them -- while the verifier re-hashes what
+    # landed on disk -- 66.  Every acceptance run on this host therefore died in
+    # load_bundle with "evidence file changed since it was recorded" before it
+    # could report a verdict at all.
+    #
+    # It never appeared on the macOS runner, which is the only other place this
+    # code runs, so CI could not see it either.  The rule it establishes: a file
+    # whose bytes are hashed is written with write_bytes or with newline="",
+    # never with a text-mode write that translates.
+    sidecar = (digest + "\n").encode("utf-8")
+    (evidence_dir / digest_name).write_bytes(sidecar)
     evidence: list[EvidenceRef] = [
         EvidenceRef(
             path=f"{EVIDENCE_DIRNAME}/{digest_name}",
             kind="manifest",
-            sha256=_sha256_bytes((digest + "\n").encode("utf-8")),
+            sha256=_sha256_bytes(sidecar),
             scope=HOST_REAL,
             observed_at=observed_at,
         )

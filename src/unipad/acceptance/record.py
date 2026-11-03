@@ -113,6 +113,7 @@ EVIDENCE_KINDS: tuple[str, ...] = (
     "probe_log",
 )
 
+
 #: A witness is ``"<file>:<lineno>:<literal>"`` -- one line of one file that
 #: only the target object could have written -- or ``"witness:<id>"`` naming a
 #: pattern registered by the probe registry.
@@ -344,13 +345,7 @@ class EvidenceRef:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", relativise(self.path))
-        if self.kind not in self.ALLOWED_KINDS:
-            raise UniPadError(
-                ErrorCode.CONFIG_INVALID,
-                "unknown evidence kind",
-                kind=self.kind,
-                known_kinds=list(self.ALLOWED_KINDS),
-            )
+        self._check_kind()
         scope_at_least(self.scope, EvidenceScope.SIMULATION)
         # A whitespace-only "explanation" is the same non-explanation as none:
         # the reason has to be read by a human, so it has to say something.
@@ -374,6 +369,24 @@ class EvidenceRef:
                 onsite_evidence_without_witness=self.path,
             )
 
+    def _check_kind(self) -> None:
+        """Refuse a kind this class's vocabulary has no word for.
+
+        Split out of ``__post_init__`` so a subclass can decline exactly this one
+        rule and keep every other -- see :class:`LoadedEvidenceRef`.  The closed
+        set is the right rule for CONSTRUCTION: a producer cannot invent a kind
+        its own class does not declare.  It is the wrong rule for
+        DESERIALISATION, where the kind was already checked by whichever producer
+        wrote it, against that producer's own wider set.
+        """
+        if self.kind not in self.ALLOWED_KINDS:
+            raise UniPadError(
+                ErrorCode.CONFIG_INVALID,
+                "unknown evidence kind",
+                kind=self.kind,
+                known_kinds=list(self.ALLOWED_KINDS),
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view of the reference."""
         return {
@@ -388,8 +401,35 @@ class EvidenceRef:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "EvidenceRef":
-        """Rebuild a reference from :meth:`to_dict` output."""
-        return cls(
+        """Rebuild a reference from :meth:`to_dict` output.
+
+        Deserialises with :class:`LoadedEvidenceRef`, NOT with ``cls``, and the
+        reason is a measured defect.
+
+        MEASURED 2026-11-03: every case in ``test_acceptance_registry.py`` was
+        red on this host, and the acceptance registry could not report a verdict
+        at all.  ``load_bundle`` reached ``Verdict.from_dict``, which hardcoded
+        ``EvidenceRef.from_dict(ref)`` -- the BASE class -- and the base class's
+        kind set is the BUNDLE vocabulary.  But the bundle was written by
+        producers whose subclasses carry WIDER sets: ``e2e`` adds
+        ``precheck_report`` and ``qemu_args``, ``milestones`` adds ``trace_log``.
+        So a kind the write side accepted was rejected by the read side, with
+
+            UniPadError: unknown evidence kind
+            kind: 'precheck_report'
+
+        The closed set is right and stays: it guards CONSTRUCTION, so a producer
+        cannot invent a kind its own class does not declare.  What it must not do
+        is re-apply ONE class's vocabulary to ANOTHER class's output.  A bundle
+        is a union of everything the producers wrote, so it is read back with the
+        union.
+
+        ``tests/acceptance/test_evidence_kind_vocabulary.py`` derives the union
+        from the imported subclasses and fails on a drift, so a producer that
+        adds a kind without extending this list is caught here rather than on a
+        host with the sample IPAs on disk.
+        """
+        return LoadedEvidenceRef(
             path=str(data["path"]),
             kind=str(data["kind"]),
             sha256=data.get("sha256"),
@@ -398,6 +438,34 @@ class EvidenceRef:
             witness=data.get("witness"),
             observed_at=str(data.get("observed_at", "")),
         )
+
+
+@dataclass(frozen=True)
+class LoadedEvidenceRef(EvidenceRef):
+    """A reference read back from a bundle: the write side already judged it.
+
+    Every rule of :class:`EvidenceRef` still applies -- path, digest, witness,
+    scope, the whitespace-reason check.  Only the kind vocabulary is declined,
+    and the reason is a measured defect.
+
+    MEASURED 2026-11-03: every case in ``test_acceptance_registry.py`` was red on
+    this host and the acceptance registry could not report a verdict at all.
+    ``load_bundle`` reached ``Verdict.from_dict``, which hardcoded
+    ``EvidenceRef.from_dict(ref)`` -- the BASE class, whose kind set is the BUNDLE
+    vocabulary.  A bundle is written by producers whose subclasses carry wider
+    sets (``e2e`` alone declares 28 more), so a kind the write side accepted was
+    rejected by the read side:
+
+        UniPadError: unknown evidence kind
+        kind: 'precheck_report'
+
+    Maintaining a union list instead would mean re-listing every e2e kind here
+    and updating it whenever a case gains one, for no gain: the kind was already
+    validated, by the class that produced it, against that class's own set.
+    """
+
+    def _check_kind(self) -> None:
+        """The producer that wrote this reference already checked its kind."""
 
 
 @dataclass(frozen=True)
