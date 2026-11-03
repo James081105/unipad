@@ -5467,3 +5467,66 @@ builds running) and the framebuffer has never moved off the UniXNU boot menu.
 * Why `fairplayd.A2` ran three times, or whether it failed.
 * What stalled after n=29.  Nothing ran, so an exit record cannot see it.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+
+---
+
+# Interval 2026-11-04 (thirty-sixth): the exit status is pinned.  A list of names
+# is not a diagnosis.
+
+## What is in flight
+
+Fork commit `4b8c68c9`, pushed to `unipad/gpu-addon-ngpu-dir`; the lock's
+`unixnu.commit` moved to it.  Build **41708386711** dispatched at 19:59 with
+`stage=M7`.  When it lands, the capture answers the question interval 35 opened.
+
+## The change
+
+    {"event":"exit.seen","n":29,"comm":"fairplayd.A2","code":-9,
+     "source":"XNU.exit_with_reason"}
+
+`rv` is the wait status the kernel is about to hand the parent, so it is the
+kernel's own number and not an interpretation of it.  Negative is emitted with a
+sign, because a process killed by a signal reports a negative status.
+
+The reason is interval 35's list: twenty-nine early boot tasks, three of them
+`fairplayd.A2`, and a stall after the last one.  A daemon that runs three times
+is usually one that failed and was relaunched -- and "usually" is exactly what
+the status field is for.
+
+The record still lands inside the 128-byte buffer: 25 prefix + 2 index + 9 + 16
+comm + 9 + 11 code + 34 suffix is 106, plus the NUL.
+
+## The defect the assembly simulation caught
+
+Two versions were wrong before one was right, and both were caught **before a
+build cycle**, which is the only reason this is a note rather than another
+twenty-minute lesson:
+
+1. the code field went between the comm and the source **without closing the
+   comm's quote**;
+2. the fix **closed it twice**, producing
+   `...,"comm":"fairplayd.A2","code":-9","source":...` -- a record no parser
+   accepts.
+
+Both were found by assembling every combination of `n` in 1..64, three comms and
+eight codes (including `INT_MIN` and `INT_MAX`) and parsing each as JSON.  A
+hand-assembled JSON record has no compiler either, and the emitters in this tree
+are all hand-assembled -- no `snprintf`, deliberately, because this translation
+unit does not include the header that declares it.
+
+## And the recount script had the same bug as the thing it checks
+
+`check-patch-headers.py` (new, `local-private/tmp/`) reports every hunk header
+against its actual line counts.  Its first version had the same broken regex the
+previous hand-count had, so it reported both headers fine while one was stale by
+42 lines -- the exact defect build 41635226688 paid a cycle for.  Fixed, and it
+now catches the stale header it was written to catch.
+
+## Not claimed
+
+* Whether `fairplayd.A2` failed.  The status field is pinned and unmeasured.
+* Whether a panic occurred.  `DumpPanic` at n=28 is consistent with one.
+* Why the exec record sees two of twenty-nine processes.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The screen: thirteen identical screendumps and six Home presses, none of which
+  changed anything.
