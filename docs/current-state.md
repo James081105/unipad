@@ -5056,3 +5056,92 @@ question and it needs a bounded per-exec record, not a once-per-boot one.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The screen: `screen_ever_changed: false` this run -- one distinct screendump,
   and six Home presses, every one of which changed nothing.
+
+---
+
+# Interval 2026-11-03 (thirty-first): a dropped `#endif` cost a build, and both
+# patch instruments said the tree was clean.
+
+## The failure
+
+Build **41635226688**, failed after 32m56s.  Four errors, all in `kern_exec.c`:
+
+    kern_exec.c:5289:2: error: unterminated conditional directive
+     5289 | #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+    kern_exec.c:9386:127: error: expected '}'
+    kern_exec.c:9386:127: error: expected '}'
+    kern_exec.c:5194:8: error: use of undeclared label 'exit_with_error'
+
+The first is the defect; the other three are consequences.  The edit that
+replaced the once-per-boot `exec.first` record with the bounded `exec.seen`
+sequence dropped the `#endif` that closes the `#if` the whole emitter sits in --
+and that `#endif` was also what separated the emitter from the rest of
+`__mac_execve()`, hence the brace and label errors further down the file.
+
+## Why neither instrument saw it
+
+    repro-patch-order.py    -> all patches applied
+    repro-patch-twopass.py  -> ALL PASSES CLEAN (three passes)
+
+Both are correct and both are answering a different question.  They check that
+`git` **applies** the patch, and git does not care what the result means.  A
+patch that opens a conditional and never closes it applies perfectly.
+
+This host has no C compiler -- the patch comments say so, and that is why CI is
+the first thing that compiles it -- so every unbalanced conditional costs a full
+build cycle.  That is the gap, and it is now closed from this side.
+
+## The guard, and the two formulations that were wrong first
+
+`tests/unit/test_console_declaration_visibility.py::
+test_a_patch_does_not_change_the_files_conditional_nesting`.
+
+The rule is **depth-neutrality**: (added `#if` - added `#endif`) must equal
+(removed `#if` - removed `#endif`).  A patch must not change the file's
+conditional nesting.
+
+Two simpler rules were tried first and **each went red on correct patches**, so
+both are recorded in the test file rather than discarded:
+
+| formulation | false positive |
+|---|---|
+| the patch's own directives balance | `apple-only-cpu-tunables.patch` adds a second `#if defined(APPLE_ARM64_ARCH_FAMILY)` pair **inside** an existing one, and its hunk context carries the outer `#endif`.  A per-patch scan cannot tell the file's conditional from the patch's. |
+| only added lines count | **seven** patches rewrite an existing condition (`-#if defined(BCM2837)` becomes `+#if defined(BCM2837) && (...)`).  They add an `#if` and no `#endif`, because the file already had one. |
+
+Proven three ways, the way this file's existing rules are proven:
+
+1. **against the real patches** -- zero false positives across all 58+;
+2. **against the exact defect** -- removing the `#endif` goes red with
+   `net conditional depth +1 (+1 #if / +0 #endif / -0 #if / -0 #endif)`;
+3. **against the shape that looks like the defect and is not** -- rewriting an
+   existing `#if` stays green.
+
+That third case is the one that matters most.  A guard that goes red on correct
+code is the same as no guard at all, and the first two formulations of this rule
+were exactly that.
+
+## Where the frontier is
+
+Measured, in order, on build 41617257137's guest:
+
+1. root volume enumerated and read back (`virtio_blk.read_back`, verified);
+2. `kernel_thread_start` returned `KERN_SUCCESS`;
+3. `install.registered`;
+4. root mounted (`system.mount`, `/`, apfs, readonly);
+5. Data mount verified (`diag.owner_data_status` stage 4, error 0);
+6. display path completed (`diag.legacy_display_status` stage 10);
+7. **`launchd` exec'd** (`exec.first`);
+8. dyld mapped the shared cache in it (`dyld.cache_read`);
+9. `springboard.running` did NOT arrive in 1500 s.
+
+Both stage-10 and stage-4 reproduced exactly across two builds.  The userspace
+boot stops inside launchd.  `exec.seen` is the record that says what launchd did
+next, and it is what the running build carries.
+
+## Not claimed
+
+* That `exec.seen` compiles.  The `#endif` is restored, both repros are clean,
+  the full unit suite is 3476 passed exit 0, and the new guard is
+  mutation-proven -- and none of those is a compiler.
+* Whether launchd spawned anything.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
