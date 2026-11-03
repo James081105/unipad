@@ -3888,3 +3888,128 @@ the cause is a hypothesis with a documented failure mode and no measurement.
   first thing that will compile it.  Nothing here says it compiles.
 * `vendor/` is gitignored and the acquisition step re-clones it from the pin, so
   the patch lives in the fork, not in this repository.
+\n
+---
+
+# Interval 2026-11-03 (eighteenth): the display emitter is pinned, and the check
+# that guards it cried wolf three times first.
+
+## What landed
+
+`device_repo.commit` moved `0efab237` -> `5ef74a1`, ONE commit, and it closes the
+second observability gap on the critical path.  `diag.owner_data_status` closed
+the Data mount's; `diag.legacy_display_status` closes the display's.
+
+    {"event":"diag.legacy_display_status","stage":N,"surface_status":S,
+     "surface_found":F,"dt":D,"source":"XNU.LegacyDisplayProbe"}
+
+Four counters were already being written by `native_legacy_display_late_body`
+and read by nothing, so "the display never came up" and "the display came up and
+drew nothing" were the same silence from the host.  The framebuffer is the only
+kernel output on this board -- there is no embedded panic log, because the ADT
+carries no `embedded-panic-log-size` and `gPanicBase` stays 0 -- so a display
+path that stops and a display path that was never taken were indistinguishable.
+
+Plus the one early exit that had no checkpoint at all: `pendingLegacyDisplay`
+already cleared means the display never ARRIVED, which is the exit every frozen
+boot took, and it is the case the record was needed for.
+
+## The linkage, which was one edit away from shipping broken
+
+`extern "C" int native_console_report(const void *, size_t);` -- both halves
+load-bearing.
+
+Strong, because MEASURED on build 41330622788 a `weak_import` reference to this
+same symbol resolved to null and dropped records behind a green build.
+
+C, because the definition is a C symbol in the XNU console patch and **every
+function in that translation unit sits outside its `extern "C"` block** (which
+ends at line 129, and the emitter is at 168).  A bare `extern int` would mangle
+the reference into C++, and the kext would carry a symbol that resolves to
+nothing at load -- the same green-build-emits-nothing failure the weak_import
+produced, reached by a different route.  `HidInputProbe.cpp` gets C linkage by
+declaring inside its `extern "C"` block; this file cannot, because its emitter is
+not in one.
+
+The first version of this emitter declared it bare.  Nothing would have caught
+it until a boot produced no records and someone went looking.
+
+## The check cried wolf three times, and that is the real story
+
+`tests/unit/test_guest_emitter_records.py`, 23 tests, all green, zero skips.
+It reassembles each emitter's literals the way the preprocessor will, decodes
+the escapes the way the compiler would, and parses the result.  Getting there
+took four false FAILs on healthy source:
+
+1. **"every field is a number"** -- flagged four healthy emitters.
+   `springboard.running`'s `comm` and `springboard.interaction`'s two screen
+   digests are legitimately strings.  Replaced with the invariant that matters.
+2. **"N empty positions need N `put_unsigned(record` calls"** -- flagged
+   `springboard.running`, which predates the helper and inlines
+   `record[used++] = text[--digits]`.
+3. **Counting from the top of the file** -- reached back into the
+   `put_unsigned` helper's own *definition*, whose body also contains
+   `record[used++] = text[--digits]`, so every emitter using the helper counted
+   its appends twice.  Fixed by starting the window at the emitter's first
+   literal.
+4. **One bucket for all value slots** -- `springboard.interaction` reported 0
+   positions with 5 appends, because its two digests are QUOTED (`"before":""`)
+   and the bare-position regex `:(?=,|\})` never saw them.  Split into bare
+   (decimal) and quoted (hex), and each family now has its own invariant.
+
+And a fifth that is not a FAIL but was equally wrong: **`system.mount` reported
+"the record is not JSON"**.  That emitter hands a whole static array to
+`native_console_report`, built from adjacent literals *and* `XNU_OWNER_*_UUID`
+macros, so the regex sees only its first fragment and half a record parses as
+nothing.  That is a limitation of the check, not a defect in the emitter, and it
+is now UNVERIFIABLE (exit 3) rather than FAIL.  A false FAIL on a healthy emitter
+is how a real FAIL gets ignored.
+
+`local-private/tmp/check-emitter-record.py` now **imports** the committed test
+rather than reimplementing it.  The two had already drifted -- the tool learned
+about the `extern "C"` declaration and the macro-sized buffer while the test did
+not, and neither noticed.  One implementation, two entry points.
+
+## Teeth, measured
+
+Four mutations on copies in pytest's own tmp directory, each killing a different
+check: a field added to the prefix with no append for it; the buffer shrunk from
+192 to 100; the trailing newline dropped; the source field removed.  All four
+turn it red, baseline stays green.  An earlier version of this family wrote the
+mutation to the real file and restored it in a `finally`, which leaves the repo
+mutated if anything interrupts -- and this repository has already lost four edits
+to a checkout that restored the wrong bytes.
+
+## A real gap the skip exposed
+
+`springboard.interaction` declares `char record[INTERACTION_RECORD_MAX]` and
+`#define`s it to 160 two hundred lines above.  Matching only a digit literal
+skipped that emitter's buffer check entirely -- a real gap, since the bound is
+the invariant under test -- and it was found by noticing the skip, not by any
+failure.  The macro is now resolved.
+
+## build-macos 41561607719: green
+
+21 m 53 s, all 34 steps.  **Step 21 is the one that matters**: "Run macOS build
+again (qemu_root_defconfig, PRD 8.1 root chain)".  That is the only pass that
+defines `XNU_OWNER_DATA_MOUNT` for `kern_exec.c` and therefore the only one that
+compiles `diag.owner_data_status`.  It succeeded.
+
+Recorded so it is not repeated: the FIRST build triggered for this was
+`build-kernel-console` (41560114213, green, 8m14s), which compiles the console
+DRIVER archive against `qemu_defconfig` -- and `qemu_defconfig` sets no owner
+mount flags at all.  A green result from it says nothing about the patch.  Same
+class of error as `repro-patch-twopass.py` testing the committed bytes: a green
+result from an instrument that is not looking at the change.
+
+## What is NOT claimed
+
+* `diag.legacy_display_status` is source only -- committed to the fork at
+  `unipad/qemu-metal-bridge-stubs` and pinned, but not compiled and not emitted.
+  CI is the first thing that compiles it.
+* Whether the new kernel carries `diag.owner_data_status` byte-level is being
+  checked against the run's own boot-inputs bundle right now.  A green step 21 is
+  not that check.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display still never draws.  The record says which stage it reached; it does
+  not make it draw.
