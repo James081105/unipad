@@ -4866,3 +4866,94 @@ Fork commit `62bc0f48`, pushed to `unipad/gpu-addon-ngpu-dir`; the lock's
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The display subsystem is up (stage 10) and the screen still shows the boot
   menu.
+
+---
+
+# Interval 2026-11-03 (twenty-ninth): the emitter is compiled and pinned; two
+# dispatch hazards and one measurement hazard, all three measured.
+
+## The build
+
+**41617257137**, green in 21m28s (the toolchain cache halved it).  Its own
+record names both pins and both match the lock:
+
+    "unixnu_commit": "62bc0f4869eb34517642e270451568e561faba33"
+    "device_commit": "5ef74a172ac8182cfb9acc74b07800abec248352"
+
+Two kernels again -- `898db814...` (125 MB, `qemu_root_defconfig`) and
+`79ed0a83...` (51 MB, no owner root chain).  **`exec.first` appears 21 times in
+the build log**, so the patch applied and the literal is in the compiled
+output; that is evidence the emitter compiled, and the boot is what proves it
+fires.
+
+## Hazard one: omitting `stage` builds M2, and it costs 31 minutes to find out
+
+The first dispatch of this pin, **41612457246**, FAILED after 31m41s.  Not a
+code defect -- I omitted `-f stage`, and the workflow's default is `'M2'`:
+
+    stage: 'Milestone/stage to build for, e.g. M2|M3|M4|M5... (PRD 6).'
+      default: 'M2'
+
+At M2 the planner does not schedule the bootloader, so the first pass produced
+no `payload.img`, and the chain step refused:
+
+    ##[error]the chain's first sub-step needs
+    build-output/unixnu-out/qemu/payload/payload.img, which the first build
+    pass did not produce.
+
+The workflow diagnosed it correctly and named the fix in its own error text
+("`plan_steps` gates build-bootloader at n>=3").  What it cannot do is tell you
+soon: the bootstrap link failure at 10:04 is EXPECTED (the same five undefined
+symbols -- `mockfs_mountroot`, `mockfs_vfsops`, `mockfs_vnodeop_opv_desc`,
+`native_legacy_display_probe`, `sheng_pmgr_run` -- because the archives that
+define them are built afterwards), so a reader who has seen that failure before
+has no reason to look further.
+
+**Recorded so it is not repeated: a dispatch that omits `stage` builds M2, and
+every capture needs `stage=M7`.**  The job name in the log says which you got:
+`build-macos (M7, target=tcg)` versus `build-macos (M2, target=tcg)`.
+
+## Hazard two: `pytest ... | tail` returns tail's exit code
+
+I measured the acceptance suite this way and read "exit 0" off it.  That is
+`tail`'s exit code, not pytest's.  Re-measured without the pipe:
+
+    pytest exit=0
+    649 dots, no F, no E
+
+**649 passed, exit 0.**  The suite is genuinely green, and the previous
+measurement happened to agree -- which is worse than being wrong, because it
+made the instrument look sound.
+
+The same run also caught a real host-side failure I had caused: bumping the
+`unixnu` pin left `local-private/upstream/UniXNU` at the old commit, and
+
+    ::error::vendor/UniXNU: the checkout is at 6f5a3d63... but the source lock
+    pins 62bc0f48...
+
+failed `test_the_cross_check_accepts_the_real_driver_status_output`.  Fixed by
+fetching the pin into that clone.  **A pin bump moves two checkouts, not one.**
+
+## The one instrument the guest has, and why every new fact costs a record
+
+The serial log stops at "Exiting boot services" plus the console driver's own
+announcement, and then carries nothing but the channel's JSON.  The reason is
+now measured rather than assumed: `NativeVirtioConsole.cpp` installs **no**
+console -- no `putc`, no `cons_ops`, no `kprintf` hook -- and
+`zzz-boot-progress.patch`'s `boot_progress_stage()` does not call
+`native_console_report` either, so the boot banner goes to the framebuffer,
+which does not draw.
+
+So the kernel's `printf` reaches nowhere observable, and the guest channel is
+the only output path there is.  That is why `load_init_program()`'s own
+"attempting to load %s" lines are unavailable and why `exec.first` had to be
+added rather than read.
+
+## Not claimed
+
+* That `exec.first` FIRES.  21 mentions in the build log say the literal is in
+  the output; only a capture says the call is reached.
+* That the first exec is launchd.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display subsystem is up (stage 10) and the screen still shows the boot
+  menu.
