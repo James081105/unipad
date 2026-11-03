@@ -4013,3 +4013,146 @@ result from an instrument that is not looking at the change.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The display still never draws.  The record says which stage it reached; it does
   not make it draw.
+\n
+---
+
+# Interval 2026-11-03 (nineteenth): the build was green and measured nothing, and
+# the reason was four unpushed commits.
+
+## What I set out to check
+
+`build-macos` 41561607719 finished green at 02:04, 21 m 53 s, all 34 steps,
+including step 21 "Run macOS build again (qemu_root_defconfig, PRD 8.1 root
+chain)" -- the only pass that defines `XNU_OWNER_DATA_MOUNT` for `kern_exec.c`
+and therefore the only one that can compile `diag.owner_data_status`.
+
+So I downloaded its boot-inputs bundle and asked the kernel directly.  The
+sha256 of `payload-esp/EFI/UniXNU/Payloads/kernel.macho` matches the
+`payload_kernel_sha256` the bundle declares, so the measurement is on the right
+artifact:
+
+    diag.install_thread_start        3
+    install.registered               1
+    system.mount                     1
+    system.volume_identity           1
+    dyld.cache_read                  1
+    diag.owner_data_status           0     <-- the emitter this run existed for
+    diag.legacy_display_status       0
+    springboard.running              1
+    springboard.interaction          1
+
+## The instrument had to be validated before the negative could be used
+
+That is the fifth instrument this session that could not be taken at face value,
+and the first time the failure would have sent me looking for a source defect
+that does not exist.  Four checks, in order:
+
+1. **`native_owner_data_prepare` count 0 but its panic string count 1.**  Read
+   carelessly, that says "the caller is compiled and the function is not", which
+   is impossible.  It actually says nothing at all: a C function name is a symbol,
+   not a string, and this image carries its symbol table separately.
+2. **The kernel's panic string is `offline scratch Data mount failed: %d @%s:%d`
+   and the patch writes it without `@%s:%d`.**  Not a different patch -- XNU's
+   own `panic` appends the location.  Confirmed by the neighbouring
+   `offline owner SystemOS mount failed: %d @%s:%d`, which the same patch also
+   writes bare.
+3. **`{"event":"springboard.running","pid":` count 0, but
+   `{"event":"springboard.running",` count 1.**  The binary's literal is missing
+   `pid":`.  That is not a compiler behaviour I can explain, and it is the reason
+   I stopped trusting the raw search and validated it properly instead.
+4. **The validation that settled it.**  `DYLD_SHARED_CACHE_DIR=...` is emitted by
+   the SAME function as `system.mount`, which IS in the kernel -- and the DYLD
+   string is absent.  That looked like the instrument failing.  It is not: those
+   two literals sit under
+   `#if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS`, and
+   `qemu_root_defconfig:36` sets `CONFIG_XNU_OWNER_UNION_SYSTEMOS=y`.  So their
+   absence is CORRECT, and the search is sound: present for compiled literals,
+   absent for compiled-out ones.
+
+With the instrument validated, the negative stands: the emitter is not in the
+kernel.
+
+## And it is not a source defect
+
+`git show 6f5a3d6:patches/xnu/offline-owner-systemos-mount.patch` contains the
+emitter; its parent does not.  The emitter sits at preprocessor depth 1 inside
+`#if defined(XNU_OWNER_DATA_MOUNT)`, the SAME depth as `char device_path[64] =
+"/dev/md0";` -- which is in the kernel, and which exists nowhere else in the
+pinned tree.  So the function compiled from a source that has the function but
+not the emitter.
+
+`artifact-manifest.json` says which source:
+
+    unixnu_commit = 757e46b19c309ab8b41101f56a74c3d6f48a625e
+
+**757e46b is the PARENT of 6f5a3d6.**  I dispatched the run with
+`unixnu_commit=6f5a3d6...` and it built 757e46b.
+
+## The root cause, and it is a workflow defect rather than only my mistake
+
+`git status` said `## main...origin/main [ahead 4]`.  The pin bump
+`8dc703d chore(pin): move unixnu to the Data-mount stage reporter` was never
+pushed.  A `workflow_dispatch` runs against `origin/main`, whose
+`config/sources.lock.json` still said `unixnu.commit = 757e46b`.
+
+And the workflow made that silent.  `build-macos.yml`'s input validation compared
+the dispatch input to the lock **only when `frozen` was true**.  With
+`frozen=false` it printed instead:
+
+    sources.lock.json is NOT FROZEN: the dispatch inputs are the freeze
+    candidates and are recorded verbatim in artifact-manifest.json
+
+That sentence describes behaviour the code does not have.  The acquire step takes
+every commit from `config/sources.lock.json` and from nowhere else -- it passes
+`--lock` and no `--commit` -- so the input is read, compared to nothing, and
+ignored, and the manifest records the LOCK's commit.  A message that promises one
+thing while the build does another is worse than no message, because the next
+reader trusts it.
+
+So: a green build, a verified kernel hash, and a run that could not possibly have
+produced the measurement it was dispatched for.
+
+## The fix
+
+A disagreement is now a refusal in **both** states.  The operator asked for a
+commit they would not have received; that is the one case where spending macOS
+minutes cannot produce the measurement they wanted.  The cost is pushing the pin
+bump before dispatching, which is one commit and is what should have happened
+here.
+
+The earlier rationale for letting it through was a deadlock: while the lock is
+unfrozen the inputs ARE the freeze candidates, so refusing them blocks a first
+build with new pins.  That model cannot be honoured without changing what the
+acquire step reads, and it must not be honoured -- the lock's own `description`
+says "Every run must be reproducible from this file plus the recorded hashes",
+and a run built from a dispatch input is not reproducible from the lock.
+
+`test_the_same_disagreement_in_an_unfrozen_lock_is_only_a_warning` is replaced by
+two tests: the disagreement is fatal in both states, and an unfrozen lock that
+AGREES still builds -- without which the first is satisfied by refusing
+everything.  Both are teeth-checked: restoring the `if frozen:` guard turns them
+red, and the workflow is restored byte-identically afterwards.
+
+## What is in flight
+
+`build-macos` **41567478691**, dispatched AFTER the push, with
+`unixnu_commit=6f5a3d63d5fd787b3c2130c4630a720e60532567` and
+`device_commit=5ef74a1` -- both now equal to the lock's pins, so the new refusal
+cannot fire and the run builds what was asked for.  Its `artifact-manifest.json`
+will say which commits it used, and that is the first thing to read when it
+lands.
+
+41565368136 was dispatched with the same defect and is CANCELLED.
+
+## Not claimed
+
+* The kernel from 41561607719 is not evidence about `diag.owner_data_status` at
+  all.  It is evidence that the run built 757e46b.
+* Nothing here says the emitter compiles.  That is still unmeasured.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display still never draws, and `diag.legacy_display_status` is still
+  source-only -- 41567478691 is the first build that can compile it.
+* `{"event":"springboard.running","pid":` being absent from the image while
+  `{"event":"springboard.running",` is present is UNEXPLAINED and is recorded as
+  such.  It is in the pre-existing emitter, not in anything I changed, and it is
+  the reason I stopped trusting the raw search long enough to validate it.
