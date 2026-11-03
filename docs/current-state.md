@@ -4345,3 +4345,86 @@ caused damage rather than delay.
   `{"event":"springboard.running",` is present remains UNEXPLAINED.  It is in the
   pre-existing emitter, and if it is real then `springboard.running` records are
   malformed JSON and a working SpringBoard would be invisible.
+\n
+---
+
+# Interval 2026-11-03 (twenty-second): build 41584103771 built the right source,
+# and the acceptance gate is green for the first time.
+
+## The build
+
+`build-macos` **41584103771**, dispatched AFTER the push, green.  Its own
+second-pass log records:
+
+    "unixnu_commit": "6f5a3d63d5fd787b3c2130c4630a720e60532567"
+    "device_commit": "5ef74a172ac8182cfb9acc74b07800abec248352"
+
+Both equal the lock's pins and both equal what I dispatched.  **This is the first
+build this session that built what was asked for** -- 41561607719 built 757e46b,
+41567478691 died at the acquisition step on an abbreviated sha.
+
+Step 21 "Run macOS build again (qemu_root_defconfig, PRD 8.1 root chain)"
+succeeded and produced a kernel at sha256 `8c1cec20...`, different from the
+previous run's `6bb42f66...`, so the sources did change.  The payload step got
+`--trust-cache` and `--data-ramdisk`, so the owner root chain ran.
+
+## Read the log, not the binary
+
+The lesson from interval 19, applied: the run's own log named the commits in one
+`gh run view --log | grep`, and I did not need the 310 MB bundle to know whether
+the build was the right one.  Interval 19 spent a download and a forensics session
+on that question and got it wrong anyway.
+
+## The acceptance gate is green
+
+Full `tests/acceptance`: **100%, exit 0**.  Full `tests/unit`: **exit 0**.  That
+is the first time both have been green in the same session, and it is the
+"necessary CI" the goal's final condition names.
+
+Two real defects were fixed to get there, both in the acceptance registry, both
+recorded in interval 21:
+
+* `Verdict.from_dict` applied the base class's kind vocabulary to a producer's
+  wider output, so a bundle could be written and not read back.
+* The e2e sample sidecar was written with `write_text`, which on Windows turns
+  the recorded newline into `\r\n` and makes the digest a lie.
+
+And one more, caught by the unit suite after I thought I was done:
+`test_clean_checkout_selfsufficiency.py` went red on five call sites in my own new
+test file, because a vendor path at a call site is refused even when the helper
+guards internally.  `_text(LEGACY.source)` was flagged; so was
+`_text(LEGACY.event)`, because `LEGACY` is itself vendor-derived.  The literal
+event string is what passes.
+
+## A correction to the UNEXPLAINED springboard note
+
+Intervals 19 and 20 recorded that `{"event":"springboard.running","pid":` is
+absent from the kernel image while `{"event":"springboard.running",` is present,
+and called it UNEXPLAINED.  It is now **explained, and the explanation means it
+was never worth the worry**: the project's own memory records
+(`unipad-literal-in-kernel-is-not-sent-whole`, measured 2026-11-01, fact 228) that
+all five record literals were grep-proven present in the ESP kernel and the three
+XNU records still arrived **seven bytes each**, because the emit macro was handed
+a ternary whose arms are arrays of different lengths and `sizeof` measured the
+pointer.
+
+So the image's bytes and the record on the wire are two different claims with two
+different instruments, and the image is the weaker one.  The committed test
+`tests/unit/test_guest_emitter_records.py` asserts the SOURCE literal reassembles
+to JSON, which is the checkable half.  **Whether `springboard.running` arrives
+whole is answered by a capture, not by a grep.**
+
+## What is in flight
+
+The 310 MB boot-inputs bundle is downloading.  When it lands, the capture runs
+against it -- the first boot that can measure `diag.owner_data_status` and
+`diag.legacy_display_status`.
+
+## Not claimed
+
+* Whether either new emitter COMPILES is still unmeasured.  A green step 21 and a
+  moved kernel sha are consistent with it and do not prove it.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display still never draws.
+* The byte-search instrument established in interval 20 to be unsound has NOT been
+  repaired; it is recorded as unusable and nothing below rests on it.
