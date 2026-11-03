@@ -4673,3 +4673,103 @@ A negative there is decisive and costs no boot.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The display still never draws.  This build's record exists to say which stage
   it reached, not to fix it.
+
+---
+
+# Interval 2026-11-03 (twenty-seventh): `stage:10`.  The display path COMPLETED,
+# and it still draws nothing.
+
+## The two records this build existed to produce, off a real guest
+
+    {"event":"diag.legacy_display_status","stage":10,"surface_status":0,
+     "surface_found":1,"dt":1,"source":"XNU.LegacyDisplayProbe"}
+    {"event":"diag.owner_data_status","stage":4,"error":0,
+     "source":"XNU.native_owner_data_prepare"}
+
+Both from `local-private/boot53/display-stage-input/guest-input.log`, 2924
+bytes, kernel sha256 `fd283772...` verified against `payload.json`'s
+`payload_kernel_sha256` before the boot ran.
+
+## What stage 10 means, read off the code
+
+`LegacyDisplayProbe.cpp:638-639` sets it, and only there:
+
+    if(started && phase==4) {
+        activeLegacyDisplay=display;activeGOPNub=nub;native_legacy_stage=10;
+
+So `display->start(nub)` returned true AND `offline-legacy-phase` is 4.  The
+fields beside it say what had to be true to get there:
+
+* `surface_status=0` -- `OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface")`
+  succeeded.
+* `surface_found=1` -- `IOService::waitForMatchingService("IOCoreSurfaceRoot")`
+  FOUND the service inside the 600 s the boot arg allows.  The 14-second gap
+  interval 12 measured between mountroot and `IOSurfaceRoot::start()` was
+  crossed.
+* `dt=1` -- the `NativeGOPFramebuffer` nub attached to `/arm-io` in the DT
+  plane as `gop-display` with `device_type = display-subsystem`.
+
+And `stage:4` on the Data record is the best outcome in its legend -- "the mount
+verified" -- with `error:0`.
+
+**This is the furthest the display path has ever been measured to go.**  Every
+previous boot reported `stage:8` (GIVE-UP) or nothing at all.
+
+## And that reframes the problem completely
+
+The display subsystem came up.  `IOSurface` loaded, `IOCoreSurfaceRoot` was
+published and found, a real `IOPlatformDevice` nub was built with the GOP
+framebuffer's actual `IODeviceMemory`, attached to the device tree, probed,
+attached and STARTED.  **And the screen still shows the UniXNU boot menu.**
+
+So "the display never comes up" is now measurably false.  The question is
+narrower and harder: something that has a working display, a working framebuffer
+and a working surface service does not present a frame.
+
+Two distinct screendumps, 120 s apart, hashed: `2e2910ab...` then `8833260e...`
+from t=121 s onward, unchanged for the remaining ~1380 s.  **Six Home presses,
+every one `changed: false`.**  The input reaches the guest (`input devices
+attached: true`, 50 install frames sent with zero send errors) and the screen
+does not respond to any of it.
+
+## What stage 10 does NOT prove
+
+The `sheng-fb-gpu=1` handoff.  `native_legacy_stage=10` is assigned at :639 and
+the GPU-handoff presenter block runs at :641-651, AFTER the assignment.  The
+checkpoint at :655 is after both.  So a handoff presenter that failed to attach
+still reports stage 10.  Stage 10 proves the display started; it does not prove
+the presenter that would put a frame on it did.
+
+That is the next measurement, and it needs a field the record does not carry.
+
+## The chain was verified before the boot, not after
+
+| member | declared | actual |
+|---|---|---|
+| kernel (payload variant) | `fd283772...` | **MATCH** |
+| kernel (pre-payload) | `8c1cec20...` | **MATCH** |
+| device tree | `26f494fd...` | **MATCH** |
+| gpu addon | `f2cacddf...` | **MATCH** |
+| trust cache | `08b14937...` | **MATCH** |
+| payload image | `f7183b35...` | **MATCH** |
+| SystemOS volume | `b4908cde...` 17.7.11 / 21H461 / `Cryptex1,SystemOS` | **MATCH** |
+
+Six of seven from the bundle's own `payload.json`, the seventh from the volume's
+sidecar.  The volume gate added in interval 25 ran and passed -- `declared_volumes.systemos.ok: true`.
+
+And a SECOND independent proof that the right source was compiled, which
+interval 23's line-number fingerprint did not have: the display archive's own
+`build-report.json` declares
+
+    kits/qemu/LegacyDisplayProbe.cpp: 0e7d4d883443e861e09d95671af1726bc59c0ed26c9a419b74b872f27096c27b
+
+and that is exactly the sha256 of the `5ef74a1` blob.  The parent `0efab23`
+hashes to `f72d63c0...`.
+
+## Still not measured
+
+* `springboard.running` and `springboard.interaction`: **ABSENT** in 1500 s.
+  M9, M9a, M9b remain FAIL.  The emitter is in the kernel (count 1 each), so
+  the absence is real.
+* Whether the GPU handoff presenter attached.  Stage 10 cannot say.
+* No IPA, no install, no interaction recorded by the guest, no persistence.
