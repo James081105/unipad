@@ -4428,3 +4428,184 @@ against it -- the first boot that can measure `diag.owner_data_status` and
 * The display still never draws.
 * The byte-search instrument established in interval 20 to be unsound has NOT been
   repaired; it is recorded as unusable and nothing below rests on it.
+
+---
+
+# Interval 2026-11-03 (twenty-third): the emitters compile, and the run's own
+# log proves it with line numbers.
+
+## What was open
+
+Interval 22 ended with "Whether either new emitter COMPILES is still
+unmeasured.  A green step 21 and a moved kernel sha are consistent with it and
+do not prove it."  That was the right caution and it is now closed -- **without
+the 310 MB bundle**, which is the point.
+
+## The instrument: a warning's line number is a fingerprint
+
+`gh run view 41584103771 --log` is 912 KB and 5198 lines.  In it, the owner root
+chain step emits twelve warnings against
+`build-output/unixnu-out/qemu/tree/kits/qemu/LegacyDisplayProbe.cpp`, the first
+of which prints the source line:
+
+    LegacyDisplayProbe.cpp:297:12: warning: implicit conversion changes
+    signedness: 'int' to 'unsigned int' [-Wsign-conversion]
+      297 |     return snprintf(out,cap,"prepare calls=%u failures=%u retried=%u
+      max_attempts=%u waited_ms=%llu",native_legacy_prepare_calls,...
+
+That line number is a fingerprint, because the two candidate sources put that
+statement in different places:
+
+| source | total lines | prepare snprintf at | `native_console_report` |
+|---|---|---|---|
+| parent `0efab23` | 595 | **222** | absent |
+| pin `5ef74a1` | 670 | **297** | line 72 |
+
+The build warned at **297** with the parent's exact text at a line the parent
+does not have.  So the compiled translation unit is `5ef74a1`, the pin the lock
+names and the commit the run's own record names.  Interval 19's method, applied
+to a question it can actually answer.
+
+## And the emitter compiled clean
+
+`5ef74a1` puts the new code at lines 144-196 (`native_legacy_put_unsigned` at
+144, `native_legacy_put_literal` at 152, the `diag.legacy_display_status`
+literal at 180, the `native_console_report` call at 196).  **The twelve warnings
+land on 290, 297, 298 and 435-458 -- none of them in the new code.**  A block of
+seventy-odd new lines that produced zero diagnostics is a block that compiled.
+
+The step then says so in its own words:
+
+    NativeLegacyDisplay: -Werror build and actual ARM64/iOS 17 object audit passed
+
+So `-Werror` was on and the archive built.  **Both new emitters compile.**  That
+is now measured, from the run's own log, at zero download cost.
+
+## A correction to interval 22's attribution
+
+Interval 22 wrote that "Step 21 'Run macOS build again (qemu_root_defconfig,
+PRD 8.1 root chain)' ... produced a kernel at sha256 `8c1cec20...`".  The kernel
+half is right; the step name is attached to the wrong work.  Mapping every key
+event to the step that produced it:
+
+| line | step | what |
+|---|---|---|
+| 2198 | Run macOS build (pass 1, `qemu_defconfig`) | kernel `c5ea0530...`, 51,859,456 B |
+| 2864-2906 | **Build the owner root chain (`build-os-root.py`)** | **compiles `LegacyDisplayProbe.cpp`** |
+| 2951 | Build the owner root chain | `-Werror build ... passed` |
+| 3459 | Run macOS build again (`qemu_root_defconfig`) | kernel `8c1cec20...`, 125,480,960 B |
+| 3486 | Run macOS build again | `unixnu build payload ... --trust-cache ... --data-ramdisk` |
+
+The display archive is built by `build-os-root.py` at 06:04:53 and the
+`qemu_root_defconfig` link runs 06:05:18-06:06:25, so the object exists before
+the link that needs it.  Both passes run `emit_prelink.py` with an **identical**
+`--root` list, so the display code is statically linked into the kernel rather
+than prelinked as a kext root -- consistent with the first pass's link error
+naming `_native_legacy_display_probe` as "referenced from `_bsd_init`".
+
+## The weak-stub design is what makes that safe, and the file says so
+
+`package/LinkStubs.c` defines the same symbol as `STUB` (weak), and its header
+comment names the resolution explicitly: "They are weak: a linked component that
+defines a hook (**qemu_root_defconfig's display archive defines the first one**)
+replaces it."  Two definitions of `native_legacy_display_probe` exist in the tree
+-- `LinkStubs.c:13` (weak, no-op) and `LegacyDisplayProbe.cpp:525` (real) -- and
+the weak one loses exactly when the display archive is linked.  That is the
+design working as documented, not a shadowing bug.
+
+## What is still not measured
+
+Whether the archive is actually **linked into** the `8c1cec20` kernel.  A green
+compile, a passed `-Werror` audit and a kernel 2.4x the size of the no-root-chain
+pass are all consistent with it and none of them prove it.  One grep of the
+downloaded kernel for `diag.legacy_display_status` settles it, and a negative
+there is decisive.
+
+The bundle also carries
+`unixnu-out/qemu/tree/build/native-legacy-display/build-report.json` (18,217
+bytes), which is the archive's own account of what it built.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The bundle carries **no** SystemOS image and no cryptex -- its payload set is
+  `kernel.macho`, `kernel.macho.adt`, `kernel.macho.gpuaddon` and
+  `unixnu.toml`, and nothing else.  The volumes come from the local IPSW.
+* The display still never draws.  That is a separate question from whether the
+  emitter is in the kernel, and it is the one this build's new record exists to
+  answer.
+
+---
+
+# Interval 2026-11-03 (twenty-fourth): the grep gate is validated, and it says
+# intervals 19-20 grepped the wrong kernel.
+
+## The instrument, checked against a kernel whose output is already known
+
+Interval 20 recorded the byte-search instrument as unsound and unusable.  That
+was the right instinct applied to the wrong evidence, and the way to find out
+which is to point it at a kernel whose guest output is ALREADY MEASURED.
+
+`local-private/boot51/install-thread-start-boot/esp/EFI/UniXNU/Payloads/kernel.macho`
+(125,480,960 bytes, sha256 `9a930370f56ee7df...`) is the kernel interval 14 read
+six records off a real guest from.  Contiguous-string counts:
+
+| event | emitted from that guest? | in the image? |
+|---|---|---|
+| `virtio_blk.read_back` | yes | **1** |
+| `diag.install_thread_start` | yes (`status: ok`) | **3** |
+| `diag.load_init_program_entered` | yes | **1** |
+| `diag.install_thread_started` | yes | **1** |
+| `diag.install_rx_bytes` | yes | **1** |
+| `install.registered` | yes | **1** |
+
+Six for six.  And the image is not compressed or encoded -- `IOSurfaceRoot`
+counts 41, `bsd_init` 15, `com.apple.driver` 49.  **So a contiguous grep of the
+ESP kernel is a sound NEGATIVE test: a literal that is absent from the image is
+an emitter that is not in the kernel.**  The capture script's refusal
+("booting a kernel that cannot emit all of them") is therefore a gate worth
+having, not a crying wolf.
+
+## And that retracts intervals 19 and 20
+
+They recorded `{"event":"springboard.running","pid":` as absent from the kernel
+image while `{"event":"springboard.running",` was present, and called the
+difference UNEXPLAINED.  Measured against the right kernel, on the same day:
+
+    springboard.running         contiguous_count = 1
+    springboard.interaction     contiguous_count = 1
+
+**Both are in the 125 MB kernel.**  Intervals 19 and 20 grepped the 51 MB
+`c5ea0530` pass-1 image -- the `qemu_defconfig` build with **no owner root
+chain**, which is the build that legitimately lacks the emitters.  The boot uses
+the 125 MB `8c1cec20` pass-2 image, and the run's own collect step proves it:
+
+    payload-esp/EFI/UniXNU/Payloads/kernel.macho 125480960
+
+This is fact 204's shape recurring on the measurement side: not "the kernel did
+not carry the driver" but "the instrument looked at a kernel that was never
+going to carry it".  Two intervals of forensic effort went into an image that
+was the wrong file.
+
+## What this buys for the run that is downloading
+
+A decisive pre-check that costs one grep and no boot.  When the bundle lands:
+
+* `diag.owner_data_status` and `diag.legacy_display_status` present in the
+  bundle's 125,480,960-byte kernel -> the display archive IS linked in, and a
+  boot can answer the question the build was dispatched for.
+* either absent -> the archive is NOT in the kernel, no boot can answer it, and
+  the next change belongs in the link, not in the emitter.
+
+On the Nov 2 kernel both count **0**, which is exactly right: it predates
+`5ef74a1`.
+
+## What is still not measured
+
+* Whether the display archive is linked into `8c1cec20`.  The `-Werror` audit
+  passing and the kernel being 2.4x the no-root-chain pass are consistent with
+  it; the grep settles it.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The bundle carries no SystemOS image and no cryptex.  Both volumes are already
+  on disk and the capture script already attaches them.
+* The display still never draws.
