@@ -4773,3 +4773,96 @@ hashes to `f72d63c0...`.
   the absence is real.
 * Whether the GPU handoff presenter attached.  Stage 10 cannot say.
 * No IPA, no install, no interaction recorded by the guest, no persistence.
+
+---
+
+# Interval 2026-11-03 (twenty-eighth): the prime suspect is cleared, and the
+# record that names the real one is pinned.
+
+## What interval 27's stage-4 record settled
+
+Interval 26 recorded the M9 hypothesis and named its suspect: "the userspace
+boot stopped very early -- most likely in launchd or its first child.  **The
+prime suspect is the Data mount**, because `native_owner_data_prepare()` panics
+on failure and `panic()` is invisible on this board".
+
+    {"event":"diag.owner_data_status","stage":4,"error":0,
+     "source":"XNU.native_owner_data_prepare"}
+
+Stage 4 is "the mount verified".  **The prime suspect is cleared.**  A
+hypothesis with a documented failure mode and no measurement is now a
+measurement, and the measurement says no.
+
+## What that leaves, precisely
+
+Two facts, both measured on the same boot:
+
+* `dyld.cache_read` arrived **once**.  On a real iPadOS boot hundreds of
+  processes map the shared cache, so one means the userspace boot stopped very
+  early.
+* `springboard.running` did not arrive in 1500 s, and the emitter is in the
+  booting kernel (count 1), so the absence is real.
+
+So: a process exec'd and ran dyld, and then nothing spawned that maps the
+cache.  That is launchd or its first child, and **nothing on the channel names
+which.**
+
+`native-dyld-cache-read.patch` says why in its own comment: "No pid, because a
+formatted pid would put a formatting path in front of a record whose only job
+is to arrive whole."  That is the right call for that record, and it is exactly
+what leaves this question unanswerable.
+
+## The change, and why it goes in the patch that already works
+
+`zzz-native-springboard-events.patch` already emits from `__mac_execve()`'s
+`if (!error)` block -- the one site where the exec has succeeded AND `p_comm`
+has been written -- already applies cleanly in both passes, and is measured
+(count 1 in the booting kernel).  Reviving the parked M8 patch would mean
+rebasing its hunk at `kern_exec.c:5284` against the springboard patch's hunk at
+`:5283`, which now FAILS on the first pass:
+
+    *** pass 1: FIRST FAILURE: zzz-native-springboard-events.patch
+    error: patch failed: bsd/kern/kern_exec.c:5283
+
+So the generic record goes where the working code already is, as 67 added lines
+in the same `#if defined(XNU_OWNER_CACHE_MOUNT)` block:
+
+    {"event":"exec.first","comm":"<name>","source":"XNU.__mac_execve"}
+
+Bounded by a flag set before the emit and never cleared -- the bound and the
+ordering `native-dyld-cache-read.patch` uses, because the channel's `send()`
+waits synchronously on a 2000 ms deadline and an unbounded emitter here charges
+one deadline per exec.  The comm is emitted only when every byte is in
+`[A-Za-z0-9._-]`, because the record is hand-assembled JSON with no escaping
+and a quote in the name would put a record on the wire no parser accepts; a
+name that cannot be encoded does not consume the one shot.  Placed AFTER the
+SpringBoard block, so the record M9 asks for is emitted first when the first
+exec IS SpringBoard.
+
+## Validated with the instruments, not with reasoning
+
+| instrument | result |
+|---|---|
+| `repro-patch-order.py` (one pass) | all 58 patches applied |
+| `repro-patch-twopass.py` (three passes) | **ALL PASSES CLEAN** -- 58 applied, then 3 applied / 55 skipped twice |
+
+The three-pass shape is what the runner's SECOND kernel pass needs and what
+killed build 41451414922, and the single-pass instrument is blind to it.  The
+hunk header had to be corrected from `@@ -5283,6 +5283,80 @@` to
+`@@ -5283,6 +5283,147 @@` by counting the actual added lines; the first attempt
+left it stale and `git apply` refused the file as corrupt.
+
+Full `tests/unit`: **exit 0**.  Full `tests/acceptance`: running.
+
+Fork commit `62bc0f48`, pushed to `unipad/gpu-addon-ngpu-dir`; the lock's
+`unixnu.commit` moved to it and `device_repo.commit` is unchanged.  Build
+**41612457246** dispatched at 09:36.
+
+## Not claimed
+
+* That the emitter COMPILES.  Two clean patch passes and a green unit suite do
+  not compile it; the build is the first thing that does.
+* That the first exec is launchd.  That is what the record is for.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display subsystem is up (stage 10) and the screen still shows the boot
+  menu.
