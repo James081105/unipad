@@ -4609,3 +4609,67 @@ On the Nov 2 kernel both count **0**, which is exactly right: it predates
 * The bundle carries no SystemOS image and no cryptex.  Both volumes are already
   on disk and the capture script already attaches them.
 * The display still never draws.
+
+---
+
+# Interval 2026-11-03 (twenty-fifth): every input to the next boot is verified
+# except one grep.
+
+The goal's condition 5 is "every boot verifies actual payload, kernel, config,
+driver, trust cache and version consistency".  Walking that list against the
+run that is about to happen, one item at a time:
+
+| input | verified how | status |
+|---|---|---|
+| kernel | `payload.json`'s `payload_kernel_sha256` vs the staged kernel | wired, runs at boot |
+| config | `unixnu.toml` args | **`offline-legacy-phase=4`**, `offline-legacy-surface-wait-ms=600000` |
+| driver | the display archive's own `-Werror ... object audit passed` | **MEASURED** (interval 23) |
+| SystemOS volume | sidecar sha256 vs the file | **MATCH** `b4908cde...`, 17.7.11 / 21H461 / `Cryptex1,SystemOS` |
+| OS root volume | the DMG's sidecar; the raw is derived, so its own digest is recorded | DMG absent from disk by design, raw present |
+| trust cache | bundle's `owner-trust.bundle` vs `payload.json`'s `trust_cache_sha256` | **present in the bundle** |
+| version | the run's own log names both pins, both equal the lock | **MEASURED** (interval 22) |
+
+## The gap this closed
+
+The volumes were the one input with no verification at all.  A boot could
+attach a stale or truncated SystemOS and the resulting mount failure would read
+as a fact about the kernel.  The capture script now hashes each member against
+its sidecar and refuses on a mismatch, and records version, build and component
+from the sidecar so the report says WHICH iPadOS was mounted.
+
+Measured while adding it: the SystemOS digest **matches**, so the gate will not
+refuse this boot.  And the gate has one shape that would have crashed rather
+than refused -- `target-volumes/` still carries `044-76040-038.json` for a DMG
+that is no longer there, because the raw root is derived from it.  The sidecar
+outlives its member; the loop now checks existence before it stats.
+
+## The display fix is in the tree and it is the right shape
+
+`LegacyDisplayProbe.cpp:559-581`.  `native_legacy_display_late_probe()` -- still
+called from `bsd_init` -- starts `native_legacy_display_late_body` on its own
+thread and returns at once, so `start_init()` is no longer blocked by the wait.
+The five non-blocking probes stay on the boot thread where they were measured
+to work.
+
+The body waits for `IOCoreSurfaceRoot` with `waitForMatchingService`, default
+120 s, overridden to 600 s by the boot arg, then re-validates the GOP handoff
+through `PE_current_console`, builds a real `IOPlatformDevice` nub with the
+framebuffer's `IODeviceMemory`, attaches and starts it, and only reaches
+`native_legacy_stage=10` when `started && phase==4`.  Every exit checkpoints,
+and the checkpoint is what emits `diag.legacy_display_status`.
+
+So the stage legend in the capture script maps one-to-one onto the code, and a
+record carrying stage N means "we reached N and then took the early exit".
+
+## The one thing still unmeasured
+
+Whether `diag.legacy_display_status` and `diag.owner_data_status` are in the
+bundle's 125,480,960-byte kernel.  Everything else in this table says the boot
+can answer the question; only that grep says the question is answerable at all.
+A negative there is decisive and costs no boot.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display still never draws.  This build's record exists to say which stage
+  it reached, not to fix it.
