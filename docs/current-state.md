@@ -5145,3 +5145,81 @@ next, and it is what the running build carries.
   mutation-proven -- and none of those is a compiler.
 * Whether launchd spawned anything.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+
+---
+
+# Interval 2026-11-03 (thirty-second): launchd spawned.  `apfs_boot_util`.  And
+# then nothing, in 1500 s.
+
+## The sequence
+
+Build **41646368244**'s guest, kernel sha256 `6b63883a...` verified against
+`payload.json` before the boot:
+
+    {"event":"exec.seen","n":1,"comm":"launchd","source":"XNU.__mac_execve"}
+    {"event":"exec.seen","n":2,"comm":"apfs_boot_util","source":"XNU.__mac_execve"}
+
+Two records, and the bound is twelve.  So the guest exec'd exactly **two**
+processes in 1500 s of a boot that ran to completion of its capture window.
+
+## The fork interval 31 left open, resolved
+
+The once-per-boot `exec.first` could not say whether launchd spawned anything,
+because `native-dyld-cache-read.patch` bounds ITS emitter to one record per boot
+and so cannot count processes.  The bounded sequence answers it:
+
+**launchd spawned.**  `apfs_boot_util` is n=2, which means it was exec'd after
+launchd started -- had the kernel spawned it from the APFS mount path during
+`bsd_init()` it would be n=1.  So launchd is NOT stuck before its first job.
+
+And it spawned exactly one thing, and then nothing.
+
+## Reproduced a third time
+
+Both of the display build's records arrived with the same values on a third
+build:
+
+    diag.owner_data_status      stage=4  error=0
+    diag.legacy_display_status  stage=10 surface_status=0 surface_found=1 dt=1
+
+Three builds, identical values.  Those are measurements, not readings.
+
+And the new emitter's literal is -- as predicted and as the patch now records --
+**not greppable**: `exec.seen` counts 0 in the kernel while the block-scope
+static `___mac_execve.native_exec_records` counts 1.  The record arrives whole.
+A byte search would have called this build a failure.
+
+## What this localises, and what it does not
+
+The boot now has a measured spine:
+
+1. root volume enumerated and read back (`virtio_blk.read_back`, verified);
+2. `kernel_thread_start` returned `KERN_SUCCESS`;
+3. `install.registered`;
+4. root mounted (`system.mount`, `/`, apfs, readonly);
+5. Data mount verified (`diag.owner_data_status` stage 4);
+6. display path completed (`diag.legacy_display_status` stage 10);
+7. `launchd` exec'd;
+8. `apfs_boot_util` exec'd;
+9. `dyld.cache_read` -- at least one process mapped the shared cache;
+10. `springboard.running` did NOT arrive in 1500 s.
+
+`apfs_boot_util` is the APFS boot utility.  On a real iPadOS it runs early and
+returns, and launchd then loads its daemon plists.  **Whether it returned is the
+next question, and nothing on the channel can say** -- the exec record proves it
+started and nothing proves it finished.
+
+That is the fork that decides the next step, exactly as the last two did:
+
+* it never exited -> the guest is stuck inside it, and launchd is blocked in
+  `waitpid`;
+* it exited and nothing followed -> launchd is stuck after it, and the place to
+  look is whatever launchd does between the boot utility and its first daemon.
+
+## Not claimed
+
+* Whether `apfs_boot_util` exited.  No record observes a process exit.
+* Whether it SUCCEEDED.  Its exit status is not on the channel either.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The screen: two distinct screendumps, frozen from t=121 s, and six Home
+  presses, every one of which changed nothing.
