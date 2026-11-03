@@ -195,3 +195,166 @@ def test_the_rule_accepts_the_pairing_that_is_correct():
         "fine when every caller is inside it -- and the first revision of this "
         "rule demanded depth zero unconditionally, which flagged exactly this."
     )
+
+
+# --- the second rule: a patch must be depth-neutral in #if/#endif -------------
+#
+# The visibility rule above checks that a declaration is in scope at its call
+# site.  It cannot see a conditional that is never closed, because there is no
+# call site to be wrong about -- the failure is a PREPROCESSOR error, and it is
+# the cheapest one there is.
+#
+# Build 41635226688 paid 32m56s for it.  A revision of
+# zzz-native-springboard-events.patch replaced the once-per-boot exec record with
+# a bounded sequence, and the edit dropped the `#endif` that closed the
+# `#if defined(XNU_OWNER_CACHE_MOUNT)` the whole emitter sits in.  Both patch
+# instruments said the tree was fine -- repro-patch-order.py reports "all patches
+# applied" and repro-patch-twopass.py reports "ALL PASSES CLEAN" -- because they
+# check that git APPLIES the patch, and git does not care what the result means.
+# The compiler said:
+#
+#     kern_exec.c:5289:2: error: unterminated conditional directive
+#     5289 | #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+#
+# and the three errors after it (`expected '}'`, twice, and `use of undeclared
+# label 'exit_with_error'`) are all consequences of that one: the `#endif` was
+# what separated the emitter from the rest of the function.
+#
+# This host has no C compiler -- the patch comments say so -- so CI is the first
+# thing that compiles it, and every unbalanced conditional costs a full build
+# cycle.
+#
+# THE RULE IS DEPTH-NEUTRALITY, and two simpler formulations were tried first and
+# are recorded here because each of them went red on correct patches:
+#
+#   * "the patch's own directives balance" -- false on
+#     apple-only-cpu-tunables.patch, which adds a second
+#     `#if defined(APPLE_ARM64_ARCH_FAMILY)` pair INSIDE an existing one and
+#     whose hunk context carries the outer `#endif`.  A per-patch scan cannot
+#     tell the file's conditional from the patch's.
+#   * "only added lines count" -- false on seven patches, each of which rewrites
+#     an existing `#if` condition (`-#if defined(BCM2837)` becomes
+#     `+#if defined(BCM2837) && ...`).  Those patches add an `#if` and no
+#     `#endif`, because the file already had one.
+#
+# What is actually true, and what the applied file needs, is that a patch must
+# not change the file's conditional nesting: (added #if - added #endif) must equal
+# (removed #if - removed #endif).  Verified against all 58+ patches with zero
+# false positives, and it catches the dropped-#endif defect.
+
+
+def _directive_balance(patch: Path) -> tuple[int, int, int, int]:
+    add_if = add_end = del_if = del_end = 0
+    for line in patch.read_text(encoding="utf-8").splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if not line or line[0] not in "+-":
+            continue
+        stripped = line[1:].strip()
+        if stripped.startswith("#if"):
+            if line[0] == "+":
+                add_if += 1
+            else:
+                del_if += 1
+        elif stripped.startswith("#endif"):
+            if line[0] == "+":
+                add_end += 1
+            else:
+                del_end += 1
+    return add_if, add_end, del_if, del_end
+
+
+def test_a_patch_does_not_change_the_files_conditional_nesting():
+    offenders: list[str] = []
+    for patch in _patches():
+        add_if, add_end, del_if, del_end = _directive_balance(patch)
+        net = (add_if - add_end) - (del_if - del_end)
+        if net:
+            offenders.append(
+                f"{patch.relative_to(REPO)}: net conditional depth {net:+d} "
+                f"(+{add_if} #if / +{add_end} #endif / "
+                f"-{del_if} #if / -{del_end} #endif)")
+
+    assert not offenders, (
+        "a patch changes the file's #if nesting, so the applied C is left with "
+        "a conditional that is never closed or closed twice:\n  "
+        + "\n  ".join(offenders)
+        + "\n\ngit applies such a patch happily and the compiler rejects the "
+          "reported the tree clean because neither of them compiles anything."
+    )
+
+
+def test_the_balance_rule_catches_the_defect_it_names():
+    """The exact shape build 41635226688 failed on must go red.
+
+    An `#if` added by the patch, the emitter inside it, and no `#endif` -- which
+    is what the edit that replaced the once-per-boot exec record produced.  In
+    memory, with no file touched.
+    """
+    defective = [
+        "@@ -5283,6 +5283,9 @@",
+        " 	if (!error) {",
+        " 		exec_done = TRUE;",
+        "+#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT",
+        "+	native_console_report(rec, used);",
+        "+	}",
+    ]
+    add_if = add_end = del_if = del_end = 0
+    for line in defective:
+        if line.startswith(("@@ ", "+++", "---", "diff ")):
+            continue
+        if not line or line[0] not in "+-":
+            continue
+        stripped = line[1:].strip()
+        if stripped.startswith("#if"):
+            if line[0] == "+":
+                add_if += 1
+            else:
+                del_if += 1
+        elif stripped.startswith("#endif"):
+            if line[0] == "+":
+                add_end += 1
+            else:
+                del_end += 1
+    net = (add_if - add_end) - (del_if - del_end)
+    assert net != 0, (
+        "the rule passed on a patch that adds an #if and no #endif.  That is "
+        "the defect build 41635226688 paid a build cycle for."
+    )
+
+
+def test_the_balance_rule_passes_the_shape_that_looked_like_a_defect():
+    """Rewriting an existing `#if` condition must NOT be flagged.
+
+    Seven patches do exactly this -- `-#if defined(BCM2837)` becomes
+    `+#if defined(BCM2837) && (...)`.  They add an `#if` and no `#endif`, and the
+    "only added lines count" formulation flagged all seven.  A guard that goes
+    red on correct code is the same as no guard at all.
+    """
+    correct = [
+        "@@ -697,7 +697,7 @@",
+        "-#if defined(BCM2837)",
+        "+#if defined(BCM2837) && (!defined(XNU_NATIVE_ARCH_TIMER) || !XNU_NATIVE_ARCH_TIMER)",
+    ]
+    add_if = add_end = del_if = del_end = 0
+    for line in correct:
+        if line.startswith(("@@ ", "+++", "---", "diff ")):
+            continue
+        if not line or line[0] not in "+-":
+            continue
+        stripped = line[1:].strip()
+        if stripped.startswith("#if"):
+            if line[0] == "+":
+                add_if += 1
+            else:
+                del_if += 1
+        elif stripped.startswith("#endif"):
+            if line[0] == "+":
+                add_end += 1
+            else:
+                del_end += 1
+    net = (add_if - add_end) - (del_if - del_end)
+    assert net == 0, (
+        "the rule flagged a patch that rewrites an existing #if condition.  "
+        "Seven patches in the tree do that and they are correct."
+    )
