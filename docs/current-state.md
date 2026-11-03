@@ -4237,3 +4237,111 @@ The workflow defect, the fix, the push, and the two new tests all stand on the
 manifest alone.  A dispatch input that is read, compared to nothing, and ignored
 -- while a warning claims the opposite -- is a defect whether or not the
 resulting kernel happened to carry the emitter.
+\n
+---
+
+# Interval 2026-11-03 (twenty-first): the acceptance gate was broken on this host,
+# and fixing it took two corrections of my own work.
+
+## Where this started
+
+`build-macos` 41561607719 came back green and I set out to verify its kernel
+carried `diag.owner_data_status`.  Interval 20 records what came of that: the run
+had built 757e46b, not the 6f5a3d6 I dispatched, because the pin bump had never
+been pushed.  Interval 19's byte-search conclusion was retracted.
+
+The root cause is now fixed and the lesson is short: **read the run's own
+`artifact-manifest.json` first.**  It names the commits, the stage, the target and
+the toolchain in one API call.  I reached for a 310 MB download and a binary
+search instead, and the binary search turned out to be unsound anyway.
+
+## Then the acceptance suite went red, and that was the real find
+
+Running the acceptance suite to check nothing had regressed produced four
+failures, and the acceptance registry -- the instrument every PRD verdict is
+computed with -- could not report a verdict **at all**:
+
+    UniPadError: unknown evidence kind
+    kind: 'precheck_report'
+
+## Defect 1: the read side applied the wrong class's vocabulary
+
+`Verdict.from_dict` hardcoded `EvidenceRef.from_dict(ref)` -- the BASE class,
+whose kind set is the BUNDLE vocabulary.  A bundle is written by producers whose
+subclasses carry wider sets; `e2e` alone declares 28 more, for the things PRD 5.2
+asks for and a bundle does not store.  So a kind the write side accepted was
+rejected by the read side.
+
+The fix is not a union list.  `LoadedEvidenceRef` declines exactly the kind check
+and keeps every other rule -- path, digest, witness, scope, the
+whitespace-reason check -- because the kind was already validated by whichever
+producer wrote it, against that producer's own set.  The check moved into
+`EvidenceRef._check_kind` so a subclass can decline that one rule, and a mutant
+that declines them ALL is killed by
+`test_the_read_side_still_enforces_every_other_rule`.
+
+## Defect 2: a Windows newline made a recorded digest a lie
+
+The e2e sample sidecar was written with `write_text(digest + "\n")`.  On Windows
+that becomes `\r\n` on disk, so the reference hashed 65 bytes while
+`load_bundle` re-hashed 66:
+
+    recorded=a252c771a84bbe74   on disk=34507f0e9f810b72
+
+It never appeared on the macOS runner, which is the only other place this code
+runs, so CI could not see it either.  Now `write_bytes`, with a source guard and
+a behavioural test, both teeth-checked.
+
+## Two host-dependent test defects, both the same shape as the bug
+
+* `test_a_missing_sample_is_blocked_not_passed` controlled `run_dir` but not the
+  sample roots, so `E2EEnvironment.create` defaulted `repo_root` to THIS
+  repository and found the real `local-private/ipa` samples.  Green in a clean
+  checkout, a worktree and CI; red here.  It now pins an empty root.
+* The `trace_log` false alarm that started defect 1 was the same shape: the probe
+  only fires where a file under `local-private/` exists, so every run without it
+  passed.
+
+**That shape is now the thing to look for first**: a test whose premise holds only
+where a gitignored file happens not to be.  Three instances this session.
+
+## And the correction that mattered most
+
+I diagnosed defect 1 backwards and very nearly "fixed" it by widening
+`record.EVIDENCE_KINDS`.  The instrument that told me so patched
+`record.EvidenceRef.__post_init__` and compared the kind against
+`rec.EvidenceRef.ALLOWED_KINDS` -- the BASE set.  Every kind a subclass
+legitimately widened to therefore looked rejected, including `trace_log`, which
+`milestones` has accepted since 2026-10-24 via `MILESTONE_EVIDENCE_KINDS`.
+
+Widening would have destroyed a deliberate design that two existing tests pin --
+`test_the_evidence_reference_is_shared_not_reimplemented` asserts the sets differ
+on purpose, with a documented reason.  **The test was right and my change was
+wrong**, which is the fourth time this session that has been true.  The correct
+instrument compares against `self.ALLOWED_KINDS`, and that points straight at
+`Verdict.from_dict`.
+
+Six instruments validated this session; this is the only one that would have
+caused damage rather than delay.
+
+## State
+
+* **Full acceptance suite: green, 100%, exit 0.**
+* `build-macos` **41584103771** is in flight, dispatched after the push, with
+  `unixnu_commit=6f5a3d63...` and `device_commit=5ef74a172...` -- both equal to
+  the lock's pins, so the new input-vs-lock refusal cannot fire.
+* `local-private/upstream/` was at 94a131ee and efa03c98 while the lock pinned
+  6f5a3d6 and 5ef74a1; both are now at the pins.  That was a stale-clone
+  environment problem the cross-check correctly refused, not a code defect.
+
+## Not claimed
+
+* Whether `diag.owner_data_status` and `diag.legacy_display_status` compile is
+  still UNMEASURED.  41584103771 is the first build dispatched with the right
+  pins, and its manifest is the first thing to read when it lands.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The display still never draws.
+* `{"event":"springboard.running","pid":` being absent from the kernel image while
+  `{"event":"springboard.running",` is present remains UNEXPLAINED.  It is in the
+  pre-existing emitter, and if it is real then `springboard.running` records are
+  malformed JSON and a working SpringBoard would be invisible.
