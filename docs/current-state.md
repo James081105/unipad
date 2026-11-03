@@ -5610,3 +5610,77 @@ high byte: 256 is exit code 1, 3328 is exit code 13.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The screen: thirteen identical screendumps and six Home presses, none of which
   changed anything.
+
+---
+
+# Interval 2026-11-04 (thirty-eighth): a clean resumable state, and the exact
+# next cycle.
+
+## Verified before this was written
+
+| check | result |
+|---|---|
+| `git status` | clean apart from an untracked `.scratch/` |
+| `main` vs `origin/main` | identical, `0ff3c4b` |
+| `config/sources.lock.json` | `unixnu` `4b8c68c9`, `device_repo` `5ef74a17`, `frozen: false` |
+| fork `unipad/gpu-addon-ngpu-dir` | `4b8c68c9`, and the local clone is on the same commit |
+| full `tests/acceptance` | **649 passed, exit 0** |
+| full `tests/unit` | **3476 passed, exit 0** |
+| last build | **41708386711**, green, 40m53s, both pins correct in its own log |
+| last capture | `exit-status-input-run/guest-input.log`, 5601 bytes, 50 records |
+
+## The frontier, stated once
+
+Twenty-eight early boot tasks with their exit statuses, four of them non-zero
+(`launchd` 1, `MSUEarlyBootTask` 1 then 0, `sysstatuscheck` 1, `prng_seedctl`
+13), and then a stall.  No SpringBoard in 1500 s.  The display subsystem is fully
+up (stage 10, six builds running) and the framebuffer has never moved off the
+UniXNU boot menu.
+
+## The next cycle, end to end
+
+1. Add a `panic` emitter.  `osfmk/kern/debug.c` is touched by no patch, so it
+   needs a new `diff --git` section **and** a `debug.o_CFLAGS_ADD` entry -- the
+   same shape as `kern_exit.o`.  Guard it on `XNU_NATIVE_VIRTIO_CONSOLE`, never
+   on `XNU_OWNER_CACHE_MOUNT` (that macro is `kern_exec.o`'s and the emitter
+   would compile out silently).
+2. Generate the section by DIFFING the pristine file
+   (`local-private/upstream/xnu/bsd/kern/debug.c`), not by hand -- then run
+   `python local-private/tmp/check-patch-headers.py` and require zero mismatches.
+3. Assemble the record in Python for every combination of fields and parse each
+   as JSON before committing.  Two of this session's emitters were wrong in
+   exactly that way and both were caught by the simulation rather than by a build.
+4. Validate with both repros and the two guards, then run the full unit suite.
+5. Commit to the fork, bump the pin with
+   `python local-private/tmp/bump-unixnu-first-exec.py` (re-pointed at the new
+   sha), move `local-private/upstream/UniXNU` to the same commit -- **a pin bump
+   moves two checkouts** -- and dispatch with
+   `-f stage=M7 -f payload_target=tcg`.  Omitting `stage` builds M2 and fails
+   31 minutes in with no `payload.img`.
+6. Download the boot inputs with the six-way parallel range download
+   (`local-private/tmp/` has the pattern), extract, verify the kernel sha against
+   `payload.json`, and check the block-scope static is in the symbol table rather
+   than grepping for the literal.
+7. Run `python -u local-private/tmp/capture-springboard-boot.py <bundle>` and
+   read it with `python local-private/tmp/read-display-stage.py <dir>/guest-input.log`.
+
+## The three lessons this session paid for, in one place
+
+* **A bounded emitter measures its bound.**  Three conclusions were wrong this
+  way.  Check whether the bound saturated before reading silence as a fact.
+* **A byte search of a mergeable-string Mach-O image is not evidence of absence,
+  in either direction.**  `exec.seen` counted zero in a kernel that carried it.
+  The block-scope static is the check.
+* **`pytest ... | tail` returns tail's exit code.**  Redirect to a file and echo
+  `$?`.  I had the memory loaded and did it anyway.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: the build
+  path exists, the driver work does not.
+* WP00/WP01: still blocked on `sources.lock.json` `frozen: false`.
+* This is not a completion report and must not be read as one.  The goal's own
+  condition is "only when every mandatory requirement passes real verification,
+  the necessary CI passes, and the deliverables and reproduction steps are
+  complete", and M9 is FAIL.
