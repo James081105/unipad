@@ -4156,3 +4156,84 @@ lands.
   `{"event":"springboard.running",` is present is UNEXPLAINED and is recorded as
   such.  It is in the pre-existing emitter, not in anything I changed, and it is
   the reason I stopped trusting the raw search long enough to validate it.
+\n
+---
+
+# Interval 2026-11-03 (twentieth): RETRACTION.  The byte search is not evidence,
+# and the root cause never needed it.
+
+## What interval 19 claimed, and what is now withdrawn
+
+Interval 19 concluded "the emitter is not in the kernel" from
+`raw.count(b'{"event":"diag.owner_data_status"') == 0` on the kernel that run
+41561607719 shipped.  **That conclusion is withdrawn.**  The instrument that
+produced it does not survive validation, and the validation is the same kind that
+caught four other instruments this session.
+
+## The validation, and it is damning
+
+The search returns 0 for:
+
+    {"event":"springboard.running","pid":     -> 0
+    {"event":"springboard.running",           -> 1
+
+The first of those is **unambiguously in the source at the pin**.  I read it out
+of `git show 6f5a3d6:patches/xnu/zzz-native-springboard-events.patch`:
+
+    static char const springboard_prefix[] =
+        "{\"event\":\"springboard.running\",\"pid\":";
+
+So a literal that is definitely compiled returns zero, and a truncated version of
+it returns one.  That is a false negative on a known-present value, which is the
+definition of an instrument that cannot support a negative conclusion.
+
+And it is not one bad literal.  `springboard.interaction`'s literal is in the
+image only in **NUL-separated fragments**:
+
+    {"event":"springboard.interaction","  \x00\x00\x00\x00  befo  \x00\x00\x00\x00
+    re":  \x00\x00\x00\x00  ","after  \x00\x00\x00\x00\x00\x00\x00\x00
+    ","source":"XNU.HidInputProbe"}\n
+
+while `system.mount` and `dyld.cache_read`, from the same segment, are clean and
+contiguous.  I checked whether the two populations sit in different segments --
+they do not; all four are in `__TEXT`.  The mechanism is UNEXPLAINED and is
+recorded as such rather than guessed at.
+
+So: `count == 0` means "the literal is not stored contiguously", which is not the
+same question as "the literal is not compiled in".
+
+## What DOES stand, and it was never in doubt
+
+The root cause does not rest on the byte search at all.  It rests on one JSON
+field in the run's own manifest:
+
+    unixnu_commit = 757e46b19c309ab8b41101f56a74c3d6f48a625e
+
+against the dispatch input `6f5a3d63d5fd787b3c2130c4630a720e60532567`.  757e46b is
+the parent of 6f5a3d6 and lacks the emitter.  That is a direct read, it is cheap,
+and it is decisive.
+
+**The lesson, recorded because I got it backwards:** I reached for a 310 MB
+download and a binary search when the run's own record of what it built was one
+API call away.  Read `artifact-manifest.json` FIRST -- it names the commits, the
+stage, the target and the toolchain -- and only reverse-engineer the artifact
+after that says the run built what was asked for.
+
+## What is therefore still unmeasured
+
+* Whether `diag.owner_data_status` compiles.  UNMEASURED, exactly as interval 17
+  said.  Interval 19's apparent answer was an artefact of a bad instrument.
+* Whether `diag.legacy_display_status` compiles.  UNMEASURED.
+* Whether the mangled `springboard.running` prefix means those records are
+  malformed JSON and would be dropped by the host even on a successful
+  SpringBoard exec.  **UNEXPLAINED and on the critical path for M9** -- if it is
+  real, a working SpringBoard produces nothing observable and the next few hours
+  go into a phantom.  It is in the pre-existing emitter, not in anything this
+  session changed.
+
+## What is NOT withdrawn
+
+The workflow defect, the fix, the push, and the two new tests all stand on the
+manifest alone.  A dispatch input that is read, compared to nothing, and ignored
+-- while a warning claims the opposite -- is a defect whether or not the
+resulting kernel happened to carry the emitter.
