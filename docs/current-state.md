@@ -5223,3 +5223,74 @@ That is the fork that decides the next step, exactly as the last two did:
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The screen: two distinct screendumps, frozen from t=121 s, and six Home
   presses, every one of which changed nothing.
+
+---
+
+# Interval 2026-11-03 (thirty-third): the exit record is pinned, and the guard
+# macro it needed is a trap worth its own note.
+
+## What is in flight
+
+Fork commit `8f3eda29`, pushed to `unipad/gpu-addon-ngpu-dir`; the lock's
+`unixnu.commit` moved to it.  Build **41668336078** dispatched at 15:52 with
+`stage=M7`.  When it lands, the capture runs against it and answers the one
+question the exec record could not.
+
+## The change
+
+`exit_with_reason()` now emits the pair of the exec record, bounded at twelve:
+
+    {"event":"exit.seen","n":K,"comm":"<name>","source":"XNU.exit_with_reason"}
+
+The fork it exists to settle, stated as interval 32 left it: the guest exec'd
+`launchd` then `apfs_boot_util` and then nothing, in 1500 s.  The exec record
+proves a process started.  Nothing observed an exit.  So the boot stopping after
+`apfs_boot_util` is equally consistent with it hanging inside that binary and
+with it returning and launchd stalling afterwards -- and those are different
+findings with different next steps.
+
+## Three traps in this one change, all of which cost something
+
+**1. The guard macro is per-object, and the wrong one is silent.**
+`build-xnu-4k-baseline.sh:466` passes `-DXNU_OWNER_CACHE_MOUNT` to
+**`kern_exec.o`**.  Guarding the exit emitter on that macro in `kern_exit.c`
+compiles it out, and nothing complains: an `extern` with no definition is free
+because the linker only resolves a symbol something references.  The build stays
+green and the boot stays silent about exits.  The guard test
+(`test_console_declaration_visibility.py`) checks that a declaration is in scope
+at its call site; it does not check that the object was given the macro.
+
+So the emitter is guarded on `XNU_NATIVE_VIRTIO_CONSOLE` -- the macro that means
+"the console transport exists" -- and the build script now passes it to
+`kern_exit.o`.
+
+**2. `make` takes the LAST `<obj>_CFLAGS_ADD`.**  The script's own comment at
+:485-486 records this for `vm_unix.o`: a second entry would silently discard the
+owner-cache-carrier one.  So the new entry is for a NEW object, not a second
+entry for an existing one.
+
+**3. A patch file is a build input and it has no compiler either.**  The section
+was DIFFED from the pristine file rather than hand-written, so the hunk header's
+line counts are right by construction -- the hand-counted header in the previous
+revision was stale and `git` refused the file as corrupt.  The first diff
+attempt then dropped `difflib`'s `---`/`+++` lines, and `git` refused the whole
+file with "patch fragment without header".  Both patch instruments had reported
+the tree clean for the previous revision's hand-written header.
+
+## Validated
+
+| instrument | result |
+|---|---|
+| `bash -n build-xnu-4k-baseline.sh` | syntax OK |
+| `repro-patch-order.py` (one pass) | all 58 applied |
+| `repro-patch-twopass.py` (three passes) | ALL PASSES CLEAN |
+| `test_console_declaration_visibility.py` (both rules) | 6 passed |
+| applied block | brace-balanced, 54 lines |
+| record assembly (12 n x 3 comms) | valid JSON, worst case 87 bytes + NUL in a 128 buffer |
+| full `tests/unit` | **3476 passed, exit 0** |
+
+## Not claimed
+
+* That `exit.seen` compiles.  Six local instruments and no compiler.
+* Whether `apfs_boot_util` exited.  That is what the build is for.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
