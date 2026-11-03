@@ -5684,3 +5684,88 @@ UniXNU boot menu.
   condition is "only when every mandatory requirement passes real verification,
   the necessary CI passes, and the deliverables and reproduction steps are
   complete", and M9 is FAIL.
+
+---
+
+# Interval 2026-11-04 (thirty-ninth): M9's record was on a path SpringBoard does
+# not take.  The absence was an instrument defect.
+
+## The finding
+
+XNU has **two** exec paths, and they are separate functions with separate success
+blocks:
+
+    execve()      -> execve()      -> __mac_execve()   kern_exec.c:5284
+    posix_spawn() -> posix_spawn() -> its own block     kern_exec.c:4280
+
+`posix_spawn()` **without** `POSIX_SPAWN_SETEXEC` forks and execs in the child,
+and **launchd spawns its daemons with `posix_spawn`**.  The measurement that says
+so is the asymmetry interval 37 recorded without understanding it: **28 exits
+against 2 execs.**  Twenty-six processes took a path the exec emitter cannot see.
+
+And `springboard.running` -- the record M9 asks for -- is emitted from
+`__mac_execve()`'s success block, while SpringBoard is exec'd by launchd from
+userspace.  By `posix_spawn`.
+
+**So the record M9 asks for sat on a path the process it asks about does not
+take.  Its absence was an instrument defect, not a guest fact, and no amount of
+booting would have changed it.**
+
+That is fact 204's shape one layer out.  The emitter was correct, the tree was
+correct, the build was green, and the instrument was pointed at the wrong
+function.  Every interval from 14 to 37 that recorded "springboard.running did not
+arrive, and the emitter is in the kernel, so the absence is real" was drawing a
+sound conclusion from an unsound premise -- the emitter being in the kernel says
+nothing about it being on the path.
+
+## The change
+
+`posix_spawn()`'s own success block now emits the same two records:
+
+    {"event":"springboard.running","pid":N,"comm":"SpringBoard",
+     "source":"XNU.posix_spawn"}
+    {"event":"spawn.seen","n":K,"comm":"<name>","source":"XNU.posix_spawn"}
+
+`springboard.running` **keeps its event name** -- the gate does not care which
+function emitted it and it should not.  The generic one is `spawn.seen` rather
+than `exec.seen` so a reader can tell the two paths apart, which is the whole
+point of adding it.
+
+Placed inside `if (error == 0 && !spawn_no_exec)`, **after**
+`proc_exec_switch_task()`, so `p` is the switched proc and `p_comm` has been
+written by `set_proc_name()` inside `exec_mach_imgact()` -- the same common
+machinery `__mac_execve` uses fifteen hundred lines below.  Guarded on
+`XNU_OWNER_CACHE_MOUNT`, which is `kern_exec.o`'s macro, and `posix_spawn()` is in
+`kern_exec.c`, so the guard is right here.  (The exit record lives in `kern_exit.c`
+and needs `XNU_NATIVE_VIRTIO_CONSOLE` instead -- the macro is per-object, which is
+the trap interval 33 recorded.)
+
+## Validated
+
+| instrument | result |
+|---|---|
+| `repro-patch-order.py` | all 58 applied |
+| `repro-patch-twopass.py` (three passes) | ALL PASSES CLEAN |
+| `check-patch-headers.py` | 0 mismatched headers |
+| both guards in `test_console_declaration_visibility.py` | 6 passed |
+| applied section | brace-balanced, 126 lines |
+| record assembly | every record valid JSON inside 128 bytes, worst 97 + NUL |
+| full `tests/unit` | **3476 passed, exit 0** |
+
+Fork commit `188f1d23`, pushed; the lock's `unixnu.commit` moved to it.  Build
+**41730055408** dispatched at 22:21 with `stage=M7`.
+
+## What this does and does not settle
+
+It settles the instrument.  It does **not** claim SpringBoard is running -- if it
+is, the next capture is the first that can see it, and if it is not, the next
+capture is the first whose silence about it means anything.
+
+## Not claimed
+
+* That SpringBoard execs.  The emitter is now on both paths; the measurement has
+  not run.
+* No IPA, no interaction, no persistence.  M9, M9a, M9b remain FAIL until a
+  capture says otherwise.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
