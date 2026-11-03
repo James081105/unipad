@@ -3482,3 +3482,313 @@ without the second volume, and it is also the reason it cannot answer M9.
   launchd until it is.
 * This is one boot.  It has not been repeated, and a single successful run is not
   a stable measurement.
+\n
+---
+
+# Interval 2026-11-03 (fifteenth): `system.mount` arrived.  So did a withdrawal.
+
+## What this run measured that the last one could not
+
+The boot reached the SystemOS mount.  Two records, byte-level in
+`local-private/boot53/springboard-boot/guest.log`:
+
+    {"event":"system.mount","mounted":true,"volume_uuid":"8846FE78-...","filesystem":"apfs"}
+    {"event":"system.volume_identity","volume_uuid":"8846FE78-...","filesystem":"apfs"}
+
+That clears **M7** (`p.system_mount`, `p.system_volume_identity`) and satisfies
+the `system_volume_mounted` half of the M9b blocker, which the patch says the
+same event clears.  With the volumes attached, `build_argv` also adds
+`virtio-tablet-device` and `virtio-keyboard-device` (`unixnu_boot.py:1985`), so
+the input path exists for the first time on this host.
+
+## The caveat that has to travel with that record
+
+**The `volume_uuid` in those two records is a compile-time constant.**  It is
+`XNU_OWNER_CACHE_VOLUME_UUID`, which defaults to the literal
+`8846FE78-2910-4297-AF97-D59BB6F8FC16`
+(`offline-owner-systemos-mount.patch:98-99`) and is concatenated straight into
+the record.  It is **not** read from the device.
+
+So the record proves `mount()` returned 0 and that `cache_authorized` held.  It
+does not prove *which* device was mounted.  Anyone citing it as evidence that the
+right SystemOS volume mounted would be over-reading it, and the emitter's own
+comment invites exactly that reading by saying "the mount is complete and
+authorized by this point".  It is true of the mount call and silent about the
+device.
+
+## WITHDRAWN: the host-side twin as evidence that input reaches the guest
+
+Interval 14 recorded:
+
+    the screen changed:  True
+
+and read it as "the input path reaches the guest AND the screen responds to it".
+**That is withdrawn.  The measurement cannot support the claim**, because of two
+defects in my own capture:
+
+1. **Home was pressed at T+0**, immediately after the kernel hand-off, when the
+   framebuffer still showed the UniXNU boot menu.  There was no SpringBoard to
+   respond to it.
+2. **The "after" shot was taken at the end of the whole 900 s budget.**  Two
+   sha256 values 15 minutes apart differ on *any* boot that progresses, so
+   `changed: true` measures the boot, not the key press.
+
+The guest-channel half of that interval stands -- `install.registered` is real
+and is the answer to the question the stop hook named.  The input half does not,
+and it was reported in the same table as if it did.  That is the defect: not a
+wrong number, a right number attached to the wrong claim.
+
+## What the framebuffer actually shows, and what that rules out
+
+`local-private/boot53/install-thread-start-boot/shots/after.ppm`, converted and
+read: the **UniXNU boot menu**, not a panic screen.  Coloured top bars,
+"DARWINBOOT: inputs validated; exiting boot services", the kernel/entry/args/video
+banner, "Exiting boot services. A green bar across the top means the kernel entry
+code ran.", the highlighted entry "QEMU virt: source 4K XNU", and
+"drivers 1 loaded / 0 failed".
+
+`unixnu_boot.py` records that the panic screen is **the only kernel output on
+this frame buffer**.  So a panic would have replaced the menu, and it did not.
+**The kernel did not panic.**  The boot reached `system.volume_identity` and the
+kernel kept running.
+
+## The one structural gap this run exposed
+
+Everything after `system.volume_identity` is invisible:
+
+| step | code | observable? |
+|---|---|---|
+| the Data mount | `native_owner_data_prepare()` | **no** -- the function emits nothing; every failure is `goto done` |
+| a Data mount failure | `panic("offline scratch Data mount failed: %d")` | **no** -- `panic()` writes to XNU's printf console |
+| the launchd load loop | `printf("attempting to load %s")` | **no** -- printf only |
+| SpringBoard exec | `springboard.running` | yes, but gated on `p_comm == "SpringBoard"` |
+
+And there is no way to read XNU's printf console from the host:
+
+* the kernel console is **not on the serial port** (`unixnu_boot.py:468-469`,
+  measured); `serial.log` ends at the hand-off and the kernel adds nothing;
+* there is **no serial console patch** in `vendor/UniXNU/patches/xnu/`;
+* there is **no embedded panic log**: the ADT has no `embedded-panic-log-size`,
+  so `gPanicBase` stays 0 and the panic text is unreachable from the host.
+
+So a hang and a panic look identical from outside, and both look identical to a
+boot that is merely slow.  **This is the diagnostic gap on the critical path**,
+and it is the thing to close before spending another 70-minute boot on a guess.
+
+## The timing evidence, and what it does and does not say
+
+All 2601 bytes of the capture arrived within the first ~60 s (two reads:
+`+924`, then `+1677`), and then **nothing arrived for the remaining 540 s**
+while the host sent 27 more install frames.
+
+That is consistent with a TCG userspace boot that needs longer than 900 s, and
+`springboard.running` is gated on `p_comm == "SpringBoard"`
+(`zzz-native-springboard-events.patch:47`), so the whole chain from launchd
+through to SpringBoard's exec has to finish first.  It is equally consistent with
+a hang in the unobservable region above.  **This run cannot separate those two**,
+and the previous interval's "the guest either mounts ... or stops" framing did
+not separate them either.
+
+## One risk, recorded and NOT concluded
+
+`XNU_OWNER_DATA_VOLUME_UUID` is supplied from
+`$DEVICE_DIR/.cache/firmware/owner-data/seed.json`
+(`build-macos.sh:2211`, `:2661`).  **This host has no
+`.cache/firmware/owner-data/` directory at all**, so a local build would export an
+empty value -- which passes the `#ifndef` guard (it is defined, as `""`) and then
+makes `native_ram_block_volume_seed("")` return 0, i.e. `ENOENT`, i.e.
+`panic("offline scratch Data mount failed: 2")`.
+
+Separately, `vendor/UniXNU/scripts/build-cpu-desktop-kernel.py:7` builds with
+`18AB5557-DC2D-469B-8758-855E60F5B0DF`, while
+`local-private/firmware/verify-data-mount.py:117-123` records that the last
+measured `seed.json` UUID was `18AF0FFB-77A7-4878-B999-70DD8B4076DC` and calls
+the discrepancy "an open item on the runner side".
+
+**Neither literal is in the kernel this run booted** (scanned: 19 UUID literals,
+neither value among them), so the runner's build used a third value that I have
+not located, and I have not read the Data seed's own UUID.
+
+**This is a risk, not a finding.**  I do not know that the Data mount failed, and
+the boot-53 kernel came from the runner where `seed.json` did exist.  What I know
+is that the failure mode is real, documented, and completely unobservable.
+
+## Next action, in order
+
+1. **A 3600 s capture with a corrected Home twin** --
+   `local-private/tmp/capture-springboard-boot.py`.  Home every 600 s from
+   T+600, each press bracketed by a screendump immediately before and one 5 s
+   after; a screendump every 120 s for a screen timeline.  The budget is 4x the
+   last one because the timing evidence is consistent with a slow boot.
+2. **If that still produces no `springboard.running`**, the next step is NOT
+   another boot.  It is to close the observability gap: emit a record at every
+   stage of `native_owner_data_prepare()` (which stage, which error) and at each
+   launchd attempt, so the next run says where it stopped instead of stopping
+   silently.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction recorded by the guest, no persistence.
+* M9 remains FAIL: neither M9 record arrived.
+* M7 is measured **with the constant-UUID caveat above**, not as proof of device
+  identity.
+* This is one boot with the volumes.  It has not been repeated.
+* The 3600 s capture is running; its result is not in this record.
+\n
+---
+
+# Interval 2026-11-03 (sixteenth): `dyld.cache_read` arrived.  So did a correction
+# about the input path.
+
+## The furthest the boot has ever gone
+
+    {"event":"dyld.cache_read","source":"XNU._shared_region_map_and_slide"}
+
+arrived at **t=914 s** of a 3538 s run, 853 s after the last of the install
+records.  That is the furthest any boot on this host has reached.
+
+`native-dyld-cache-read.patch:41` bounds the emitter to **one record per boot**
+on purpose -- the site is per-process, and the transport is synchronous with a
+2000 ms deadline per record.  So one record proves **at least one** userspace
+process exec'd and dyld ran in it.  It does not say how many, and it does not say
+which.  What it does say is that `load_init_program()` got past the launchd
+attempts, that `native_owner_cache_prepare()`'s
+`DYLD_SHARED_CACHE_DIR` environment reached a real process, and that the SystemOS
+union mount is serving the shared cache to it.
+
+That is the first evidence of userspace execution on this host.
+
+## The timeline, which is the part that matters
+
+    t=   15 s   +945 bytes    (xnu.*, iokit.*, virtio_blk.read_back)
+    t=   46 s   +1339 bytes   (diag.install_thread_start, install.registered)
+    t=   61 s   +338 bytes    (system.mount, system.volume_identity)
+    t=  121 s   the screen stops changing, permanently
+    t=  914 s   +72 bytes     (dyld.cache_read)
+    t= 3538 s   the budget ends
+
+Everything the kernel has to say about itself arrives in the first 61 s.  Then
+853 s of nothing, one record, and 2624 s of nothing.
+
+## The screen never advanced, and now that is measured rather than inferred
+
+30 screendumps, 120 s apart, hashed and deleted.  **Two distinct images**: the
+first at t=0 (`2e2910ab...`, mid-boot) and the second from t=121 s onward
+(`8833260e...`).  The second is the same image for the remaining 3417 s.
+
+So the framebuffer settled onto the UniXNU boot menu by t=121 s and never moved
+again, while the guest channel delivered records at t=914 s.  The kernel was
+executing userspace code with a display that showed a boot menu.  This is the
+same gap `unixnu_boot.py` records ("XNU's video console draws nothing here
+despite -v") now with a timeline attached: it is not that the console draws late,
+it is that it never draws at all on this path.
+
+## No SpringBoard
+
+`springboard.running` and `springboard.interaction` did not arrive in 3538 s.
+The emitter is byte-level in the booting kernel (count 1 each), so the absence is
+a real absence and not a missing emitter.  M9 remains FAIL.
+
+## CORRECTION to interval 15: the input path has never been measured
+
+Interval 15 withdrew the host-side twin and gave the reason as timing -- Home
+pressed at T+0, the "after" shot taken at the end of the budget.  **That is not
+the reason, and the real one is worse.**
+
+    Home press failed: UniPadError: qmp client is already connected
+
+on **all six presses** of this run, and on the one press of boot 53
+(`"input_error": "UniPadError: qmp client is already connected"`, which I read
+past).  `QmpClient.__enter__` calls `connect()`
+(`src/unipad/host/qmp.py:283-285`), and the capture called `connect()` again
+inside the `with` block.  The second connect raises, so **no key was ever sent to
+any guest on this host.**
+
+So:
+
+* the input path is UNMEASURED, not "measured with a timing defect";
+* `input devices attached: True` proves the argv carries
+  `virtio-tablet-device` and `virtio-keyboard-device`, and nothing more;
+* every earlier claim that a Home press reached the guest is withdrawn.  There
+  was no such measurement.
+
+The fix is one line -- drop the redundant `connect()` -- and it is applied.  The
+next capture measures it for the first time.
+
+## The observability gap is closed in source
+
+`native_owner_data_prepare()` emitted nothing, so a Data mount failure, a hang in
+the launchd loop and a slow boot were indistinguishable from the host.  It now
+emits:
+
+    {"event":"diag.owner_data_status","stage":N,"error":E,
+     "source":"XNU.native_owner_data_prepare"}
+
+at its single `done:` label, which every path in the function reaches.
+`native_owner_data_stage` was already maintained by all of them, so the record
+costs nothing to produce and turns "the guest went quiet" into "the guest stopped
+at stage N": 0 the seed was not found or its geometry was rejected, 1 the copyout
+of the mount arguments failed, 2 `mount()` failed, 3 `vnode_lookup` failed, 4 the
+mount verified.
+
+**This is source only.  It is not compiled and not measured** -- this host has no
+C compiler, so CI is the first thing that compiles it and a matched kernel build
+is the first thing that can emit it.
+
+## Three defects my own edit caused, and what caught each
+
+Recorded because each one was invisible to the tool I reached for first.
+
+1. **A hunk header that disagreed with its body.**  I added 85 lines to hunk 1 and
+   left `+332` in the header.  `git apply` rejects the file as "corrupt patch at
+   line 431" -- a message that reads like file damage.  Caught by
+   `local-private/tmp/check-hunk-headers.py`, now
+   `test_every_hunk_header_matches_the_body_it_has`.
+2. **The later hunks' new-side starts then pointed inside hunk 1's output.**
+   `zzy-native-gpu-addon-mount.patch` failed at `kern_exec.c:7193`, because its
+   six-line context block is exactly `char native_owner_data_device_path[64];` /
+   blank / `static int` / `native_owner_data_prepare(...)` / `{` -- and I had put
+   28 helper lines in that gap.  Fixed by moving the helpers above the globals.
+3. **A duplicate `extern`.**  My emitter carried a block-scoped
+   `native_console_report` on the reasoning that
+   `native-install-service-dispatcher.patch` needed one at both scopes.  That
+   patch needed it because ITS caller sits above ITS declaration; here the
+   file-scope declaration is 888 lines above the function and outside every
+   guard, so the copy was redundant.  Caught by
+   `test_the_console_reference_is_strong_not_weak`, which asserts exactly one
+   declaration.  **That test was right and my comment justifying the duplicate
+   was wrong**, so the comment was corrected rather than the test weakened.
+
+## And the reason (1) was not caught by the tool I trusted
+
+`repro-patch-twopass.py` staged patches with `git show HEAD:<path>` -- the
+**committed** bytes.  I edited the patch, ran it, and it printed "ALL PASSES
+CLEAN" about a patch that did not contain my edit.  A green result from an
+instrument that is not looking at the change under test is worse than no result.
+
+It now stages from the working tree and prints a note when the two differ.  This
+is the third time this session that an instrument has had to be validated before
+its answer could be used, and the first time the instrument was my own.
+
+## A known defect fell out as a side effect
+
+`test_the_unreachable_hunk_starts_are_exactly_the_known_set` recorded
+`("offline-owner-systemos-mount.patch", 346)` as an unreachable hunk start, with a
+comment saying the offset was "deliberately left alone".  Recomputing the
+new-side starts as `old_start + the running (new-old) delta` -- the relation a
+unified diff actually has -- made the patch internally consistent, and the entry
+disappeared.  The patch still applies in all three idempotency passes.
+
+So that offset was not a design decision, it was an uncorrected defect that
+`git apply` happened to tolerate.  The entry is removed and the correction
+recorded in its place, rather than renumbered -- renumbering it would have
+preserved the wrongness.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* `dyld.cache_read` proves at least one userspace process exec'd.  It does not
+  prove launchd completed, and it does not name the process.
+* The input path is UNMEASURED.  The one-line fix is applied and not yet run.
+* `diag.owner_data_status` is source only -- not compiled, not booted.
+* This is one 3538 s boot.  It has not been repeated.

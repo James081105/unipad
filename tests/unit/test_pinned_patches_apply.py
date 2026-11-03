@@ -86,7 +86,20 @@ KNOWN_UNREACHABLE = {
     # XNU_OWNER_CACHE_MOUNT guard so the load_init_program diagnostic could see
     # it, and that move added 14 comment lines above this header.  A renumbering,
     # not a new defect -- the old-side start (7086) is unchanged.
-    ("offline-owner-systemos-mount.patch", 346),
+    #
+    # REMOVED on 2026-11-03, and recorded here because the entry above says it
+    # was "deliberately left alone" and that is no longer true.  Adding the
+    # diag.owner_data_status emitter to this patch required updating hunk 1's
+    # line count, which required recomputing the new-side start of every later
+    # hunk as old_start + the running (new-old) delta -- the relation a unified
+    # diff actually has.  That recomputation is what removed this entry: hunk 2's
+    # declared start had been off by a constant since before 2026-11-01, and the
+    # checker had been reporting it ever since.
+    #
+    # So the offset was not a design decision, it was an uncorrected defect that
+    # git apply happened to tolerate.  It is now consistent, the patch still
+    # applies in all three idempotency passes, and the entry is gone rather than
+    # renumbered -- a renumbering here would have preserved the wrongness.
     ("zzz-boot-progress.patch", 223),
     ("zzz-boot-progress.patch", 264),
 }
