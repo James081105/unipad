@@ -5769,3 +5769,145 @@ capture is the first whose silence about it means anything.
   capture says otherwise.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+---
+
+# Interval 2026-11-04 (fortieth): fifty-three daemons, and the window that said
+# "nothing after" had closed while records were still arriving.
+
+## The measurement
+
+Build **41730055408**, kernel sha256
+`aebcf2e585b17b8e88dcf80d0eacc36f0f933a61df5176d65541692fd0e2ff95` verified
+against `payload.json` before the boot.  9664 bytes, 103 records.
+
+The `posix_spawn` emitter -- added in interval 39 because `springboard.running`
+sat on the one exec path SpringBoard does not take -- **fired for the first time
+and produced 53 records**:
+
+    n=1  notifyd            n=2  UserEventAgent     n=3  mediaserverd
+    n=4  logd               n=5  mobiletimerd       n=6  wifid
+    n=7  rapportd           n=8  DumpPanic          n=9  watchdogd
+    n=10 distnoted          n=11 fseventsd         n=12 timed
+    n=13 thermalmonitord    n=14 IOMFB_FDR_Loader  n=15 configd
+    n=16 containermanager   n=17 AppleCredentialM  n=18 mtmergeprops
+    n=19 driverkitd         n=20 ptpd              n=21 keybagd
+    n=22 fairplayd.A2       n=23 sleepd            n=24 amfid
+    n=25 remoted            n=26 logd_helper       n=27 containermanager
+    n=28 MobileGestaltHel   n=29 runningboardd     n=30 fairplayd.A2
+    n=31 identityservices   n=32 bluetoothd        n=33 cfprefsd
+    n=34 CommCenter         n=35 cfprefsd          n=36 backboardd
+    n=37 nfcd               n=38 lockdownd         n=39 sharingd
+    n=40 imagent            n=41 locationd         n=42 usermanagerd
+    n=43 fairplayd.A2       n=44 lsd               n=45 powerd
+    n=46 com.apple.datami   n=47 biomesyncd        n=48 liveactivitiesd
+    n=50 contextstored      n=51 audiomxd          n=52 PowerUIAgent
+    n=53 iconservicesagen   n=55 triald
+
+These are the **real iOS daemon set**.  `configd`, `notifyd`, `distnoted`,
+`fseventsd`, `logd`, `wifid`, `mediaserverd`, `thermalmonitord`, `driverkitd`,
+`containermanager`, `keybagd`, `amfid` -- none of which the
+`__mac_execve`-only emitter could ever have seen, because launchd spawns them
+with `posix_spawn`.
+
+## The exit sequence is byte-for-byte the one interval 37 recorded
+
+Same 28 exits, same four non-zero statuses (`launchd` 1, `MSUEarlyBootTask` 1
+then 0, `sysstatuscheck` 256, `prng_seedctl` 3328).  That is a reproducibility
+check on the whole userspace chain, and it passes.
+
+## What this does to the "userspace stall" model
+
+Intervals 30 through 38 carried the model **"28 early boot tasks, then a
+stall."**  That model was built from the `exit.seen` stream alone, and the exit
+stream only ever showed the SHORT-LIVED tasks -- by definition, the ones that
+exit.  The long-running daemons were invisible to it.  Twenty-six of the
+twenty-eight were a complete list of nothing.
+
+The real picture: **the boot runs to at least 53 daemons and was still going when
+the capture stopped.**  It reaches `runningboardd` (the process manager),
+`backboardd` (SpringBoard's parent on a real iPadOS boot), `CommCenter`,
+`lockdownd`, `powerd`, `lsd`, `nfcd`, `bluetoothd`, `locationd`, `cfprefsd`,
+`biomesyncd`, `liveactivitiesd` -- and `biomesyncd`, `liveactivitiesd`,
+`lockdownd`, `locationd` and `sharingd` are daemons that normally start *after*
+SpringBoard on a real boot.
+
+**So "the userspace boot stalls after the early tasks" is refuted.**  There is no
+stall.  There is a boot that goes further than any previous measurement could
+see.
+
+## And yet `springboard.running` did not arrive -- and that is not yet a fact
+
+The reason is in the capture, not the guest:
+
+    listen deadline = started + LISTEN_BUDGET_S, LISTEN_BUDGET_S = 1500
+
+A **hard deadline.**  The channel's last byte arrived at 23:30:53, which was
+`spawn.seen` n=55 `triald` -- and the capture stopped at exactly that moment
+because 1500 s had elapsed, not because the guest went quiet.  QEMU was killed
+by the script while the daemon stream was still flowing.
+
+**53 of the emitter's 64-record bound.**  So the bound did not saturate and was
+not the cause.  The *observation window* is what saturated, and it measured
+itself.
+
+This is the `kMaxExecRecords` lesson from interval 36 one layer out.  A bound
+anywhere -- in the emitter, in the reader, or in the wall clock -- makes silence
+look like a fact.  Interval 37's "then a stall" was a window artifact too: 1500 s
+had not been reached, but 28 exits had, and the model was read off the exits.
+
+## The instrument is validated
+
+The 53 records carry correct `p_comm` values -- `notifyd`, `configd`,
+`backboardd`, not `launchd`.  That is the proof that the emitter's placement,
+after `proc_exec_switch_task()` at `kern_exec.c:4281-4284`, sees the switched
+proc's post-exec name.  Reading the source alone would not have settled it,
+because `set_proc_name()` runs inside `exec_mach_imgact()` fifteen hundred lines
+away and the ordering is not obvious from either site.
+
+The `n` field also behaves as a strict counter with two visible properties:
+records arrive **out of order** (n=12 before n=11, n=25 before n=24, n=38 before
+n=37) which is multi-CPU concurrency, and two values are **missing** (n=49,
+n=54), which is channel loss at the tail rather than a counter defect -- the
+increment only happens inside the emit guard.
+
+## The two changes, and why they are separate
+
+| change | where | cost |
+|---|---|---|
+| stop on **quiet**, not on the clock; cap 5400 s, quiet 600 s | `capture-springboard-boot.py` | none, no rebuild |
+| `kMaxSpawnRecords` 64 -> 512 | `zzz-native-springboard-events.patch` | one build |
+
+They are separate because they answer different questions.  The window is what
+truncated this run, and fixing it needs no kernel at all.  The bound was at 53 of
+64 and would have saturated before SpringBoard -- but **`springboard.running` is
+NOT bounded**: it lives in its own `if (strncmp(p->p_comm, "SpringBoard",
+MAXCOMLEN) == 0)` block *before* the bounded one, so it fires whenever
+SpringBoard spawns regardless of the counter.  The bound only limits the
+*diagnostic* view of what comes after.
+
+So the re-run uses the **same kernel, same bundle, same verified sha** with the
+longer window, and a raised-bound build is dispatched in parallel on CI in case
+the longer run still shows no SpringBoard and the missing tail is what matters.
+
+## The re-run
+
+`capture-springboard-boot.py local-private/boot53/spawn-seen-input`, output to
+`local-private/boot53/quiet-stop-input-run`, scratch
+`local-private/boot53/quiet-stop-input-run-scratch`.  Kernel sha re-verified at
+boot: `aebcf2e5...`, matches `payload.json`.
+
+## What this does and does not settle
+
+It settles that the userspace boot runs to at least 53 daemons and was still
+running when the last capture stopped.  It does **not** settle whether
+SpringBoard spawns -- that measurement was truncated and has been re-run
+properly.
+
+## Not claimed
+
+* That SpringBoard runs.  The record has not been observed on either path.
+* No IPA, no interaction, no persistence.  M9, M9a, M9b remain FAIL until a
+  capture says otherwise.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
