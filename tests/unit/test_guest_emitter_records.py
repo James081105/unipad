@@ -102,9 +102,24 @@ UNVERIFIABLE = {
 LEGACY = next(e for e in EMITTERS if e.event == "diag.legacy_display_status")
 
 
-def _text(relative: str) -> str:
-    require(REPO / relative)
-    return (REPO / relative).read_text(encoding="utf-8")
+#: event -> the pinned file that emits it.  Lets the reader take an EVENT rather
+#: than a path; see the note on :func:`_text`.
+_SOURCE_OF = {e.event: e.source for e in EMITTERS}
+
+
+def _text(event: str) -> str:
+    """The source of the emitter named *event*, guarded before it is read.
+
+    Takes the EVENT and not the path, and that is load-bearing.  A vendor path at
+    the call site is exactly what
+    ``tests/unit/test_clean_checkout_selfsufficiency.py`` refuses: the guard has
+    to be evaluated in the same function, and a caller that passes the path looks
+    like it knows better than the guard.  Measured -- this file was written with
+    ``_text("diag.legacy_display_status")`` and that test went red on five call sites, in a
+    clean checkout where ``vendor/`` is empty.
+    """
+    require(REPO / _SOURCE_OF[event])
+    return (REPO / _SOURCE_OF[event]).read_text(encoding="utf-8")
 
 
 def _decode(part: str) -> str:
@@ -236,7 +251,7 @@ def _record(template: str) -> dict:
 
 @pytest.mark.parametrize("emitter", EMITTERS, ids=lambda e: e.event)
 def test_the_record_reassembles_to_json_with_the_keys_it_claims(emitter):
-    got = reassemble(_text(emitter.source), emitter.event)
+    got = reassemble(_text(emitter.event), emitter.event)
     record = _record(got.template)
     assert record["event"] == emitter.event
     assert record["source"] == emitter.claimed_source
@@ -250,7 +265,7 @@ def test_the_record_reassembles_to_json_with_the_keys_it_claims(emitter):
 def test_the_record_is_a_newline_terminated_object(emitter):
     """The host splits records on newlines; a record without one merges with
     the next and both are lost."""
-    got = reassemble(_text(emitter.source), emitter.event)
+    got = reassemble(_text(emitter.event), emitter.event)
     assert got.template.rstrip(chr(10)).endswith("}"), (
         f"{emitter.event} does not close with '}}'"
     )
@@ -275,7 +290,7 @@ def test_every_empty_value_position_has_a_digit_append(emitter):
     appends, because its two screen digests are quoted and the bare-position
     regex never saw them.
     """
-    got = reassemble(_text(emitter.source), emitter.event)
+    got = reassemble(_text(emitter.event), emitter.event)
     assert got.bare == got.decimal, (
         f"{emitter.event} leaves {got.bare} bare value position(s) empty but has "
         f"{got.decimal} decimal append(s); a field would be emitted as `:` with "
@@ -293,7 +308,7 @@ def test_the_buffer_can_hold_the_worst_case_record(emitter):
     """A short buffer truncates silently -- put_literal stops at size-1 -- and
     truncation produces a record that is not JSON, which reads as a missing
     event."""
-    got = reassemble(_text(emitter.source), emitter.event)
+    got = reassemble(_text(emitter.event), emitter.event)
     if got.buffer is None:
         pytest.skip(f"{emitter.event} declares no resolvable record buffer")
     assert got.buffer >= got.worst_case, (
@@ -317,7 +332,7 @@ def test_the_legacy_emitters_console_reference_is_strong_and_c_linked():
     weak_import produced, reached by a different route, and it was one edit away
     from shipping: the first version of this emitter declared it bare.
     """
-    text = _text(LEGACY.source)
+    text = _text("diag.legacy_display_status")
     declaration = re.search(r"^extern\s*(?:\"C\"\s*)?int\s+native_console_report"
                             r"\s*\([^\n]*$", text, re.M)
     assert declaration, "the legacy emitter declares no native_console_report"
@@ -351,7 +366,7 @@ def test_the_legacy_display_checkpoint_reaches_the_early_exit():
     which is the case the record was needed for -- and it is the exit every
     frozen boot took.
     """
-    text = _text(LEGACY.source)
+    text = _text("diag.legacy_display_status")
     line = next(l for l in text.splitlines()
                 if "pendingLegacyDisplay" in l and "if(!display)" in l)
     assert "native_legacy_display_checkpoint()" in line, (
@@ -376,7 +391,7 @@ def test_the_emitters_this_check_cannot_see_are_named():
     updating -- which is the correct outcome, and much better than the check
     quietly beginning to assert something it cannot see.
     """
-    text = _text("vendor/UniXNU/patches/xnu/offline-owner-systemos-mount.patch")
+    text = _text("diag.owner_data_status")
     for event, why in UNVERIFIABLE.items():
         with pytest.raises(Unverifiable) as caught:
             reassemble(text, event)
@@ -403,7 +418,7 @@ def _mutate(tmp_path: Path, **replacements: str) -> Path:
     repository has already lost four edits to a checkout that restored the wrong
     bytes.
     """
-    text = _text(LEGACY.source)
+    text = _text("diag.legacy_display_status")
     for old, new in replacements.items():
         assert old in text, f"the mutation anchor {old!r} is no longer in the source"
         text = text.replace(old, new)
@@ -420,7 +435,7 @@ def test_a_field_with_no_append_is_caught(tmp_path):
     a display path that never ran.
     """
     q = BACKSLASH + QUOTE
-    good = _text(LEGACY.source)
+    good = _text("diag.legacy_display_status")
     mutated = _mutate(tmp_path, **{
         q + "surface_status" + q + ":":
             q + "mode" + q + ":," + q + "surface_status" + q + ":"})
