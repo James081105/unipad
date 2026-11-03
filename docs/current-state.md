@@ -5373,3 +5373,97 @@ chain.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The screen: two distinct screendumps, frozen from t=121 s, six Home presses,
   every one of which changed nothing.
+
+---
+
+# Interval 2026-11-04 (thirty-fifth): twenty-nine early boot tasks, a panic dump,
+# and a stall after `fairplayd.A2`.
+
+## The sequence
+
+Build **41690023024**, kernel sha256 `5ba8c8c0...` verified against
+`payload.json` before the boot.  5423 bytes, 51 records:
+
+    exec.seen  n=1  launchd
+    exit.seen  n=1  fsck
+    exit.seen  n=2  mount
+    exit.seen  n=3  seputil
+    exit.seen  n=4  mobile_obliterat
+    exit.seen  n=5  launchd
+    exec.seen  n=2  apfs_boot_util
+    exit.seen  n=6  apfs_boot_util
+    exit.seen  n=7  MSUEarlyBootTask
+    exit.seen  n=8  MSUEarlyBootTask
+    exit.seen  n=9  cc_fips_test
+    exit.seen  n=10 keybagd
+    exit.seen  n=11 usermanagerd
+    exit.seen  n=12 dirs_cleaner
+    exit.seen  n=13 xpcroleaccountd
+    exit.seen  n=14 init_featureflag
+    exit.seen  n=15 auearlyboot
+    exit.seen  n=16 tzinit
+    exit.seen  n=17 FinishRestoreFro
+    exit.seen  n=18 finish_demo_rest
+    exit.seen  n=19 sysstatuscheck
+    exit.seen  n=20 prng_seedctl
+    exit.seen  n=21 launchd_cache_lo
+    exit.seen  n=22 init_exclavekit
+    exit.seen  n=23 mtmergeprops
+    exit.seen  n=24 watchdogd
+    exit.seen  n=25 fairplayd.A2
+    exit.seen  n=26 fairplayd.A2
+    exit.seen  n=27 IOMFB_FDR_Loader
+    exit.seen  n=28 DumpPanic
+    exit.seen  n=29 fairplayd.A2
+
+Both display records reproduced for a FIFTH time with identical values
+(`diag.legacy_display_status` stage 10, `diag.owner_data_status` stage 4).
+
+## The bound was the limit.  Now the boot is.
+
+Twenty-nine exits against a bound of sixty-four, so the bound did NOT saturate.
+The boot produced twenty-nine early boot tasks and then **stopped** -- the last
+one is `fairplayd.A2` at n=29, and nothing followed for the remaining ~400 s of
+the capture window.
+
+That is the first time this session the boot itself, and not the instrument, has
+been the thing that stopped.  Interval 34's "the bound hid the rest" was right
+about the previous build and is now retired as the explanation for this one.
+
+## Three things in that list that were not there before
+
+* **`DumpPanic` at n=28.**  That binary exists to dump a panic log.  Its presence
+  says a panic happened, or that a previous one was found.  Which of those is
+  UNMEASURED -- the record names the process, not its reason.
+* **`fairplayd.A2` THREE times** (n=25, 26, 29).  A daemon that runs three times
+  in one boot is usually one that failed and was relaunched.  It is also the
+  LAST thing that ran.
+* **`IOMFB_FDR_Loader` at n=27.**  The IOMobileFramebuffer FDR loader, i.e. the
+  display's factory-data reader, running immediately before the panic dump.
+
+## And the exec record is nearly blind
+
+**Two execs against twenty-nine exits.**  `exec.seen` caught `launchd` and
+`apfs_boot_util` and nothing else, while `exit.seen` named all twenty-nine.  So
+`__mac_execve()` is not on the path most of these processes take -- whatever
+that path is, the exec emitter does not see it and the exit emitter does.
+
+The cause is UNMEASURED and I am not going to guess at it in this record.  What
+is measured is the consequence: **for process-level questions the exit record is
+the reliable one**, and an exec-only instrument would have reported two processes
+for a boot that ran twenty-nine.
+
+## The screen
+
+Thirteen screendumps, 120 s apart, **all identical** (`8833260e...`), and the
+first was already that image.  `screen_ever_changed: false`.  Six Home presses,
+every one of which changed nothing.  The display subsystem is up (stage 10, five
+builds running) and the framebuffer has never moved off the UniXNU boot menu.
+
+## Not claimed
+
+* Whether a panic occurred THIS boot.  `DumpPanic` running is consistent with one
+  and does not prove it.
+* Why `fairplayd.A2` ran three times, or whether it failed.
+* What stalled after n=29.  Nothing ran, so an exit record cannot see it.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
