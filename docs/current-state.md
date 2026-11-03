@@ -3792,3 +3792,99 @@ preserved the wrongness.
 * The input path is UNMEASURED.  The one-line fix is applied and not yet run.
 * `diag.owner_data_status` is source only -- not compiled, not booted.
 * This is one 3538 s boot.  It has not been repeated.
+\n
+---
+
+# Interval 2026-11-03 (seventeenth): the Home press works now, and it changed
+# nothing -- which is a measurement, not a failure.
+
+## The instrument is fixed
+
+    [  484s] Home pressed=True changed=False
+    [  974s] Home pressed=True changed=False
+
+`Home pressed=True` on every attempt.  The fix was one line: `QmpClient.__enter__`
+already calls `connect()` (`qmp.py:283-285`), and the capture called `connect()`
+again inside the `with` block, so every press raised "qmp client is already
+connected" and **no key was ever sent to any guest on this host**.  Interval 16
+recorded that; this is the fix landing.
+
+## What it measured, precisely
+
+`changed=False` on both presses, five seconds after each.  The screen did not
+respond to Home.
+
+**That is not evidence that the guest ignores input**, and it would be wrong to
+record it as such.  The framebuffer is showing the UniXNU boot menu, which has no
+Home affordance -- the menu's own keys are Up/Down/Enter/1-9/Esc.  A key that
+does nothing to a boot menu tells you nothing about whether the guest received it.
+
+What IS now measured, and was not before:
+
+* the QMP key event is accepted and delivered;
+* the framebuffer does not change within 5 s of it;
+* the screen timeline is 30 dumps, 2 distinct images, the second frozen from
+  t=121 s to the end.
+
+The guest-side emitter `springboard.interaction` digests the scanout before and
+after a Home press from inside the guest.  It cannot fire while the scanout never
+changes, so it is gated on the same thing the host-side twin is gated on: **a
+display that draws.**  Until the display works, the input path has no observable
+consequence, and neither instrument can say more than "the key was delivered".
+
+## So the display is the gate, and it always was
+
+Two boots, 3538 s and 1500 s, same result: the framebuffer settles onto the boot
+menu by t=121 s and never moves again, while the guest channel delivers
+`dyld.cache_read` at t=914-1055 s.  The kernel runs userspace code with a display
+that shows a boot menu.
+
+`CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y` is set, and the boot args carry
+`offline-legacy-register=1 offline-legacy-phase=4 offline-legacy-gop=1
+offline-legacy-surface-wait-ms=600000`.  The 600 s surface wait is longer than
+the 121 s at which the screen froze, so the wait was still open when the screen
+stopped -- the display path had not been given up on, it simply never produced a
+frame.
+
+## What is in flight, and what it will answer
+
+`build-macos` run **41561607719**, against `unixnu.commit` 6f5a3d6, stage M7,
+gpu_broker=0, target=tcg.  That is the build that compiles
+`qemu_root_defconfig` on its second pass, which is the only pass that defines
+`XNU_OWNER_DATA_MOUNT` for `kern_exec.c` and therefore the only one that compiles
+`diag.owner_data_status`.
+
+**The first build I triggered was the wrong one and is recorded here so it is not
+repeated.**  `build-kernel-console` (41560114213, green, 8m14s) compiles the
+console DRIVER archive against `qemu_defconfig` -- `config-divergence.json` names
+that defconfig, and `qemu_defconfig` sets no owner mount flags at all.  So it
+cannot compile the emitter, and a green result from it says nothing about the
+patch.  It is the same class of error as `repro-patch-twopass.py` testing the
+committed bytes: a green result from an instrument that is not looking at the
+change.
+
+## The question the next capture answers
+
+One `dyld.cache_read` in 3538 s.  On a real iPadOS boot, hundreds of processes map
+the shared cache, so one means the userspace boot stopped very early -- most
+likely in launchd or its first child.  The prime suspect is the Data mount,
+because `native_owner_data_prepare()` panics on failure and `panic()` is
+invisible on this board, and because `XNU_OWNER_DATA_VOLUME_UUID` has no
+`seed.json` on this host, the desktop builder uses `18AB5557-...` and the last
+measured seed carried `18AF0FFB-...`, a discrepancy
+`verify-data-mount.py:117-123` calls "an open item on the runner side".
+
+`diag.owner_data_status` answers it with a stage number.  Until that build lands,
+the cause is a hypothesis with a documented failure mode and no measurement.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction recorded by the guest, no persistence.
+  M9, M9a, M9b FAIL.
+* The input path is delivered-and-unobservable, not measured end to end.  There is
+  no display to respond.
+* `diag.owner_data_status` is source only.  It is committed to the UniXNU fork at
+  `unipad/gpu-addon-ngpu-dir` and pinned at 6f5a3d6, and build 41561607719 is the
+  first thing that will compile it.  Nothing here says it compiles.
+* `vendor/` is gitignored and the acquisition step re-clones it from the pin, so
+  the patch lives in the fork, not in this repository.
