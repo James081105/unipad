@@ -4957,3 +4957,102 @@ added rather than read.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The display subsystem is up (stage 10) and the screen still shows the boot
   menu.
+
+---
+
+# Interval 2026-11-03 (thirtieth): `exec.first` says **launchd**.  The userspace
+# boot stops inside it.
+
+## The record
+
+    {"event":"exec.first","comm":"launchd","source":"XNU.__mac_execve"}
+
+From `local-private/boot53/exec-first-input-run/guest-input.log`, 2992 bytes,
+21 records, kernel sha256 `62a3b6c7...` verified against `payload.json` before
+the boot.  Build **41617257137**.
+
+So the FIRST successful exec in the guest is `launchd`.  `load_init_program()`
+found it, `exec_mach_imgact()` wrote its `p_comm`, `__mac_execve()`'s `!error`
+block ran, and dyld then mapped the shared cache in it.  Both of the previous
+build's records reproduced exactly:
+
+    diag.legacy_display_status  stage=10 surface_status=0 surface_found=1 dt=1
+    diag.owner_data_status      stage=4  error=0
+
+**Two builds, identical values for both.**  Those are now reproducible
+measurements rather than one boot's readings.
+
+## And the emitter gate cried wolf a third time
+
+The capture script REFUSED to boot a kernel whose required literals were not
+contiguous in the image.  For this build that refusal would have fired:
+
+    emitter_missing_from_kernel: ["exec.first"]
+
+and it would have been wrong.  The emitter is in the kernel.  The proof is not
+an argument, it is a differential:
+
+| literal | build 41584103771 | build 41617257137 |
+|---|---|---|
+| `native_first_exec_reported` | 0 | **1** |
+| `{"event"` | 26 | **27** |
+| `exec.first` | 0 | 0 |
+
+The block-scope static appears in the symbol table as
+`___mac_execve.native_first_exec_reported`, and it is absent from the previous
+kernel and present in this one.  So the code compiled and linked.  The literal
+is invisible because `ld`'s `SHF_MERGE|SHF_STRINGS` pass split the 30-byte
+string: the image carries a 16-byte head `{"event":"exec.f` immediately after
+the springboard string's tail, with the shared remainder stored elsewhere.
+
+**That is fact 228's shape on a new emitter, and it is the third time a byte
+search of this image has produced a false answer** (interval 19-20 grepped the
+wrong kernel; interval 20 retracted its own byte-search conclusion).  The gate
+is now an OBSERVATION -- counts are recorded, the boot proceeds, and a record
+that fails to arrive is settled against the symbol table rather than against a
+grep.
+
+This is the second time in two intervals that a guard I wrote had to be
+demoted from a refusal to a record.  The pattern is worth naming: **a byte
+search of a mergeable-string Mach-O image is not evidence of absence, in either
+direction.**
+
+## Where the boot stops, stated precisely
+
+Measured, in order:
+
+1. the root volume enumerated and read back (`virtio_blk.read_back`, verified);
+2. `kernel_thread_start` returned `KERN_SUCCESS`;
+3. `install.registered` -- the install service registered;
+4. the root mounted (`system.mount`, `/`, apfs, readonly);
+5. the Data mount verified (`diag.owner_data_status` stage 4, error 0);
+6. the display path completed (`diag.legacy_display_status` stage 10);
+7. **`launchd` exec'd** (`exec.first`);
+8. dyld mapped the shared cache in it (`dyld.cache_read`);
+9. `springboard.running` did NOT arrive in 1500 s.
+
+So the userspace boot stops INSIDE launchd, after dyld initialises and before
+SpringBoard is exec'd.
+
+## A correction to my own reasoning in interval 28
+
+I wrote that "one dyld.cache_read ... means the userspace boot stopped very
+early" and treated the single record as evidence that nothing spawned.  It is
+not.  `native-dyld-cache-read.patch` bounds the emitter to **one record per
+boot** on purpose, so it cannot count processes: launchd could have spawned
+fifty daemons and the channel would still carry exactly one.  The correct
+statement is only that at least one process ran dyld, which `exec.first` now
+identifies as launchd.
+
+**Whether launchd spawned anything at all is unmeasured.**  That is the next
+question and it needs a bounded per-exec record, not a once-per-boot one.
+
+## Not claimed
+
+* Whether launchd spawned any daemon.  The once-per-boot dyld record cannot
+  say, and nothing else on the channel does.
+* Whether the `sheng-fb-gpu=1` handoff presenter attached.  Stage 10 is assigned
+  before that block runs.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The screen: `screen_ever_changed: false` this run -- one distinct screendump,
+  and six Home presses, every one of which changed nothing.
