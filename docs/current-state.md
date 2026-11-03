@@ -5294,3 +5294,82 @@ the tree clean for the previous revision's hand-written header.
 * That `exit.seen` compiles.  Six local instruments and no compiler.
 * Whether `apfs_boot_util` exited.  That is what the build is for.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+
+---
+
+# Interval 2026-11-04 (thirty-fourth): the boot is not stuck.  It ran twelve
+# early boot tasks, and the BOUND is what hid the rest.
+
+## The sequence, off a real guest
+
+Build **41671199388**, kernel sha256 `8fb9f563...` verified against
+`payload.json` before the boot.  3990 bytes, 34 records:
+
+    exec.seen  n=1  launchd
+    exit.seen  n=1  fsck
+    exit.seen  n=2  mount
+    exit.seen  n=3  seputil
+    exit.seen  n=4  mobile_obliterat
+    exit.seen  n=5  launchd
+    exec.seen  n=2  apfs_boot_util
+    exit.seen  n=6  apfs_boot_util
+    exit.seen  n=7  MSUEarlyBootTask
+    exit.seen  n=8  MSUEarlyBootTask
+    exit.seen  n=9  cc_fips_test
+    exit.seen  n=10 keybagd
+    exit.seen  n=11 usermanagerd
+    exit.seen  n=12 dirs_cleaner
+
+And both display records reproduced for a FOURTH time with identical values
+(`diag.legacy_display_status` stage 10, `diag.owner_data_status` stage 4).
+
+## RETRACTION of interval 32
+
+Interval 32 concluded, from two execs and no exits, that "the userspace boot
+stops INSIDE launchd, after dyld initialises and before SpringBoard is exec'd".
+**The first half of that is wrong and the instrument is why.**
+
+launchd was not stopped.  It was working through its early boot task chain --
+`fsck`, `mount`, `seputil`, `mobile_obliteration`, `apfs_boot_util`,
+`MSUEarlyBootTask`, `cc_fips_test`, `keybagd`, `usermanagerd`, `dirs_cleaner` --
+which is the standard iOS sequence, and it had done twelve of them when the
+bound saturated.  The exec record alone could not see any of it, because a
+process that runs and exits produces an exit and no second exec.
+
+This is the third time a bound on an emitter has been mistaken for a fact about
+the guest.  The first was `dyld.cache_read`'s once-per-boot bound read as
+"nothing spawned"; the second was the exec record's twelve read as "nothing after
+apfs_boot_util"; this is the third.  **A bounded emitter measures its bound.**
+
+## What is actually still unknown
+
+Twelve exits is roughly the first ten early boot tasks.  On a real iPadOS the
+chain continues -- `syslogd`, `configd`, `notifyd`, `powerd`, and eventually
+`SpringBoard` -- and every one of those is behind the bound.  Whether the boot
+reaches SpringBoard's exec, stalls partway, or loops is UNMEASURED, and the
+answer is behind the same twelve-record wall that produced the last wrong
+conclusion.
+
+`springboard.running` did not arrive in 1500 s.  That much is still true, and
+now it means much less than it did.
+
+## The next change, and why it is cheap
+
+Both bounds go from 12 to 64.  The cost argument that set 12 was the channel's
+2000 ms synchronous deadline per record, and the measurement says that argument
+was too pessimistic: twelve records arrived over about 100 s of guest time, i.e.
+roughly one per eight seconds, which is the boot's own pace and not the
+transport's.  Sixty-four records is therefore a few extra minutes of guest time
+on a boot that already takes fifteen hundred, and it covers the whole early boot
+chain.
+
+## Not claimed
+
+* Whether the boot reaches SpringBoard.  Twelve of the exits are behind the
+  bound.
+* Whether any of these tasks SUCCEEDED.  The record names the process, not its
+  exit status -- and a `launchd` exit at n=5 with the boot continuing afterwards
+  says the record is not yet telling us which process it was.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The screen: two distinct screendumps, frozen from t=121 s, six Home presses,
+  every one of which changed nothing.
