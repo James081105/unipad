@@ -406,27 +406,92 @@ def test_a_frozen_lock_with_a_null_commit_is_a_hard_failure(tmp_path: Path) -> N
     assert any("null" in problem for problem in report["problems"]), report["problems"]
 
 
-def test_the_same_disagreement_in_an_unfrozen_lock_is_only_a_warning(tmp_path: Path) -> None:
-    """The frozen flag is what makes the mismatch fatal -- and nothing else.
+def test_the_same_disagreement_in_an_unfrozen_lock_is_a_hard_failure_too(tmp_path: Path) -> None:
+    """``frozen`` is not what makes a mismatch fatal, and never should have been.
 
-    Without this the test above could be satisfied by a step that fails on any
-    commit mismatch, which would break the only path to a first build: while
-    the lock is unfrozen the dispatch inputs ARE the freeze candidates, and
-    refusing them is the deadlock
-    ``test_build_script_gates.py`` measured on the shell side.
+    REFUTED 2026-11-03 by run 41561607719, which is why this test replaced
+    ``test_the_same_disagreement_in_an_unfrozen_lock_is_only_a_warning``.
+
+    That run was dispatched with ``unixnu_commit=6f5a3d6...``.  Its own
+    ``artifact-manifest.json`` records ``unixnu_commit=757e46b...``.  The kernel
+    it shipped therefore lacked every literal the requested pin added --
+    including ``diag.owner_data_status``, the emitter the run existed to
+    compile -- and the job was GREEN.
+
+    The cause is structural, not a typo: the acquire step takes every commit
+    from ``config/sources.lock.json`` and from nowhere else (it passes
+    ``--lock`` and no ``--commit``), so when the lock is unfrozen the dispatch
+    input is read, compared to nothing, and then ignored.  The old code guarded
+    the comparison behind ``if frozen:`` and, in the ``else``, printed
+
+        the dispatch inputs are the freeze candidates and are recorded
+        verbatim in artifact-manifest.json
+
+    -- a sentence describing behaviour the code does not have.  The manifest
+    recorded the lock's commit.  A message that promises one thing while the
+    build does another is worse than no message, because the next reader trusts
+    it.
+
+    The earlier rationale for letting it through was a deadlock: while the lock
+    is unfrozen the inputs ARE the freeze candidates, so refusing them blocks
+    the first build with new pins.  That model cannot be honoured without
+    changing what the acquire step reads, and it must not be honoured: the lock
+    exists so a run is reproducible *from the lock plus the recorded hashes*
+    (its own ``description`` says exactly that).  A run built from a dispatch
+    input is not reproducible from the lock.  The cost of the refusal is pushing
+    the pin bump before dispatching, which is one commit and is what should have
+    happened here.
     """
     lock = _lock_from_repository()
     lock["frozen"] = False
     result = _run_inputs_step(tmp_path, lock)
 
-    assert result == 0, (
+    assert result == 1, (
         "an unfrozen lock whose commit disagrees with the dispatch input was "
-        f"refused, which is the deadlock the shell side already measured; "
-        f"exit={result}"
+        "accepted, so the job builds the lock's commit while the operator "
+        f"asked for another; exit={result}"
+    )
+    report = _inputs_report(tmp_path)
+    assert report["status"] == "fail", report
+    assert report["lock"]["frozen"] is False, report["lock"]
+    assert any(
+        "unixnu_commit" in problem and "sources.lock.json" in problem
+        for problem in report["problems"]
+    ), report["problems"]
+
+
+def test_an_unfrozen_lock_that_agrees_with_the_request_still_builds(tmp_path: Path) -> None:
+    """The other half, without which the test above is satisfied by refusing
+    everything.  An unfrozen lock whose pins ARE the requested commits must
+    pass, and must say what the unfrozen state actually means now.
+    """
+    lock = _lock_from_repository()
+    lock["frozen"] = False
+    lock_path = tmp_path / "sources.lock.json"
+    lock_path.write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    result = _execute_step(INPUTS_STEP, {
+        "LOCK_PATH": lock_path.as_posix(),
+        "REPORT_DIR": (tmp_path / "build").as_posix(),
+        "EXPERIMENT_ID": "coverage-gap",
+        # The dispatch request IS the lock's own pin.
+        "UNIXNU_COMMIT": lock["unixnu"]["commit"],
+        "DEVICE_COMMIT": lock["device_repo"]["commit"],
+        "STAGE": "M0",
+        "SYSTEM_BUILD": "",
+        "PAYLOAD_TARGET": "tcg",
+    })
+
+    assert result == 0, (
+        "an unfrozen lock that agrees with the dispatch request was refused, "
+        f"so there is no path to any build; exit={result}"
     )
     report = _inputs_report(tmp_path)
     assert report["status"] == "pass", report
-    assert any("NOT FROZEN" in warning for warning in report["warnings"]), report["warnings"]
+    # The warning must now tell the truth: the lock is what gets built.  The old
+    # wording promised the inputs were the freeze candidates, which is the
+    # sentence that let run 41561607719 look intentional.
+    assert any("NOT FROZEN" in warning and "acquire step" in warning
+               for warning in report["warnings"]), report["warnings"]
 
 
 # ---------------------------------------------------------------------------

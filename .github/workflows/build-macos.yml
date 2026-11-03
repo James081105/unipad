@@ -144,8 +144,9 @@ jobs:
           echo "toolchain: os=$os arch=$arch xcode=${xcode:-unknown} clang=${clang:-unknown} python=${py:-unknown}"
 
       # PRD 8.1/8.3: validate the dispatch inputs against the pinned source lock
-      # before spending macOS minutes.  A frozen lock that disagrees with the
-      # requested commits is a hard failure; an unfrozen lock is reported loudly.
+      # before spending macOS minutes.  A lock that disagrees with the requested
+      # commits is a hard failure in BOTH states, frozen or not -- see the note
+      # below the block for why the frozen check alone was not enough.
       - name: Validate inputs against sources.lock.json
         id: inputs
         env:
@@ -258,15 +259,36 @@ jobs:
                   problems.append("sources.lock.json must contain 'unixnu' and 'device_repo' objects (PRD 8.1 inputs)")
               lock_unixnu = (lock.get("unixnu") or {}).get("commit") if isinstance(lock.get("unixnu"), dict) else None
               lock_device = (lock.get("device_repo") or {}).get("commit") if isinstance(lock.get("device_repo"), dict) else None
-              if frozen:
-                  if lock_unixnu and lock_unixnu.lower() != unixnu_commit.lower():
-                      problems.append(f"unixnu_commit '{unixnu_commit}' != sources.lock.json unixnu.commit '{lock_unixnu}'")
-                  if lock_device and lock_device.lower() != device_commit.lower():
-                      problems.append(f"device_commit '{device_commit}' != sources.lock.json device_repo.commit '{lock_device}'")
-                  if not lock_unixnu or not lock_device:
-                      problems.append("sources.lock.json is frozen but a repository commit is null")
-              else:
-                  warnings.append("sources.lock.json is NOT FROZEN: the dispatch inputs are the freeze candidates and are recorded verbatim in artifact-manifest.json")
+              # MEASURED 2026-11-03, run 41561607719, and the reason this is no
+              # longer conditional on `frozen`.  That run was dispatched with
+              # unixnu_commit=6f5a3d6... and its own artifact-manifest.json
+              # records unixnu_commit=757e46b..., because the acquire step takes
+              # every commit from this lock and from nowhere else (it passes
+              # --lock and no --commit), and origin/main still carried the
+              # un-bumped pin.  The kernel it shipped therefore lacked every
+              # literal the requested pin added -- including the emitter the run
+              # existed to compile -- and the job was GREEN.
+              #
+              # The old code compared the two only when frozen, and when not
+              # frozen printed "the dispatch inputs are the freeze candidates
+              # and are recorded verbatim in artifact-manifest.json".  That
+              # sentence describes behaviour the code does not have: the inputs
+              # were not used and were not what the manifest recorded.  A
+              # message that promises one thing while the build does another is
+              # worse than no message, because the next reader trusts it.
+              #
+              # So a disagreement is now a refusal in both states.  The operator
+              # asked for a commit they would not have received; that is the one
+              # case where spending macOS minutes cannot produce the measurement
+              # they wanted.
+              if lock_unixnu and lock_unixnu.lower() != unixnu_commit.lower():
+                  problems.append(f"unixnu_commit '{unixnu_commit}' != sources.lock.json unixnu.commit '{lock_unixnu}'")
+              if lock_device and lock_device.lower() != device_commit.lower():
+                  problems.append(f"device_commit '{device_commit}' != sources.lock.json device_repo.commit '{lock_device}'")
+              if not lock_unixnu or not lock_device:
+                  problems.append("sources.lock.json has a null repository commit")
+              if not frozen:
+                  warnings.append("sources.lock.json is NOT FROZEN: the pins above are what this run builds, because the acquire step reads every commit from this lock; the dispatch inputs were checked against them and must agree")
           elif not any("sources.lock.json" in problem for problem in problems):
               problems.append("sources.lock.json is empty or has no repository pins (PRD 8.1 inputs)")
 
