@@ -1960,11 +1960,26 @@ _KERNEL_BLOCKER = Blocker(
 
 _XNU_BLOCKER = Blocker(
     blocker_id="xnu_initialised",
+    # WHAT THIS TESTS, not what once failed.  The reason used to describe one
+    # historical route -- "the firmware-free route reached the kernelcache EL1
+    # entry and stopped on its first undefined instruction" -- which is a true
+    # sentence about a boot that is no longer the one being run.  A reader
+    # seeing it goes looking for a boot-path defect that does not exist.
+    #
+    # What the predicate actually tests is three on-site probes, and what
+    # actually fails is that the evidence has a shelf life: the kernel ring is
+    # 131072 bytes and was measured holding 7331 seconds of history on a guest
+    # that had been up 12720 seconds, so the boot-time `xnu.*` records are
+    # evicted roughly two hours in.  `NativeVirtioConsole.start` really does
+    # emit all three on a real boot -- see local-private/boot41/xnu-records --
+    # so this blocker is clearable, but only from a guest log captured early.
     reason=(
-        "XNU has not initialised on this host: the firmware-free route reached the "
-        "kernelcache EL1 entry and stopped on its first undefined instruction, which "
-        "proves the CPU entered kernel code and proves nothing about page tables, "
-        "exception vectors, the interrupt controller or the clock"
+        "the guest never reported XNU's own page tables, exception vectors and "
+        "interrupt state: those three records are emitted by "
+        "NativeVirtioConsole.start early in a real boot, and they live in the "
+        "kernel ring, which was measured at 131072 bytes holding about two "
+        "hours of history -- so a guest that has been up longer than that no "
+        "longer carries them, whatever its CPU is doing"
     ),
     satisfied_by="xnu_initialisation",
 )
