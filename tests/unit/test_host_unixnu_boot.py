@@ -350,13 +350,20 @@ def test_the_real_board_declares_the_payload_the_module_boots(
     assert real_spec["size_mib"] == 192, real_spec
     assert real_spec["dram_size"] == "0x180000000", real_spec
     assert real_spec["panic_screen"] is True, real_spec
-    # 26, not the 25 this asserted after the surface wait was raised.  The
-    # count is the point of the line -- a board that silently loses an argument
-    # boots a different machine -- so it moves with the board rather than being
-    # loosened.  The arguments themselves are asserted by name below, because a
-    # count alone cannot tell you WHICH argument changed.
-    assert len(real_spec["kernel_args"]) == 26, real_spec
+    # 28, not the 26 this asserted before the display-vtable instrument and not
+    # the 25 before the surface wait was raised.  The count is the point of the
+    # line -- a board that silently loses an argument boots a different machine
+    # -- so it moves with the board rather than being loosened.  The arguments
+    # themselves are asserted by name below, because a count alone cannot tell
+    # you WHICH argument changed.
+    assert len(real_spec["kernel_args"]) == 28, real_spec
     assert "sheng-gpu-addon=1" in real_spec["kernel_args"], real_spec
+    # The display-vtable instrument.  Both are OFF by default and gated on a
+    # command-line argument, so a board that carries them boots exactly as one
+    # that does not; the second rides on the first, because without the thunks
+    # there is nowhere to answer a refused call from.
+    assert "offline-legacy-slot-trace=1" in real_spec["kernel_args"], real_spec
+    assert "offline-legacy-lift-refusals=1" in real_spec["kernel_args"], real_spec
     # The kernel-side presenter.  This one is not the addon: NativeGOPPresenter::
     # start() is the only writer of native_gop_ready, and the object is only
     # constructed under phase==3 or under phase==4 with this argument, so with
