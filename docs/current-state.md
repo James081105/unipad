@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-04 (interval forty-seventh, addendum K). The emitter caps are raised to 65536 and saturation is now visible; fork `3d83de1`, lock pin `3d83de17dd4e4be468ac3fb8d30ee21c597e8972`. The six-hour capture ENDED at t=9106 s on quiet -- spawn.seen and exit.seen both saturated at 512, and the channel went quiet 21 s before the exit emitter's cap record was written, so the quiet is the instrument's bound. The framebuffer changed once at t=122 and then never again for 8884 s; the Home key was pressed 18 times and never changed a pixel. `springboard.running` is compiled into the kernel, gated on `p_comm == "SpringBoard"`, and never fired. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg) is complete; its boot inputs are downloading.
-Main repo at `72a1283`.
+Last updated: 2026-11-04 (interval forty-seventh, addendum L). The emitter caps are raised to 65536 and saturation is now visible; fork `3d83de1`, lock pin `3d83de17dd4e4be468ac3fb8d30ee21c597e8972`. The six-hour capture ENDED at t=9106 s on quiet -- spawn.seen and exit.seen both saturated at 512, and the channel went quiet 21 s before the exit emitter's cap record was written, so the quiet is the instrument's bound. The framebuffer changed once at t=122 and then never again for 8884 s; the Home key was pressed 18 times and never changed a pixel. `springboard.running` is compiled into the kernel, gated on `p_comm == "SpringBoard"`, and never fired. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg) is complete; its boot inputs are downloading.
+Main repo at `6446420`.
 
 ---
 
