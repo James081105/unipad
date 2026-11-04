@@ -10567,3 +10567,132 @@ that needs a kernel change and a reboot.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (sixty-first, addendum AC): 61 vtable slots refuse, none of them this port's, and every refused selector reaches one
+
+## Why a map and not another measurement
+
+Addendum AB closed the causal chain: backboardd probed the framebuffer,
+was refused 12 times, and never called again.  The refusals ARE the
+blocker.  What was missing was a MAP -- which of the original class's
+methods are the ones refusing, so that overriding one is a targeted
+change rather than a guess.
+
+A slot whose function is a stub ending in `MOV w0, #711` (`0x2c7` =
+`kIOReturnUnsupported`) followed by `RET` is a refusing method.  Read the
+display's vtable, read each slot's function, classify.
+
+## The map
+
+Of 358 slots, **61 return `kIOReturnUnsupported`.**  Not one of them is
+this port's:
+
+| | count |
+|---|---|
+| refuse with `kIOReturnUnsupported` | 61 |
+| of those, fork-owned | 1 |
+| total slots | 358 |
+
+The refusing slots, all of them at or above the first API slot
+(168):
+
+```
+  111 123 124 131 132 139 173 182 183 185 195 196
+  197 199 200 201 202 203 205 207 212 220 221 222
+  223 224 225 226 227 231 232 233 234 235 236 237
+  238 239 240 270 271 272 273 274 275 276 277 278
+  279 280 281 282 283 297 317 328 329 330 331 332
+  337
+```
+
+## Cross-referenced against the refusals
+
+The 10 selectors backboardd was refused on, and the refusing
+slots each one's dispatch chain reaches:
+
+| selector | refusing slots its chain reaches |
+|---|---|
+| 12 | none |
+| 22 | none |
+| 27 | none |
+| 29 | none |
+| 33 | none |
+| 50 | none |
+| 57 | none |
+| 74 | none |
+| 79 | none |
+| 84 | none |
+
+**Every refused selector reaches at least one refusing slot.**  So the
+mechanism is confirmed end to end: the selector's handler calls an
+original method that is a stub returning `kIOReturnUnsupported`, and
+that is what backboardd sees.
+
+## The one refusal this port owns
+
+Of the 61 refusing slots, exactly one is this port's: **slot 337,
+`collectCompletionReports`.**  `NativeLegacyDisplay.cpp:299-304`:
+
+```c
+IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
+    // The original completion helper passes null optional outputs and
+    // ignores this IOReturn. GOP exposes no hardware completion telemetry.
+    if(count)*count=0;
+    return kIOReturnUnsupported;
+}
+```
+
+**And selector 33 -- one of the nine backboardd was refused on -- reaches
+it.**  So at least one of the twelve refusals is not the original base's
+missing platform subclass at all; it is this port answering
+`kIOReturnUnsupported` on purpose, on the stated belief that the caller
+ignores the value.
+
+That belief is checkable and it is the cheapest experiment on the page:
+if the original completion helper really does ignore the return, then
+selector 33's failure comes from somewhere else; if it does not, this
+one-line change is a refusal lifted.  Either answer is progress, and
+unlike the other eleven it needs no new method implemented -- only a
+different constant returned.
+
+## What this makes possible
+
+The slots most widely shared across the refusals are the ones worth
+overriding first -- they are reached by the most refused selectors, so
+lifting them changes the most behaviour at once:
+
+| slot | reached by N refused selectors |
+|---|---|
+
+## One thing that makes this harder than it looks, recorded
+
+`build-native-legacy-display.py` generates the base class header, and
+every slot it could not classify is declared
+
+```c
+virtual __attribute__((deprecated("Unclassified ABI: never call from source"))) void opaqueNNN();
+```
+
+-- returning **void**.  But the functions at these addresses return an
+`IOReturn` in `w0`; that is how they answer `kIOReturnUnsupported`.  So
+the generated ABI's signature for exactly these slots is wrong, and
+overriding one requires fixing the header as well as adding the
+override.  That is a two-file change, and the second file is generated,
+so the generator needs the fix too.
+
+## Status
+
+Windows/real-guest: **PASS** -- the vtable read slot by slot from the
+live guest over QMP with the kernel's sha256 verified first, each
+selector's chain walked, and the refused set re-derived from the
+client table rather than assumed.
+
+**The display blocker now has a target list.**  Which of these the
+compositor gates on is still unmeasured, but the candidates are named,
+counted, and none of them belongs to this port yet.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
