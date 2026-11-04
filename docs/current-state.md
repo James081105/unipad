@@ -10798,3 +10798,192 @@ saved, and one fork away from runnable.  Which of the two paths to take
 a decision about a new public repository, and it is the user's.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (sixty-third, addendum AE): the experiment is delivered, and delivering it found three red tests of which two were mine
+
+## What addendum AD left open, and what closed it
+
+Addendum AD designed the experiment and recorded that it could not be
+delivered: the file is `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`,
+the submodule's only remote was upstream, and the build takes the pinned
+commits rather than reading this working tree -- so an uncommitted edit
+there was invisible to it even before the remote question arose.
+
+Two forks now exist and three commits are pushed:
+
+| repository | branch | commit | what it is |
+|---|---|---|---|
+| `James081105/GopFramebuffer` | `unipad/display-refusal-experiment` | `5b83ab7f` | the experiment itself |
+| `James081105/UniXNU` | `unipad/display-refusal-experiment` | `1b4f4a7c` | `.gitmodules` repointed + the gitlink moved |
+
+**NOTE THE RENAME, which is the trap in this whole operation.**  Upstream
+is now `UniXNU/GopFramebuffer`, and `UniXNU/NativeMobileDisplay` is a
+redirect alias that resolves for the upstream repository but **not for a
+fork** -- so the fork is `James081105/GopFramebuffer`, and a fork named
+`James081105/NativeMobileDisplay` would have been created empty.  The same
+rename was already recorded for `NativeVirtioConsole`.
+
+### Why both halves are required
+
+`apply_divergences()` fetches `pin.commit` from the submodule's own
+`origin`, and `git submodule update --init --recursive` sets that origin
+from `.gitmodules`.  So a `.gitmodules` left on upstream makes a fork
+commit **unfetchable**, and the build refuses 13 seconds into a runner
+cycle.  Moving the gitlink as well is what makes `protect()`
+belt-and-braces rather than load-bearing -- with gitlink == pin, the
+driver's own `submodule update` reset becomes a no-op.
+
+### Both pins were proven fetchable before the lock moved
+
+The check that mattered is the one the build actually performs:
+`git fetch --depth 1 <url> <sha>` followed by `cat-file -t <sha>`.  The
+first attempt used `git ls-remote <url> <sha>` instead, which filters by
+**ref name** and answers empty for a raw object -- it reported the
+UniXNU pin as absent when it had been pushed seconds earlier.  That is the
+same instrument defect this project has now hit repeatedly: a tool that
+answers a different question than the one asked.
+
+## Three tests went red, and they are three different things
+
+| test | attribution |
+|---|---|
+| `test_the_locked_display_driver_overrides_only_declared_slots` | **test defect** -- the guard read its own documentation as code |
+| `test_the_locked_display_driver_declares_its_divergence_from_the_gitlink` | **my mistake** -- I dropped a field the lock needs |
+| `test_the_cross_check_accepts_the_real_driver_status_output` | **pre-existing host state** -- red before I touched anything |
+
+### The pre-existing one, proved rather than assumed
+
+The local clone `local-private/upstream/UniXNU` was at `1b4f4a7c` when the lock still
+pinned its predecessor, so the cross-check was already failing.  Re-running
+the test against the previous lock revision confirmed it.  Reporting this
+as a consequence of the pin move would have been wrong, and would have
+sent the next reader looking for a defect in a commit that did not
+introduce one.
+
+### My mistake, and what caught it
+
+I dropped `gitlink_commit` from the `NativeMobileDisplay` entry on the
+reasoning that the gitlink now equals the pin, so there was no divergence
+left to record.  `test_the_locked_display_driver_declares_its_divergence_
+from_the_gitlink` refused it, and it was right: its own docstring says the
+shape is *either the two agree, or both are present and the note explains
+the move*.  An **absent** field is indistinguishable from one whose
+divergence was never recorded -- which is exactly the state the test
+exists to refuse.  The field is restored and now equals the pin, which is
+a stronger statement than removing it, and it was verified against the
+pushed commit rather than assumed.
+
+### The guard that read its own documentation as code
+
+`test_the_locked_display_driver_overrides_only_declared_slots` extracts
+every `name(...) override` from the driver source and compares that set
+against the slot table `build-native-legacy-display.py` generates.  It
+went red on a source that overrides `['EXPERIMENT']` -- a name the class
+does not have.
+
+The match was a comment reading `// EXPERIMENT (state-document addendum
+AC).` twelve lines above a real `IOReturn supportedFrameInfo(...)
+override`, with no `;`, `{` or `}` between them.  The extraction pattern's
+`[^;{}]*` crosses newlines, so the comment and the signature joined up.
+
+**A guard that goes red on its own documentation is the same as no
+guard.**  The scan now strips comments first.  `tests/source_text.py` is
+the one implementation (91 lines), and it replaced three
+separately written copies of the same function:
+
+* `test_native_virtio_block_records` -- *"a call site inside a comment is
+  not a call site"*
+* `test_native_virtio_console_records` -- *"a scan that does not strip
+  comments reports that quoted line as a live defect -- the test goes red
+  on its own documentation, which is the same as no test at all"*
+* `test_native_screen_interaction_probe` -- a comment with an odd number of
+  double quotes shifted the literal pairing for every literal after it, so
+  the record *"silently stops being found"*
+
+Four copies is four chances to fix it in three places.  The probe copy was
+also not literal-aware, which is a latent bug on sources whose records are
+made of quotes and escapes.
+
+### Teeth-checked before it was wired in
+
+| check | result |
+|---|---|
+| the phantom `EXPERIMENT` disappears | pass |
+| all fourteen real overrides survive | pass |
+| a synthetic undeclared override is still caught | pass |
+| offsets and line counts preserved | pass |
+| `"a // b"` inside a literal is not a comment | pass |
+
+The third row is the one that matters: a fix that made the guard green by
+measuring nothing would have been worse than the defect.
+
+## The generator invariant, and why it is untouched by construction
+
+`build-native-legacy-display.py` requires
+
+```python
+require(owned==sorted([0,1,7,14,84,86,87,141,155,184,188,288,290,296]+pure),
+       'Exact owned method set')
+```
+
+`owned` is derived from the **vtable relocations** of the compiled object,
+which depend on which methods are declared `override` -- not on their
+bodies.  The experiment's whole diff is two return statements and
+comments; it changes no declaration.  So `owned` is byte-identical to
+`eb9c949`'s, which the pinned device repository already accepts.
+
+## The local model of the build was brought onto the pins too
+
+| | commit | origin |
+|---|---|---|
+| `upstream/UniXNU` | `1b4f4a7c` | (superproject) |
+| `.../NativeMobileDisplay` | `5b83ab7f` | `https://github.com/James081105/GopFramebuffer.git` |
+| `.../NativeVirtioConsole` | `3ca09c93` | `https://github.com/James081105/VirtioMmioConsole.git` |
+
+Both submodules were repointed by `git submodule sync`, which reads the
+pinned tree's own `.gitmodules` -- so the local clone now models exactly
+what a runner will do rather than what the host happened to have.
+
+`drivers/NativeVirtioConsole` had been sitting on `d25974c`, an unpushed
+experiment.  The lock's own note records it as superseded on 2026-11-02 by
+`3ca09c93` on a measured defect, so the local checkout was
+stale rather than precious.  The sha is recorded here so it is not lost.
+
+## Status
+
+Windows: **PASS for the delivery** -- both forks created, both branches
+pushed, both pins moved, both pins proven fetchable by the operation the
+build performs, the lock's shape validated by its own tests, and the local
+model aligned.
+
+**The experiment has not run.**  Nothing here says backboardd gets past
+its probe.  The build is dispatched and its result is a separate interval.
+
+Onsite: N/A.
+
+## A correction to addendum AD, found while writing this one
+
+Addendum AD's table reports
+
+```
+| `.gitmodules` URL | `(not found)` |
+```
+
+for `drivers/NativeMobileDisplay`.  **That is wrong.**  The URL was present
+the whole interval and read
+`https://github.com/UniXNU/NativeMobileDisplay.git`.  The lookup keyed on the
+stanza *name* -- `[submodule "drivers/NativeMobileDisplay"]` -- while searching
+for `NativeMobileDisplay`, so it matched nothing and reported absence for a
+value it had simply failed to ask about correctly.
+
+This is the same instrument defect this project has now recorded many times: a
+tool answers a question adjacent to the one asked, and the answer reads as a
+fact.  Here the false negative was harmless -- the surrounding text reached the
+right conclusion by a different route, and the URL was quoted correctly in the
+lock's own note -- but a reader who trusted the table would have concluded the
+submodule declared no URL at all.
+
+It is corrected here rather than edited in place, because the addendum log is
+append-only and an edit would hide that the table was ever wrong.
