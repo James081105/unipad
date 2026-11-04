@@ -10186,3 +10186,101 @@ the submodule's refs enumerated, the reflog read.
 **BLOCKED for the fix**, deliberately, pending the decision above.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (fifty-seventh, addendum Y): the swap-enqueue code exists, and it is reached only indirectly -- which is why no static scan can name the selector
+
+## The question, restated as something measurable
+
+Addendum V left one question open: which selector submits a swap.  It
+said static BL-reachability could not answer it, because a handler that
+returns early still contains the swap-path code and the walk reaches it
+anyway.  That is a statement about a method, not about the thing being
+looked for.
+
+The generated `OriginalLegacyFramebufferABI.h` makes the thing findable
+by pattern instead.  It names the queue's layout -- current at +5472,
+head at +5480, tail at +5488 -- and its own empty state is
+`*(self+5480) = nullptr` with `*(self+5488) = self+5480`.  A swap
+submission WRITES one of those fields, and 5480 fits a single ARM64
+`STR (immediate, 64-bit)`: imm12 is scaled by 8, so offset 5480 is
+imm12 = 685.  So the enqueue site can be found by scanning for a store
+to +5472, +5480 or +5488, and then asking what reaches it.
+
+## What the scan found
+
+16842752 bytes of the original family's window scanned.  10 stores to a
+swap-queue field:
+
+| store address | field |
+|---|---|
+| `0xfffffff005787d84` | +5480 (queue head) |
+| `0xfffffff005787d90` | +5488 (queue tail) |
+| `0xfffffff005788030` | +5472 (current swap) |
+| `0xfffffff00578a6b0` | +5488 (queue tail) |
+| `0xfffffff00578a710` | +5472 (current swap) |
+| `0xfffffff00578a850` | +5488 (queue tail) |
+| `0xfffffff00578afb0` | +5472 (current swap) |
+| `0xfffffff00579d098` | +5472 (current swap) |
+| `0xfffffff00579d1bc` | +5488 (queue tail) |
+| `0xfffffff00579d214` | +5472 (current swap) |
+
+Those collapse into **4 distinct functions**:
+
+| function | queue fields it writes | in a `__ZTV` symbol | `BL` callers in either window |
+|---|---|---|---|
+| `0xfffffff0057872f0` | +5472, +5480, +5488 | **no** | **0** |
+| `0xfffffff00578a42c` | +5472, +5488 | **no** | **0** |
+| `0xfffffff00578a970` | +5472 | **no** | **0** |
+| `0xfffffff00579cf70` | +5472, +5488 | **no** | **0** |
+
+## And that is the answer to WHY, not to WHICH
+
+Every one of the four writers:
+
+- is in **no** `__ZTV` symbol in this kernel, and
+- has **zero** `BL` callers in the family's window *or* the fork's text.
+
+So the swap-enqueue code is reached only **indirectly** -- a register
+loaded from a table or a vtable whose symbol this kernel does not carry,
+then a `BR`.  A scan that follows `BL` cannot see that edge, which is
+why addendum V's walk reached the swap-path *slots* but could not say
+which selector *submits*, and why this scan finds the writers but cannot
+name their callers.
+
+**This closes the question's mechanism and leaves the question open.**
+Which selector submits a swap at run time is UNMEASURED, and the reason
+is now known rather than assumed: the dispatch is indirect, so no
+static analysis of this shape can answer it.  Answering it needs a
+run-time instrument -- interposing the display's vtable the way
+`LegacyDisplayProbe.cpp` already interposes the client's -- which is a
+kernel change, not an observation.
+
+## Two instrument defects, both recorded
+
+**A hand-typed address was wrong by a nibble again.**  The first scan
+window's lower bound was written with 17 hex digits, which is not an
+address at all.  Every read in the window was refused, the scan reported
+"scanned 0 bytes", and "no enqueue store anywhere" looked exactly
+like a real negative.  A digit-count guard now runs before any read.
+That is the third time this interval a kernel address has been wrong by
+a nibble or a digit, and each time the wrong value produced a confident
+negative rather than an error.
+
+**A bare `except` around a read hides a refused address.**  The scan
+skips chunks it cannot read and counts only what it read, which is why
+"scanned 0 bytes" was visible at all -- but the skip itself is silent.
+The guard above plus the printed byte count is what makes the negative
+checkable.
+
+## Status
+
+Windows/real-guest: **PASS for the mechanism** -- the family window
+scanned, the writers found, every vtable symbol checked, both windows
+searched for callers.  **UNMEASURED for the selector**, and now known to
+need a run-time instrument.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
