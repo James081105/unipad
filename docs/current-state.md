@@ -5911,3 +5911,135 @@ properly.
   capture says otherwise.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+---
+
+# Interval 2026-11-04 (forty-first): the instrument is closed.  The absence of
+# `springboard.running` is finally a **guest fact**.
+
+## The measurement
+
+Same kernel, same bundle, same verified sha as interval 40 --
+`aebcf2e585b17b8e88dcf80d0eacc36f0f933a61df5176d65541692fd0e2ff95` against
+`payload.json`.  10840 bytes.  **3183 s of listening, and it stopped because the
+guest went quiet, not because a clock expired:**
+
+    listen_seconds   : 3183
+    stopped_on_quiet : true
+    last_bytes_at_s  : 2574
+
+The quiet-stop fix from interval 40 works.  The last byte arrived at 2574 s and
+the run held for 600 s more before stopping, which is the behaviour that was
+missing when a hard 1500 s deadline killed the previous capture mid-stream.
+
+## `springboard.running`: ABSENT -- and this time it means something
+
+    springboard.running     : ABSENT
+    springboard.interaction : ABSENT
+
+Every reason interval 40 gave for withholding that conclusion has now been
+closed, one at a time:
+
+| the doubt | how it was closed |
+|---|---|
+| the emitter was on the wrong exec path | both `__mac_execve` and `posix_spawn` now emit, and the `posix_spawn` one produced 64 records |
+| `p_comm` might not be set yet at the emit site | 64 records carry correct daemon names, not `launchd` |
+| the record bound might have saturated | 64 of 512; it did not |
+| the capture window truncated the boot | 3183 s, stopped on quiet, 600 s past the last byte |
+
+**So this is the first capture in the project whose silence about SpringBoard is
+evidence rather than an instrument defect.**  That sentence is the whole interval.
+
+## The 64 daemons
+
+    notifyd, UserEventAgent, mediaserverd, logd, mobiletimerd, wifid, rapportd,
+    DumpPanic, watchdogd, distnoted, fseventsd, timed, thermalmonitord,
+    IOMFB_FDR_Loader, configd, containermanager, AppleCredentialM, mtmergeprops,
+    driverkitd, ptpd, keybagd, fairplayd.A2, sleepd, amfid, remoted,
+    logd_helper, containermanager, MobileGestaltHel, runningboardd,
+    fairplayd.A2, fairplayd.A2, fairplayd.A2, lockdownd, bluetoothd,
+    identityservices, cfprefsd, CommCenter, cfprefsd, backboardd, nfcd,
+    sharingd, usermanagerd, imagent, locationd, powerd, lsd, com.apple.datami,
+    liveactivitiesd, biomesyncd, chronod, audiomxd, contextstored, triald, dasd,
+    iconservicesagen, PowerUIAgent, apsd, peopled, biomed, calaccessd, passd,
+    securityd, PerfPowerService
+
+`backboardd` and `runningboardd` are in there.  `apsd`, `securityd`, `biomed`,
+`CommCenter`, `lockdownd`, `locationd`, `biomesyncd`, `liveactivitiesd` are
+daemons that normally start **after** SpringBoard on a real boot.  So launchd is
+working through a job list that spans both sides of where SpringBoard belongs,
+and SpringBoard's job produces nothing on either exec path.
+
+## The exit stream, and one new non-zero
+
+32 exits.  The four interval-37 statuses reproduce (`launchd` 1,
+`MSUEarlyBootTask` 1 then 0, `sysstatuscheck` 256, `prng_seedctl` 3328), plus one
+that is new and is display-relevant:
+
+    exit.seen n=30 comm='IOMFB_FDR_Loader' code=256   (exit code 1)
+
+`IOMFB_FDR_Loader` is the IOKit Mobile Framebuffer FDR loader.  It exited 0 on
+the interval-40 run and 1 on this one.  It is the only process in the whole boot
+whose job is the framebuffer, and it did not succeed.
+
+## The screen: it moved exactly once, in the first 121 seconds
+
+21 dumps over 2447 s, and exactly two distinct images:
+
+    t=    0s  2e2910ab95c982d0...   the UniXNU boot menu
+    t=  121s  8833260ecd372e44...   <-- the only change in the entire run
+    t=  242s ... t= 2447s           byte-identical, 20 dumps
+
+**Six Home presses, every one `changed=False`.**  So the framebuffer is not
+"frozen on the boot menu" -- interval 38's phrasing was wrong.  It changed once,
+early, and then stopped changing for 39 minutes while 64 daemons spawned around
+it.  That is a display that came up once and then drew nothing, which is the
+failure mode `diag.legacy_display_status` stage 10 was added to distinguish --
+and stage 10 says the legacy display path itself succeeded
+(`surface_found=1`, `dt=1`, phase 4).  The probe is healthy and the screen is
+still static.
+
+## SpringBoard.app IS in the volume
+
+One pass over the 3.3 GB raw SystemOS APFS image
+(`044-76034-038.dmg`): `SpringBoard.app` occurs 8 times,
+`CoreServices/SpringBoard` 6 times, `com.apple.SpringBoard` 46 times.  The 46 are
+almost all in the filename catalog and localized-string tables rather than in
+plist XML, so the job definition itself was not readable this way -- APFS
+compresses many system plists and a raw byte scan will not see the XML.
+
+**So the missing binary is not the explanation.**  The app is on disk, launchd is
+spawning 64 other jobs, and this one produces nothing.
+
+## What that leaves, precisely
+
+Two possibilities, and they are distinguishable:
+
+1. **launchd never attempts the spawn.**  Then nothing on either path fires and
+   there is no kernel-side trace at all.
+2. **launchd attempts it and the spawn fails before either success block.**  The
+   `exit.seen` stream would show a child that died pre-exec under the PARENT's
+   name -- which is exactly what `exit.seen n=5 comm='launchd' code=1` is -- and
+   there is no second such record.  But a `posix_spawn` that returns an error
+   creates no child and therefore leaves no exit either.
+
+The blind spot is (2)'s second half: **`posix_spawn`'s failure path emits
+nothing.**  Interval 39 closed the success path; the failure path is still dark,
+and it is the only remaining place a SpringBoard spawn attempt could hide.
+
+## The next instrument
+
+`spawn.failed`, emitted from `posix_spawn`'s error path with the errno.  It
+cannot name the binary -- at that point `p_comm` is the parent's -- but the errno
+is decisive on its own: ENOENT says the binary is not where the plist says,
+EACCES or a signature error says something else entirely, and nothing at all says
+launchd never tried.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL, and
+  for the first time the failure is measured rather than assumed.
+* The screen changed once and then never again; that is a measurement, not a
+  diagnosis of why.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
