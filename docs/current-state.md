@@ -6442,3 +6442,106 @@ capture on the current kernel would silently lose every exit after the 64th.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+
+---
+
+# Interval 2026-11-04 (forty-fourth, addendum B): every number re-derived, and
+# the crash loop nobody had counted.
+
+## The re-derivation
+
+Interval 44 cited interval 42's numbers.  Citing them is not measuring them, so
+they were recomputed from the raw capture at
+`local-private/boot53/spawn-failed-input-run/guest-input.log` (21,025 bytes, 241
+JSON lines, 0 unparseable):
+
+    spawn.seen records      155      (n = 1..155, CONTIGUOUS)
+    exit.seen records        64      (n = 1..64,  CONTIGUOUS)
+    distinct spawned comms  109
+    any Spring* comm        none
+
+All four match.  The contiguity matters more than the counts: **the spawn
+emitter's bound of 512 did NOT saturate** (n runs 1..155 with no gap), while
+**the exit emitter's bound of 64 DID** -- n runs 1..64 and stops, which is the
+bound itself and not a coincidence.  That is the saturation interval 43 reported,
+now confirmed structurally rather than inferred from bluetoothd's behaviour.
+
+## The crash loop
+
+Splitting the 155 spawn records by comm:
+
+    bluetoothd        35 spawns   28 exits
+    fairplayd.A2      10 spawns    8 exits
+    containermanager   2 spawns    0 exits
+    cfprefsd           2 spawns    0 exits
+    com.apple.datami   2 spawns    2 exits
+
+    distinct comms                109
+    spawned exactly once          104
+    spawned more than once          5
+    spawn records that are RESPAWNS 46
+
+**Five of 109 daemons respawned, and 46 of the 155 spawn records -- 30% -- are
+respawns rather than first starts.**  `bluetoothd` alone accounts for 35 spawns
+and 28 exits.  This has never been recorded anywhere in the project, and it was
+visible in interval 42's own file the whole time.
+
+And the exits are mostly failures:
+
+    wait status 0   31     (clean exit)
+    wait status 1   30     (FAILURE)
+    SIGHUP            2
+    wait status 13    1
+
+**30 of 64 exits are exit status 1.**  `bluetoothd` is not restarting because it
+finished; it is restarting because it is failing.
+
+## Why this was invisible: the capture kept no timestamps
+
+The guest channel's records carry no clock.  `spawn.seen` is
+`{"event","n","comm","source"}` and `exit.seen` adds `code` -- no `t_s`, no
+`mach_absolute_time`, nothing.  The arrival time existed only in the capture
+script's stdout (`+N bytes (total X) at Ts`), and **interval 42's run did not
+preserve that stdout** -- the directory holds `guest-input.log` and nothing else.
+The scratch dir holds `guest-channel.log`, `serial.log` and the screendumps; the
+stdout went to a terminal and is gone.
+
+The consequence is a measurement this project cannot make and should be able to:
+**a crash loop respawning every 150 s and a crash loop respawning every 2 s
+produce the same byte stream and the same quiet-stop.**  In the first case
+launchd is throttling a job and the guest is healthy; in the second the guest is
+pinned and nothing else will ever start.  Those are different defects with
+different fixes, and without `t_s` they are one result.
+
+`capture-springboard-boot.py` now timestamps every record as it arrives
+(`t_s`, seconds since the kernel handoff) and writes `guest-input.timed.jsonl`
+beside the byte-exact `guest-input.log`.  Records are split on arrival rather
+than at the end because a listen batch can end mid-record, and a record cut in
+half would inherit the batch's time instead of its own.  The script also computes
+the respawn summary and each loop's median gap, so the next run reports the crash
+loop instead of leaving it to be found by hand.
+
+## What this predicts about the long capture
+
+If `bluetoothd` keeps failing at interval 42's pace, **the 1200 s quiet-stop will
+never fire** -- a respawn every ~150 s is a new byte every ~150 s, forever -- and
+the run will exhaust the full 21600 s budget and stop on the deadline rather than
+on quiet.  That is still an answer ("SpringBoard had not spawned after six hours
+of guest time"), but it should be predicted rather than discovered at hour six,
+and the distinction is visible in the report: `stopped_on_quiet: false` with
+`listen_seconds: 21600` means the guest never settled, while
+`stopped_on_quiet: true` means it did.
+
+## Not claimed
+
+* The crash loop's PERIOD is unknown.  There are no timestamps, so "every ~150 s"
+  above is an average over the whole run (35 spawns across ~5400 s), not a
+  measurement of the gap.
+* Nothing here says WHY bluetoothd fails.  Exit status 1 with no other record;
+  on a guest with no Bluetooth hardware that may be entirely expected.
+* Nothing here says the crash loop blocks SpringBoard.  It is a fact about two
+  daemons, not a causal claim about the job list.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
