@@ -6263,3 +6263,182 @@ has nothing to start it.
   at least 64.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+
+---
+
+# Interval 2026-11-04 (forty-third, addendum): adjacency fails 98.8% of the time,
+# measured.  And the volume scanned is provably the volume the guest booted.
+
+## The adjacency claim was one control; now it is a measurement
+
+Interval 43 said the bytes following a filename do not belong to that file, and
+supported it with one control.  One control is a hint.  This measures it.
+
+Walking the whole LaunchDaemons catalog region (offsets 295,000,000 to
+360,000,000, 62 MiB), pairing every `com.apple.*.plist` filename with the binary
+plist that follows it within 64 bytes, and comparing the plist's own `Label`
+against the filename:
+
+    name -> next bplist pairs : 799
+      Label AGREES with name  : 4
+      Label disagrees         : 332
+      plist did not parse     : 463
+
+**Adjacency is right 1.2% of the time.**  The disagreements are not random --
+they are shifted by a fixed number of records:
+
+    com.apple.ckdiscretionaryd.sync.plist -> com.apple.containermanagerd.sync
+    com.apple.containermanagerd.sync.plist -> com.apple.cloudphotod.sync
+    com.apple.cloudphotod.sync.plist      -> com.apple.cloudd.sync
+    com.apple.DMHelper.plist              -> com.apple.CoreAuthentication.daemon
+    com.apple.PowerUIAgent.plist          -> com.apple.PointerUI.pointeruid
+
+An APFS catalog node keeps its keys and its values in separate regions, so a
+name and the plist after it belong to different records.  This retires the
+temptation to read the 326-byte plist after `com.apple.SpringBoard.plist` as
+SpringBoard's job definition: it parses as `com.apple.SiriTTSTrainingAgent`, and
+now that is expected rather than surprising.
+
+## The volume scanned is provably the volume the guest booted
+
+The obvious objection to interval 43 is that it repeats interval 43's own
+mistake -- that the OS root volume is not the volume the guest actually attached.
+It is.  `capture-springboard-boot.py` sets
+
+    root_image = volumes / "raw/044-76040-038.raw"
+
+and the capture's own report records
+
+    "root_raw_sha256": "e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2"
+
+which is the sha256 of the file every scan in interval 43 was run against,
+recomputed and matched byte for byte.  The filename evidence is about the guest's
+own root volume.
+
+## Why the plist cannot be read, stated precisely
+
+* An APFS catalog node separates keys from values, so adjacency does not pair
+  them (1.2%, measured above).
+* Enumerating every `bplist00` in the volume and keeping those with a `Label`
+  recovered **373 jobs**, but only **53 of interval 42's 109 spawned comms**
+  match one; `notifyd` and `usermanagerd` are both among the 56 that do not, and
+  both provably spawned.
+* An XML `<key>Label</key><string>...` scan found 113 labels, but all five of its
+  controls (configd, backboardd, runningboardd, apsd, akd -- every one of which
+  spawned) returned 0 while `notifyd` returned 1, so its zeros are void.
+
+**No available instrument can read `com.apple.SpringBoard.plist`'s contents, and
+neither can prove the job absent.**
+
+## launchd cannot be instrumented
+
+The fork carries patches for `libpthread`, `mesa` and `xnu` only.  There is no
+launchd source in `vendor/UniXNU`, and launchd is not built by this project -- it
+is the binary that ships on the root volume.  So the question "why does launchd
+skip this job" cannot be answered by adding an emitter to launchd.
+
+The kernel, however, sees every file open.  An emitter on the VFS open path that
+reports paths under `/System/Library/LaunchDaemons/` would answer the one
+question that decides the branch: **did launchd ever open
+`com.apple.SpringBoard.plist`?**  If it did, the decision is inside the plist.  If
+it never did, the job is not in the directory launchd scanned, which is a
+different finding with a different next step.  That is the next measurement.
+
+
+---
+
+# Interval 2026-11-04 (forty-fourth): 1435 job plists, 74 spawned, and "not
+# spawned" is the normal case.  Interval 42's "essentially complete" is wrong.
+
+## The directory, counted
+
+The LaunchDaemons catalog region of the guest's root volume (offsets 295,000,000
+to 360,000,000, 62 MiB) holds
+
+    distinct com.apple.*.plist filenames : 1435
+
+and interval 42's guest spawned 109 distinct daemons.  Matching a spawned comm
+against a plist of the same name (the comm truncated to 15 characters, which is
+what the kernel reports):
+
+    spawned comms with a plist of the same name : 74
+    spawned comms with no matching plist        : 35
+    plists present but NOT spawned              : 1361
+    plists present AND spawned                  : 74
+
+**1361 of 1435 job plists -- 95% -- were present and not spawned.**  On a real
+iOS boot most LaunchDaemons jobs are on-demand and never start at boot, so being
+present and unspawned is what launchd does with the overwhelming majority of its
+job list.
+
+## What that does to interval 42's conclusion
+
+Interval 42 said: *"The userspace boot is essentially complete except for
+SpringBoard."*  That was drawn from 155 spawns and the absence of SpringBoard
+among them.  With the directory counted, **155 spawns is 109 daemons out of a
+1435-job list -- 7.6%.**  A boot that has run 7.6% of its job list is not
+complete; it is early.  The claim is withdrawn.
+
+It also retires the framing that made SpringBoard look anomalous.  Interval 43
+concluded "launchd never attempts SpringBoard, and that is the defect".  It is
+not a defect: launchd does not attempt 1361 of 1435 jobs.  SpringBoard is one of
+the 1361, and the interesting question is what it is waiting for, not why it was
+skipped.
+
+## Is there a discriminator?  Not a clean one
+
+Reading the 373 job plists whose bytes are recoverable, and splitting them by
+whether their daemon ran:
+
+    key                    ran (56)                          not ran (317)
+    RunAtLoad              25/56 (44%)  Truex23, Falsex2      45/317 (14%) Falsex36, Truex9
+    ProcessType            12/56 (21%)  Adaptive 9, Int. 3    129/317 (40%) Adaptive 81, Background 27, Int. 16
+    POSIXSpawnType         43/56 (76%)  Interactive 22, Adaptive 21
+                                                             163/317 (51%) Adaptive 122, Interactive 31, App 7
+    KeepAlive              20/56 (35%)                       37/317 (11%)
+    UserName               34/56 (60%)  mobile 30            227/317 (71%) mobile 210
+    LaunchEvents           32/56 (57%)                       144/317 (45%)
+    MachServices           51/56 (91%)                       285/317 (89%)
+
+**No key separates the two groups.**  `RunAtLoad` is the strongest signal (44%
+versus 14%) but 9 not-ran jobs carry `RunAtLoad=True` and 2 ran jobs carry
+`RunAtLoad=False`, so it is not a rule.  The one clean split is
+`POSIXSpawnType=App`: **7 of 7 in the not-ran group, 0 in the ran group** -- but
+7 samples is not a discriminator, and SpringBoard's own plist cannot be read, so
+there is no way to check whether it is one of them.
+
+**And the sample is biased, which is the honest caveat.**  Only 56 of the 109
+spawned daemons have a readable plist, and only 373 of 1435 plists are readable
+at all.  Every number above is a statement about the readable subset, not about
+the job list.
+
+## The one thing that would settle it
+
+The guest was still spawning when interval 42's capture hit its 5400 s cap
+(`last_bytes_at_s: 5382`, and `bluetoothd` is the final record in the file).  At
+the observed pace the boot had worked through 109 of 1435 jobs in 90 minutes.
+Whether it would ever reach SpringBoard's job is **unknown**, and no measurement
+this project has taken can answer it, because no capture has run long enough.
+
+That is a bounded question with a bounded answer: **run the capture long enough
+for the guest to go quiet, and see whether `SpringBoard` appears.**  The
+quiet-stop logic already exists (`QUIET_STOP_S = 600` under a
+`LISTEN_BUDGET_S = 5400` cap); the cap is what ended interval 42, not the guest
+settling.
+
+The exit bound has to be fixed in the same build.  `kMaxExitRecords` is still 64
+and it saturated in interval 42 while `bluetoothd` was still exiting, so a longer
+capture on the current kernel would silently lose every exit after the 64th.
+
+## Not claimed
+
+* SpringBoard's plist contents remain UNKNOWN.  Nothing above says what
+  `ProcessType`, `RunAtLoad`, `LaunchEvents` or `POSIXSpawnType` it carries.
+* The 1435 count is filenames in one 62 MiB catalog region, not a verified
+  directory listing.  It is a lower bound on the job list.
+* The 74 matches are name matches between a truncated comm and a plist stem, not
+  verified job-to-process bindings.
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
