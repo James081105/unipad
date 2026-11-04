@@ -11230,3 +11230,162 @@ run's own bundle, and the fix teeth-checked against all forty rows.
 
 **The display experiment is still unmeasured.**  The build is in flight
 and nothing here says backboardd gets past its probe.
+
+---
+
+# Interval 2026-11-05 (sixty-sixth, addendum AH): the experiment ran, one refusal lifted, and the screen did not move
+
+## What was measured, and on what
+
+Build `exp-2026-11-05-display-refusal` (run 41880912125), kernel
+`5b83ab7f` -- the experiment commit itself.  The run's
+own log records what it checked out:
+
+```
+chain: drivers/NativeMobileDisplay already at 5b83ab7f1fa3c0535a4499959e7e2ad4318d8e5b
+chain: drivers/NativeMobileDisplay 5b83ab7f1fa3c0535a4499959e7e2ad4318d8e5b (experiment(display): answer the compositor's two probe questions instead of refusing them)
+```
+
+So the bytes measured are the bytes the change produced.  The guest
+booted, backboardd spawned, and the channel carried 174 records in
+15507 bytes.
+
+## The result, and it is two things at once
+
+| | baseline (addendum AB) | now |
+|---|---|---|
+| backboardd pid | 58 | 58 |
+| external calls | 15 | 15 |
+| failures | 12 | **11** |
+| `kIOReturnUnsupported` | 11 | 10 |
+| `kIOReturnError` | 1 | 1 |
+| successes | 3 | 4 |
+
+**One refusal lifted, and it is the one the change targeted:**
+
+```
+selector  74 (supportedFrameInfo, slot 213): NOW SUCCESS   <== CHANGED
+selector  33 (collectCompletionReports, slot 337): STILL Unsupported
+```
+
+Selector 74 was `kIOReturnUnsupported` in the baseline and is
+`kIOReturnSuccess` now, with `fails` dropping from 1 to 0.  That is the
+change, on the wire, against a kernel whose sha256 the boot verified
+before handoff.
+
+**And the screen did not move.**  backboardd made exactly 15 calls --
+the same 15 -- and the counts are static over the whole window, so it
+still never called again.  One screendump changed, at t=121 s, and the
+image is the **UniXNU boot menu**: *"Booting QEMU virt: source 4K XNU
+in 1 s / Up/Down: select  Enter: boot / drivers 1 loaded / 0 failed"*.
+Not a black screen, not SpringBoard -- the compositor is still not
+driving the framebuffer at all.
+
+### So the honest statement is a conjunction
+
+The experiment is a **POSITIVE on the narrow question** -- lifting a
+refusal is visible, and the mechanism works -- and a **NEGATIVE on the
+big one** -- one of twelve is not enough to get the compositor past its
+capability probe.  Both halves are load-bearing for the next step: the
+delivery path is proven, so the remaining work is lifting more
+refusals, not fixing the build.
+
+### And selector 33 taught us something for free
+
+`collectCompletionReports` (slot 337) was changed to return
+`kIOReturnSuccess` with `*count = 0` and **the recorded status did not
+move**.  That confirms the belief the source comment stated and nobody
+had tested:
+
+> *The original completion helper passes null optional outputs and
+> ignores this IOReturn.*
+
+The dispatch wrapper for selector 33 discards the return, so that
+constant is invisible by construction.  It is not a candidate for
+lifting a refusal, and now that is measured rather than argued.
+
+## The instrument defect that would have hidden all of this
+
+The first version of the measurement script declared only the first
+**1176** bytes of the probe's `ClientStat` -- `object`, `pid`, `calls`,
+`fails` and the three selector arrays -- and used that as the entry
+stride.  The real struct continues:
+
+```c
+unsigned regs;
+struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[8];
+uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;
+uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
+uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
+uintptr_t original_external,original_register;
+```
+
+**Every field offset inside the prefix was correct**, which is exactly
+why the defect was invisible: each individual read was right and the
+ENTRY was wrong.  Reading "entry 2" at 2x1176 landed in the middle of
+entry 1, and the bytes it found there -- an `object` of `0x100000000`
+where a pointer belongs, thirteen selector calls against a `calls` of 1
+-- were another entry's fields.  The instrument reported
+`seenClientCount=4` and no backboardd, which reads exactly like "the
+compositor never probed the framebuffer this boot".
+
+The real stride is **2312**, and it was settled by data rather than by
+arithmetic: a scan of every 8-byte-aligned offset for an entry whose
+`calls` equals the sum of its own `selector_calls` found
+self-consistent entries at 0, 2312, 4624 and 6936, each with a kernel
+pointer in `object`.  The first hand computation said 2312; ctypes with
+one padding slot too many said 2320; the guest said 2312.
+
+### The guard that caught it, and the second bug inside the guard
+
+Two checks are now asserted before any entry is compared:
+
+* `calls == sum(selector_calls)` and `fails == sum(selector_fails)` --
+  the probe increments both inside the same function, so they cannot
+  disagree;
+* `object` is zero or a kernel pointer.
+
+The second check was itself wrong on the first attempt: it tested
+`(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and
+is false for **every** valid pointer.  So every entry read VOID and the
+instrument reported *"NO SELF-CONSISTENT CLIENT MADE A CALL"* against a
+table that had backboardd in it, 15 calls and all.  **A guard that
+rejects everything is worse than no guard** -- it converts a readable
+table into a confident false negative.  The correct test is
+`(object >> 48) == 0xFFFF`.
+
+That is the fourth time in this project that validating the instrument
+changed the answer, and the second time the validator itself was the
+defect.
+
+## What is left, stated as a number
+
+backboardd's remaining refusals on this kernel:
+
+| selector | status |
+|---|---|
+| 12 | Unsupported |
+| 15 | Error |
+| 22 | Unsupported |
+| 27 | Unsupported |
+| 29 | Unsupported |
+| 33 | Unsupported |
+| 50 | Unsupported |
+| 57 | Unsupported |
+| 79 | Unsupported |
+| 84 | Unsupported |
+
+Ten `kIOReturnUnsupported` and one `kIOReturnError`, from eleven
+distinct selectors (79 was called twice).  Addendum AC's map names the
+vtable slots these reach; the next experiment lifts the ones shared by
+the most refused selectors, which that addendum already ranks.
+
+## Status
+
+Windows/real-guest: **PASS** -- the kernel's sha256 verified before
+handoff, the run's own log names the commit it built, the client table
+read with a measured stride and two guards, and the screen read as an
+image rather than inferred from its hash.
+
+**M9, M9a, M9b and M8 remain unproven.**  One refusal of twelve is
+lifted; the compositor still does not drive the display.
