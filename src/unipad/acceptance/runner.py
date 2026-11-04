@@ -334,20 +334,52 @@ class CheckResult:
 
         So: a BLOCKED verdict keeps the declared text, which for those rows is
         the better of the two (``M1``'s declaration explains the missing boot
-        chain, where ``verdict.reasons[0]`` is only ``blocked_by:M0``); every
-        other non-PASS verdict reports the reason that actually decided it; and
-        PASS reports nothing, which is what the ONSITE-evidence clause above
-        already did.
+        chain, where ``verdict.reasons[0]`` is only ``blocked_by:M0``); a PASS
+        keeps the declared text exactly when it has no ONSITE reference, because
+        that is the row whose on-site column reads BLOCKED and must say why
+        (``test_a_pass_check_does_not_report_a_blocker_it_has_satisfied`` pins
+        both halves of that); and an UNVERIFIED or FAIL verdict on a check that
+        DECLARES a gap reports the reason that actually decided it, because the
+        declared gap is not what decided it.
+
+        The last clause is narrow on purpose, and two existing tests are why.
+        The first attempt cleared the column for every non-BLOCKED verdict, which
+        ``test_a_pass_check_does_not_report_a_blocker_it_has_satisfied`` refused
+        -- correctly: a check that PASSes on simulation evidence alone has its
+        on-site half still blocked, and blanking the blocker there would hide the
+        one genuine on-site gap a Windows-only PASS must report.  The second
+        attempt reported ``verdict.reasons[0]`` for every non-PASS verdict, which
+        ``test_the_bundle_round_trips_from_disk`` refused -- also correctly: an
+        advisory FAIL that declares no gap and holds no evidence must read
+        UNVERIFIED on site, not BLOCKED, because there is no on-site gap to name.
+        So the rule is the conjunction: report the verdict's reason only when the
+        check declares a gap in the first place.
         """
-        if self.verdict.kind == VerdictKind.BLOCKED:
-            blocker = self.check.blocker
-            if blocker is None and self.verdict.reasons:
-                blocker = self.verdict.reasons[0]
-        elif self.verdict.kind == VerdictKind.PASS:
-            blocker = None
+        declared = self.check.blocker
+        reasons = self.verdict.reasons
+        if self.verdict.kind == VerdictKind.PASS:
+            # A PASS resting on ONSITE evidence has closed the declared gap, so
+            # there is nothing to report.  A PASS with no ONSITE reference has
+            # not: its on-site column still reads BLOCKED and the declared text
+            # is what must name it.
+            blocker = (
+                None
+                if any(ref.scope == EvidenceScope.ONSITE for ref in self.verdict.evidence)
+                else declared
+            )
+        elif self.verdict.kind == VerdictKind.BLOCKED:
+            # The one kind FourFields refuses to construct without a blocker, and
+            # the one where the declared text is the more readable of the two.
+            blocker = declared if declared is not None else (reasons[0] if reasons else None)
+        elif declared is not None:
+            # UNVERIFIED or FAIL on a check that declares a gap: the gap is not
+            # what decided this row, so name what did.
+            blocker = reasons[0] if reasons else None
         else:
-            # UNVERIFIED or FAIL: the declared gap is not what decided this row.
-            blocker = self.verdict.reasons[0] if self.verdict.reasons else None
+            # UNVERIFIED or FAIL on a check that declares no gap and holds no
+            # on-site evidence.  There is nothing to name, and saying so is what
+            # keeps the on-site column reading UNVERIFIED rather than BLOCKED.
+            blocker = None
         return FourFields(
             check_id=self.check.check_id,
             verdict=self.verdict,
