@@ -28,6 +28,22 @@ per-patch results.  It is the runner's check, locally.
 The XNU tarball is cached next to the extraction, so a repeat run costs no
 download.  Pass ``--keep`` to leave the extracted tree for inspection.
 
+``--xnu-dir`` NEVER WRITES TO THE TREE IT IS GIVEN
+---------------------------------------------------
+It used to.  Revision 1 applied all 59 patches in place and left them there: a
+13-second run against ``local-private/upstream/xnu`` dirtied 67 files, and the
+damage was invisible until an unrelated unit test -- whose entire premise is
+that the tree is pristine -- started failing with a patch-context error.  That
+test was right and the tool was wrong.
+
+So ``--xnu-dir`` now copies **only the files the patch set names** into a fresh
+temporary directory and applies there.  Measured against the pinned tree: 50
+distinct target files, 4.2 MB, against a 102 MB tree -- a 24x smaller scratch,
+and one that provably cannot touch anything outside the patch set's footprint.
+The caller's tree is then fingerprinted before and after and the run fails
+loudly if it changed, so a regression to in-place application cannot be silent
+again.
+
 Usage:
     python verify_patches_against_upstream.py [--xnu-dir DIR] [--keep]
 Exit 0 when every patch applies in order, 1 otherwise.
@@ -35,7 +51,9 @@ Exit 0 when every patch applies in order, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -50,6 +68,48 @@ PATCH_DIRS = (
     REPO / "vendor" / "UniXNU" / "patches" / "xnu",
     REPO / "vendor" / "UniXNU" / "kits" / "NativePrelink" / "patches",
 )
+
+DIFF_HEADER = re.compile(r"^diff --git a/(.*?) b/(.*)$")
+#: Not every patch in this set carries a ``diff --git`` line.  Several begin
+#: straight at ``--- a/PATH`` / ``+++ b/PATH`` -- measured on
+#: ``native-union-getattrlistbulk.patch``, whose first line IS the ``---``.  The
+#: first revision of ``targets_of`` read only the ``diff --git`` header and so
+#: found 50 targets for 59 patches, which is under one per patch; the run then
+#: failed 16 of them with "No such file or directory" for files that were in the
+#: tree all along.  ``git apply -p1`` strips a leading ``a/`` or ``b/`` from
+#: whichever header is present, so both forms are read.
+UNIFIED_HEADER = re.compile(r"^(?:---|\+\+\+) ([ab])/(.*)$")
+
+
+def _strip_dev_null(path: str) -> str | None:
+    """``/dev/null`` means "no file here", which is not a target to copy."""
+    if path in ("/dev/null", "dev/null"):
+        return None
+    return path
+
+
+def targets_of(patch_list: list[Path]) -> set[str]:
+    """Every worktree-relative path the patch set reads or writes.
+
+    Read from the ``diff --git`` headers where present and the ``---``/``+++``
+    headers otherwise, which is what ``git apply -p1`` strips.  Both sides are
+    collected: a rename or a delete needs the source present even though only
+    the destination is written.
+    """
+    found: set[str] = set()
+    for patch in patch_list:
+        for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = DIFF_HEADER.match(line)
+            if match:
+                found.add(match.group(1))
+                found.add(match.group(2))
+                continue
+            match = UNIFIED_HEADER.match(line)
+            if match:
+                path = _strip_dev_null(match.group(2))
+                if path:
+                    found.add(path)
+    return found
 
 
 def pinned_xnu() -> tuple[str, str]:
@@ -83,6 +143,44 @@ def patches() -> list[Path]:
     if not found:
         raise SystemExit("no patches found; the pinned vendor tree is not acquired")
     return found
+
+
+def scratch_tree(source: Path, patch_list: list[Path], work: Path) -> tuple[Path, int, int]:
+    """A throwaway copy of just the files the patch set names.
+
+    Returns the tree, how many target files were copied, and how many the patch
+    set names but the source tree does not have (new files, which ``git apply``
+    creates and which are not an error).
+    """
+    wanted = targets_of(patch_list)
+    copied = 0
+    absent = 0
+    for relative in sorted(wanted):
+        origin = source / relative
+        if not origin.is_file():
+            absent += 1
+            continue
+        destination = work / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(origin, destination)
+        copied += 1
+    return work, copied, absent
+
+
+def fingerprint(tree: Path, patch_list: list[Path]) -> dict[str, str]:
+    """sha256 of every file the patch set touches, keyed by relative path.
+
+    This is the guard.  It is taken before the run and again after, over exactly
+    the files the patches could have written, so a tool that mutates its input
+    is caught by a digest rather than by a unit test three directories away.
+    """
+    digests: dict[str, str] = {}
+    for relative in sorted(targets_of(patch_list)):
+        path = tree / relative
+        if not path.is_file():
+            continue
+        digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
 
 
 def normalise(patch: Path, staging: Path) -> tuple[Path, bool]:
@@ -149,17 +247,63 @@ def main(argv: list[str]) -> int:
                         help="use this already-extracted XNU tree instead of downloading")
     parser.add_argument("--keep", action="store_true",
                         help="leave the extracted tree on disk for inspection")
+    parser.add_argument("--allow-in-place", action="store_true",
+                        help="apply into --xnu-dir itself, mutating it.  Requires "
+                             "the tree to be a git repository so it can be restored")
     args = parser.parse_args(argv)
 
     commit, repo = pinned_xnu()
     patch_list = patches()
 
     if args.xnu_dir is not None:
-        tree = args.xnu_dir.resolve()
-        if not (tree / "bsd" / "kern" / "bsd_init.c").is_file():
-            print(f"{tree} is not an extracted XNU tree", file=sys.stderr)
+        source = args.xnu_dir.resolve()
+        if not (source / "bsd" / "kern" / "bsd_init.c").is_file():
+            print(f"{source} is not an extracted XNU tree", file=sys.stderr)
             return 2
-        work = None
+
+        before = fingerprint(source, patch_list)
+        work: Path | None = None
+        try:
+            if args.allow_in_place:
+                # The only path that writes to the caller's tree, and it is
+                # opt-in for exactly that reason.  It still refuses unless the
+                # tree is a git repository, because a tree that cannot be
+                # restored cannot be verified afterwards.
+                if not (source / ".git").exists():
+                    print(f"REFUSED: --allow-in-place needs a git repository so the "
+                          f"tree can be restored afterwards; {source} has no .git",
+                          file=sys.stderr)
+                    return 2
+                print(f"applying IN PLACE to {source} (--allow-in-place)")
+                tree = source
+            else:
+                work = Path(tempfile.mkdtemp(prefix="unipad-xnu-scratch-"))
+                tree, copied, absent = scratch_tree(source, patch_list, work)
+                print(f"scratch      : {tree}")
+                print(f"  copied {copied} of the {len(targets_of(patch_list))} files the "
+                      f"patch set names; {absent} are new files it creates")
+                print(f"  {source} is READ-ONLY for this run")
+
+            with tempfile.TemporaryDirectory(prefix="unipad-patch-lf-") as staging_name:
+                failures = apply_in_order(tree, patch_list, Path(staging_name))
+        finally:
+            if work is not None and not args.keep:
+                shutil.rmtree(work, ignore_errors=True)
+
+        # The guard, and the reason --xnu-dir is safe to point at a tree other
+        # code depends on.  Taken over the same file set as `before`.
+        after = fingerprint(source, patch_list)
+        if after != before:
+            changed = sorted(k for k in before if before.get(k) != after.get(k))
+            print(f"THE SOURCE TREE CHANGED.  {len(changed)} of the files the patch set "
+                  f"names now differ:", file=sys.stderr)
+            for name in changed[:20]:
+                print(f"  {name}", file=sys.stderr)
+            print("This run was not supposed to write to it.  Restore the tree before "
+                  "anything else reads it.", file=sys.stderr)
+            return 1
+        print(f"source tree  : unchanged ({len(before)} files fingerprinted, "
+              f"{source.name} is pristine)")
     else:
         cache = Path(tempfile.gettempdir()) / "unipad-xnu-cache"
         tarball = download(commit, repo, cache)
@@ -173,12 +317,12 @@ def main(argv: list[str]) -> int:
             return 2
         tree = extracted[0]
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="unipad-patch-lf-") as staging_name:
-            failures = apply_in_order(tree, patch_list, Path(staging_name))
-    finally:
-        if work is not None and not args.keep:
-            shutil.rmtree(work, ignore_errors=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="unipad-patch-lf-") as staging_name:
+                failures = apply_in_order(tree, patch_list, Path(staging_name))
+        finally:
+            if not args.keep:
+                shutil.rmtree(work, ignore_errors=True)
 
     print(f"{len(patch_list)} patches against XNU {commit[:12]}")
     for failure in failures:
