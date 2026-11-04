@@ -3,7 +3,7 @@
 本文件由 `scripts/windows/build-coverage-table.py` 生成，请勿手改；改代码后重新生成。数据来源是一次真实的 `unipad.acceptance` 运行，不是对进度的转述。
 
 - 运行 id：`coverage-matrix`
-- 写入时间：2026-11-04T06:15:10+00:00
+- 写入时间：2026-11-04T12:20:59+00:00
 - 门禁身份：`unipad.controller.verifier` v1.1.0
 - 主机：Microsoft Windows 11 CoreCountrySpecific (zh-CN)
 - 加速器：tcg
@@ -18,7 +18,7 @@
 | blocking_failures | M9:FAIL, M9a:FAIL |
 | reasons | blocking_failed:M9, blocking_failed:M9a |
 | verdict | FAIL |
-| 证据域 `host_real` | 129 |
+| 证据域 `host_real` | 130 |
 | 证据域 `onsite` | 13 |
 | 证据域 `simulation` | 1 |
 
@@ -39,7 +39,7 @@
 | `P1-6` | docs/PRD.md:91 | 简洁的 Windows 启动器：开始、停止、导入 IPA、查看日志、恢复。 | advisory | UNVERIFIED | SIMULATION PASS | PASS | UNVERIFIED | `acceptance/scripts/launcher.cmd`, `acceptance/scripts/windows/UniPad-Launcher.ps1`, `acceptance/scripts/windows/Start-UniPad.ps1`, `acceptance/docs/launcher.md` | - |
 | `WP00` | docs/PRD.md:232 | 基线冻结：盘点 CPU/RAM/磁盘；获取候选仓库和锁文件；审计上游 AGENTS/贡献约定 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/host-inventory.json`, `acceptance/config/sources.lock.json`, `acceptance/local-private/upstream/UniXNU/.git/HEAD`, `acceptance/local-private/upstream/UniXNU-qemu/.git/HEAD` (+2 more) | sources.lock.json still declares frozen=false, so the pinned inputs are not a frozen base… |
 | `WP01` | docs/PRD.md:233 | 干净构建：先原样构建设备仓库最小配置；记录 bootstrap、ABI 与缓存前提 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/docs/kernel-build-windows.md` | sources.lock.json is not frozen, and the Windows cross-build chain still lacks iig, csh,… |
-| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+69 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
+| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+70 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
 | `WP03` | docs/PRD.md:235 | 引导交接：跑通 UniXNU 与 DarwinBoot，不同时加入 IPA/GPU 工作 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/boot32/boot-inputs/UniXNU.efi`, `acceptance/local-private/boot10/esp/EFI/UniXNU/Payloads/DarwinBoot.efi`, `acceptance/local-private/boot33/display-counters/esp/EFI/UniXNU/Payloads/QemuRamfb.efi`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log` (+4 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
 | `WP04` | docs/PRD.md:236 | 内核进入：固定 TCG CPU、GIC、时钟、内存与页配置；定位首次真实阻塞 | advisory | UNVERIFIED | SIMULATION PASS | PASS | PASS | `acceptance/config/machine.json`, `acceptance/local-private/tools/qemu/qemu-system-aarch64.exe`, `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/trace.log` (+2 more) | - |
 | `case1_start_new_qemu_process` | docs/PRD.md:172 | 在用户 Windows 本机启动一个全新的 QEMU 进程；保留实际配置与版本证据 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
