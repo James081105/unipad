@@ -7619,6 +7619,14 @@ Onsite: N/A.
 # Interval 2026-11-04 (forty-seventh, addendum F): `App` and `Background` are a
 # measured 0-for-12 separator, and a respawn loop is two thirds of the guest
 
+> **CORRECTED BY ADDENDUM G, two sections below.** The cross-tabulation and the
+> 0-for-12 split stand; they were built from the plists on the volume, not from
+> the capped emitters. The third section's respawn-loop claims do not: spawn.seen
+> saturated at exactly its `kMaxSpawnRecords` cap of 512, so "the loop has not
+> stopped" and "not a throttling failure hidden by a small sample" were read off
+> the instrument's bound rather than the guest. Read addendum G before relying on
+> anything in that section.
+
 ## The anomalous set is 8, not 13, and the reason it was 13 matters
 
 Addendum E inherited a 13-job set of "RunAtLoad=True, daemon did not spawn". Five
@@ -7726,3 +7734,106 @@ take a scratch copy of the guest's Data volume, remove `POSIXSpawnType` from
 load-bearing and the gate is the spawn type. If it does not, the key is a proxy
 and the gate is the session the twelve jobs belong to — which is the same
 experiment either way, because a scratch volume is discarded afterwards.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum G): the spawn emitter saturated at
+# 512, and that is why "the loop has not stopped"
+
+## What addendum F got wrong, and the one line that did it
+
+Addendum F's third section reported a respawn loop from the still-running capture:
+345 of 512 spawns, "the loop has not stopped", and "not a throttling failure being
+hidden by a small sample". **None of those three statements survives contact with
+the emitter's bound.**
+
+    enum { kMaxSpawnRecords = 512 };     zzz-native-springboard-events.patch
+    enum { kMaxExitRecords   = 512 };    same file
+    enum { kMaxJobOpenRecords = 512 };   zzz-native-job-open-events.patch
+    enum { kMaxExecRecords    = 64 };    zzz-native-springboard-events.patch
+    enum { kMaxSpawnFailRecords = 64 };  same file
+
+Measured against those caps, at the moment of writing:
+
+    record        count   cap   last n   at line   verdict
+    spawn.seen      512   512      511      1399   SATURATED
+    exit.seen       433   512      433      1453   79 left
+    job.open        454   512      454      1353   58 left
+    exec.seen         2    64        2        58   62 left
+    spawn.failed      0    64        -        -    unused
+
+**`spawn.seen` is at exactly its cap.** The last spawn record is at line 1399 of
+1453; the 54 lines after it contain nothing but `exit.seen`. Addendum F read that
+tail as "the loop has not stopped" and, separately, as the guest going quiet.
+Neither is right: the emitter is blind past record 512, so the tail says nothing
+about the guest at all.
+
+The cycle rate addendum F denied is real and measurable. Over a 60-second window,
+bluetoothd produced 3 records and fairplayd.A2 1 -- a respawn every 20 seconds and
+every 60 seconds. That is throttle-shaped, not a hot spin. The earlier reading of
+"tight crash-respawn loop" came from 138 lines in which the two daemons' records
+are adjacent; adjacency in the file is not adjacency in time, and these records
+carry no timestamp.
+
+## And the patch's own comment predicted this, in writing
+
+The exit emitter's header says:
+
+    AND SIXTY-FOUR SATURATED IN INTERVAL 42.  exit.seen stopped at exactly
+    n=64 and the 64th record is `exit.seen n=64 comm='bluetoothd'
+    code=256`, while bluetoothd kept exiting afterwards ... This is the same
+    defect that hid 91 of interval 41's 155 spawns on the spawn emitter: that
+    bound went 64 -> 512 afterwards and this one was left behind.
+
+So the cap hid exits at 64 in interval 42, the spawn cap was raised 64 -> 512 in
+response, the exit cap was raised 64 -> 512 later, and 512 has now saturated the
+spawn cap on a six-hour capture. **Three raises, same defect, and the response has
+been to move the number each time.** The cap is not the problem; the cap being
+silent is. An emitter that stops without saying so turns a bounded measurement
+into an apparent fact about the guest, which is precisely the failure mode this
+document has now recorded eight times.
+
+## What still stands, and what is now unfalsifiable
+
+**The cross-tabulation stands, because it did not come from the emitters.** The
+518-plist table was built by reading the plists out of the guest's APFS volume and
+joining them against `spawn.seen`'s comm field. The plist side is complete; the
+spawn side is capped. So the table is sound as a description of the first 512
+spawns.
+
+**But the 0-for-12 negative is now unfalsifiable rather than confirmed.** A job
+that spawns after record 512 is invisible, and session-scoped jobs are exactly the
+jobs that launch LATE -- after the session is established, which is the phase the
+emitter is now blind to. The honest statement is: *no App- or Background-typed job
+spawned within the window the instrument can see, and that window ends before the
+phase in which such a job would be expected to spawn.* That is weaker than
+"launchd declines them", and the distinction is the whole point of this addendum.
+
+What still stands independently of the cap:
+
+- The plist was opened twice, both times err:0, from two different paths.
+- 442 distinct job basenames were read (of 518 on the volume).
+- No SpringBoard-shaped comm appeared among the 161 distinct comms the emitter saw.
+- The framebuffer has not changed since t=121 while the kernel spawned 512
+  processes, and the serial log confirms the hand-off reached the kernel.
+
+## Status and what has to happen before another long capture
+
+Windows/real-guest: FAIL for the capture's own instrument. spawn.seen saturated at
+512 after roughly 90 minutes of a 6-hour budget, and job.open and exit.seen have
+58 and 79 records left, so the capture goes silent within about 137 more records
+and then contributes nothing for the remaining four hours.
+
+The fix is not a larger number. Two changes, both small:
+
+1. **Emit a saturation record when a cap is reached**, so a later reader cannot
+   mistake the bound for the guest. One record per emitter, at the cap, naming the
+   emitter and the cap.
+2. **Raise the caps by orders of magnitude, not by factors.** The header's own
+   justification for the current values is that "the bound costs four bytes of
+   static data" -- which is an argument for a large bound, not a small one. The
+   channel is a virtio console whose purpose is these records.
+
+Until both land, no long capture on this kernel can distinguish "the guest stopped"
+from "the emitter stopped", and every negative read off one is worthless.
