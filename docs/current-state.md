@@ -10293,3 +10293,96 @@ need a run-time instrument.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (fifty-eighth, addendum Z): the respawn loop's cause, measured -- `bluetoothd` exits with status 1 every single time
+
+## What was missing, and where it was
+
+Addendum R said the loop's cause was unmeasurable because the
+`spawn.seen` record carries only `comm`, `event`, `n` and `source`.
+That is true of `spawn.seen`.  It was never checked whether the kernel
+emits a SIBLING record that does carry the cause.
+
+**It does.**  The same channel carries `exit.seen`, and its record is
+`{'event': 'exit.seen', 'n': ..., 'comm': ..., 'code': ...,
+'source': 'XNU.exit_with_reason'}`.  The exit code was in the channel the
+whole time, one record kind away from the one being read.
+
+## The cause
+
+1711 `exit.seen` records.  The two loop members:
+
+| process | exits | exit code |
+|---|---|---|
+| bluetoothd | 917 | 256 (*every time*) |
+| fairplayd.A2 | 752 | 0 (*every time*) |
+
+**`bluetoothd` exits with code 256 on all 917 of its launches, and never with
+anything else.**  `fairplayd.A2` exits 0 on all 752.
+
+Code 256 is the raw wait status, so `WEXITSTATUS` is 1: **bluetoothd is
+exiting with status 1 -- a failure -- every time it is started.**  It has
+never once started successfully on this boot.
+
+The live cycle, in order:
+
+```
+spawn  bluetoothd
+spawn  fairplayd.A2
+exit   bluetoothd      code=256
+exit   fairplayd.A2    code=0
+... and again
+```
+
+So the loop is: both are launched, bluetoothd fails with status 1,
+fairplayd.A2 succeeds, and both are relaunched.  The relauncher is
+respawn policy, and the thing being respawned cannot start.
+
+## What this is not
+
+**It is not the display blocker.**  Nothing here touches the
+framebuffer, and addenda S through V measured that independently.  It is
+a separate defect with its own cause.
+
+**It is not explained.**  Exit status 1 says bluetoothd failed; it does
+not say why.  Its stderr and its own log are the next instrument, and
+they are not in this channel -- `exit.seen` carries a code and nothing
+else.  So the cause is now *narrowed to one process and one exit status*,
+which is a different and much smaller question than "why do two daemons
+respawn".
+
+## The instrument that almost hid this, recorded
+
+`_posix_spawn.native_spawn_records` looks like the spawn count and is not
+one.  Read twice, 75 seconds apart:
+
+| | first | second | delta |
+|---|---|---|---|
+| kernel counter | 1838 | 1838 | **0** |
+| channel `spawn.seen` records | 1838 | 1851 | **13** |
+
+The counter did not move while the channel gained 13 records.  The
+first version of this addendum read only the counter, twice, and
+concluded **the loop had stopped** -- a confident negative off an
+instrument that does not track the thing.  It was caught only because the
+channel's own record count was checked alongside it and disagreed.
+
+That is the fourth time this interval an instrument has answered a
+question other than the one being asked, and the second time the wrong
+answer was a confident negative.  **A counter that does not move is not
+evidence of stillness until the counter has been shown to move at all.**
+
+## Status
+
+Windows/real-guest: **PASS** -- read from the live guest's own channel
+with the kernel's sha256 verified first, and the exit codes cross-checked
+against the spawn sequence.
+
+**The loop's cause is narrowed, not solved:** bluetoothd, exit status 1,
+917 times, never otherwise.  Why it fails needs its own log.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
