@@ -6545,3 +6545,99 @@ and the distinction is visible in the report: `stopped_on_quiet: false` with
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+
+---
+
+# Interval 2026-11-04 (forty-fourth, addendum C): the volume question, settled.
+# SpringBoard's job plist is on the OS root volume.  SpringBoard.app is not.
+
+## Why this needed proving at all
+
+Interval 43 scanned `raw/044-76040-038.raw` and found SpringBoard's job filename
+there, having first scanned the SystemOS cryptex and found nothing.  Two things
+made that conclusion weaker than it looked:
+
+1. **The cryptex is mounted at `/System`.**  The boot console line is
+   `disk1s1 mounting volume ...SystemCryptex, requested by: init (pid 1)`, and
+   the cryptex is the third read-only `virtio-blk-device` the capture attaches.
+   A mount at `/System` shadows whatever the root volume has there, so "the
+   filename is in the root volume" does not by itself mean "launchd can see it".
+2. **A zero-hit scan of an encrypted volume is the expected result.**  If the
+   cryptex were encrypted, finding zero job plists in it would prove nothing,
+   and the control test that justified scanning the root volume instead would
+   have been circular.
+
+## The cryptex is plaintext, so the control is real
+
+`044-76034-038.dmg` is 3,303,014,400 bytes and carries a readable APFS container
+superblock: `NXSB` at offset 32 with `nx_block_size` = 4096, and valid object
+headers on the 8192-byte stride.  It is **not** encrypted.  So a zero-hit scan of
+it means what it says.
+
+## Both volumes, same names, side by side
+
+    name                              OS root   SystemOS
+    com.apple.SpringBoard.plist              5          0
+    com.apple.configd.plist                  3          0
+    com.apple.notifyd.plist                  3          0
+    com.apple.runningboardd.plist            3          0
+    com.apple.backboardd.plist               3          2
+    com.apple.launchd.plist                  0          0
+    LaunchDaemons                          545         21
+    NanoLaunchDaemons                        5          0
+    LaunchAgents                            21          4
+
+And the content profile of each:
+
+    OS root    bplist00 17032   fpmc 161444   <?xml 50466   com.apple. 247980
+    SystemOS   bplist00   993   fpmc   2224   <?xml   235   com.apple.  85693
+
+**The OS root volume is the configuration volume and the cryptex is the binary
+volume.**  17032 bplists against 993; 50466 XML plists against 235.  The cryptex
+carries the frameworks and the dyld shared cache, which is why `com.apple.`
+appears 85693 times there against the root's 247980 -- those are string tables
+inside Mach-O images, not catalog keys.
+
+## The deduction
+
+`com.apple.configd.plist`, `com.apple.notifyd.plist` and
+`com.apple.runningboardd.plist` exist **only** in the OS root volume, and all
+three of those daemons demonstrably spawned in interval 42's guest.  Therefore
+launchd reads job plists out of the OS root volume.  Therefore the root volume's
+`/System/Library/LaunchDaemons` is visible to the guest despite the cryptex being
+mounted at `/System` -- which means the two compose rather than shadow, and a
+path the cryptex does not carry falls through to the root volume.
+
+`com.apple.SpringBoard.plist` is also **only** in the OS root volume (5 hits, 0
+in the cryptex).  **So SpringBoard's job file IS available to the guest's
+launchd.**  Interval 43 scanned the right volume, and the reason SpringBoard has
+not spawned is not that its job file is missing from the mounted tree.
+
+## Where SpringBoard.app actually is
+
+`springboard-find.txt` scanned the cryptex and found, inside its binaries:
+
+    com.apple.SpringBoard     300
+    SpringBoard.app             8
+    CoreServices/SpringBoard    6
+
+So **`/System/Library/CoreServices/SpringBoard.app` lives on the SystemOS
+cryptex**, while `/System/Library/LaunchDaemons/com.apple.SpringBoard.plist`
+lives on the OS root volume.  Spawning SpringBoard therefore requires both
+volumes to be mounted and composed, which the 109 spawned daemons prove they are.
+
+## The caveat, stated
+
+The cryptex is not fully enumerated: 993 bplists across 3.3 GB is not a directory
+listing, and APFS `decmpfs` compression (`fpmc`, 2224 headers there) could hide a
+plist's bytes.  So "0 occurrences" is strong evidence of absence, not proof.  The
+deduction above does not need proof -- it needs only that the three control
+plists are absent from the cryptex, and those three daemons spawned.
+
+## What this leaves
+
+The question is back to exactly where interval 44 put it, now with the volume
+doubt removed: **launchd has SpringBoard's job file available and has not spawned
+it.**  Whether it ever tries is what the long capture measures, and whether it
+tries and declines is what the plist's contents would say.
