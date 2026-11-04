@@ -3482,7 +3482,6 @@ without the second volume, and it is also the reason it cannot answer M9.
   launchd until it is.
 * This is one boot.  It has not been repeated, and a single successful run is not
   a stable measurement.
-\n
 ---
 
 # Interval 2026-11-03 (fifteenth): `system.mount` arrived.  So did a withdrawal.
@@ -3634,7 +3633,6 @@ is that the failure mode is real, documented, and completely unobservable.
   identity.
 * This is one boot with the volumes.  It has not been repeated.
 * The 3600 s capture is running; its result is not in this record.
-\n
 ---
 
 # Interval 2026-11-03 (sixteenth): `dyld.cache_read` arrived.  So did a correction
@@ -3792,7 +3790,6 @@ preserved the wrongness.
 * The input path is UNMEASURED.  The one-line fix is applied and not yet run.
 * `diag.owner_data_status` is source only -- not compiled, not booted.
 * This is one 3538 s boot.  It has not been repeated.
-\n
 ---
 
 # Interval 2026-11-03 (seventeenth): the Home press works now, and it changed
@@ -3888,7 +3885,6 @@ the cause is a hypothesis with a documented failure mode and no measurement.
   first thing that will compile it.  Nothing here says it compiles.
 * `vendor/` is gitignored and the acquisition step re-clones it from the pin, so
   the patch lives in the fork, not in this repository.
-\n
 ---
 
 # Interval 2026-11-03 (eighteenth): the display emitter is pinned, and the check
@@ -4013,7 +4009,6 @@ result from an instrument that is not looking at the change.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The display still never draws.  The record says which stage it reached; it does
   not make it draw.
-\n
 ---
 
 # Interval 2026-11-03 (nineteenth): the build was green and measured nothing, and
@@ -4156,7 +4151,6 @@ lands.
   `{"event":"springboard.running",` is present is UNEXPLAINED and is recorded as
   such.  It is in the pre-existing emitter, not in anything I changed, and it is
   the reason I stopped trusting the raw search long enough to validate it.
-\n
 ---
 
 # Interval 2026-11-03 (twentieth): RETRACTION.  The byte search is not evidence,
@@ -4237,7 +4231,6 @@ The workflow defect, the fix, the push, and the two new tests all stand on the
 manifest alone.  A dispatch input that is read, compared to nothing, and ignored
 -- while a warning claims the opposite -- is a defect whether or not the
 resulting kernel happened to carry the emitter.
-\n
 ---
 
 # Interval 2026-11-03 (twenty-first): the acceptance gate was broken on this host,
@@ -4345,7 +4338,6 @@ caused damage rather than delay.
   `{"event":"springboard.running",` is present remains UNEXPLAINED.  It is in the
   pre-existing emitter, and if it is real then `springboard.running` records are
   malformed JSON and a working SpringBoard would be invisible.
-\n
 ---
 
 # Interval 2026-11-03 (twenty-second): build 41584103771 built the right source,
@@ -6148,5 +6140,126 @@ project has built.
 * No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
 * The capture hit its 5400 s cap with the guest still spawning, so the daemon
   count is a LOWER BOUND, not a total.  155 is "at least 155".
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
+---
+
+# Interval 2026-11-04 (forty-third): the job file exists.  The scan that said it
+# did not was reading the wrong volume -- and the exit bound saturated.
+
+## The instrument was wrong, and the control is what caught it
+
+Every byte scan this project has ever run against the SystemOS image was run
+against `044-76034-038.dmg`, whose metadata says `"component":
+"Cryptex1,SystemOS"`.  A control scan of that file returned:
+
+    com.apple.configd.plist          0     <- daemon that SPAWNED
+    com.apple.notifyd.plist          0     <- daemon that SPAWNED
+    com.apple.runningboardd.plist    0     <- daemon that SPAWNED
+    com.apple.backboardd.plist       2     <- daemon that SPAWNED
+
+Three of four daemons that provably spawned read zero, so the file cannot answer
+the question at all.  The two `backboardd.plist` hits were
+`/var/mobile/Library/Preferences/com.apple.backboardd.plist` -- preference plists,
+not job plists.  The scan was finding the wrong kind of file in the wrong place.
+
+`/System/Library/LaunchDaemons` is on the **OS root volume**,
+`raw/044-76040-038.raw` (`"component": "OS"`, 6,077,580,800 bytes decompressed).
+The same scan of *that* volume:
+
+    com.apple.configd.plist          3
+    com.apple.notifyd.plist          3
+    com.apple.runningboardd.plist    3
+    com.apple.backboardd.plist       3
+    com.apple.usermanagerd.plist     2
+    com.apple.SpringBoard.plist      5     <-- IT EXISTS
+    com.apple.loginwindow.plist      0
+    com.apple.usercontextd.plist     0
+
+Every control is non-zero.  The instrument is validated, and on it
+**`com.apple.SpringBoard.plist` is present in the LaunchDaemons catalog.**  Two of
+the five occurrences carry a `com.apple.decmpfs` extended attribute (magic
+`fpmc`, type 9) with uncompressed sizes of 326 and 656 bytes, so it is a real
+file with real content, not a dangling catalog name.
+
+**`com.apple.loginwindow.plist` is absent, and so is
+`com.apple.usercontextd.plist`.**  With the control validated those zeros mean
+what they say.  Nothing on this system ever defines a loginwindow job, which is
+the same fact interval 42 reached from the guest side and reached first.
+
+## A second thing the control caught: `.dmg` members are not UDIF
+
+`UdifImage` refuses `044-76034-038.dmg` with *"the file does not end in a UDIF
+'koly' trailer, so it is not a UDIF image"*.  The file is intact -- its sha256 is
+`b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f`, which matches
+`044-76034-038.json` exactly.  It is simply not a UDIF image: an IPSW member
+named `.dmg` can be a **raw APFS container**.  The APFS object header sits at file
+offset 24 (`NXSB` at +8) on an 8192-byte stride, and `nx_block_size` reads 4096.
+The module docstring's premise -- that a `.dmg` is UDIF -- does not hold for
+Cryptex members, and the refusal was correct rather than a defect.
+
+## What is NOT known: the plist's contents
+
+The content of `com.apple.SpringBoard.plist` -- its `ProcessType`, `RunAtLoad`,
+`LaunchEvents`, `POSIXSpawnType` -- **could not be read**, and two separate
+attempts failed for two separate reasons.
+
+**Adjacency does not work, and this is proven, not assumed.**  The bytes that
+follow a filename in this volume do not belong to that file.  Control:
+`com.apple.configd.plist` is followed by a 1213-byte XML plist, and the binary
+plist 1411 bytes further on parses as `com.apple.companion_proxy`.  Likewise
+`com.apple.SpringBoard.plist` is followed by a 326-byte binary plist that parses
+as `com.apple.SiriTTSTrainingAgent`, and by a 656-byte XML plist that names
+itself `com.apple.sports.plist` in its own header comment.  An APFS catalog node
+keeps its keys and its values in separate regions; without the node's table of
+contents there is no way to pair them.
+
+**Neither content scan is complete, and both say so.**  Enumerating every
+`bplist00` in the volume and keeping those with a `Label` recovered **373 jobs**,
+but only **53 of interval 42's 109 spawned comms** match one -- `notifyd` and
+`usermanagerd` are both among the 56 that do not, and both provably spawned.  A
+second scan for XML job plists (`<key>Label</key><string>...`) found **113
+labels**, but its controls -- configd, backboardd, runningboardd, apsd, akd, all
+of which spawned -- returned **0**, while `notifyd` returned 1.  Neither scan can
+prove a job absent, and neither found SpringBoard's.
+
+So the honest statement is: **the job file is there; what it says is not known.**
+
+## The exit bound saturated, which is the interval-41 defect again
+
+`exit.seen` stopped at exactly n=64.  The 64th record is
+`exit.seen n=64 comm='bluetoothd' code=256`, and bluetoothd kept exiting after
+it -- it spawned 35 times in total and is the last record in the entire capture.
+`kMaxExitRecords = 64` in `zzz-native-springboard-events.patch`.
+
+This is the same defect that hid 91 of interval 41's 155 spawns, now on the other
+emitter.  The spawn bound was bumped 64 -> 512 afterwards; the exit bound was
+left at 64 and has now saturated in turn.  Every exit after n=64 is invisible,
+which is why `exit.seen` reports 64 while `spawn.seen` reports 155.
+
+## Where M9 stands
+
+| question | answer | instrument |
+|---|---|---|
+| Is `com.apple.SpringBoard.plist` on the system? | **YES**, 5 occurrences | validated filename scan of the OS root volume |
+| Is `com.apple.loginwindow.plist` on the system? | **NO**, 0 occurrences | same scan, same controls |
+| Does launchd attempt to spawn SpringBoard? | **NO** -- 0 `spawn.failed` in 155 spawns | interval 42's emitter |
+| What does SpringBoard's job plist say? | **UNKNOWN** | both content scans shown incomplete |
+
+Interval 42 asked whether launchd's job list was missing SpringBoard or whether
+launchd decided not to run it.  The answer is the second: **the job is in the
+list, and launchd does not run it.**  Combined with `loginwindow`'s job file not
+existing at all, the per-user GUI domain has nothing to create it and SpringBoard
+has nothing to start it.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* SpringBoard's `ProcessType`, `RunAtLoad`, `LaunchEvents` and `POSIXSpawnType`
+  are NOT known.  Nothing in this interval says why launchd skips the job.
+* The 373-job and 113-label enumerations are lower bounds.  Neither can prove a
+  job absent, and neither found SpringBoard's content.
+* `exit.seen` is truncated at 64 records.  The true exit count is unknown and is
+  at least 64.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
