@@ -11389,3 +11389,91 @@ image rather than inferred from its hash.
 
 **M9, M9a, M9b and M8 remain unproven.**  One refusal of twelve is
 lifted; the compositor still does not drive the display.
+
+---
+
+# Interval 2026-11-05 (sixty-seventh, addendum AI): the reach map cannot rank the remaining refusals, and the reason is a BLR
+
+## The question, and the answer that was almost believed
+
+Addendum AH left a number: ten `kIOReturnUnsupported` and one
+`kIOReturnError` across ten selectors.  The obvious next step is addendum
+AC's map -- rank the refusing vtable slots by how many of those selectors
+reach them, then override the most-shared ones.
+
+Rebuilt on the experiment kernel, the map answers: **none of the ten
+reaches any refusing slot.**
+
+That would have been a major finding -- that the refusals do not come
+from the display's vtable at all, and the whole subclass-override plan is
+pointless.  It is also false, and the way it is false is the same defect
+class this log keeps recording.
+
+## Why it is false, in one level of indirection
+
+Selector 74's dispatch function is at `0xfffffff00577a718`.  It makes
+**5 direct BL calls** and **0 indirect BLR** of its own.
+
+A BL carries its target in the instruction, so a static walk can follow
+it.  A BLR goes through a register loaded from the display object's
+vtable, and no static walk can see it.  The indirect calls are **not** in
+the dispatch function -- they are one level down:
+
+| callee | direct BL | indirect BLR |
+|---|---|---|
+| `0xfffffff005778688` | [] | 5 |
+| `0xfffffff005778720` | [] | 6 |
+| `0xfffffff005778758` | [] | 6 |
+| `0xfffffff005778790` | [] | 5 |
+| `0xfffffff0057787c8` | [] | 4 |
+
+**26 indirect calls in the chain, and every one of them is in a leaf.**  So the
+walk reaches the dispatch function, follows its five BLs, and stops --
+six nodes, exactly what was measured.  It then reports that selector 74
+reaches nothing, for a selector whose refusal demonstrably came from slot
+213.
+
+Addendum AB had already recorded the limitation in the other direction
+(*"static BL-reachability cannot answer it, because it
+over-approximates"*).  This is the under-approximation, and it is the one
+that produces a confident false negative instead of a vague one.
+
+## What the map DID get right, and it is worth keeping
+
+Slot 213's function now begins `0x52805840` --
+`MOV w0,#0x2c2` -- and carries no `MOV w0,#0x2c7` anywhere
+(`mov_2c7 = []`).  That is `supportedFrameInfo`'s own
+`if(!count || !key || !mask)return kIOReturnBadArgument;` guard, which is
+the change.  So the refusing-slot count dropping from 61 to 60 is
+confirmed a second way, independently of the client table.
+
+## What this means for the next experiment
+
+The reach map cannot choose the targets.  Two ways forward, and the
+second is the better instrument:
+
+1. Override the slots the fork already declares, on the theory that the
+   ones it bothered to name are the ones the compositor drives.  Cheap,
+   but it is a guess and a negative would not narrow anything.
+2. **Interpose the DISPLAY's vtable the way the probe already interposes
+   the client's**, and count calls per slot at run time.  That measures
+   exactly which of the 60 refusing slots each refused selector drives,
+   which is the question the static walk cannot answer.
+
+The interposer is task #29 and it belongs in `LegacyDisplayProbe.cpp`,
+the device repository this project owns -- so it is deliverable with one
+commit and one pin bump, unlike the driver fork.  A thunk is
+straightforward on ARM64: `x16`/`x17` are intra-procedure-call scratch, so
+a naked stub can increment a counter and `br` to the original without
+disturbing the arguments in `x0`-`x7` or the return in `x0`.
+
+## Status
+
+Windows/real-guest: **PASS for the correction** -- the anchors re-checked
+against the live kernel, the dispatch function and each of its callees
+disassembled to count direct and indirect calls, and slot 213's own bytes
+read to confirm the change is in the kernel that booted.
+
+**The "none" result is withdrawn.**  It was an instrument defect, not a
+finding, and it would have discarded the subclass-override plan for no
+reason.
