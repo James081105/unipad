@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval sixty-seventh, addendum AI). THE HEADLINE is unchanged from AH -- **the display experiment RAN, one refusal lifted, and the screen did not move** -- with one correction that matters more than it looks: **the static reach map CANNOT choose the next targets, and the reason is a BLR.** Selector 74's dispatch function makes 5 direct BL calls and 0 indirect BLR of its own; its five callees make 0 direct BL and **26 indirect BLR between them**. The virtual calls sit one level down, every one in a leaf, so a BL walk stops after six nodes and reports "selector 74 reaches nothing" for a selector whose refusal demonstrably came from slot 213. An earlier run of the map concluded "none of the ten remaining refused selectors reaches any refusing slot" -- that is WITHDRAWN; it was an instrument defect, not a finding, and it would have discarded the subclass-override plan for no reason. Addendum AB recorded this limitation as over-approximation; this is the under-approximation, which produces a confident false negative rather than a vague one. **So the next instrument must measure at runtime: task #29, interpose the DISPLAY's vtable the way the probe already interposes the client's and count calls per slot.** It belongs in `LegacyDisplayProbe.cpp` -- the device repository this project owns -- so it is deliverable with one commit and one pin bump. Design: naked ARM64 thunks using `x16`/`x17` (intra-procedure-call scratch) so a stub can increment a counter and `br` to the original without disturbing `x0`-`x7` or the return in `x0`; hook at `native_legacy_client_observed()` (:462), where the client is interposed and `native_legacy_object` is already set. **Everything from AH still stands:** build `exp-2026-11-05-display-refusal` (run 41880912125) built commit `5b83ab7` and the run's own log names it; backboardd's failures dropped 12 -> 11 with its call count unchanged at 15; selector 74 (`supportedFrameInfo`, slot 213) is now `kIOReturnSuccess`; selector 33 (`collectCompletionReports`, slot 337) is STILL `kIOReturnUnsupported` because the original completion helper discards that IOReturn -- confirmed, not argued; the one screendump that changed (t=121 s) is the UniXNU boot menu; and slot 213's function now begins `MOV w0,#0x2c2` with no `MOV w0,#0x2c7` anywhere, so the refusing-slot count dropping 61 -> 60 is confirmed a second way, independently of the client table. **What is left is a number: ten `kIOReturnUnsupported` and one `kIOReturnError` across selectors 12, 15, 22, 27, 29, 33, 50, 57, 79, 84 -- and no static way to say which of the 60 refusing slots they come through.** **ALSO FROM AH: the instrument had a defect that would have hidden all of it** -- the first measurement used 1176 as the `ClientStat` entry stride when the real struct is 2312 (it continues with `regs`, `reg[8]`, `sel6_*`, `seq[24]`, `original_external`/`register`), so every field read was right and the ENTRY was wrong; and the guard added to catch it tested `(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and is false for EVERY valid pointer, so it reported "NO SELF-CONSISTENT CLIENT MADE A CALL" against a table with backboardd in it. **A guard that rejects everything is worse than no guard.** That is the fourth time validating the instrument changed the answer and the second time the validator itself was the defect. **M9, M9a, M9b and M8 remain unproven.**
-Main repo at `763eb41`.
+Last updated: 2026-11-05 (interval sixty-eighth, addendum AJ). THE HEADLINE is a build failure that was the pre-flight's fault: run 41906787039, which pinned the display-vtable slot tracer, failed on six assembler errors -- every one of them the three `adrp` instructions -- because the Apple kext relocation model refuses `adrp xN, sym; add xN, xN, :lo12:sym` for a global and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF`. THE PRE-FLIGHT WAS GREEN, and that is the finding: it had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form. So it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". A pre-flight that validates the wrong target is worse than none, because it converts a 40-minute failure into a false confidence. The replacement reads the asm OUT OF the file, assembles with the SAME target and mode the runner uses, asserts the register set and the relocations, and is mutation-tested. The same interval adds the other half of the instrument: `2bb2d1e` answers kIOReturnSuccess for every slot whose function is a refusing stub, because addendum AH lifted ONE refusal of twelve and nothing moved. The lift is safe because a refusing stub writes NOTHING -- its body is `MOV w0,#0x2c7` and a RET, so replacing it with `MOV w0,#0` changes exactly one register. One build now carries both, and it is dispatched on `fa8d73e`. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never compiled.** THE HEADLINE is unchanged from AH -- **the display experiment RAN, one refusal lifted, and the screen did not move** -- with one correction that matters more than it looks: **the static reach map CANNOT choose the next targets, and the reason is a BLR.** Selector 74's dispatch function makes 5 direct BL calls and 0 indirect BLR of its own; its five callees make 0 direct BL and **26 indirect BLR between them**. The virtual calls sit one level down, every one in a leaf, so a BL walk stops after six nodes and reports "selector 74 reaches nothing" for a selector whose refusal demonstrably came from slot 213. An earlier run of the map concluded "none of the ten remaining refused selectors reaches any refusing slot" -- that is WITHDRAWN; it was an instrument defect, not a finding, and it would have discarded the subclass-override plan for no reason. Addendum AB recorded this limitation as over-approximation; this is the under-approximation, which produces a confident false negative rather than a vague one. **So the next instrument must measure at runtime: task #29, interpose the DISPLAY's vtable the way the probe already interposes the client's and count calls per slot.** It belongs in `LegacyDisplayProbe.cpp` -- the device repository this project owns -- so it is deliverable with one commit and one pin bump. Design: naked ARM64 thunks using `x16`/`x17` (intra-procedure-call scratch) so a stub can increment a counter and `br` to the original without disturbing `x0`-`x7` or the return in `x0`; hook at `native_legacy_client_observed()` (:462), where the client is interposed and `native_legacy_object` is already set. **Everything from AH still stands:** build `exp-2026-11-05-display-refusal` (run 41880912125) built commit `5b83ab7` and the run's own log names it; backboardd's failures dropped 12 -> 11 with its call count unchanged at 15; selector 74 (`supportedFrameInfo`, slot 213) is now `kIOReturnSuccess`; selector 33 (`collectCompletionReports`, slot 337) is STILL `kIOReturnUnsupported` because the original completion helper discards that IOReturn -- confirmed, not argued; the one screendump that changed (t=121 s) is the UniXNU boot menu; and slot 213's function now begins `MOV w0,#0x2c2` with no `MOV w0,#0x2c7` anywhere, so the refusing-slot count dropping 61 -> 60 is confirmed a second way, independently of the client table. **What is left is a number: ten `kIOReturnUnsupported` and one `kIOReturnError` across selectors 12, 15, 22, 27, 29, 33, 50, 57, 79, 84 -- and no static way to say which of the 60 refusing slots they come through.** **ALSO FROM AH: the instrument had a defect that would have hidden all of it** -- the first measurement used 1176 as the `ClientStat` entry stride when the real struct is 2312 (it continues with `regs`, `reg[8]`, `sel6_*`, `seq[24]`, `original_external`/`register`), so every field read was right and the ENTRY was wrong; and the guard added to catch it tested `(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and is false for EVERY valid pointer, so it reported "NO SELF-CONSISTENT CLIENT MADE A CALL" against a table with backboardd in it. **A guard that rejects everything is worse than no guard.** That is the fourth time validating the instrument changed the answer and the second time the validator itself was the defect. **M9, M9a, M9b and M8 remain unproven.**
+Main repo at `6bdb0c5`.
 
 ---
 
@@ -11512,3 +11512,163 @@ process was killed mid-run (the guest died with it, which is by design -- the
 capture owns the QEMU it starts), and `/f/unipad-tmp` is down to 8.2 GB with no
 `pytest-*` basetemp left to reclaim, so the disk pressure is separate from the
 memory pressure and was not the cause.
+
+---
+
+# Interval 2026-11-05 (sixty-eighth, addendum AJ): the pre-flight was assembled for the wrong target, and that is the finding
+
+## The build failed, and it was mine
+
+Run 41906787039 pinned `aae08cd` -- the display-vtable slot tracer -- and
+failed.  Six errors, and every one of them is the same instruction:
+
+```
+LegacyDisplayProbe.cpp:490:9:   error: ADR/ADRP relocations must be GOT relative
+LegacyDisplayProbe.cpp:490:9:   error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:490:49:  error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:492:40:  error: ADR/ADRP relocations must be GOT relative
+LegacyDisplayProbe.cpp:492:40:  error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:493:45:  error: unknown AArch64 fixup kind!
+```
+
+The tracer's common thunk loads the display's vtable, a call counter and a lift
+flag out of three arrays, and it addressed them the ELF way:
+
+```asm
+adrp x17, native_legacy_slot_original
+add  x17, x17, :lo12:native_legacy_slot_original
+```
+
+The kext is built with `-fapple-kext --target=arm64-apple-ios17.0.0`, and the
+Apple relocation model does not accept that.  It wants
+
+```asm
+adrp x17, native_legacy_slot_original@GOTPAGE
+ldr  x17, [x17, native_legacy_slot_original@GOTPAGEOFF]
+```
+
+which loads the symbol's address out of the GOT.  Three extra loads on a path
+that runs a few hundred times a boot.  The label had to become numeric for the
+same class of reason: the Apple integrated assembler refuses a `.L` name as the
+target of a conditional branch ("conditional branch requires assembler-local
+label"), and GNU as accepts both, so `1f` is the portable form.
+
+## Why the pre-flight did not catch it, which is the part worth recording
+
+There WAS a pre-flight.  `local-private/tmp/thunk-preflight.c` carried the same
+asm text with the kernel-only surroundings stripped and assembled it on Windows,
+precisely so a syntax error would not cost a 40-minute build cycle.  It
+reported: all 358 thunks assemble, all 358 carry `R_AARCH64_JUMP26 ->
+native_legacy_slot_common`, the common thunk writes only `x9`/`x10`/`x16`/`x17`,
+and the slot numbers stringify correctly.
+
+Every one of those statements is true.  And the build was red.
+
+**Because the pre-flight was assembled with `--target=aarch64-unknown-linux-gnu`,
+which is ELF, and ELF accepts the direct form.**  So it answered "is this valid
+AArch64" while the build asks "is this valid AArch64 under the Apple relocation
+model".  The first is green and the second is red.
+
+A pre-flight that validates the wrong target is worse than no pre-flight.  It
+converts a 40-minute failure into a false confidence, and it did -- the pin was
+moved and the build dispatched on the strength of it.
+
+## The replacement pre-flight, and what it now checks
+
+`local-private/tmp/preflight-slot-thunks.py` does two things the old one did
+not:
+
+1. **It reads the asm OUT OF `LegacyDisplayProbe.cpp`** rather than restating it
+   by hand, so a copied divergence cannot reintroduce the defect.  If the file's
+   asm changes, the pre-flight sees the change.
+2. **It assembles with the SAME target and mode the runner uses**,
+   `--target=arm64-apple-ios17.0.0 -fapple-kext`, so it checks the Apple
+   relocation model -- the thing that actually gates the build.
+
+It then disassembles the result and asserts the properties the instrument rests
+on: the common thunk writes no register outside `w0`/`w10`/`x17`/`x9` (`x16` is
+set by the stub, not by the common thunk); all four spot-checked stubs branch to
+the common thunk; there are exactly three GOT-relative loads; and the slot
+numbers stringify (`0=#0x0`, `7=#0x7`, `213=#0xd5`, `357=#0x165`).
+
+**And it is mutation-tested**, by `local-private/tmp/mutate-preflight.py`, which
+puts the ELF form back and requires the pre-flight to refuse.  It does, and the
+file is restored and passes again.  A guard that cannot go red is not a guard,
+and this one can.
+
+Reproduced locally first, before touching the device repo: the same six errors
+at the same lines, from
+
+```
+clang++ --target=arm64-apple-ios17.0.0 -fapple-kext -c thunk-preflight-lift.c
+```
+
+## The lifter, which rides on the tracer
+
+`2bb2d1e` adds the other half, and the reason is addendum AH's result: lifting
+ONE refusal of twelve moved nothing.  Backboardd still made exactly 15 calls,
+still failed 11 of them, and never called the framebuffer again.  So the next
+experiment does not pick targets -- it lifts all of them and asks whether the
+refusals are the gate collectively.
+
+The common thunk gains three instructions.  After counting, it reads this slot's
+lift flag; if the flag is set the method is answered `kIOReturnSuccess` in `w0`
+and the original is never entered.  The flag is set only for a slot whose own
+function is a refusing stub, decided by addendum AC's classifier ported into the
+kernel so the lift needs no host in the loop: `MOV w0,#0x2c7`, nothing CALLED
+before it, a RET within eight words, bounded to the first 24 words (96 bytes,
+the same window the host classifier read).
+
+**The "nothing called" clause is load-bearing.**  Slots 306, 307 and 337 are
+`LEAF()` guards whose body is `MOV w0,#<slot>; BL native_legacy_backend_guard`
+with a noreturn panic, and the compiler still emits a dead `MOV w0,#0x2c7` tail
+after them.  Matching those would answer a guard's call with success instead of
+panicking, which is not what an experiment should do.
+
+### The safety argument, because it is the whole reason this is acceptable
+
+**A refusing stub writes NOTHING.**  Its body is `MOV w0,#0x2c7` and a RET.
+Replacing that with `MOV w0,#0` changes exactly one register -- the return --
+and no out parameter a caller might read.  A caller that dereferenced those
+outputs would already be reading uninitialised memory today, and it is not
+crashing today.  **The lift is not more dangerous than the status quo; it is the
+status quo with a different answer.**
+
+## Two guard tests pinned the board's argument count, and both were right
+
+Adding `offline-legacy-lift-refusals=1` to `board.toml` turned two tests red:
+`test_the_pinned_board_line_still_diverges_from_the_delivered_payload` and
+`test_the_real_board_declares_the_payload_the_module_boots`.  Both assert the
+board's kernel-argument count against a recorded measurement, and the count is
+the point of the line -- a board that silently loses an argument boots a
+different machine.
+
+Both are fixed by moving the recorded fact from 26 to 28 and naming the two new
+arguments rather than leaving them to the count.  Both directions verified:
+adding either argument turns them red, and removing either one turns them red
+again.
+
+### DISCLOSED, and it is mine and it is not the one above
+
+`test_the_pinned_board_line_still_diverges_from_the_delivered_payload` was
+**already red since `aae08cd` added `offline-legacy-slot-trace=1`**.  The tests
+run after that commit were the pin tests -- `test_run_lock`,
+`test_acquire_submodule_divergences`, `test_build_script_repins_submodules` --
+and the kernel-args files were not among them.  A guard test that has been red
+for an interval is the same defect as no guard test at all, and the fix is to
+run the suite that reads the board, not to loosen the assertion.
+
+## Status
+
+Windows/real-guest: **the pre-flight is now a real instrument** -- it reads the
+file, assembles for the target the runner uses, asserts the register set and
+the relocations, and is mutation-tested in both directions.
+
+Build: run 41906787039 **FAILED**, and the failure is the six `adrp` errors
+above.  Run 41915052472 is dispatched on `fa8d73e`, which fixes them.
+
+Onsite: N/A.
+
+**Nothing is measured on the guest yet.**  The instrument that would measure it
+has never compiled, which is what this addendum records.  M9, M9a, M9b and M8
+remain unproven.
