@@ -10098,3 +10098,91 @@ blocker's wording is part of the contract a reader relies on.
 Build: `exp-2026-11-04-emitter-caps`, kernel spawn-failed-input-run-scratch.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (fifty-sixth, addendum X): the checkout the acceptance gate reads holds unpushed work, and the obvious fix would destroy it
+
+## The failure, and the reading that is wrong
+
+`tests/acceptance/test_p0p1_gate_main.py::
+test_the_cross_check_accepts_the_real_driver_status_output` fails with:
+
+```
+::error::vendor/UniXNU: the checkout is at e6abdf28f287ab7a7b055d159ef7c40cf17c9b4b but the source lock pins 3d83de17dd4e4be468ac3fb8d30ee21c597e8972
+```
+
+The label says `vendor/UniXNU`, but the value comes from `local-private/upstream/UniXNU` -- the test's `base` is the upstream
+clone and it labels the row after the path the lock names.  That is the
+first thing to get straight: **the row that fails is not the checkout
+that builds.**
+
+The obvious reading is "a stale checkout, align it to the pin".  That
+reading is wrong, and acting on it would lose work.
+
+## What is actually there
+
+| checkout | HEAD |
+|---|---|
+| `local-private/upstream/UniXNU` | `e6abdf2` |
+| `vendor/UniXNU` | `3d83de1` |
+| `local-private/upstream/UniXNU-qemu` | `5ef74a1` |
+| `vendor/UniXNU-qemu` | `5ef74a1` |
+| `local-private/upstream/UniXNU/drivers/NativeVirtioConsole` | `d25974c` |
+
+- `e6abdf2` is `feat(xnu): report every open under the job directories, with its errno`, dated 2026-11-04 14:45
+- it IS on a remote: `refs/remotes/fork/unipad/gpu-addon-ngpu-dir`
+- the superproject records the console submodule at `3ca09c9`, and the working tree is at `d25974c`
+- the console submodule's HEAD is `d25974c 2026-11-02 10:10 test(console): an experiment to isolate which variable killed the kernel-side records`
+- refs containing that experiment commit: **NONE**
+
+So the console submodule is checked out to a commit that is on **no
+remote and reachable from no ref at all** -- only from its own HEAD and
+reflog.  Aligning the superproject to the pin would move HEAD and reset
+the submodule pointers, and that experiment would become unreachable.
+A `git gc` with any pruning would then remove it outright.
+
+## Why this is not mine, and not the product's
+
+Nothing in this interval touched either checkout.  The reflog shows a
+deliberate walk forward, not an accident:
+
+```
+e6abdf2 HEAD@{0}: checkout: moving from bc210df... to e6abdf28...
+bc210df HEAD@{1}: checkout: moving from 39de8d3... to bc210df...
+39de8d3 HEAD@{2}: checkout: moving from 188f1d2... to 39de8d3...
+188f1d2 HEAD@{3}: checkout: moving from 4b8c68c... to 188f1d2...
+```
+
+**Attribution: an environment/checkout defect caused by parallel work,
+not a product defect and not the milestones.py change committed alongside
+it.**  `tests/acceptance/test_p0p1_gate_main.py` does not import
+`unipad.acceptance.milestones` at all, so the blocker-reason fix in the
+same interval cannot reach this test.
+
+## What has to happen, and who decides
+
+The experiment has to be dealt with before the checkout can be aligned,
+and that is a decision about work, not a mechanical step:
+
+1. **push the experiment** to a branch on the console submodule's
+   remote, or
+2. **decide it is abandoned** and say so, or
+3. **leave the checkout alone** and record that the acceptance
+   cross-check cannot pass until one of the first two happens.
+
+This addendum takes (3).  It is the only option that does not destroy
+something on the strength of a guess about what it is for.  The commit
+message names it as "an experiment to isolate which variable killed the
+kernel-side records", which is the same question addendum W answered by
+measurement -- the ring holds two hours and the records are evicted -- so
+the experiment may already be superseded.  **Superseded is not the same
+as worthless, and only whoever ran it can say.**
+
+## Status
+
+Windows/real-guest: **PASS for the diagnosis** -- four checkouts read,
+the submodule's refs enumerated, the reflog read.
+**BLOCKED for the fix**, deliberately, pending the decision above.
+
+Onsite: N/A.
