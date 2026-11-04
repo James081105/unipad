@@ -7612,3 +7612,117 @@ Windows/real-guest: PASS for the measurement (453 job.open, 442 distinct jobs,
 SpringBoard comm). IN PROGRESS for the six-hour capture, live at 09:55 with
 roughly 4.7 hours of budget left.
 Onsite: N/A.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum F): `App` and `Background` are a
+# measured 0-for-12 separator, and a respawn loop is two thirds of the guest
+
+## The anomalous set is 8, not 13, and the reason it was 13 matters
+
+Addendum E inherited a 13-job set of "RunAtLoad=True, daemon did not spawn". Five
+of those thirteen never failed to spawn at all — their comm in `spawn.seen` is
+MAXCOMLEN-truncated to 16 characters and the comparison was exact:
+
+    com.apple.AppleCredentialManagerDaemon  ->  AppleCredentialM      spawned n=21
+    com.apple.accessoryupdaterd             ->  accessoryupdater     spawned n=100
+    com.apple.containermanagerd             ->  containermanager     spawned n=18, 27
+    com.apple.familynotificationd           ->  familynotificati     spawned n=87
+    com.apple.identityservicesd             ->  identityservices     spawned n=36
+
+Corrected to prefix matching, the anomalous set is **8**, and every one of the 8
+was opened with err:0 except `com.apple.iomfb_bics_daemon.plist`, whose plist
+launchd never opened at all — a different failure mode, not the same one.
+
+This instance belongs to neither of the two series this document already counts.
+It is not "measured too early" -- that series is at six, and its four named
+instances are the QMP client without `qmp_capabilities`, the pytest argv, the
+four SHF_MERGE fragment greps and the PARTIAL gate. It is not "an instrument
+that reported a result it could not support" either -- that series is at three,
+and here the instrument reported exactly what it saw. The defect was in the
+COMPARISON: an exact string match against a field the kernel truncates to
+MAXCOMLEN. **The instrument was right and the join was wrong**, which is a third
+category and the one most likely to recur, because it produces a plausible
+empty set rather than an error.
+
+## The cross-tabulation: two perfect separators, four refuted gates
+
+Over all 518 plists in `/System/Library/LaunchDaemons`, 136 spawned:
+
+    POSIXSpawnType    ABSENT       236 plists   44 spawned
+    POSIXSpawnType    Adaptive     193 plists   56 spawned
+    POSIXSpawnType    Interactive   76 plists   36 spawned
+    POSIXSpawnType    App            7 plists    0 spawned
+    POSIXSpawnType    Background     5 plists    0 spawned
+    POSIXSpawnType    AdaptiveUtility 1 plist    0 spawned
+
+**`POSIXSpawnType` in {App, Background} is 0-for-12.** Nine of the twelve were
+opened with err:0, so launchd read the plist, parsed it, and did not spawn it.
+
+    EmbeddedHomeScreen=True     3 plists (ClarityBoard, SpringBoard, checkerboard)
+                                3 opened err:0, 0 spawned
+    EmbeddedHomeScreen absent 515 plists, 136 spawned, 0 of the 136 carry it
+
+**`EmbeddedHomeScreen=True` is 0-for-3.** These are the three home-screen jobs;
+two are also App-typed, one (ClarityBoard) has no POSIXSpawnType at all, so the
+two separators are not the same set.
+
+Four other candidate gates are refuted by the same table, each by a job that
+passes the gate and spawned anyway:
+
+    UserName=mobile              90 spawned, 263 did not   -> NOT a gate
+    LimitLoadFromHardware         2 plists carry
+      {osenvironment:[diagnostics]}                         -> 1 of 2 spawned
+    Program (bare path)          29 spawned, 100 did not   -> NOT a gate
+    MachServices with 11+ names  20 spawned,   8 did not   -> NOT a gate
+
+So the answer to "which keys do the anomalous jobs share" is: **only `Label` and
+`RunAtLoad`**, and `RunAtLoad` is shared by the spawned set too. There is no plist
+key that separates them. The decision is in launchd's runtime state, which is what
+the 0-for-12 spawn-type split is a proxy for.
+
+## What was found while the capture kept running
+
+**A respawn loop is two thirds of everything the guest does.** Over the capture's
+512 `spawn.seen` records:
+
+    bluetoothd     214 spawns, 216 exits, EVERY exit code 256 (status 1)
+                   first at line 118 / n=39, last at line 1398 / n=512
+    fairplayd.A2   131 spawns, 131 exits, EVERY exit code 0 (clean)
+                   first at line  94 / n=17, last at line 1399 / n=511
+
+Together they are 345 of 512 spawns — **67%**. `bluetoothd`'s last spawn is the
+capture's last spawn overall, so the loop has not stopped. In the tail past line
+1250, 73 of 76 spawns are in the loop.
+
+Two things this loop is NOT. It is not starving SpringBoard: QEMU has burned 6599
+seconds of CPU in 89 minutes of wall clock, which is 1.24 cores on a 16-core host
+whose total load is 15.5%, and the guest's own vCPU threads are mostly idle. And
+it is not a throttling failure being hidden by a small sample — 214 respawns with
+no interval is the measurement.
+
+**The framebuffer has not changed since t=121.** The screenshot at
+`shots/change-01-t00121.png` still shows UniXNU's own EFI boot menu, the green bar
+the loader's legend says means the kernel entry code ran, and "Booting QEMU virt:
+source 4K XNU in 1 s". The serial log confirms the hand-off reached the kernel
+(`DARWINBOOT: hand-off to the kernel`, `Exiting boot services`). So the kernel is
+running, has spawned 512 processes, and has never presented anything to the
+display. The display and SpringBoard are two separate blockers.
+
+## Status and the next experiment
+
+Code: unchanged from addendum E. The separators above are measurements, not
+patches.
+Windows/real-guest: PASS for the cross-tabulation (518 plists, 136 spawned,
+0-for-12 App/Background, 0-for-3 EmbeddedHomeScreen, four gates refuted).
+FAIL/OPEN for the two new defects: a 67%-of-spawns respawn loop, and a framebuffer
+frozen on the bootloader's own UI for 90 minutes of live kernel activity.
+Onsite: N/A.
+
+The next experiment is now fully specified by the 0-for-12 split and is cheap:
+take a scratch copy of the guest's Data volume, remove `POSIXSpawnType` from
+`com.apple.SpringBoard.plist`, and boot. If SpringBoard spawns, the key is
+load-bearing and the gate is the spawn type. If it does not, the key is a proxy
+and the gate is the session the twelve jobs belong to — which is the same
+experiment either way, because a scratch volume is discarded afterwards.
