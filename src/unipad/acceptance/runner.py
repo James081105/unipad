@@ -312,14 +312,42 @@ class CheckResult:
         blocked".  A ``BLOCKED`` verdict keeps its blocker unconditionally,
         because that is the one kind :class:`FourFields` refuses to construct
         without one.
+
+        WHY THE NON-BLOCKED BRANCH USES THE VERDICT'S OWN REASON.  The first
+        version cleared the declared blocker only for a non-BLOCKED verdict that
+        already held ONSITE evidence, which left it in place for every
+        UNVERIFIED and FAIL row.  Measured on run ``coverage-matrix``: eight of
+        forty rows carried a declared blocker their verdict does not support,
+        and two of them were the worst possible kind.  ``M9`` and ``M9a`` are
+        FAIL because an explicit PRD veto fired -- the veto text is the verdict's
+        own first reason -- yet the row reported them BLOCKED by "the guest never
+        reported XNU's page tables", a gap that is in fact satisfied (the three
+        records are on disk at ``local-private/boot-mount-41316953324/root-mount/
+        guest.log``, and ``milestones._xnu_initialisation`` returns True).
+        ``M8`` and ``M9b`` read BLOCKED for the same reason while their verdicts
+        are ``evidence_absent:m8.original_launchd,m8.later_daemons`` and
+        ``evidence_absent:m9b.written,...`` -- branch (3) of
+        ``milestones.evaluate``, which is reachable only when ``unmet_blockers``
+        is empty.  A row that names a reason the gate did not use is the same
+        defect class as a value read as the answer to a different question, and
+        here it sent the reader hunting a blocker that was already closed.
+
+        So: a BLOCKED verdict keeps the declared text, which for those rows is
+        the better of the two (``M1``'s declaration explains the missing boot
+        chain, where ``verdict.reasons[0]`` is only ``blocked_by:M0``); every
+        other non-PASS verdict reports the reason that actually decided it; and
+        PASS reports nothing, which is what the ONSITE-evidence clause above
+        already did.
         """
-        blocker = self.check.blocker
-        if blocker is None and self.verdict.kind == VerdictKind.BLOCKED:
-            blocker = self.verdict.reasons[0]
-        if self.verdict.kind != VerdictKind.BLOCKED and any(
-            ref.scope == EvidenceScope.ONSITE for ref in self.verdict.evidence
-        ):
+        if self.verdict.kind == VerdictKind.BLOCKED:
+            blocker = self.check.blocker
+            if blocker is None and self.verdict.reasons:
+                blocker = self.verdict.reasons[0]
+        elif self.verdict.kind == VerdictKind.PASS:
             blocker = None
+        else:
+            # UNVERIFIED or FAIL: the declared gap is not what decided this row.
+            blocker = self.verdict.reasons[0] if self.verdict.reasons else None
         return FourFields(
             check_id=self.check.check_id,
             verdict=self.verdict,

@@ -3,7 +3,7 @@
 本文件由 `scripts/windows/build-coverage-table.py` 生成，请勿手改；改代码后重新生成。数据来源是一次真实的 `unipad.acceptance` 运行，不是对进度的转述。
 
 - 运行 id：`coverage-matrix`
-- 写入时间：2026-11-04T18:03:51+00:00
+- 写入时间：2026-11-04T18:29:23+00:00
 - 门禁身份：`unipad.controller.verifier` v1.1.0
 - 主机：Microsoft Windows 11 CoreCountrySpecific (zh-CN)
 - 加速器：tcg
@@ -26,8 +26,8 @@
 
 | 检查 | PRD | 需求 | 层级 | 实现状态 | Windows/模拟 | 运行器验证 | 现场（Windows 实测） | 证据路径 | 阻断原因 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `M0` | docs/PRD.md:206 | 依赖盘点与构建成立 | blocking | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/artifacts/m0/ai-smoke.json` | config/sources.lock.json is absent or unparseable, so there is no pinned source identity… |
-| `M10a` | docs/PRD.md:219 | IPA 接受和执行策略明确 | blocking | UNVERIFIED | NOT RUN | UNVERIFIED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
+| `M0` | docs/PRD.md:206 | 依赖盘点与构建成立 | blocking | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/artifacts/m0/ai-smoke.json` | evidence_absent:m0.clean_build_artifacts |
+| `M10a` | docs/PRD.md:219 | IPA 接受和执行策略明确 | blocking | UNVERIFIED | NOT RUN | UNVERIFIED | BLOCKED | — | evidence_absent:m10a.signature,m10a.entitlements,m10a.failure_reason |
 | `M13` | docs/PRD.md:222 | PRD 6 M13, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M13 |
 | `M14` | docs/PRD.md:223 | PRD 6 M14, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M14 |
 | `M15` | docs/PRD.md:224 | PRD 6 M15, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M15 |
@@ -39,8 +39,8 @@
 | `P1-6` | docs/PRD.md:91 | 简洁的 Windows 启动器：开始、停止、导入 IPA、查看日志、恢复。 | advisory | UNVERIFIED | SIMULATION PASS | PASS | UNVERIFIED | `acceptance/scripts/launcher.cmd`, `acceptance/scripts/windows/UniPad-Launcher.ps1`, `acceptance/scripts/windows/Start-UniPad.ps1`, `acceptance/docs/launcher.md` | - |
 | `WP00` | docs/PRD.md:232 | 基线冻结：盘点 CPU/RAM/磁盘；获取候选仓库和锁文件；审计上游 AGENTS/贡献约定 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/host-inventory.json`, `acceptance/config/sources.lock.json`, `acceptance/local-private/upstream/UniXNU/.git/HEAD`, `acceptance/local-private/upstream/UniXNU-qemu/.git/HEAD` (+2 more) | sources.lock.json still declares frozen=false, so the pinned inputs are not a frozen base… |
 | `WP01` | docs/PRD.md:233 | 干净构建：先原样构建设备仓库最小配置；记录 bootstrap、ABI 与缓存前提 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/docs/kernel-build-windows.md` | sources.lock.json is not frozen, and the Windows cross-build chain still lacks iig, csh,… |
-| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+70 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
-| `WP03` | docs/PRD.md:235 | 引导交接：跑通 UniXNU 与 DarwinBoot，不同时加入 IPA/GPU 工作 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/boot32/boot-inputs/UniXNU.efi`, `acceptance/local-private/boot10/esp/EFI/UniXNU/Payloads/DarwinBoot.efi`, `acceptance/local-private/boot33/display-counters/esp/EFI/UniXNU/Payloads/QemuRamfb.efi`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log` (+4 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
+| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+70 more) | evidence_absent:wp02.run_directory,wp02.control_port |
+| `WP03` | docs/PRD.md:235 | 引导交接：跑通 UniXNU 与 DarwinBoot，不同时加入 IPA/GPU 工作 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/boot32/boot-inputs/UniXNU.efi`, `acceptance/local-private/boot10/esp/EFI/UniXNU/Payloads/DarwinBoot.efi`, `acceptance/local-private/boot33/display-counters/esp/EFI/UniXNU/Payloads/QemuRamfb.efi`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log` (+4 more) | evidence_absent:wp03.unixnu_run_evidence,wp03.darwinboot_handoff |
 | `WP04` | docs/PRD.md:236 | 内核进入：固定 TCG CPU、GIC、时钟、内存与页配置；定位首次真实阻塞 | advisory | UNVERIFIED | SIMULATION PASS | PASS | PASS | `acceptance/config/machine.json`, `acceptance/local-private/tools/qemu/qemu-system-aarch64.exe`, `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/trace.log` (+2 more) | - |
 | `case1_start_new_qemu_process` | docs/PRD.md:172 | 在用户 Windows 本机启动一个全新的 QEMU 进程；保留实际配置与版本证据 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M1` | docs/PRD.md:207 | Windows TCG 启动 UEFI | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/config/machine.json`, `acceptance/local-private/tools/qemu/qemu-system-aarch64.exe`, `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd` | the target-guest boot chain does not exist on this host: no guest display has been witnes… |
@@ -57,11 +57,11 @@
 | `case7_notes_app_save_and_reopen` | docs/PRD.md:178 | 导入 UniPadNotes.ipa，输入本次生成的字符串并保存；关闭重开 App 后可读 | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance-e2e/UniPadNotes.ipa.sha256`, `acceptance-e2e/sample-UniPadNotes.ipa.precheck.json` | blocked_by:case6_tap_button_ten_times |
 | `M7` | docs/PRD.md:213 | 正确 RootFS/SystemOS 可用 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot53/bounds64-input-run/guest-input.log` | - |
 | `case8_shutdown_and_reboot_from_disk` | docs/PRD.md:179 | 正常关机，结束 QEMU 进程，再从磁盘启动新进程；两款 App 和保存的字符串仍存在 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
-| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | UNVERIFIED | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
+| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | evidence_absent:m8.original_launchd,m8.later_daemons |
+| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | UNVERIFIED | BLOCKED | — | evidence_absent:m9b.written,m9b.normal_shutdown,m9b.read_back |
 | `case9_three_cold_boots` | docs/PRD.md:180 | 重复冷启动流程三次，保存耗时和结果；测试失败时保留证据，不覆盖上次失败 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M9` | docs/PRD.md:215 | SpringBoard 可操作 | blocking | NOT STARTED | NOT RUN | FAIL | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
-| `M9a` | docs/PRD.md:216 | 软件/最小图形路径满足 UIKit | blocking | PARTIAL | NOT RUN | FAIL | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
+| `M9` | docs/PRD.md:215 | SpringBoard 可操作 | blocking | NOT STARTED | NOT RUN | FAIL | BLOCKED | — | refused:m9.veto.homescreen_screenshot_only:只展示主屏幕截图 |
+| `M9a` | docs/PRD.md:216 | 软件/最小图形路径满足 UIKit | blocking | PARTIAL | NOT RUN | FAIL | BLOCKED | — | refused:m9a.veto.wallpaper_only:只显示桌面壁纸 |
 | `case10_unsupported_platform_package` | docs/PRD.md:181 | 导入一个不支持的平台包，返回明确原因；已有可用系统和应用保持可恢复 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M10` | docs/PRD.md:218 | IPA 安装 | blocking | UNVERIFIED | NOT RUN | BLOCKED | FAIL | `acceptance/local-private/boot51/install-thread-start-boot/guest-channel.log` | there is no real guest install service on this host: install_service_unavailable is injec… |
 | `M12` | docs/PRD.md:221 | 输入与应用交互 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
@@ -88,8 +88,8 @@
 
 ## 未验证字段
 
-- M0: config/sources.lock.json is absent or unparseable, so there is no pinned source identity to inventory
-- M10a: there is no real guest install service on this host: install_service_unavailable is injectable in the fake guest and has never once succeeded against a real object
+- M0: evidence_absent:m0.clean_build_artifacts
+- M10a: evidence_absent:m10a.signature,m10a.entitlements,m10a.failure_reason
 - M13: probe_not_registered:M13
 - M14: probe_not_registered:M14
 - M15: probe_not_registered:M15
@@ -101,8 +101,8 @@
 - P1-6: -
 - WP00: sources.lock.json still declares frozen=false, so the pinned inputs are not a frozen baseline and no clean build has been run against them
 - WP01: sources.lock.json is not frozen, and the Windows cross-build chain still lacks iig, csh, the six SETUP host tools, Darwin freestanding headers and the two Apple-clang builtins (__builtin_xnu_type_summary / __builtin_xnu_types_compatible), so no clean build can be run against these pins
-- WP02: no UniXNU kernel image built from the pinned sources exists on this host. This used to be true and was recorded as the reason several milestones were BLOCKED; it is no longer true -- a prelinked UniXNU kernel with the admission symbols emit_prelink.py requires is present and boots, and the pr…
-- WP03: no UniXNU kernel image built from the pinned sources exists on this host. This used to be true and was recorded as the reason several milestones were BLOCKED; it is no longer true -- a prelinked UniXNU kernel with the admission symbols emit_prelink.py requires is present and boots, and the pr…
+- WP02: evidence_absent:wp02.run_directory,wp02.control_port
+- WP03: evidence_absent:wp03.unixnu_run_evidence,wp03.darwinboot_handoff
 - case1_start_new_qemu_process: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - M1: the target-guest boot chain does not exist on this host: no guest display has been witnessed in a guest channel. The kernel image and XNU initialisation that used to be named here are no longer missing -- a prelinked UniXNU kernel is present and boots, and it initialises to the BSD stage (imple…
 - case2_reach_springboard: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
@@ -114,11 +114,11 @@
 - case6_tap_button_ten_times: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - case7_notes_app_save_and_reopen: blocked_by:case6_tap_button_ten_times
 - case8_shutdown_and_reboot_from_disk: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
-- M8: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that ha…
-- M9b: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that h…
+- M8: evidence_absent:m8.original_launchd,m8.later_daemons
+- M9b: evidence_absent:m9b.written,m9b.normal_shutdown,m9b.read_back
 - case9_three_cold_boots: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
-- M9: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that ha…
-- M9a: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that h…
+- M9: refused:m9.veto.homescreen_screenshot_only:只展示主屏幕截图
+- M9a: refused:m9a.veto.wallpaper_only:只显示桌面壁纸
 - case10_unsupported_platform_package: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - M10: there is no real guest install service on this host: install_service_unavailable is injectable in the fake guest and has never once succeeded against a real object
 - M12: there is no real guest install service on this host: install_service_unavailable is injectable in the fake guest and has never once succeeded against a real object
