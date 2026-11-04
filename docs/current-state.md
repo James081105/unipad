@@ -10386,3 +10386,85 @@ against the spawn sequence.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (fifty-ninth, addendum AA): launchd reads the job plists fine, so the respawn loop is bluetoothd failing inside itself
+
+## The question addendum Z left
+
+Addendum Z narrowed the loop to one process and one exit status:
+`bluetoothd` exits with status 1 on all 905 launches.  The obvious next
+question is whether launchd can even start it.  A missing or unreadable
+job plist, or a matching failure, would produce exactly that symptom --
+and it would be a completely different fix.
+
+## The answer, from an emitter that was already there
+
+The channel carries `job.open`, one record per open launchd makes under
+the job directories, **with the errno**:
+
+```json
+{"event":"job.open","n":2,"job":"com.apple.jetsamproperties.J120.plist","err":0,"source":"XNU.openat_internal"}
+```
+
+**455 opens, 442 distinct job plists, and 453 of them
+succeeded.**  Only 2 failed, both with errno 2 (ENOENT):
+
+| job plist | errno |
+|---|---|
+| `com.apple.jetsamproperties.NonUI.plist` | 2 |
+| `com.apple.bootpd.plist` | 2 |
+
+And `com.apple.bluetoothd.plist` itself -- the process that cannot start -- was opened
+**2 times, every one with errno 0.**
+
+## What that rules out
+
+**The respawn loop is not a plist, matching or filesystem defect.**
+launchd finds and reads the job plists, including bluetoothd's own, and
+reads 442 distinct ones across the boot.  So the failure is INSIDE
+bluetoothd: it is exec'd, it runs, and it exits with status 1.
+
+That closes a whole class of causes and leaves a much smaller one.  It
+also means the earlier question -- why launchd declines
+`POSIXSpawnType=App` jobs -- is settled on this evidence: it does not
+decline them for want of a plist.
+
+## A second thing this explains
+
+`exec.seen` carries only two records:
+
+| n | comm | source |
+|---|---|---|
+| 1 | launchd | XNU.__mac_execve |
+| 2 | apfs_boot_util | XNU.__mac_execve |
+
+`launchd` itself and `apfs_boot_util`.  Not one of the 455 spawned
+daemons appears, because the `__mac_execve` emitter only fires on the
+exec path -- and addendum R established that 158 of launchd's 171
+children take the `fork1(PROC_CREATE_SPAWN)` branch where
+`spawn_no_exec = TRUE` and `__mac_execve` is never reached.  So a near
+empty `exec.seen` table is the expected shape of this boot, not a
+missing instrument.
+
+## And the one false positive, confirmed
+
+`job.springboard_open` fired 1 time(s):
+
+- `/System/Library/Preferences/Logging/Subsystems/com.apple.SpringBoard.plist` errno 0
+
+That is the Logging/Subsystems plist, not the launchd job -- the
+basename match the state document already recorded.  It succeeded, and it
+says nothing about SpringBoard's job.
+
+## Status
+
+Windows/real-guest: **PASS** -- read from the live guest's own channel.
+
+**The respawn loop's cause is narrowed twice now:** bluetoothd, exit
+status 1, 905 times; and launchd's half of the job is provably fine.  The
+remaining question is what bluetoothd does internally before it exits,
+and that needs its own log or stderr, which is not in this channel.
+
+Onsite: N/A.
