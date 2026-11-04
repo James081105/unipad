@@ -369,18 +369,20 @@ def test_the_pinned_board_line_still_diverges_from_the_delivered_payload() -> No
     assert "sheng-gpu-addon=1" in row["only_staged"], row
     assert row["only_delivered"] == [], row
     assert row["changed"] == [], row
-    # The two the display-vtable instrument added, and they are listed by name
-    # rather than left to the count, because the count alone cannot say which
-    # argument appeared.  `offline-legacy-slot-trace` arrived with the tracer
-    # (device commit aae08cd) and `offline-legacy-lift-refusals` with the
-    # refusal lifter on top of it.  Both are OFF-by-default instruments gated on
-    # a command-line argument, so a board that carries them boots exactly as one
-    # that does not -- the divergence is a capability, not a behaviour change.
-    assert "offline-legacy-slot-trace=1" in row["only_staged"], row
+    # The refusal lifter, listed by name rather than left to the count, because
+    # the count alone cannot say WHICH argument appeared.  It replaced a slot
+    # tracer that was naked AArch64 assembly: a symbol named from inline asm is
+    # emitted as an undefined reference ld64 will not resolve out of an archive,
+    # and PRD 8.1's root chain links this driver from
+    # libNativeLegacyDisplay.late.a while the first pass links the object
+    # directly -- same source, one red and one green.
     assert "offline-legacy-lift-refusals=1" in row["only_staged"], row
-    # 23 delivered arguments against the board's 28: the count is part of the
-    # recorded fact, so a sixth argument appearing is visible even if it is one
-    # nobody thought to list.  It was 26 until the display-vtable instrument
-    # added its two.
+    assert "offline-legacy-slot-trace=1" not in row["only_staged"], row
+    assert "offline-legacy-slot-trace=1" not in board_line, row
+    # 23 delivered arguments against the board's 27: the count is part of the
+    # recorded fact, so a fifth argument appearing is visible even if it is one
+    # nobody thought to list.  It was 26 until the display instrument added its
+    # argument, 28 while the tracer and the lifter were both there, and 27 again
+    # once the tracer went.
     assert len(DELIVERED_PAYLOAD_ARGS.split()) == 23, DELIVERED_PAYLOAD_ARGS
-    assert len(board_line.split()) == 28, board_line
+    assert len(board_line.split()) == 27, board_line
