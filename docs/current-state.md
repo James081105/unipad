@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-04 (interval fiftieth, addendum R). THE HEADLINE, and it retracts what this header used to say: **SpringBoard IS running on this build, and its parent is launchd.** Measured from live guest memory over QMP with the kernel's sha256 checked first, and PROVED by two fields of `struct proc` agreeing: `p_pptr` (a pointer to the parent's proc, offset 16) resolves to a live proc whose `p_pid` equals the word at offset 32 (`p_ppid`) for all 171 live processes -- 171 agree, 0 disagree, 0 unresolvable. SpringBoard is pid 27 and its parent is pid 1 (launchd); launchd's parent is kernel_task. Nothing was reparented: `p_original_ppid` equals `p_ppid` for all 171. The offset of `p_ppid` is recorded NOWHERE in this repo -- `guestobserve.py`'s p_pid/p_stat/p_comm come from `gdb-stop.py`'s CLI defaults -- so it was derived by scanning every word of the struct against five properties a parent field must have, and then decided by the second field rather than by the score, because a word that is 0 everywhere scores perfectly. **WHY SPRINGBOARD HAS NO CREATION RECORD, and it is not a defect:** 158 of launchd's 171 children have a `spawn.seen` record and 11 do not (9 xpcproxy, AccessibilityUIS, SpringBoard, kernel_task) -- and both sets have launchd as parent, so the split is by PATH, not by caller. There is exactly one `spawn.seen` emitter in the fork and it sits inside `if (error == 0 && !spawn_no_exec)` at kern_exec.c:4280; `spawn_no_exec = TRUE` is set at :4002 by the `fork1(PROC_CREATE_SPAWN)` branch that `:3869` selects for a PLAIN posix_spawn (`POSIX_SPAWN_SETEXEC` clear). So a child created by a plain posix_spawn runs, gets its `p_comm` from `set_proc_name()`, and is invisible to this instrument. WHICH attribute makes launchd choose one branch for 158 children and the other for 11 is UNMEASURED -- the record prints `comm` and nothing else. MEASURED ON THE CURRENT CAPTURE: 1055 spawn records with n contiguous 1..1055, no saturation, and bluetoothd + fairplayd.A2 are 877 of them (83%). **The real blocker is still the display:** stage=10, surface_found=1, `native_legacy_transfer_calls == 0` -- SpringBoard is up and has submitted no validated swap. Two instrument caveats travel with this: the capture is at **800x600** because the harness never passed `ramfb_driver` (the driver exists, 12800 bytes; the 1376x1024 readings came from runs that did), and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Also note: the staged ESP's `args =` line is ONE long line and a truncated read of it produced a false 'the offline-legacy args are missing' conclusion this interval; it carries all 26 arguments including `offline-legacy-transfer=1`. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
-Main repo at `13025da`.
+Last updated: 2026-11-04 (interval fifty-first, addendum S). THE HEADLINE, and it supersedes what this header used to lead with: **the display blocker now has a measured cause, and it is not a configuration defect.** The framebuffer's user client is the ORIGINAL Apple `IOMobileFramebufferUserClient` — the probe interposed it and saved the vtable slot it displaced, `0xfffffff005778d40`, which is the exact address `scripts/audit-mobile-graphics-userclient.py` extracts from the target's own `com.apple.iokit.IOMobileGraphicsFamily`, confirmed by five byte anchors re-read off the live kernel. **backboardd (pid 58) opened it and made 15 external calls; 11 returned `0xe00002c7` = `kIOReturnUnsupported` and one returned `0xe00002bc` = `kIOReturnError`.** Those refusals are NOT missing dispatch entries: the table at `0xfffffff005f354c0` has 90 rows, its null set is exactly [59,60,61,62,63,64,65,70,71] as the audit records, 81 of 90 rows carry a function, and every selector any client used is among them — so the method RAN and refused. The chain closes on this kernel's object: backboardd's client field `+0xd8` is `0xfffffff6a8afa000`, which is `native_legacy_object`. **SpringBoard (pid 27) never opened the framebuffer at all.** Selector 74's refusal is by design (`NativeLegacyDisplay.cpp:370-374` returns `kIOReturnUnsupported` with the comment "This backend implements no trace-key subscription contract", and its dispatch row `in=(1,0) out=(2,64)` is exactly that signature); the other eleven land in the original `IOMobileFramebufferLegacy` base, which this port does not override — and the fork says why at `NativeLegacyDisplay.cpp:85-87`: *"the platform subclass that normally writes it is not part of this port."* The driver itself is fully up: stage=10, surface_found=1, dt_attached=1, registration_calls=1, properties_length=576, pm_stage=4, and the GOP is mapped at physical `0x1BC7A0000` — DARWINBOOT's own `video base` — at 800x600 and 1920000 bytes. **Earlier finding, still standing:** SpringBoard IS running and its parent is launchd, proved by two fields of `struct proc` agreeing across all 171 live processes (`p_pptr` at offset 16 resolves to a live proc whose `p_pid` equals the word at offset 32; 171 agree, 0 disagree). SpringBoard has no `spawn.seen` record because 158 of launchd's 171 children take the `spawn_no_exec` branch at kern_exec.c:4002 and 11 do not, and the single emitter sits inside `if (error == 0 && !spawn_no_exec)` at :4280 — a split by PATH, not by caller, and not a defect. Three instrument caveats travel with all of this: `GuestObserver.translate()` walks `_TABLE_SHIFTS` from bit 30, so only bits 0..38 of an address reach an index and a mistyped high half is silently accepted; the capture is at **800x600** because the harness never passed `ramfb_driver`; and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
+Main repo at `8aa48f3`.
 
 ---
 
@@ -9359,5 +9359,279 @@ The display defect is unchanged and is not re-measured here.
 
 Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, fork `3d83de1`,
 lock pin `3d83de17dd4e4be468ac3fb8d30ee21c597e8972`, kernel `4914d56c`, booting since 12:03Z.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fifty-first, addendum S): the framebuffer's client is Apple's own, and twelve of its fifteen calls were refused by code this port does not implement
+
+Addendum R closed the parent question and left the display blocker as a
+symptom: *SpringBoard is up and has submitted no validated swap.*  That
+reading is true and it is one link too late.  This addendum measures the
+link before it, and the cause turns out to have a name, an address and a
+status code attached to every one of its refusals.
+
+## What was open, and what closes it
+
+`native_legacy_transfer_calls == 0` was read as "no client ever
+presented a frame".  The counters that answer the question one step
+earlier were not in the window.  They are now:
+
+`native_legacy_client_calls == 5`, and
+`native_legacy_client_pid == 93`.  So the framebuffer WAS opened --
+5 times -- and `client_pid` names only
+the last of them, because `native_legacy_client_enter()` overwrites it on
+every open.  The probe keeps the full table: `LegacyDisplayProbe.cpp:381`
+declares `static ClientStat seenClients[8]`, and `interpose()` fills one
+entry per user client with its pid, its per-selector call and failure
+counts, and the status each selector last returned.
+
+## The table is reachable only under its mangled name
+
+The first version of the reader looked up `seenClients` and found
+nothing, which reads exactly like "this kernel does not have that
+table".  It does.  A C++ file-scope `static` is emitted under its
+MANGLED local-linkage name, so the symbol table carries
+`__ZL11seenClients` and `__ZL15seenClientCount`, not the source
+spelling.  Looking up the source spelling returns `None` and produces a
+confident negative about a table that was there the whole time.  This is
+the third time this interval has had to be told that a missing symbol is
+not a missing fact.
+
+## The five clients
+
+| | pid | process | calls | fails |
+|---|---|---|---|---|
+| C0 | 58 | backboardd | 15 | 12 |
+| C1 | 93 | MobileGestaltHel | 2 | 1 |
+| C2 | 86 | not in the snapshot | 0 | 0 |
+| C3 | 74 | PerfPowerService | 0 | 0 |
+| C4 | 93 | MobileGestaltHel | 1 | 0 |
+
+Every one of the five carries the SAME `original_external`:
+`0xfffffff005778d40`.  That is the function the probe displaced when it
+pointed vtable slot 168 at its own wrapper, so it is the real
+`externalMethod` the framebuffer's user client was using before the
+probe touched it.
+
+**And it is Apple's.**  `scripts/audit-mobile-graphics-userclient.py`
+extracts that exact address out of the target's own
+`com.apple.iokit.IOMobileGraphicsFamily` and calls it *"Original
+unsigned selector <90 check and kIOReturnInvalid refusal"*.  Five byte
+anchors were re-read off the live kernel before anything was believed:
+
+- `+0x54` == `0x71016908`
+- `+0x58` == `0x1a9f27e8`
+- `+0x5c` == `0x370000a8`
+- `+0x64` == `0x32030fe8`
+- `+0x7c` == `006d40f9080040f908d942f900013fd6`
+
+All five match, and `native_legacy_client_class` reads
+`IOMobileFramebufferUserClient`.  So the client backboardd was
+driving is the ORIGINAL Apple user client, not a stand-in this port
+wrote.
+
+## Every selector any client used has a dispatch entry
+
+Eleven of backboardd's fifteen calls returned
+`0xe00002c7` and one returned `0xe00002bc`.  The target's
+own `IOKit/IOReturn.h` names both values exactly:
+
+```c
+#define kIOReturnUnsupported     iokit_common_err(0x2c7) // unsupported function
+```
+
+and XNU's `IOUserClient::externalMethod` returns that one value from one
+place:
+
+```c
+if (!(method = getTargetAndMethodForIndex(&object, selector)) || !object)
+	return kIOReturnUnsupported;
+```
+
+which would mean the selectors were missing from the dispatch table.
+**They are not.**  The table is at `0xfffffff005f354c0`, 90 rows of 24 bytes
+(`function, scalar_in, struct_in, scalar_out, struct_out`), and its null
+set is [59, 60, 61, 62, 63, 64, 65, 70, 71] -- exactly the nine the audit records.  81 of 90
+rows carry a function.  Every selector any client used is among them:
+
+| selector | used by | dispatch function | in (scalar, struct) | out (scalar, struct) | result |
+|---|---|---|---|---|---|
+| 6 | pid 58 x1 | `0xfffffff005779518` | (3, 0) | (0, 0) | ok |
+| 8 | pid 58 x1, pid 93 x1, pid 93 x1 | `0xfffffff00577966c` | (0, 0) | (2, 0) | ok |
+| 12 | pid 58 x1 | `0xfffffff005779f24` | (1, 0) | (0, 0) | kIOReturnUnsupported |
+| 15 | pid 58 x1 | `0xfffffff00577a014` | (2, 0) | (1, 0) | kIOReturnError |
+| 22 | pid 58 x1 | `0xfffffff00577a2e4` | (1, 0) | (0, 0) | kIOReturnUnsupported |
+| 27 | pid 58 x1 | `0xfffffff00577a464` | (0, 0) | (0, 3084) | kIOReturnUnsupported |
+| 28 | pid 93 x1 | `0xfffffff00577a554` | (0, 0) | (1, 0) | kIOReturnNotFound |
+| 29 | pid 58 x1 | `0xfffffff00577a5ac` | (0, 0) | (0, 8) | kIOReturnUnsupported |
+| 33 | pid 58 x1 | `0xfffffff00577a770` | (1, 0) | (0, 0) | kIOReturnUnsupported |
+| 50 | pid 58 x1 | `0xfffffff00577a25c` | (2, 0) | (0, 0) | kIOReturnUnsupported |
+| 57 | pid 58 x1 | `0xfffffff00577a200` | (0, 0) | (1, 0) | kIOReturnUnsupported |
+| 74 | pid 58 x1 | `0xfffffff00577a718` | (1, 0) | (2, 64) | kIOReturnUnsupported |
+| 79 | pid 58 x2 | `0xfffffff0057799b4` | (0, 0) | (0, 0) | kIOReturnUnsupported |
+| 84 | pid 58 x1 | `0xfffffff00577a4dc` | (0, 4) | (0, 0) | kIOReturnUnsupported |
+| 88 | pid 58 x1 | `0xfffffff00577adb0` | (1, 0) | (0, 0) | ok |
+
+Sixteen distinct selectors across 18 calls from five
+clients; backboardd used fourteen of them.  Every row has a function,
+so not one of these calls was refused for a missing entry.
+So the method RAN and returned `kIOReturnUnsupported`.  The refusals
+are answers, not absences.
+
+## The chain closes on this kernel's display object
+
+`audit-mobile-graphics-userclient.py` adds the next link: *"All
+in-range requests must first call the actual provider at field 0xd8,
+virtual slot 182"*.  If the client's `+0xd8` did not name THIS
+kernel's display object, every conclusion above would be about the
+wrong object.  Read:
+
+- `native_legacy_object` = `0xfffffff6a8afa000`
+- C0 (pid 58, backboardd): `+0xd8` = `0xfffffff6a8afa000` -- == the display object
+- C1 (pid 93, MobileGestaltHel): `+0xd8` = `0x0` -- 0 (freed)
+- C2 (pid 86, not in the snapshot): `+0xd8` = `0x0` -- 0 (freed)
+- C3 (pid 74, PerfPowerService): `+0xd8` = `0x0` -- 0 (freed)
+- C4 (pid 93, MobileGestaltHel): `+0xd8` = `0x0` -- 0 (freed)
+
+**backboardd's provider field is this kernel's display object.**  The
+other four are `0` -- those clients have been freed, which is why their
+`*object` is `0` too.  So the twelve refusals really did come back
+through this kernel's `NativeLegacyDisplay`.
+
+## One of the twelve is deliberate, and the fork says so
+
+Selector 74 is `supportedFrameInfo`.  `NativeLegacyDisplay.cpp:370-374`
+overrides it and ends:
+
+```c
+*count=0;*mask=0;bzero(key,64);return kIOReturnUnsupported;
+```
+
+with the comment *"Selector 74 enumerates optional frame-info trace
+keys, not display modes.  This backend implements no trace-key
+subscription contract."*  Its dispatch row is `in=(1,0) out=(2,64)`,
+which is exactly that signature: one scalar in, two scalars out, a
+64-byte key out.  So at least one of the twelve is a refusal BY DESIGN.
+
+## The other eleven, and the fork's own explanation
+
+`NativeLegacyDisplay` overrides roughly twenty methods.  Of the twelve
+failing selectors only 74 maps to one of them.  The other eleven land in
+the ORIGINAL `IOMobileFramebufferLegacy` base, which this port does not
+override.  The fork already knows why, and it is written in the source
+next to the one method that works around it:
+
+> *"...the platform subclass that normally writes it is not part of
+> this port, so without it the user client's wait (selector 6) answers
+> kIOReturnBusy forever and the compositor never presents."*
+
+`NativeLegacyDisplay.cpp:85-87`.  The eleven refusals are that same
+missing platform subclass, seen from the other eleven call sites.
+
+## SpringBoard never opened the framebuffer
+
+The five client pids are [58, 93, 86, 74, 93].  **SpringBoard (pid
+27) is not among them.**  Only two live processes could
+own a screen, and the one that did is backboardd:
+
+| pid | process | state |
+|---|---|---|
+| 27 | SpringBoard | run |
+| 58 | backboardd | run |
+
+So `native_legacy_swap_validation_calls == 0` and
+`native_legacy_prepare_calls == 0` for a measured reason: backboardd
+opened the framebuffer, made 15 external calls, was
+refused on 12 of them -- eleven with `kIOReturnUnsupported` and one
+with `kIOReturnError` -- and never got as far as submitting a swap.
+The driver is not idle; it is being asked for things it does not have.
+
+Clients that opened it and called NOTHING: ['pid 86 (?)', 'pid 74 (PerfPowerService)'].
+
+## The driver itself is up, and that is a reading
+
+| counter | value |
+|---|---|
+| `native_legacy_stage` | 10 |
+| `native_legacy_surface_found` | 1 |
+| `native_legacy_dt_attached` | 1 |
+| `native_legacy_surface_status` | 0 |
+| `native_legacy_registration_calls` | 1 |
+| `native_legacy_properties_length` | 576 |
+| `native_legacy_init_result` | 1 |
+| `native_legacy_start_result` | 1 |
+| `native_legacy_probe_match` | 1 |
+| `native_legacy_parent_match` | 1 |
+| `native_legacy_pm_stage` | 4 |
+| `native_legacy_pm_calls` | 4 |
+| `native_legacy_pm_status` | 0 |
+| `native_legacy_unit_scale_calls` | 1 |
+| `native_legacy_chosen_scale` | 1 |
+| `native_legacy_gop_physical` | 7457079296 (`0x1bc7a0000`) |
+| `native_legacy_gop_width` x `native_legacy_gop_height` | 800 x 600 |
+| `native_legacy_gop_bytes` | 1920000 |
+
+The GOP is mapped at physical `0x1bc7a0000`,
+which is DARWINBOOT's own `video base=0x1BC7A0000`, at 800x600 and
+1920000 bytes.  Nothing is wrong with the
+driver's own half of the job.
+
+## Two things this addendum nearly got wrong, both recorded
+
+**The vtable could not identify the class, and the reason is the
+probe itself.**  `interpose()` does not merely read the client's
+vtable; it `IOMalloc`s a COPY, points the object's vptr at the copy,
+and overwrites slot 168.  So `*client` is a heap address and can never
+be matched against the symbol table.  Reading it as "no `__ZTV`
+symbol, so the class is unknown" would have been a negative off an
+instrument the probe had already modified.  The original function is
+the one the probe saved BEFORE overwriting the slot, which is why
+`original_external` is the field that answers the question.
+
+**"Selector 6, the swap/wait selector" was an annotation, not a
+measurement.**  It came from the probe's own field names
+(`sel6_first`, `sel6_seen`) and from `NativeLegacyDisplay.cpp:87`'s
+comment.  The dispatch table says selector 6 is `in=(3,0) out=(0,0)`,
+which is consistent with the recorded argument triple
+`0x0 0x80000003 0x0` and with the fork calling it *the user client's
+wait*, but the table does not name it.  Recorded as an inference, not a
+fact.
+
+**And the address reader has a hole in it that this addendum walked
+into.**  `GuestObserver.translate()` walks `_TABLE_SHIFTS =
+((1, 30, 0xFF), (2, 21, 0x1FF), (3, 12, 0x1FF))`, so only bits 0..38
+of a kernel virtual address ever reach an index.  Two addresses that
+agree on their low 39 bits translate to the same physical address, and
+everything above bit 38 is ignored without a refusal.  Measured:
+`0xffffffff005778d40`, `0x0ffffff005778d40`, and the same value with bit
+62, bit 40 or bit 39 flipped all translate to physical
+`0x49578d40`; only an address whose LOW bits are wrong is refused.  The
+first version of the dispatch reader carried an `EXTERNAL` constant
+with one hex digit too few and still read the right bytes -- which is
+not a lucky read, it is the instrument not asking.  The anchors are the
+only reason this table can be believed, and they are checked before a
+single row is read.
+
+## Status
+
+Windows/real-guest: **PASS for the client measurement** -- read from
+live guest memory over QMP with the kernel's sha256 verified first, the
+original `externalMethod` confirmed by five byte anchors, and the
+provider field closing the chain on this kernel's display object.
+**UNMEASURED for what the eleven unimplemented methods would need**:
+the platform subclass is not in this port, and building it is a code
+change, not an observation.
+
+**The display defect is now correctly located, and it is not a
+configuration defect.**  It is eleven API methods the original
+`IOMobileFramebufferLegacy` expects its platform subclass to supply,
+plus a compositor that never reaches a swap because it is refused
+first.  What is still open: whether the eleven are all needed before a
+frame can be presented, or only some of them.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, fork
+`3d83de1`, kernel `4914d56`, booting since 12:03Z.
 
 Onsite: N/A.
