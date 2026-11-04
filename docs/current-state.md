@@ -7973,3 +7973,201 @@ dispatched on lock commit 620f440 at 10:56Z. The push-triggered preflight run
 41817495435 cross-checks `unixnu_commit` against the lock on the same ref.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum I): the capture ended, and it
+# settled three of the four open tasks with measurements no cap can bound
+
+## H is wrong about one thing, and the correction is the result
+
+Addendum H said: "The harness is alive. PID 39124, `capture-springboard-boot.py`,
+created 16:37:57 local, with a 21600 s budget. It has been running 2h27m and
+still has about 3.5 hours left."
+
+It is not alive. It stopped at `listen_seconds: 9106` of 21600, on
+`stopped_on_quiet: true`, after `last_bytes_at_s: 7902` -- 1204 s of silence
+against a 1200 s threshold. The report is preserved verbatim at
+`local-private/boot53/spawn-failed-input-run-scratch/harness-final-report.txt`,
+because it was only ever in a background task's stdout and that buffer is bounded.
+
+**The quiet is the emitter's bound, and this time it is a measurement rather than
+an inference.** The harness started at 08:38Z. Its last channel bytes arrived at
+t=7901 s, which is 10:49:41Z. `guest-channel.log`'s last write is 10:50:02Z, and
+that write is `exit.seen n=512` -- the exit emitter's cap. The channel did not go
+quiet because the guest went quiet; it went quiet because the last emitter that
+could still write hit its bound and stopped. The two timestamps are 21 s apart and
+the last record is the cap.
+
+So addendum G's honest statement -- "the guest did not go quiet and the loop did
+not persist, the emitter went blind" -- is now supported by a correlation rather
+than by an argument. The guest's silence and the instrument's bound are the same
+event.
+
+## What the capture measured that no cap can bound
+
+These come from instruments with no record limit at all, so they are not affected
+by anything in addenda G or H.
+
+**The screen changed once, at t=122, and then never again for 8884 s.** 74
+dumps, 2 distinct images:
+
+    t=0      fb086cbfb138cfb9d6c3e504177460be884190a985a93412f7f3d248b0d42fdd
+    t=122    f54dadc07fb07106c07e7383d897053a0f7d9e50b53b11c86fecc9e694cc3081
+    t=242 through t=9000: f54dadc0... every time
+
+`f54dadc0` is the exact sha256 of the screendump taken directly through QMP on
+the live guest during addendum H, which is what proves the harness and that dump
+were looking at the same guest. The image is the UniXNU EFI boot menu, and the
+pixel comparison in H -- 0 of 480000 pixels differ between t=121 and t=8820 --
+stands.
+
+**H's paragraph about a mis-sourced baseline was solving a problem that did not
+exist.** The harness's own timeline for this boot was in the background task's
+stdout the whole time and records the t=122 change directly. The pixel diff and
+the hash timeline agree. I looked in the wrong file first, found the right answer
+anyway, and then wrote up the wrong file as though it were the finding.
+
+**The Home key was pressed 18 times and never changed the screen once.**
+
+    t=486, 980, 1461, 1941, 2422, 2916, 3411, 3891, 4371, 4866,
+       5360, 5853, 6345, 6836, 7327, 7820, 8310, 8798  --  all changed=False
+
+18 presses over 2h27m, each followed by a 5 s settle and a screendump, and not
+one produced a single different pixel. The input devices were attached
+(`input_devices: true` in the report) and the install frame was sent 299 times
+with `send_errors: []`. This is a clean negative on the input path reaching the
+display, and unlike the spawn and exit negatives it is not bounded by anything.
+
+What it does NOT establish: whether the guest's HID driver received the key at
+all. The harness presses it through QEMU's input layer; the guest has to have a
+driver bound to `virtio-keyboard-device` for the press to mean anything. That is
+a separate question and it is not answered here.
+
+**The respawn table, with measured periods.** The harness computed this from the
+spawn records it did get:
+
+    bluetoothd        214 spawns,  median gap  16 s
+    fairplayd.A2      131 spawns,  median gap  30 s
+    com.apple.datami     5 spawns, median gap 883 s
+    containermanager    2 spawns, median gap 127 s
+    cfprefsd            2 spawns, median gap   0 s
+    locationd           2 spawns, median gap 3543 s
+    CloudKeychainPro    2 spawns, median gap 1006 s
+
+Task #23 asked about "the bluetoothd/fairplayd respawn loop". It is two loops
+with different periods and, as it turns out, different causes.
+
+## The exit codes say bluetoothd is failing, not cycling
+
+The exit emitter records `rv`, which its own comment defines precisely:
+
+> rv is the wait status the kernel is about to hand the parent, so it is the
+> kernel's own number and not an interpretation of it. Negative is emitted with
+> a sign: a process killed by a signal reports a negative status.
+
+`zzz-native-springboard-events.patch:371-374`. So `code` is the raw wait status,
+not `WEXITSTATUS`. Decoding it under XNU's `W_EXITCODE(ret, sig) = (ret << 8) |
+sig`:
+
+    code  256  ->  WIFEXITED, WEXITSTATUS 1    303 exits (300 bluetoothd)
+    code    0  ->  WIFEXITED, WEXITSTATUS 0    205 exits (174 fairplayd.A2)
+    code    1  ->  killed by signal 1 (SIGHUP)   2 exits (MSUEarlyBootTask, launchd)
+    code 3328  ->  WIFEXITED, WEXITSTATUS 13    1 exit  (prng_seedctl)
+    code    6  ->  killed by signal 6 (SIGABRT)  1 exit  (transparencyd)
+
+**The decode is proved by impossibility, not by the header.** If `rv` were the
+raw exit code, `bluetoothd` would have called `exit(256)`, which POSIX truncates
+to 0 -- so a raw exit code of 256 is not reachable. As a wait status, 256 is
+exactly `W_EXITCODE(1, 0)`. All five values decode consistently under the
+wait-status reading and one of them is impossible under the raw-exit-code
+reading. The XNU header itself is not in this tree -- only the patches are -- so
+the decode is inferred from the encoding, and it is labelled as such.
+
+**So bluetoothd exited with status 1 three hundred times.** That is a failure
+exit, not a clean cycle. It was relaunched every 16 s regardless. The guest was
+run with `-nic none` and no Bluetooth device of any kind, so the obvious cause is
+that bluetoothd cannot find a controller and `exit(1)`s, and launchd's KeepAlive
+restarts it forever. That is a hypothesis with an obvious test and an
+investigator is checking the plist and the device tree.
+
+**fairplayd.A2 is the opposite**: 174 clean `exit(0)`s, relaunched every 30 s. A
+daemon that completes successfully and is immediately relaunched is a different
+defect from one that fails, and the two should not have been reported as one
+"respawn loop".
+
+## The display started. The defect is downstream of the probe.
+
+The harness decodes `diag.legacy_display_status` itself, and its decode is not
+the one I gave it in addendum H:
+
+    stage 10 -- the display started AND phase == 4: activeLegacyDisplay is set
+    and the GOP presenter can be built
+
+So `surface_found: 1` and `surface_status: 0` mean the probe SUCCEEDED and set
+`activeLegacyDisplay`, and the GOP presenter can be built. Addendum H said "the
+probe found a surface and nothing drew to the surface, or what it drew went
+somewhere the ramfb is not", which is the right shape but too weak: the display
+did not merely find a surface, it initialised.
+
+What is still missing is whatever happens after `activeLegacyDisplay` is set. The
+screen shows the bootloader's last frame with the green bar that the menu itself
+says means the kernel entry code ran, and the kernel spawned 512 processes behind
+it. So the hand-off is not in doubt, the display probe is not in doubt, and the
+gap is between the two.
+
+## `springboard.running` and `springboard.interaction` never appeared on the channel
+
+The report's `emitter_counts` field is not a count of runtime events. It is
+`{e: kernel_bytes.count(e.encode()) for e in wanted}` -- a count of how many times
+each literal appears in the KERNEL BINARY. It reports `springboard.running: 1`
+and `springboard.interaction: 1`, which means those literals exist in the image,
+not that they fired.
+
+And that gate is known-unreliable, by the harness's own words:
+`"recorded, not enforced: a mergeable-string image can hide a literal that is
+present, so absence is not evidence (build 41617257137)"`. The same field reports
+`exec.seen: 0`, `exit.seen: 0` and `spawn.seen: 0` -- three emitters that
+demonstrably fired 512, 512 and 2 times respectively on this very channel. The
+gate produces false negatives on emitters that provably ran.
+
+**So the literal count is not evidence that the SpringBoard emitters are in the
+kernel either.** The only reliable statement is the direct one, from the
+harness's own event list:
+
+    missing (the experiment): ['springboard.running', 'springboard.interaction']
+
+Neither record ever appeared on the channel in 2h32m of listening, across 356
+byte-arrival batches totalling 139590 bytes, while 512 processes spawned and 512
+exited. **SpringBoard did not run.** That is the whole finding, and it needs no
+instrument beyond the channel itself.
+
+## Status
+
+Windows/real-guest: the capture is COMPLETE and its instrument is FAIL, as
+predicted. spawn.seen and exit.seen both saturated at 512; the channel went quiet
+at t=7901 s, 21 s before the exit emitter's cap was written, and the harness
+stopped on quiet at t=9106 s. PASS for everything measured without a bound: the
+screen's single change at t=122 and 8884 s of nothing after it, 18 Home presses
+with no effect, the respawn table with measured periods, and the exit-code
+histogram.
+
+Answered by this addendum:
+- #21 the six-hour capture: ended at 2h32m on quiet; its quiet is the emitter's
+  bound, correlated to within 21 s of the cap being written.
+- #23 the respawn loop: two loops, not one. bluetoothd exits 1 every 16 s;
+  fairplayd.A2 exits 0 every 30 s.
+- #24 the framebuffer: frozen on the EFI boot menu since t=122, measured in
+  pixels; the display probe SUCCEEDED and set activeLegacyDisplay, so the defect
+  is downstream of the probe.
+
+Still open:
+- #22 why no App/Background job spawned. Unchanged, and now with a sharper edge:
+  the SpringBoard emitters are absent from the channel, so SpringBoard did not
+  run, and the window the capped emitters could see ended before the session
+  phase. The 65536-cap build will say whether the same is true with 128x the
+  window.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, in progress at the
+time of writing. Preflight 41817495435 passed on the same ref, which is the run
+that cross-checks `unixnu_commit` against the lock.
