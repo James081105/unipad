@@ -8732,3 +8732,93 @@ Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, booting since
 12:03Z, spawn n=671, exit n=538, job.open n=454 at the time of writing.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum O): a corrupt git object, its cause,
+# and a repair that will be needed again
+
+## What happened
+
+`git fsck` reported:
+
+    error: inflate: data stream error (incorrect header check)
+    error: unable to unpack header of .git/objects/35/e5ab85...
+    missing blob 35e5ab856febb937343274865313f62c6b5695b0
+
+The blob is `docs/current-state.md` at commit `a35be3bfed123c6374d152c197ebf3665499e9e1`
+(2026-11-03 13:29:31 +0800), which is reachable from `refs/heads/main` and from
+`refs/remotes/origin/main`. The loose object's mtime was 2026-11-03 05:29Z, so it
+was written corrupt and sat there for a day and a half.
+
+**Nothing failed.** Every commit, push and checkout worked, because they only need
+the CURRENT tree. The corruption surfaced only when a command happened to read
+that historical blob. A repository can carry a corrupt object indefinitely and
+tell you nothing.
+
+**This is an environment defect, not a product or test defect.** F: is a 601 GB
+volume at 100% used, and a write that runs out of space mid-flight produces a
+truncated object. The project's own standing note about this host already says
+"C: drive has very little free ... F: (5.9 GB free, 100% used)". It was 4.8 GB
+free at the time of the corruption.
+
+## The repair, in four steps, because `git fetch` does not do it
+
+1. **Find the commit that owns the blob.** `git rev-parse <commit>:<path>` cannot
+   resolve it -- the blob is what is missing -- so this uses `git ls-tree`, which
+   reads only the tree and not the blob:
+
+       for c in $(git log main --format=%H -- docs/current-state.md); do
+         git ls-tree $c docs/current-state.md | grep -q $SHA && echo $c
+       done
+
+2. **Fetching by SHA is a no-op.** `git fetch origin <sha>` succeeded and returned
+   FETCH_HEAD, but git negotiates on "have" lines and the local repo already had
+   the commit, so the server sent nothing. The blob stayed missing.
+
+3. **Get the content from the GitHub API at that commit** and verify it by hash
+   before writing anything:
+
+       gh api "repos/James081105/unipad/contents/docs/current-state.md?ref=a35be3bf" -q .content
+
+   Decoding it and computing `sha1("blob <len>\0" + data)` gave
+   `35e5ab856febb937343274865313f62c6b5695b0` -- an exact match. **The hash check is
+   what makes this safe**: a file that did not hash to the expected SHA would have
+   been refused rather than written into the object store.
+
+4. **Write it with `git hash-object -w`**, which puts the object in place under the
+   SHA its content dictates. `git fsck` then reported no errors apart from the
+   normal dangling objects, and `git show a35be3bf:docs/current-state.md` reads
+   again.
+
+The corrupt object was backed up first at
+`local-private/tmp/git-repair/corrupt-blob.bak` (98484 bytes) and the recovered
+content at `local-private/tmp/git-repair/current-state-a35be3bf.md` (233532 bytes).
+Neither is needed any more; they are kept until the next fsck is clean on a
+fresh clone.
+
+## The cause was fixed too, not just the symptom
+
+F: was at 4.8 GB free. Three numbered boot-input bundles from 2026-10-29 to
+2026-10-30 (`local-private/tmp/bundle7`, `bundle8`, `bundle9`, 2.6 GB total) were
+superseded and are also retained in CI for 30 days, so they were reclaimed. F: is
+now at 7.4 GB free.
+
+**That is a mitigation, not a fix.** The volume is a 601 GB disk at 99% used and
+the project's own builds each produce a 1.16 GB artifact plus a 310 MB boot-inputs
+bundle. The next full disk will corrupt another object, and the next one may not
+be a historical version of a document. A `git fsck` after every large write, or a
+move of the scratch and bundle directories onto a volume with headroom, is the
+actual fix and neither is done.
+
+## Status
+
+Environment: one corrupt loose object, repaired and verified by hash. Root cause
+is F: at 100% used, mitigated by reclaiming 2.6 GB of superseded bundles, not
+fixed.
+
+Windows/real-guest: unchanged. The 65536-cap kernel is still capturing; at the
+time of writing spawn n=732, exit n=599, job.open n=454, no saturation record, no
+SpringBoard record.
+
+Onsite: N/A.
