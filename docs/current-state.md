@@ -10468,3 +10468,102 @@ remaining question is what bluetoothd does internally before it exits,
 and that needs its own log or stderr, which is not in this channel.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (sixtieth, addendum AB): the refusals did not merely fail -- they made the compositor abandon the framebuffer, permanently
+
+## The question this answers
+
+Addendum S measured that 11 of backboardd's 15 external calls were
+refused with `kIOReturnUnsupported`, and addenda T through V
+characterised the gap.  None of them established whether those refusals
+are a **symptom** of something else or the **cause** of the frozen
+screen.
+
+The distinction matters.  If backboardd kept probing, the refusals would
+be noise and the real blocker would be elsewhere.  If it stopped, the
+refusals are the blocker -- and the fix is to stop them, not to look
+further.
+
+## The measurement
+
+The probe's client table read twice, 90 seconds apart:
+
+| | pid | calls | fails |
+|---|---|---|---|
+| C0 | 58 | 15 | 12 |
+| C1 | 0 | 0 | 0 |
+| C2 | 0 | 1 | 0 |
+| C3 | 0 | 0 | 0 |
+| C4 | 0 | 0 | 0 |
+
+**Nothing moved.**  `seenClientCount` stayed at 5, and every
+client's call and fail counts are identical.  backboardd is still entry
+0, still pid 58, still 15 calls and 12 fails -- exactly the numbers
+addendum S recorded hours earlier.
+
+## So the refusals are the cause
+
+backboardd opened the framebuffer, probed it with 15 external methods,
+was refused 12 times, **and never called again.**  Not in 90 seconds,
+not in the hours since.  A compositor that had merely hit a transient
+error would retry; one whose capability probe failed does not set up a
+swap at all.
+
+That closes the causal chain, end to end, with every link measured:
+
+1. backboardd opens the framebuffer -- 5 clients, `client_calls == 5`.
+2. backboardd probes it -- 15 external methods, all with dispatch
+   entries, so every one RAN.
+3. 12 are refused `kIOReturnUnsupported` by the original
+   `IOMobileFramebufferLegacy` base, because this port implements 14 of
+   the 190 methods that base exposes above vtable slot 167.
+4. **backboardd never calls again** -- measured, twice, hours apart.
+5. No swap is submitted: `swap_validation_calls == 0`, and the queue is
+   empty in the generated ABI's own sense (head `0`, tail
+   `display+5480`).
+6. No frame is presented: `transfer_calls == 0`, and `screendump` is
+   byte-identical across the whole interval.
+
+**Step 4 is the link that was missing, and it is the one that makes the
+refusals causal rather than incidental.**  The screen is frozen because
+the compositor walked away, and it walked away because it was refused.
+
+## What this changes about the next step
+
+It makes the experiment small and falsifiable.  The question is no longer
+"what is wrong with the display" -- it is **"which of the 12 refusals
+does backboardd's probe gate on"**, and that is answerable by making one
+refusal stop and watching whether backboardd proceeds.  A candidate
+already exists and is cheap: `supportedFrameInfo` (selector 74) returns
+`kIOReturnUnsupported` *by design* in `NativeLegacyDisplay.cpp:370-374`,
+and its dispatch row `in=(1,0) out=(2,64)` is exactly that signature.
+Returning success with `*count = 0` there is a one-line change.
+
+**It also means the change needs a reboot to test.**  backboardd does not
+re-probe, so patching the running guest would prove nothing -- the
+compositor has already made its decision.  That rules out the tempting
+in-memory experiment and leaves a kernel change plus a boot.
+
+## One detail worth recording
+
+Entries C1, C3 and C4 now read pid 0 where addendum S read 93, 74 and
+93.  Those clients were freed; `interpose()`'s vtable copy went with
+them, and the pid field was zeroed on the way out.  C1's selector sums
+read as freed-memory garbage.  Only C0 (backboardd) and C2 are still
+live, and only C0 ever did anything.
+
+## Status
+
+Windows/real-guest: **PASS** -- the client table read twice from the live
+guest over QMP with the kernel's sha256 verified first, 90 s apart,
+and cross-checked against the counts addendum S recorded hours earlier.
+
+**The display blocker's causal chain is now complete and every link is
+measured.**  The remaining question is which refusal to lift first, and
+that needs a kernel change and a reboot.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
