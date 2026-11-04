@@ -8564,3 +8564,91 @@ Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, caps verified in
 the image, booting since 12:03Z.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum M): spawn.seen passed 512 on a real
+# guest, and job.open was never window-limited at all
+
+## The emitter is no longer blind, and this is the measurement the interval was for
+
+The 65536-cap kernel has been capturing since 12:03Z. At spawn n=513 the watcher
+fired:
+
+    PAST THE OLD CAP: spawn.seen reached n=513, which the previous kernel's
+    emitter could not record.
+
+The final census at that moment:
+
+    spawn.seen                 513 records,  max_n = 513
+    exit.seen                  382 records,  max_n = 382
+    job.open                   454 records,  max_n = 454
+    exec.seen                    2 records,  max_n = 2
+    no .saturated record fired
+    no springboard.running
+
+**The fix is confirmed on a real guest, not just in a compiler.** `capcheck.py`
+proved the emitters format correctly past their caps and `validate-emit.py` proved
+the records parse; the kernel literal check proved the saturation blocks are
+compiled in. This is the thing neither of those could prove: the guest's spawn
+counter went past the value at which the old emitter went blind, and the channel
+carried every record.
+
+**No saturation record fired, which is the second half of the result.** The caps
+are at 65536 and the guest reached 513, so the saturation path was not exercised.
+That is the intended outcome -- a saturation record is a statement that the
+instrument went blind, and the point of raising the caps was to not need one. The
+fact that the literal is in the kernel and the code path is compiled is verified
+by `capcheck.py`, which drives each emitter past its cap deliberately.
+
+## job.open stopped at 454 in both captures, and 454 is not a cap
+
+This one was not expected and it is the more useful of the two findings.
+
+The previous capture's job.open emitter reached 454 with 58 records of headroom
+before its cap of 512, so addendum G predicted it would "go silent within about
+137 more records". It did not. The new capture, with a cap of 65536 and no bound
+anywhere near 454, ALSO stopped at exactly 454.
+
+    previous capture   job.open = 454   (cap 512, 58 records of headroom)
+    this capture       job.open = 454   (cap 65536, 65082 records of headroom)
+
+Two builds, two caps four orders of magnitude apart in headroom, the same number.
+**454 is the number of job files launchd reads, not a bound on the instrument.**
+
+So the job-open window was never limited. That independently confirms addendum L
+from a second direction: the 0-for-12 App separator, and the 0-for-6 on the read
+subset, were never artefacts of a truncated window. Launchd read 454 job files,
+including com.apple.SpringBoard.plist at spawn n=239, and spawned no App-typed
+job.
+
+It also retracts addendum G's prediction about job.open specifically. G said the
+capture "goes silent within about 137 more records and then contributes nothing
+for the remaining four hours". The job.open emitter did not go silent; it
+finished. The exit emitter is the one that saturated, at 512.
+
+## What is still open, stated exactly
+
+- No App- or Background-typed job has spawned, now over 513 spawns rather than
+  512. The separator holds with a larger window AND with a window that was never
+  the limit for job.open.
+- No springboard.running and no springboard.interaction, though both emitters are
+  compiled into the kernel and one of them is gated on `p_comm == "SpringBoard"`.
+- The mechanism by which launchd declines an App-typed job it has just read is
+  still unmeasured. The separator is measured twice over; the cause is not.
+- runningboardd and backboardd both spawned and neither exited, so the app-domain
+  machinery is up. The gap is between backboardd being up and it launching
+  SpringBoard, and the display -- which found its surface and never presented a
+  frame -- is the leading candidate for what is missing.
+
+## Status
+
+Windows/real-guest: PASS for the instrument, which was the interval's goal. The
+spawn emitter recorded past the value at which the previous one went blind, on a
+real guest, with no saturation record. FAIL still for SpringBoard, and now with
+the window ruled out as an explanation from two independent directions.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, booting since
+12:03Z and still capturing.
+
+Onsite: N/A.
