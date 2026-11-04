@@ -9836,3 +9836,133 @@ alone.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fifty-fourth, addendum V): the swap path IS reachable -- addendum U's negative was bounded, not false
+
+## Correcting addendum U
+
+Addendum U reported that no dispatch function loads a swap-path vtable
+slot within 512 bytes.  That is true, and it was bounded to the dispatch
+function's OWN bytes.  Those bytes are a trampoline:
+
+```asm
+LDR  x8, [x31, #0x8]      ; the per-client context
+LDR  x8, [x8,  #0x20]     ; the provider -- the display object
+LDR  x8, [x8,  #0x0]      ; the provider's VPTR
+MOV  x1, x8
+BL   <a per-selector handler>
+```
+
+The vtable dispatch happens inside the handler.  A fixed-window scan of
+the trampoline therefore finds no slot load and would read as "the swap
+path is unreachable" -- which is wrong.  U is corrected here rather
+than quietly superseded, because a bounded negative that looks like a
+plain negative is the failure mode this project keeps hitting.
+
+## Following the chain instead
+
+ARM64 `BL` is `100101 imm26` with target `pc + 4 * sign_extend(imm26)`.
+Walking it to depth 3 over 384 bytes per node:
+
+| selector | outcome | nodes | swap-path slots reached |
+|---|---|---|---|
+| 12 | refused | 6 | 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap) |
+| 22 | refused | 7 | none |
+| 27 | refused | 7 | none |
+| 29 | refused | 6 | none |
+| 33 | refused | 7 | 337 (collectCompletionReports) |
+| 50 | refused | 7 | none |
+| 57 | refused | 6 | none |
+| 79 | refused | 1 | none |
+| 84 | refused | 7 | none |
+| 6 | succeeded | 5 | 249 (getDisplayDimensions), 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap) |
+| 8 | succeeded | 6 | 249 (getDisplayDimensions), 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap) |
+| 88 | succeeded | 7 | 249 (getDisplayDimensions), 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap) |
+
+Distinct slots reached across the twelve: 124 of
+358.  The swap path -- slots 249 (getDisplayDimensions), 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap), 337 (collectCompletionReports)
+-- is reached, from the refused selectors and from the ones that
+succeeded.
+
+## What this does and does not say
+
+**It does NOT say a refused selector calls `validateSwap`.**  This is
+static reachability, and it over-approximates: a handler that returns
+`kIOReturnUnsupported` on its first branch still has the swap-path code
+in its body, so the walk reaches it.  Which selector submits a swap at
+RUN time remains UNMEASURED, and no static analysis of this shape can
+answer it.
+
+What it does say, and it is the useful part: **the refusals are
+answered by overwhelmingly ORIGINAL slots.**  Of every slot the walk
+reached, only these are this port's:
+
+| slot | name |
+|---|---|
+| 184 | isMainDisplay |
+| 188 | getDotPitch |
+| 213 | supportedFrameInfo |
+| 245 | unclassified `opaque` |
+| 290 | kickSwapQueue |
+| 296 | validateSwap |
+| 337 | collectCompletionReports |
+| 338 | unclassified `opaque` |
+| 345 | unclassified `opaque` |
+
+Everything else in the reachable set is the original
+`IOMobileFramebufferLegacy` base.  So the eleven refusals are answered
+by Apple's code, which is exactly what addendum S concluded and what
+addendum T's vtable census supports -- but addendum S reached that
+conclusion without being able to see the chain, and now the chain has
+been walked.
+
+## The queue is empty, independently of every counter
+
+The generated `OriginalLegacyFramebufferABI.h` defines the swap queue
+as a tail queue -- current at +5472, head at +5480, tail at +5488 -- and
+its own empty state is `*(self+5480) = nullptr` with
+`*(self+5488) = self+5480`.  Read off the live display object
+`0xfffffff6a8afa000`:
+
+| field | value |
+|---|---|
+| `+5472` current swap | `0x0` |
+| `+5480` queue head | `0x0` |
+| `+5488` queue tail | `0xfffffff6a8afb568` (= display + 5480) |
+| `swapEventCount` | 0 |
+
+That is the empty state exactly.  So no swap was ever enqueued, which
+is a second and independent confirmation of `swap_validation_calls ==
+0` -- a struct field rather than a probe counter, so it cannot be wrong
+in the way a probe counter could.
+
+## One more symbol-kind slip
+
+`native_legacy_swap_stage` looked like a counter and read
+`0xd100c3ff`.  It is a FUNCTION (`LegacyDisplayProbe.cpp:271`), and
+those four bytes are its first instruction -- `SUBS` immediate, in
+fact, the standard `0xd100c3ff` prologue that opens nearly every
+function in this kernel.  The real counter for accepted swaps is
+`swapEventCount`, a file-scope static under `__ZL14swapEventCount`.
+A symbol's existence says nothing about its kind, and reading four
+bytes off a function produces a number that looks like a measurement.
+
+## Status
+
+Windows/real-guest: **PASS** -- the chain walked, the queue read, and
+the anchors re-verified before either.  **UNMEASURED for which
+selector submits a swap at run time**, and static reachability cannot
+close it.
+
+The display blocker is now bounded from both ends: the driver is up and
+mapped, the client is Apple's and really does drive it, the refusals
+are answered by the original base, and the queue is empty.  What is
+left is which of the original base's methods has to exist before the
+compositor will enqueue anything, and that needs either the original
+source or a run-time experiment.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
