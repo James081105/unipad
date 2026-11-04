@@ -6833,3 +6833,186 @@ answer confidently.
   only.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+
+---
+
+# Interval 2026-11-04 (forty-sixth): the emitter is fixed, pinned, and building.
+# And the instrument that validated it was itself wrong once.
+
+## The four findings, and the vector that proves each one
+
+`c-review-job-open.txt` found four defects in revision 1 of
+`zzz-native-job-open-events.patch`.  All four were real.  All four are fixed, and
+each fix is now covered by a behaviour vector that **revision 1 fails** -- which
+is the only thing that makes the fix a fact rather than a claim.
+
+| # | Finding | Fix | Vector that rev 1 fails |
+| :-- | :-- | :-- | :-- |
+| 1 | The `segflg` guard the comment described was not in the code | `UIO_SEG_IS_USER_SPACE(segflg)`, XNU's own macro at `bsd/sys/uio.h:130` | a `UIO_SYSSPACE` caller now emits nothing |
+| 2 | The errno the comment called "part of the measurement" was in neither record | `,"err":E` in both records | the same path with errno 0 and errno 2 now yields different records |
+| 3 | The whole emitter sat inside `copyinstr(...) == 0` with a 96-byte probe | `kJobOpenProbe = 256` | a 107-byte path still reports SpringBoard |
+| 4 | `job_dirs[]` held only the three `/System/Library` forms | all six, both mount arms | `/private/preboot/System/Library/LaunchDaemons/` is watched |
+
+### Finding 1's stated mechanism was also wrong, and the correction matters
+
+The comment claimed an unguarded kernel-space caller would **fault**.  It would
+not.  `copy_validate()` (`osfmk/arm64/copyio.c:141-147`) returns **EFAULT** when
+the source falls outside `[vm_map_min, vm_map_max]` of the current map, and a
+kernel address is far above any user map's max; `is_kernel_to_kernel_copy()`
+(`:169-172`) returns EFAULT as well, because `copyinstr` never sets
+`COPYIO_ALLOW_KERNEL_TO_KERNEL`.
+
+So the real consequence of an unguarded kernel-space caller is a **silently
+dropped record** -- which is precisely the failure this patch exists to prevent.
+The guard is there anyway, but for the right reason, and a reader who believed the
+original comment would have looked for a panic that cannot happen.
+
+## The instrument was wrong once, and that is the most useful finding here
+
+`check-job-open-logic.py` transliterates the emitter's C to Python
+statement-for-statement, because **there is no working C compiler on this host**:
+the vendored MSYS2 `gcc.exe` reports 16.2.0, but `cc1.exe` exits 1 with **no
+diagnostic** on every input, including `int main(void){return 0;}`.  `-v` shows it
+invoked with a temp file under the non-ASCII user profile.  Not fixable here.
+
+Revision 1's port **hand-copied the C's string constants, and got one wrong**.  It
+wrote `,"err":` where the C has `","err":`.  That drops the closing quote of the
+`"job"` value, so the record on the wire is:
+
+    {"event":"job.open","n":1,"job":"com.apple.SpringBoard.plist,"err":17,...}
+
+which **no JSON parser accepts**.  The C was correct.  The port was wrong.  A port
+whose constants are typed by the same person who wrote the C reproduces that
+person's mistakes instead of catching them -- the port had become decoration.
+
+**The fix is structural, not a correction.**  Every literal, bound and watched
+directory is now **parsed out of the patch text** by
+`extract_c_strings()` / `extract_c_numbers()` / `extract_job_dirs()`, with C
+escapes resolved and adjacent-literal concatenation joined, and a literal that
+cannot be found is a hard `REFUSED` rather than a silent fallback.  The port can
+no longer disagree with the patch, because it reads the patch.
+
+This is the third time this project has been bitten by an instrument that reported
+a result it could not support, and the third time the fix was the same shape: make
+the instrument answer a question whose answer is already known.
+
+## The negative control
+
+`prove-job-open-vectors-discriminate.py` rebuilds revision 1 by reversing each of
+the four fixes, and runs the same vectors against it.  **Every one goes red on
+revision 1 and green on revision 2.**  Without that, a vector both revisions pass
+would be decoration, and the claim "rev 2 fixes finding N" would be unsupported.
+
+It also caught a defect in itself: the first run reported four rev-2 failures,
+because the counters are `static` in the C and the rev-1 section had left them
+set, suppressing the targeted record and inflating the counter.  That is exactly
+the leakage the port's `reset_state()` exists for, and it was missing from the
+second section.
+
+## The record, as it now goes on the wire
+
+    {"event":"job.open","n":1,"job":"notifyd.plist","err":0,"source":"XNU.openat_internal"}
+    {"event":"job.springboard_open","err":0,"source":"XNU.openat_internal"}
+
+Both parse.  The first carries the job's name and the errno from `open1at()`; the
+second is bounded to **one**, because the second and later opens of the same file
+add nothing to "did it ever open this".
+
+## What is verified, and what is not
+
+**Verified, on this host:**
+
+* All **59** xnu patches apply in name order against upstream
+  `xnu-10063.141.1`, with the new one at position **56**.  This is the check that
+  `git apply --check` on a pristine tree cannot do: it proves the patch composes
+  with the whole set.
+* The hunk header (`-5116,6 +5116,276`) matches its body, counted with context
+  lines.  The earlier checker omitted context and reported two false positives,
+  which is why it counts them now.
+* `UIO_SEG_IS_USER_SPACE` resolves through `vfs_syscalls.c:85` ->
+  `sys/uio_internal.h:70` -> `bsd/sys/uio.h:130`.
+* `segflg` is a parameter at `:5093` and `error` is a local at `:5103`; the
+  emitter's anchor is at `:5117`.  Both are in scope.
+* No other patch touches `vfs_syscalls.c` or `openat_internal`, so there is no
+  conflict.
+* The logic port passes every vector, and every vector discriminates.
+
+**NOT verified, and stated rather than implied:**
+
+* **C syntax.**  No compiler on this host.  A syntax error survives every check
+  above.
+* **That the emitter is reached.**  That is a boot measurement, and it needs
+  build `41788097516`.
+* **That `NATIVE_VIRTIO_CONSOLE` is on for this build.**  The build script
+  propagates the macro to `vfs_syscalls.o` and removes a stale object when the
+  switch changes, but the switch's value for M7/tcg is not yet measured.
+
+## Why the console transport had to move with it
+
+`NativeVirtioConsole` advances to `3ca09c9`, and it is not a drive-by.
+`reset()` returned true for an instance that never started
+(`NativeVirtioConsole.cpp:183`):
+
+    if(!registers || !ownsDevice)return true;
+
+so **every** instance's `cleanup()` cleared `g_console` -- including one that got
+as far as being constructed and then stopped.  The port that publishes the records
+this emitter depends on was therefore withdrawn by a bystander.  An emitter that
+is compiled in, reached, and silent **looks like a measurement**, which is the
+worst of the three states, so that fix travels with this one.
+
+## And why the display pointer did not move
+
+`drivers/NativeMobileDisplay`'s working tree is at `eb9c949`, a **detached
+FETCH_HEAD** commit.  It is **not an ancestor of `origin/main`** (`8666a99`,
+"retire a GPU-copied swap when the client takes it"), which supersedes it.  So
+recording `eb9c949` would make the build's `git submodule update` fail, for a
+change this emitter does not need.  The pointer stays at `c031d88` and the
+divergence is recorded here rather than silently absorbed.
+
+## The pin, and the build
+
+`unixnu.commit` `5a8bfaa` -> `e6abdf28`.  `device_repo.commit` unchanged at
+`5ef74a17`.  Build **`41788097516`** dispatched at `stage=M7`,
+`payload_target=tcg`, `gpu_broker=0`.
+
+The lock's `commit_note` was re-serialised with `ensure_ascii=True`, **not**
+`False`: the lock was written with the default, and `ensure_ascii=False`
+un-escapes the `\u53cd\u5411\u5ba1\u67e5` in `device_repo`'s note -- a one-line
+change to a section this bump has no business touching.
+
+## A disk condition that produced three spurious unit-suite failures
+
+The unit suite reported `F` at ~8%, ~16% and ~16%.  **F: was at 2.1 GB free, 100%
+used.**  That is the same shape as the earlier suite "failure" whose real output
+was `tail: write error: No space left on device` -- the pipeline failed, not the
+tests.
+
+Reclaimed **4.4 GB** by name, with every candidate checked against `git grep`
+first so nothing cited by a tracked doc, test or script was touched:
+
+    bi-m9 (644M), bi-41382433090 (574M), bi-41376479360 (574M),
+    kernelconsole (294M), bundle-41750576785.zip (297M),
+    dl41242825926 (547M), stage-probe (444M),
+    bootinputs.zip (163M), bundle13.zip (296M), bundle14.zip (296M),
+    bundle15.zip (296M), build-logs14.zip (2M)
+
+F: is now at 6.5 GB free.  The suite is re-running; its three `F`s are **not yet
+attributed** and must not be reported as product defects until it finishes on a
+host with room to write.
+
+## Not claimed
+
+* The emitter's C has never been compiled.  Not here.
+* SpringBoard has still NOT been observed to spawn.  No IPA, no interaction, no
+  persistence.  M9, M9a, M9b FAIL.
+* Whether launchd ever OPENS `com.apple.SpringBoard.plist` is unknown until build
+  `41788097516` boots.  That is the question this emitter exists to answer, and
+  the answer is one of exactly three: no `job.springboard_open` record while
+  hundreds of `job.open` records are present (the defect is in launchd's
+  selection, and `POSIXSpawnType=App` is the lead); a record with `err=0` (the
+  defect is downstream of the open); or no records at all (the emitter is not
+  reached, and that is a defect in this patch, not in launchd).
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
