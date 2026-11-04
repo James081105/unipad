@@ -9966,3 +9966,135 @@ source or a run-time experiment.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fifty-fifth, addendum W): the kernel ring holds two hours, so the gate's XNU evidence has a shelf life
+
+## What the gate needs, and where it already exists
+
+M9, M9a and M9b are the acceptance gate's only `blocking_failures`, and
+all three declare the `xnu_initialised` blocker.  That blocker needs
+three on-site probes:
+
+```python
+@_predicate("xnu_initialisation")
+def _xnu_initialisation(snapshot):
+    return (_onsite_ok(snapshot, "p.xnu_page_tables")
+            and _onsite_ok(snapshot, "p.xnu_exception_state")
+            and _onsite_ok(snapshot, "p.xnu_interrupt_state"))
+```
+
+and `local-private/boot41/xnu-records/guest.log` carries exactly those
+three, emitted by `NativeVirtioConsole.start` on a real boot:
+
+```json
+{"event":"xnu.page_tables","mmu_enabled":true,"source":"NativeVirtioConsole.start"}
+{"event":"xnu.exception_vectors","vectors_installed":true,"source":"NativeVirtioConsole.start"}
+{"event":"xnu.interrupts","irqs_unmasked":true,"timer_configured":true,"source":"NativeVirtioConsole.start"}
+```
+
+So the evidence is producible.  It is not permanent.
+
+## The live ring, measured
+
+`_guest_log_probe` against the live boot on QMP port 15919:
+
+| | |
+|---|---|
+| ready | yes |
+| ring size | 131072 bytes |
+| fingerprint | `9c62ddcf35448120ab16a706ceed7c54f3cd0b7dbbb755260ba048d2e5440f87` |
+| oldest timestamp | 5408.105 s |
+| newest timestamp | 12720.639 s |
+| span held | 7313 s (122 min) |
+| guest uptime | 12721 s (3.5 h) |
+| log lines in the ring | 112 |
+| `xnu.page_tables` records | 0 |
+| `xnu.exception_vectors` records | 0 |
+| `xnu.interrupts` records | 0 |
+
+The ring holds 122 minutes of history and the guest has
+been up 3.5 hours, so it has wrapped and the three
+records are gone.  `"event"` appears **zero** times in the whole ring,
+and so do `NativeVirtioConsole`, `DARWINBOOT` and `hand-off`.
+
+## What wrapped it, and it is not what I first said
+
+The ring's contents, normalised (addresses and digits masked):
+
+| lines | line |
+|---|---|
+| 73 | ` void CoreAnalyticsHub::handleNagTimerExpiry(IOTimerEventSource *)::N:messageClients of ` |
+| 5 | ` IOReturn CoreAnalyticsUserClient::sendDataToUser(uintN_t *, size_t)::N: sending N bytes` |
+| 4 | ` Sandbox: no system group container path found for group "systemgroup.com.apple.logd_hel` |
+| 2 | ` void CoreAnalyticsEventRatePolicy::zeroOutPerEventCounts()::N:event com.apple.xnu.memor` |
+| 2 | ` void CoreAnalyticsEventRatePolicy::zeroOutPerEventCounts()::N:event com.apple.xnu.stack` |
+
+`CoreAnalyticsHub::handleNagTimerExpiry` is 72% of the LINES and only
+`5.2% of the BYTES -- 81 lines at 84 bytes each is 6804 of
+131072.  The first version of this note blamed that spam for the
+eviction.  It is not the cause: the ring holds only 112 lines,
+so the average line is 1170 bytes, and the
+bulk of the ring is a few dozen very large USERSPACE lines -- the
+bluetoothd sandbox and container-path messages that repeat every few
+seconds.
+
+So the honest statement is: **the ring is evicted by a small number of
+very large userspace log lines, and it holds about two hours.**  The
+`handleNagTimerExpiry` spam is a separate runaway worth its own
+measurement, and it is not what cost us these records.
+
+## What this means for the gate
+
+`xnu_initialisation` is satisfiable, but only from a guest log captured
+within about two hours of boot.  An acceptance run that boots, waits,
+and then reads the ring will find nothing -- and will report the
+blocker with a reason describing a firmware-free route that has nothing
+to do with why the evidence is missing.
+
+**The blocker's reason text is stale and it is actively misleading.**
+It reads:
+
+> *"XNU has not initialised on this host: the firmware-free route
+> reached the kernelcache EL1 entry and stopped on its first undefined
+> instruction..."*
+
+That describes one historical route.  What the blocker actually tests is
+three on-site probes, and what actually fails is that the ring they
+live in has wrapped.  A reader seeing that reason would go looking for a
+boot-path defect that does not exist.
+
+## And the gate itself is behaving correctly
+
+M9 and M9a are not blocked on this at all.  Their reasons are:
+
+```
+M9:  refused:m9.veto.homescreen_screenshot_only   dependency_not_passed:M8:UNVERIFIED
+M9a: refused:m9a.veto.wallpaper_only              dependency_not_passed:M8:UNVERIFIED
+M9b: evidence_absent:m9b.written,m9b.normal_shutdown,m9b.read_back
+```
+
+So the gate refuses a homescreen screenshot as proof of an operable
+SpringBoard, and refuses wallpaper as proof of a UIKit-satisfying
+graphics path.  Both are the right call and both match the display
+measurements in addenda S through V: the driver is up, backboardd
+really drives the framebuffer, and no frame has been presented.
+**There is no test defect here to fix.**  The gate is honest; the
+blocker's *reason string* is what is wrong.
+
+## Status
+
+Windows/real-guest: **PASS for the ring measurement** -- read from the
+live guest over QMP with the kernel's sha256 verified first.
+
+**Actionable, and it is a documentation fix rather than a code one:**
+`_XNU_BLOCKER`'s reason in `src/unipad/acceptance/milestones.py:1964`
+describes a route, not the predicate.  It should say what the predicate
+tests and that the evidence is time-bounded.  Recorded as the next
+change; not made here because this addendum is a measurement, and a
+blocker's wording is part of the contract a reader relies on.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel spawn-failed-input-run-scratch.
+
+Onsite: N/A.
