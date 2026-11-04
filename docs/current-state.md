@@ -6043,3 +6043,110 @@ launchd never tried.
   diagnosis of why.
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+---
+
+# Interval 2026-11-04 (forty-second): 155 spawns, **zero** spawn failures, and a
+# framebuffer that is still the UniXNU boot menu.  Hypothesis 2 is refuted.
+
+## The measurement
+
+Build **41750576785**, kernel sha256
+`df785f5b58807b05693bd8ce036b4d88be4c57ac4534816b20dd54eb79b8a767` verified
+against `payload.json` before the boot.  21025 bytes.
+
+    listen_seconds   : 5418
+    stopped_on_quiet : false        <-- it hit the 5400 s CAP, not a quiet guest
+    last_bytes_at_s  : 5382         <-- the guest was STILL SPAWNING when it stopped
+
+    springboard.running     : ABSENT
+    springboard.interaction : ABSENT
+    spawn.seen              : 155
+    spawn.failed            : 0
+
+**155 spawns and not one failure.**  The `spawn.failed` emitter added in `bc210df`
+fired zero times across the entire boot.
+
+## That refutes one of the two hypotheses outright
+
+Interval 41 left two explanations for SpringBoard's absence:
+
+1. launchd never attempts the spawn -- no trace at all.
+2. launchd attempts it and `posix_spawn` returns an error.
+
+**Hypothesis 2 is refuted.**  If launchd were attempting a SpringBoard spawn and
+failing, the emitter placed before the `if (imgp != NULL)` cleanup -- which covers
+all ~26 `goto bad` paths, not just the ones after `exec_activate_image()` -- would
+have recorded it.  It recorded nothing.  Every spawn in this boot succeeded.
+
+So what remains is **hypothesis 1: launchd never attempts to spawn SpringBoard.**
+Not a failed spawn.  Not a missing binary -- `SpringBoard.app` is in the SystemOS
+volume (interval 41, 8 occurrences of the path, 6 of `CoreServices/SpringBoard`).
+A job that is never started.
+
+## The bound bump was not optional
+
+**155 spawns.**  `kMaxSpawnRecords` was 64 when interval 41 ran, and interval 41
+reached exactly 64.  Had this run kept the old bound it would have lost **91 of
+the 155** -- including the entire second half of the daemon set:
+
+    ... biomesyncd, liveactivitiesd, chronod, dasd, PowerUIAgent, apsd,
+    peopled, biomed, calaccessd, passd, securityd, PerfPowerService,
+    IOMFB_FDR_Loader, coreduetd, mobileactivation, analyticsd, accountsd,
+    contactsd, assistantd, accessoryupdater, symptomsd-diag, assistant_cdmd,
+    WiFiCloudAssetsX ...
+
+That is a much deeper iOS daemon set than interval 41 could see, and it changes
+the picture again: the boot does not merely reach `backboardd`, it runs
+`assistantd`, `accountsd`, `contactsd`, `analyticsd` and `symptomsd` -- daemons
+that in a real boot come up around or after the UI layer.  **The userspace boot is
+essentially complete except for SpringBoard.**
+
+## And the screen: one image, for ninety minutes, and now we can SEE it
+
+45 screendumps over 5418 s, and **exactly one distinct image**.  Eleven Home
+presses, every one `changed=False`.
+
+The PNG is saved at
+`local-private/boot53/screen-evidence/boot-menu-at-t0.png` and it says what no
+hash could: **the framebuffer is showing the UniXNU boot menu.**  Green bar across
+the top -- which the serial log says is what proves the kernel entry code ran --
+plus `DARWINBOOT: hand-off to the kernel`, the UniXNU logo, `Booting QEMU virt:
+source 4K XNU in 1 s`, `Up/Down: select  Enter: boot`, and `drivers 1 loaded /
+0 failed`.
+
+**So the kernel entry code ran, 155 daemons spawned around it, and nothing ever
+drew to the framebuffer.**  The bootloader's menu pixels are simply still sitting
+there because no later writer replaced them.
+
+This retires interval 41's phrasing in both directions.  It is not "the display
+came up once and then froze" -- the display never took over at all.  And it is not
+a display defect: `diag.legacy_display_status` stage 10 says the legacy display
+path succeeded, and `NativeMobileDisplay`'s own commits record measured frame
+timings (~4.4 ms render + ~3 ms copy on int-243), so the swap pipeline works when
+a client draws.  **Nothing is drawing.**  That is downstream of SpringBoard, not a
+separate bug.
+
+## What this converges on
+
+Three independent measurements now agree:
+
+| measurement | result |
+|---|---|
+| 155 spawns, 0 failures on both exec paths | launchd never attempts SpringBoard |
+| `SpringBoard.app` present in the SystemOS volume | it is not a missing binary |
+| framebuffer still holds the bootloader's menu | no UI client ever drew |
+
+The next question is therefore about **launchd's job loading**, not about the
+kernel's exec machinery and not about the display.  The emitter that would answer
+it is not in the kernel at all -- it is in which plists launchd read and which
+conditions it evaluated -- and that is a different instrument from anything this
+project has built.
+
+## Not claimed
+
+* No SpringBoard, no IPA, no interaction, no persistence.  M9, M9a, M9b FAIL.
+* The capture hit its 5400 s cap with the guest still spawning, so the daemon
+  count is a LOWER BOUND, not a total.  155 is "at least 155".
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
