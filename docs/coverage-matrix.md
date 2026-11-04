@@ -3,7 +3,7 @@
 本文件由 `scripts/windows/build-coverage-table.py` 生成，请勿手改；改代码后重新生成。数据来源是一次真实的 `unipad.acceptance` 运行，不是对进度的转述。
 
 - 运行 id：`coverage-matrix`
-- 写入时间：2026-11-04T12:20:59+00:00
+- 写入时间：2026-11-04T18:03:51+00:00
 - 门禁身份：`unipad.controller.verifier` v1.1.0
 - 主机：Microsoft Windows 11 CoreCountrySpecific (zh-CN)
 - 加速器：tcg
@@ -57,11 +57,11 @@
 | `case7_notes_app_save_and_reopen` | docs/PRD.md:178 | 导入 UniPadNotes.ipa，输入本次生成的字符串并保存；关闭重开 App 后可读 | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance-e2e/UniPadNotes.ipa.sha256`, `acceptance-e2e/sample-UniPadNotes.ipa.precheck.json` | blocked_by:case6_tap_button_ten_times |
 | `M7` | docs/PRD.md:213 | 正确 RootFS/SystemOS 可用 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot53/bounds64-input-run/guest-input.log` | - |
 | `case8_shutdown_and_reboot_from_disk` | docs/PRD.md:179 | 正常关机，结束 QEMU 进程，再从磁盘启动新进程；两款 App 和保存的字符串仍存在 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
-| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | UNVERIFIED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
+| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
+| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | UNVERIFIED | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
 | `case9_three_cold_boots` | docs/PRD.md:180 | 重复冷启动流程三次，保存耗时和结果；测试失败时保留证据，不覆盖上次失败 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M9` | docs/PRD.md:215 | SpringBoard 可操作 | blocking | NOT STARTED | NOT RUN | FAIL | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
-| `M9a` | docs/PRD.md:216 | 软件/最小图形路径满足 UIKit | blocking | PARTIAL | NOT RUN | FAIL | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
+| `M9` | docs/PRD.md:215 | SpringBoard 可操作 | blocking | NOT STARTED | NOT RUN | FAIL | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
+| `M9a` | docs/PRD.md:216 | 软件/最小图形路径满足 UIKit | blocking | PARTIAL | NOT RUN | FAIL | BLOCKED | — | the guest never reported XNU's own page tables, exception vectors and interrupt state: th… |
 | `case10_unsupported_platform_package` | docs/PRD.md:181 | 导入一个不支持的平台包，返回明确原因；已有可用系统和应用保持可恢复 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M10` | docs/PRD.md:218 | IPA 安装 | blocking | UNVERIFIED | NOT RUN | BLOCKED | FAIL | `acceptance/local-private/boot51/install-thread-start-boot/guest-channel.log` | there is no real guest install service on this host: install_service_unavailable is injec… |
 | `M12` | docs/PRD.md:221 | 输入与应用交互 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
@@ -114,11 +114,11 @@
 - case6_tap_button_ten_times: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - case7_notes_app_save_and_reopen: blocked_by:case6_tap_button_ten_times
 - case8_shutdown_and_reboot_from_disk: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
-- M8: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
-- M9b: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
+- M8: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that ha…
+- M9b: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that h…
 - case9_three_cold_boots: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
-- M9: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
-- M9a: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
+- M9: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that ha…
+- M9a: the guest never reported XNU's own page tables, exception vectors and interrupt state: those three records are emitted by NativeVirtioConsole.start early in a real boot, and they live in the kernel ring, which was measured at 131072 bytes holding about two hours of history -- so a guest that h…
 - case10_unsupported_platform_package: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - M10: there is no real guest install service on this host: install_service_unavailable is injectable in the fake guest and has never once succeeded against a real object
 - M12: there is no real guest install service on this host: install_service_unavailable is injectable in the fake guest and has never once succeeded against a real object
