@@ -8171,3 +8171,123 @@ Still open:
 Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, in progress at the
 time of writing. Preflight 41817495435 passed on the same ref, which is the run
 that cross-checks `unixnu_commit` against the lock.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum J): the literal gate's mechanism is
+# proven, and addendum I was too pessimistic about it
+
+## Addendum I gave up a finding it did not have to give up
+
+Addendum I's last section argued: `emitter_counts` reports `exec.seen: 0`,
+`exit.seen: 0` and `spawn.seen: 0` for emitters that fired 512, 512 and 2 times,
+therefore the gate produces false negatives, therefore "the literal count is not
+evidence that the SpringBoard emitters are in the kernel either".
+
+The first two clauses are right and the third does not follow. A false NEGATIVE
+rate says nothing about the false POSITIVE rate. I checked, and the two
+SpringBoard literals are present contiguously in the kernel that ran the
+512-record boot. The emitters are compiled in. They never fired.
+
+## The mechanism, proven rather than noted
+
+The harness carried a warning about this gate: "recorded, not enforced: a
+mergeable-string image can hide a literal that is present, so absence is not
+evidence (build 41617257137)". That warning is correct and it is now explained.
+
+Each emitter stores its record as three static arrays. From
+`zzz-native-springboard-events.patch:496-499`:
+
+    static char const spawn_prefix[] =
+        "{\"event\":\"spawn.seen\",\"n\":";
+    static char const spawn_middle[] = ",\"comm\":\"";
+    static char const spawn_suffix[] = ...
+
+The linker merges the common TAILS of those arrays with unrelated literals in the
+kernel. Enumerating every contiguous `{"event":"...` literal in the kernel that
+booted -- sha256 `bcb2a9474c590b629fec97c3149072a6e8b38ea529352166781069048d50a28a`,
+verified against the harness's own `kernel_sha256` field -- gives:
+
+    {"event":"diag.control_from_driver","source":"NativeVirtioConsole.start"}\n
+    {"event":"diag.free_fn_from_driver","source":"NativeVirtioConsole.start"}\n
+    {"event":"diag.free_fn_status","status":"not_open"}\n
+    {"event":"diag.free_fn_status","status":"other"}\n
+    {"event":"diag.free_fn_status","status":"success"}\n
+    {"event":"diag.install_rx_bytes","source":"XNU.native_console_poll"}\n
+    {"event":"diag.install_thread_start","status":"failed"}\n
+    {"event":"diag.install_thread_start","status":"ok"}\n
+    {"event":"diag.install_thread_started","source":"XNU.bsdinit_task"}\n
+    {"event":"diag.load_init_program_entered","source":"XNU.load_init_program"}\n
+    {"event":"diag.owner_data_status","stage,"error","source":"XNU.native_owner_data\xed\x01
+    {"event":"dyld.cache_read","source":"XNU._shared_region_map_and_slide"}\n
+    {"event":"exec.s                                              <- TRUNCATED
+    {"event":"exit.s,"source":"XNU.exit_with_reason"lockf         <- MERGED with another literal
+    {"event":"install.registered","source":"XNU.native_install_service"}\n
+    {"event":"job.op                                              <- TRUNCATED
+    {"event":"job.springboard_open",,"source":"XNU.openat_internal"}{"event":"job.op
+    {"event":"spawn.                                              <- TRUNCATED
+    {"event":"xnu.page_tables","mmu_enabled":true,"source":"NativeVirtioConsole.start"}\n
+
+Read the four truncated ones. `{"event":"exec.s` stops mid-word. `{"event":"exit.s`
+is followed immediately by `,"source":"XNU.exit_with_reason"` and then `lockf` --
+the tail of an unrelated literal, merged in. `{"event":"job.op` stops mid-word.
+`{"event":"spawn.` stops at the dot. And `job.springboard_open` carries a DOUBLE
+comma, `,,`, where its err field's middle array was relocated.
+
+That is why `spawn.seen` counts 0 in a kernel that emitted it 512 times: the
+substring does not exist. The literal stops at `spawn.`.
+
+**And it is why the SpringBoard literals are real.** `springboard.running` is
+present once, contiguously, with its whole prefix and suffix:
+
+    {"event":"springboard.running",","comm":"SpringBoard","source":"XNU.posix_spawn"
+
+`springboard.interaction` is present once as `:"springboard.interaction","` -- its
+name contiguous, its prefix relocated. `legacy_display_status` once as
+`:"diag.legacy_display_status`, same shape. And `job.springboard_open` once as
+`{"event":"job.springboard_open",,"source":"XNU.openat_internal"` -- name and
+prefix contiguous, its err field relocated, which is what the double comma is.
+
+So the honest split is: `springboard.running` is a full contiguous literal and is
+therefore a trustworthy positive on its own. The other three carry their event
+name contiguously with a relocated prefix, which is enough to say the emitter is
+compiled in but is not the same strength of evidence.
+
+## What that buys, and what it does not
+
+**It buys the sharpest statement yet about task #22.** The harness's own header
+says the emitter is gated on `p_comm == "SpringBoard"`. That gate is compiled into
+this kernel, it is reachable, and in 2h32m of listening -- across 356 byte-arrival
+batches totalling 139590 bytes, while 512 processes spawned and 512 exited -- it
+never fired once. Neither did `springboard.interaction`.
+
+That is no longer a statement about a capped window. It is a statement about the
+guest: **SpringBoard did not run, and the kernel was watching for it by name.**
+
+**It does not buy anything about the caps.** The same kernel has `saturated` zero
+times, which is correct and expected -- it predates revision 4. The check for the
+new kernel is the same fragment, and it is now a meaningful one rather than a
+guess, because the control has been run: a kernel known to have emitted
+`spawn.seen` 512 times counts that literal 0, and a kernel known not to carry the
+saturation blocks counts `saturated` 0. The instrument has answered a
+known-present question and a known-absent one.
+
+**And it retires one more way to be wrong.** Addendum I's caution -- "absence is
+not evidence" -- was the right instinct applied too broadly. The correct rule is
+narrower and more useful: in THIS kernel, absence proves nothing because the
+linker merges these arrays, but presence is real. Any future check that reads a
+zero off this gate and calls it a finding is making the same mistake the gate's
+own warning describes.
+
+## Status
+
+Windows/real-guest: unchanged from addendum I, with #22 sharpened. The
+SpringBoard emitters are compiled into the kernel that ran, gated on
+`p_comm == "SpringBoard"`, and never fired in 2h32m.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, all 34 steps
+complete, four artifacts uploaded. `boot-inputs` (310 MB) is downloading into
+`local-private/tmp/dl-caps/`; the kernel literal check will be run against it as
+soon as it lands, with the control above already recorded.
+
+Onsite: N/A.
