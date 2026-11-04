@@ -101,6 +101,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_text import strip_comments
+
 REPO = Path(__file__).resolve().parents[2]
 VENDOR = REPO / "vendor" / "UniXNU"
 DRIVERS = VENDOR / "drivers"
@@ -189,26 +191,14 @@ def _added_lines(patch: Path) -> list[str]:
 
 
 def _strip_comments(text: str) -> str:
-    """Remove C/C++ comments before scanning for string literals.
+    """Delegate to :func:`tests.source_text.strip_comments`.
 
-    WHY THIS EXISTS.  ``_LITERAL`` pairs up quote characters, and it has no idea
-    what a comment is.  A comment carrying an odd number of double quotes
-    therefore shifts the pairing for every literal after it, and the record
-    silently stops being found -- the test then reports "no interaction emitter
-    exists" against a file that has one, three lines below the comment that broke
-    the scan.  That is exactly what happened when a code comment quoted a
-    malformed record to explain what NOT to write: the explanation disabled the
-    check.
-
-    So comments come out first.  The raw text is still returned alongside the
-    decoded literals, because the structural checks (the gate, the arm condition)
-    read code and comments alike.
+    The scan that uses this must read code, not prose -- a call site or a
+    record inside a comment is neither.  Four copies of the stripper were
+    written independently in this repository; this is the one
+    implementation, and the call sites here delegate to it.
     """
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
-
-
+    return strip_comments(text)
 def _all_text() -> dict[Path, str]:
     """Every source file's text, with each C source's literals decoded.
 

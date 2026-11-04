@@ -43,6 +43,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_text import strip_comments
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "macos" / "build-macos.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "build-macos.yml"
@@ -627,6 +629,15 @@ def test_the_locked_display_driver_overrides_only_declared_slots() -> None:
     # guarded leaves the generator already accounts for.
     macro = re.search(r"#define LEAF\(n\).*", text)
     body = text[: macro.start()] + text[macro.end():] if macro else text
+    # ...and take the comments out.  Without this the extraction pattern's
+    # `[^;{}]*` crosses newlines and joins a comment to the next real signature:
+    # a comment reading `// EXPERIMENT (state-document addendum AC).` twelve
+    # lines above `IOReturn supportedFrameInfo(...) override` made this test
+    # report an override named EXPERIMENT that the class does not have.  A
+    # guard that goes red on its own documentation is the same as no guard, so
+    # the scan reads code and the prose is gone before it starts.  Offsets and
+    # line numbers survive, so a match still points at the real line.
+    body = strip_comments(body)
     overrides = set(
         re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*override\b", body)
     )

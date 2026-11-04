@@ -52,6 +52,7 @@ from pathlib import Path
 import pytest
 
 from tests.vendor_paths import require
+from tests.source_text import strip_comments
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -134,46 +135,14 @@ def _literals(fragment: str) -> list[str]:
 
 
 def _strip_comments(source: str) -> str:
-    """The source with ``//`` and ``/* */`` comments blanked out, in place.
+    """Delegate to :func:`tests.source_text.strip_comments`.
 
-    A call site inside a comment is not a call site, and an event name inside a
-    comment is not an emitted event.  Literal-aware, because ``"//"`` inside a
-    string is not a comment and these records are made of quotes and escapes.
+    The scan that uses this must read code, not prose -- a call site or a
+    record inside a comment is neither.  Four copies of the stripper were
+    written independently in this repository; this is the one
+    implementation, and the call sites here delegate to it.
     """
-    out: list[str] = []
-    i, n = 0, len(source)
-    while i < n:
-        ch = source[i]
-        if ch != '"':
-            if ch == "/" and i + 1 < n and source[i + 1] == "/":
-                while i < n and source[i] != NEWLINE:
-                    out.append(" ")
-                    i += 1
-                continue
-            if ch == "/" and i + 1 < n and source[i + 1] == "*":
-                end = source.find("*/", i + 2)
-                stop = n if end == -1 else end + 2
-                out.append(" " * (stop - i))
-                i = stop
-                continue
-            out.append(ch)
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-        while i < n:
-            if source[i] == BACKSLASH and i + 1 < n:
-                out.append(source[i:i + 2])
-                i += 2
-                continue
-            out.append(source[i])
-            if source[i] == '"':
-                i += 1
-                break
-            i += 1
-    return "".join(out)
-
-
+    return strip_comments(source)
 def _call_arguments(source: str, opener: str) -> list[tuple[int, str]]:
     """Every call to ``opener(`` and its argument text, parentheses balanced.
 
