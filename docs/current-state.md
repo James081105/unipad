@@ -6641,3 +6641,195 @@ The question is back to exactly where interval 44 put it, now with the volume
 doubt removed: **launchd has SpringBoard's job file available and has not spawned
 it.**  Whether it ever tries is what the long capture measures, and whether it
 tries and declines is what the plist's contents would say.
+
+
+---
+
+# Interval 2026-11-04 (forty-fifth): `com.apple.SpringBoard.plist` is READ.  And
+# the discriminator is `POSIXSpawnType=App`.
+
+## The file, byte-exact
+
+**2634 bytes**, sha256
+`a071265c26b9415973c8bbab8d99fcff6e347d6b7831b9f059903ea63dd835fe`, 17 keys,
+saved verbatim at `local-private/boot53/com.apple.SpringBoard.launchd.plist`.
+It parses, and its `Label` is `com.apple.SpringBoard`.
+
+    Label                       com.apple.SpringBoard
+    RunAtLoad                   TRUE
+    KeepAlive                   TRUE
+    POSIXSpawnType              App
+    ProcessType                 ABSENT
+    UserName                    mobile
+    ThrottleInterval            5
+    ProgramArguments            ['/System/Library/CoreServices/SpringBoard.app/SpringBoard']
+    LimitLoadFromHardware       {'osenvironment': ['diagnostics']}
+    _LimitLoadFromClarityMode   True
+    EmbeddedHomeScreen          True
+    EnablePressuredExit         False
+    LaunchEvents                ABSENT
+    MachServices                36 entries
+
+**`RunAtLoad` is TRUE.**  launchd was told to start this job at boot and did not.
+
+## How it was read
+
+The raw file is a **GPT-partitioned disk**, not a bare container: the APFS
+container starts at **file offset 17408** (GPT first usable LBA 34).  `NXSB` sits
+at 17440 and every 8192 bytes after it, always congruent to 1056 mod 4096.
+`nx_block_size` 4096, `nx_block_count` 1,483,776.
+
+    live container superblock   block 0       xid 418 (of 58 checksum-valid copies)
+    container omap              15897 -> tree 15898
+    volume superblock APSB      15896         (oid 1026, via the container omap)
+    volume omap                 67545 -> tree 67578
+    catalog root                65684         (apfs_root_tree_oid 1028, virtual)
+
+The catalog root's `apfs_btree_info` declares `bt_key_count = 983,966` and
+`bt_node_count = 39,944`; the walk visited 39,497 nodes and emitted 983,966
+records.  **The walk's own counts match the tree's own metadata**, which is the
+strongest single check available.
+
+Path resolution, all through DIR_REC records with root inode 2:
+`2 -> System(1152921500311900600) -> Library(...1101) ->
+LaunchDaemons(...072820) -> com.apple.SpringBoard.plist(...072888)`.
+
+The file has **no extents of its own**.  It carries two xattrs:
+`com.apple.decmpfs` (flags 0x0002 DATA_EMBEDDED, xdata_len 16) and
+`com.apple.ResourceFork` (flags 0x0001 DATA_STREAM, xdata_len 48).  The decmpfs
+header says magic `fpmc`, **compression type 4**, uncompressed size 2634.  The
+ResourceFork's stream is 1798 bytes at physical block 498020, and it is a chunked
+container: a 16-byte header, a chunk descriptor at 256, then a **zlib stream at
+fork offset 272..1748**, then a 50-byte trailer.  `zlib.decompress` of those 1476
+bytes yields exactly 2634 bytes, and the result begins `bplist00`.
+
+## The validation, before anything was believed
+
+* **The instrument was proved first.**  fletcher64 was validated by reproducing
+  two independent stored checksums exactly -- the container superblock copies at
+  xid 418 and xid 379 -- before any block was trusted.  (It is modulo
+  2^32 - 1, not 2^32; with the wrong modulus every block "fails".)
+* **Every rung self-checks**: NXSB magic + fletcher, OMAP object type + fletcher,
+  APSB magic + fletcher, volume OMAP object type + fletcher, and fletcher64 on
+  all 39,497 catalog nodes.
+* **Four control daemons that provably spawned in the guest**, read through the
+  identical code path, all pass with a matching `Label`: `com.apple.configd`
+  (827 B), `com.apple.notifyd` (797 B), `com.apple.runningboardd` (385 B),
+  `com.apple.backboardd` (1179 B).  **4/4.**
+* **Three independent size agreements** on the target: the inode's
+  `uncompressed_size` (2634) = the decmpfs header's uncompressed size (2634) =
+  the actual decompressed byte count (2634).
+* **The bplist trailer closes exactly**: `offset_table_offset 2340 + off_size 2 x
+  num_objects 131 = 2602 = 2634 - 32`.  No trailing garbage.
+* **An independent second sample**: the same decoder on
+  `/System/Library/Preferences/Logging/Subsystems/com.apple.SpringBoard.plist`
+  (a different file id, 2179 declared) produces exactly 2179 bytes.
+* **518 of the 523** decmpfs job plists in LaunchDaemons decode with correct size
+  and magic through the same path.
+
+## And now the discriminator interval 44 wanted, on real data
+
+Interval 44 could read only 373 of 1435 job plists, by pairing a filename with
+whatever bplist sat beside it -- right 1.2% of the time, so every number in that
+table described a sample that was mostly noise.  With the catalog walk the whole
+directory is readable, so the table can be rebuilt:
+
+    job plists in /System/Library/LaunchDaemons, readable : 518
+      whose daemon spawned in interval 42                 :  92
+      whose daemon did not                                : 426
+
+    RunAtLoad=True  AND the daemon did NOT spawn          :  13
+
+**Thirteen.**  Out of 518.  That is the anomalous set -- the jobs the guest was
+told to start at boot and did not -- and it is small enough to read in full.
+
+### `LimitLoadFromHardware` is RULED OUT
+
+SpringBoard carries `LimitLoadFromHardware = {osenvironment: [diagnostics]}`,
+which looked like the answer.  It is not: **`com.apple.logd.plist` carries the
+identical value and it spawned.**  So the restriction is satisfied on this guest
+(the guest's osenvironment is `diagnostics`), and it is not what stops
+SpringBoard.
+
+### `POSIXSpawnType=App` is a perfect separator
+
+    POSIXSpawnType      RAN (92)                        NOT RAN (426)
+    Interactive         35                              41
+    Adaptive            28                             165
+    ABSENT              29                             207
+    App                  0                               7     <-- all seven
+    Background           0                               5     <-- all five
+
+**Seven jobs carry `POSIXSpawnType=App`.  Zero of the 92 that ran have it.  All
+seven are in the not-ran group.**  SpringBoard is one of the seven:
+
+    com.apple.SpringBoard.plist
+    com.apple.TextInput.kbd.plist
+    com.apple.assistivetouchd.plist
+    com.apple.bluetoothuiservice.plist
+    com.apple.checkerboard.plist
+    com.apple.commandandcontrol.plist
+    com.apple.fullkeyboardaccess.plist
+
+And the "board" family makes the shape plain:
+
+    com.apple.backboardd.plist    RunAtLoad=true  POSIXSpawnType=Interactive  RAN
+    com.apple.runningboardd.plist RunAtLoad=true  POSIXSpawnType=Adaptive      RAN
+    com.apple.SpringBoard.plist   RunAtLoad=true  POSIXSpawnType=App           NOT RAN
+    com.apple.checkerboard.plist  RunAtLoad=true  POSIXSpawnType=App           NOT RAN
+
+## Two things that are NOT the answer
+
+* **`frontboardd` has no job plist on this volume at all.**  The LaunchDaemons
+  directory holds SpringBoard, backboardd, checkerboard, checkerboardd and
+  runningboardd -- and no frontboardd.  SpringBoard's MachServices include
+  `com.apple.frontboard.systemappservices`, but **MachServices in a launchd plist
+  are the services the job PROVIDES, not the ones it consumes.**  It is not a
+  dependency, and frontboardd's absence is not the blocker.
+* **`ProcessType` and `LaunchEvents` are both ABSENT** from SpringBoard's plist,
+  so neither is filtering it.
+
+## The caveat, stated
+
+**Seven samples is a correlation, not a mechanism.**  `POSIXSpawnType=App`
+separates perfectly in this data set, and that is worth reporting, but nothing
+here says WHY launchd declines an `App` job -- only that it declines all seven.
+Two of the thirteen anomalous jobs have a visible reason of their own
+(`safetyalertsd` carries `LimitLoadFromHardware={targettype:[D16,D17,D20,...]}`,
+which a QEMU guest cannot match; `iomfb_bics_daemon` carries
+`LimitLoadToSessionType=System`), which leaves eleven, of which two are `App`.
+
+The instrument that settles the mechanism is the one already written:
+`zzz-native-job-open-events.patch` reports every open under the three job
+directories, so it answers whether launchd ever READS
+`com.apple.SpringBoard.plist`.  "Never opened" and "opened and declined" are
+different defects with different fixes, and the spawn stream cannot tell them
+apart.
+
+## A defect in existing tooling
+
+`local-private/out/real-boot/esp-and-os-root/followup/work/apfs_reader.py` parses
+**4-byte TOC entries**; the correct entry is `apfs_kvloc`, 8 bytes
+(`k.off, k.len, v.off, v.len`), 4 only when `APFS_BTNODE_FIXED_KV_SIZE` is set.
+It reads `j_key_t`'s record type from the **low 16 bits**; the type is the **top
+4 bits** (`>> 60`).  Its `inode` field offsets are wrong for this volume (mode at
++0x50, uncompressed_size at +0x54, xfields at +0x5C).  And its
+`probe_springboard.py` "proof" is not a proof: it searched for
+`com.apple.springboard.plist`, lowercase, which was never in the region it
+scanned.  That file is under `local-private/` and therefore untracked, so nothing
+in the repository depends on it -- but anyone reaching for it will get a wrong
+answer confidently.
+
+## Not claimed
+
+* Nothing here says why launchd declines `POSIXSpawnType=App`.  The 7/7 split is
+  measured; the mechanism is unknown.
+* SpringBoard has still NOT been observed to spawn.  No IPA, no interaction, no
+  persistence.  M9, M9a, M9b FAIL.
+* The 518 readable plists are those that are decmpfs-compressed with a
+  single-chunk resource fork.  Five fail to decode (the four
+  `com.apple.jetsamproperties.J*` and `com.apple.duetexpertd`) because their
+  resource forks are multi-chunk; the decoder handles the single-chunk layout
+  only.
+* M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
+  does not exist.  WP00/WP01: blocked on `frozen: false`.
