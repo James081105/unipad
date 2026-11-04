@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval sixty-eighth, addendum AJ). THE HEADLINE is a build failure that was the pre-flight's fault: run 41906787039, which pinned the display-vtable slot tracer, failed on six assembler errors -- every one of them the three `adrp` instructions -- because the Apple kext relocation model refuses `adrp xN, sym; add xN, xN, :lo12:sym` for a global and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF`. THE PRE-FLIGHT WAS GREEN, and that is the finding: it had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form. So it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". A pre-flight that validates the wrong target is worse than none, because it converts a 40-minute failure into a false confidence. The replacement reads the asm OUT OF the file, assembles with the SAME target and mode the runner uses, asserts the register set and the relocations, and is mutation-tested. The same interval adds the other half of the instrument: `2bb2d1e` answers kIOReturnSuccess for every slot whose function is a refusing stub, because addendum AH lifted ONE refusal of twelve and nothing moved. The lift is safe because a refusing stub writes NOTHING -- its body is `MOV w0,#0x2c7` and a RET, so replacing it with `MOV w0,#0` changes exactly one register. One build now carries both, and it is dispatched on `fa8d73e`. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never compiled.** THE HEADLINE is unchanged from AH -- **the display experiment RAN, one refusal lifted, and the screen did not move** -- with one correction that matters more than it looks: **the static reach map CANNOT choose the next targets, and the reason is a BLR.** Selector 74's dispatch function makes 5 direct BL calls and 0 indirect BLR of its own; its five callees make 0 direct BL and **26 indirect BLR between them**. The virtual calls sit one level down, every one in a leaf, so a BL walk stops after six nodes and reports "selector 74 reaches nothing" for a selector whose refusal demonstrably came from slot 213. An earlier run of the map concluded "none of the ten remaining refused selectors reaches any refusing slot" -- that is WITHDRAWN; it was an instrument defect, not a finding, and it would have discarded the subclass-override plan for no reason. Addendum AB recorded this limitation as over-approximation; this is the under-approximation, which produces a confident false negative rather than a vague one. **So the next instrument must measure at runtime: task #29, interpose the DISPLAY's vtable the way the probe already interposes the client's and count calls per slot.** It belongs in `LegacyDisplayProbe.cpp` -- the device repository this project owns -- so it is deliverable with one commit and one pin bump. Design: naked ARM64 thunks using `x16`/`x17` (intra-procedure-call scratch) so a stub can increment a counter and `br` to the original without disturbing `x0`-`x7` or the return in `x0`; hook at `native_legacy_client_observed()` (:462), where the client is interposed and `native_legacy_object` is already set. **Everything from AH still stands:** build `exp-2026-11-05-display-refusal` (run 41880912125) built commit `5b83ab7` and the run's own log names it; backboardd's failures dropped 12 -> 11 with its call count unchanged at 15; selector 74 (`supportedFrameInfo`, slot 213) is now `kIOReturnSuccess`; selector 33 (`collectCompletionReports`, slot 337) is STILL `kIOReturnUnsupported` because the original completion helper discards that IOReturn -- confirmed, not argued; the one screendump that changed (t=121 s) is the UniXNU boot menu; and slot 213's function now begins `MOV w0,#0x2c2` with no `MOV w0,#0x2c7` anywhere, so the refusing-slot count dropping 61 -> 60 is confirmed a second way, independently of the client table. **What is left is a number: ten `kIOReturnUnsupported` and one `kIOReturnError` across selectors 12, 15, 22, 27, 29, 33, 50, 57, 79, 84 -- and no static way to say which of the 60 refusing slots they come through.** **ALSO FROM AH: the instrument had a defect that would have hidden all of it** -- the first measurement used 1176 as the `ClientStat` entry stride when the real struct is 2312 (it continues with `regs`, `reg[8]`, `sel6_*`, `seq[24]`, `original_external`/`register`), so every field read was right and the ENTRY was wrong; and the guard added to catch it tested `(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and is false for EVERY valid pointer, so it reported "NO SELF-CONSISTENT CLIENT MADE A CALL" against a table with backboardd in it. **A guard that rejects everything is worse than no guard.** That is the fourth time validating the instrument changed the answer and the second time the validator itself was the defect. **M9, M9a, M9b and M8 remain unproven.**
+Last updated: 2026-11-05 (interval sixty-ninth, addendum AK). THE HEADLINE is that the display-vtable instrument needed THREE commits to build and NONE of them changed the instrument -- what changed three times was my confidence that it compiled, and the measurement it exists for still has not happened. TWO 40-minute builds failed, and BOTH were green on the pre-flight that existed at the time. Run 41906787039: six assembler errors, all of them the three `adrp` instructions, because the Apple kext relocation model refuses the ELF form and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF` -- and the pre-flight had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form, so it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". Run 41915052472: the compile passed and the -Werror object audit passed -- `NativeLegacyDisplay: -Werror build ... passed` is in the run's own log -- and then the kernel LINK failed with `ld: symbol(s) not found for architecture arm64` naming exactly these symbols, every reference from inside the very object that defines them. A symbol named from inline asm is emitted as an UNDEFINED reference no matter what, and ld only satisfies one against a real, GLOBAL definition -- neither a `static` symbol nor a TENTATIVE definition in `__DATA,__common` is one. THE PRE-FLIGHT now reads the declarations out of the file, assembles with the target the runner uses, and reads the assembled object's SYMBOL TABLE, refusing unless every asm-created undefined reference has a global definition; it is mutation-tested four ways and all four are caught. A pre-flight that validates the wrong question is worse than none, and this interval had two of them. THE COUNTEREXAMPLE is a third dispatch that went out with a mistyped SHA: the input-validation gate refused it in 0.3 seconds with `device_commit '630e141a4d8b...' != sources.lock.json device_repo.commit '630e141a1802...'`. Two checks aimed at the wrong question cost forty minutes each; one aimed at the right question cost nothing. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never linked.** THE HEADLINE is unchanged from AH run 41906787039, which pinned the display-vtable slot tracer, failed on six assembler errors -- every one of them the three `adrp` instructions -- because the Apple kext relocation model refuses `adrp xN, sym; add xN, xN, :lo12:sym` for a global and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF`. THE PRE-FLIGHT WAS GREEN, and that is the finding: it had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form. So it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". A pre-flight that validates the wrong target is worse than none, because it converts a 40-minute failure into a false confidence. The replacement reads the asm OUT OF the file, assembles with the SAME target and mode the runner uses, asserts the register set and the relocations, and is mutation-tested. The same interval adds the other half of the instrument: `2bb2d1e` answers kIOReturnSuccess for every slot whose function is a refusing stub, because addendum AH lifted ONE refusal of twelve and nothing moved. The lift is safe because a refusing stub writes NOTHING -- its body is `MOV w0,#0x2c7` and a RET, so replacing it with `MOV w0,#0` changes exactly one register. One build now carries both, and it is dispatched on `fa8d73e`. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never compiled.** THE HEADLINE is unchanged from AH -- **the display experiment RAN, one refusal lifted, and the screen did not move** -- with one correction that matters more than it looks: **the static reach map CANNOT choose the next targets, and the reason is a BLR.** Selector 74's dispatch function makes 5 direct BL calls and 0 indirect BLR of its own; its five callees make 0 direct BL and **26 indirect BLR between them**. The virtual calls sit one level down, every one in a leaf, so a BL walk stops after six nodes and reports "selector 74 reaches nothing" for a selector whose refusal demonstrably came from slot 213. An earlier run of the map concluded "none of the ten remaining refused selectors reaches any refusing slot" -- that is WITHDRAWN; it was an instrument defect, not a finding, and it would have discarded the subclass-override plan for no reason. Addendum AB recorded this limitation as over-approximation; this is the under-approximation, which produces a confident false negative rather than a vague one. **So the next instrument must measure at runtime: task #29, interpose the DISPLAY's vtable the way the probe already interposes the client's and count calls per slot.** It belongs in `LegacyDisplayProbe.cpp` -- the device repository this project owns -- so it is deliverable with one commit and one pin bump. Design: naked ARM64 thunks using `x16`/`x17` (intra-procedure-call scratch) so a stub can increment a counter and `br` to the original without disturbing `x0`-`x7` or the return in `x0`; hook at `native_legacy_client_observed()` (:462), where the client is interposed and `native_legacy_object` is already set. **Everything from AH still stands:** build `exp-2026-11-05-display-refusal` (run 41880912125) built commit `5b83ab7` and the run's own log names it; backboardd's failures dropped 12 -> 11 with its call count unchanged at 15; selector 74 (`supportedFrameInfo`, slot 213) is now `kIOReturnSuccess`; selector 33 (`collectCompletionReports`, slot 337) is STILL `kIOReturnUnsupported` because the original completion helper discards that IOReturn -- confirmed, not argued; the one screendump that changed (t=121 s) is the UniXNU boot menu; and slot 213's function now begins `MOV w0,#0x2c2` with no `MOV w0,#0x2c7` anywhere, so the refusing-slot count dropping 61 -> 60 is confirmed a second way, independently of the client table. **What is left is a number: ten `kIOReturnUnsupported` and one `kIOReturnError` across selectors 12, 15, 22, 27, 29, 33, 50, 57, 79, 84 -- and no static way to say which of the 60 refusing slots they come through.** **ALSO FROM AH: the instrument had a defect that would have hidden all of it** -- the first measurement used 1176 as the `ClientStat` entry stride when the real struct is 2312 (it continues with `regs`, `reg[8]`, `sel6_*`, `seq[24]`, `original_external`/`register`), so every field read was right and the ENTRY was wrong; and the guard added to catch it tested `(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and is false for EVERY valid pointer, so it reported "NO SELF-CONSISTENT CLIENT MADE A CALL" against a table with backboardd in it. **A guard that rejects everything is worse than no guard.** That is the fourth time validating the instrument changed the answer and the second time the validator itself was the defect. **M9, M9a, M9b and M8 remain unproven.**
 Main repo at `6bdb0c5`.
 
 ---
@@ -11672,3 +11672,189 @@ Onsite: N/A.
 **Nothing is measured on the guest yet.**  The instrument that would measure it
 has never compiled, which is what this addendum records.  M9, M9a, M9b and M8
 remain unproven.
+
+---
+
+# Interval 2026-11-05 (sixty-ninth, addendum AK): two builds, two pre-flights that were green, and a gate that earned its keep
+
+## The interval in one line
+
+Three commits were needed to make the display-vtable instrument build, and
+**none of them changed the instrument**.  What changed three times was my
+confidence that it compiled.  The measurement it exists for still has not
+happened.
+
+## Failure one: run 41906787039, and the pre-flight was green
+
+```
+LegacyDisplayProbe.cpp:490:9:   error: ADR/ADRP relocations must be GOT relative
+LegacyDisplayProbe.cpp:490:9:   error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:490:49:  error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:492:40:  error: ADR/ADRP relocations must be GOT relative
+LegacyDisplayProbe.cpp:492:40:  error: unknown AArch64 fixup kind!
+LegacyDisplayProbe.cpp:493:45:  error: unknown AArch64 fixup kind!
+```
+
+Six errors, every one of them the three `adrp` instructions in the slot
+tracer's common thunk.  The kext is built with
+`-fapple-kext --target=arm64-apple-ios17.0.0`, and the Apple relocation model
+does not accept
+
+```asm
+adrp x17, native_legacy_slot_original
+add  x17, x17, :lo12:native_legacy_slot_original
+```
+
+It wants `sym@GOTPAGE` / `sym@GOTPAGEOFF`, which loads the address out of the
+GOT.  Three extra loads on a path that runs a few hundred times a boot.  The
+label had to become numeric too: the Apple integrated assembler refuses a `.L`
+name as the target of a conditional branch ("conditional branch requires
+assembler-local label"), and GNU as accepts both, so `1f` is the portable form.
+
+**Why the pre-flight did not catch it, which is the part worth recording.**
+There WAS a pre-flight.  It carried the same asm text with the kernel-only
+surroundings stripped and assembled it on Windows precisely so a syntax error
+would not cost a 40-minute cycle.  It reported: all 358 thunks assemble, all
+358 carry `R_AARCH64_JUMP26 -> native_legacy_slot_common`, the common thunk
+writes only `x9`/`x10`/`x16`/`x17`, and the slot numbers stringify correctly.
+
+Every one of those statements is true.  And the build was red.
+
+**Because the pre-flight was assembled with
+`--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct
+form.**  So it answered "is this valid AArch64" while the build asks "is this
+valid AArch64 under the Apple relocation model".  The first is green and the
+second is red.
+
+A pre-flight that validates the wrong target is worse than no pre-flight.  It
+converts a 40-minute failure into a false confidence, and it did -- the pin was
+moved and the build dispatched on the strength of it.
+
+## Failure two: run 41915052472, and the pre-flight was green again
+
+The compile passed.  The `-Werror` object audit passed --
+`NativeLegacyDisplay: -Werror build and actual ARM64/iOS 17 object audit
+passed` is in the run's own log.  Then the kernel LINK failed:
+
+```
+Undefined symbols for architecture arm64:
+  "_native_legacy_slot_lifted", referenced from:
+      _native_legacy_client_observed in
+          libNativeLegacyDisplay.late.a[4](LegacyDisplayProbe.o)
+  "native_legacy_slot_calls", referenced from:
+      _native_legacy_slot_common in
+          libNativeLegacyDisplay.late.a[4](LegacyDisplayProbe.o)
+  "native_legacy_slot_common", referenced from:
+      _native_legacy_slot_thunk_0 in
+          libNativeLegacyDisplay.late.a[4](LegacyDisplayProbe.o)
+ld: symbol(s) not found for architecture arm64
+```
+
+Every reference from inside the very object that DEFINES the symbols.  That is
+not a missing definition; it is a definition ld will not accept.
+
+**The mechanism, reproduced locally before the fix was written**, with the same
+target and mode the runner uses: a symbol named from inline asm is emitted as
+an UNDEFINED reference no matter what, because the assembler cannot know the
+reference is intra-unit.  ld only satisfies such a reference against a real,
+GLOBAL definition.  Two things are not one:
+
+* a `static` symbol -- local binding cannot satisfy an undefined reference,
+  which is why `native_legacy_slot_common` was named too;
+* a TENTATIVE definition in `__DATA,__common` -- commons are merged in a later
+  pass, by which time the undefined reference has already been reported.  Every
+  zero-initialised global in this translation unit lands there, and neither an
+  explicit `= {}` nor `-fno-common` moves it.
+
+The fix is three attributes on each of the five globals -- `extern "C"`, an
+explicit `__DATA,unipad_slots` section, and an explicit zero initializer,
+without which a section-attributed declaration is a mere declaration and clang
+emits NOTHING -- plus making the common thunk global.
+
+## The pre-flight, which is the part that matters
+
+It now does three things the previous two did not:
+
+1. **It reads the DECLARATIONS out of `LegacyDisplayProbe.cpp`** as well as the
+   asm, so it compiles them exactly as spelled, attributes included.  A
+   hand-copied divergence cannot reintroduce either defect.
+2. **It assembles with the SAME target and mode the runner uses**,
+   `--target=arm64-apple-ios17.0.0 -fapple-kext`, so it checks the Apple
+   relocation model -- the thing that actually gates the build.
+3. **It reads the assembled object's SYMBOL TABLE** and refuses unless every
+   asm-created undefined reference has a global definition in the same unit.
+   That is the check that would have caught failure two before the pin moved.
+
+It is mutation-tested four ways by `local-private/tmp/mutate-preflight.py`,
+and all four are caught: the ELF `adrp` form; the `__common` definitions; the
+`static` common thunk; and -- the one that proves the symbol-table check itself
+has teeth, because the declaration regex still matches and only the table can
+see it -- a section-attributed declaration with its initializer removed, which
+clang silently drops.
+
+**And the first version of that parser reported an EMPTY set of undefined
+references** against an object that plainly had them, because
+`llvm-objdump -t` prints `<addr> *UND* <name>` in three fields and the parser
+skipped every line with fewer than five.  A parser that silently drops the rows
+it exists to read is the same defect as a guard that rejects everything, and it
+would have made the new check decorative.
+
+## The gate that earned its keep
+
+A third dispatch went out with a mistyped device SHA -- I fabricated the tail
+of a 40-character hash instead of reading it.  The input-validation step
+refused in 0.3 seconds:
+
+```
+##[error]device_commit '630e141a4d8b0e42...' != sources.lock.json
+device_repo.commit '630e141a18027e575f495edf4c466c04fd6ce21a'
+input validation status: fail
+```
+
+That is the counterexample.  The two build failures each cost forty minutes
+because the check that existed was aimed at the wrong question; this one cost
+nothing because the check was aimed at the right one.  The dispatch now reads
+both pins out of the lock rather than taking them from my typing.
+
+## Also this interval
+
+* **Task #28 is closed.**  All 21 locked submodule pins match the local clone,
+  verified by `local-private/tmp/check-submodule-alignment.py`.  The
+  `NativeVirtioConsole` half of the task was stale: the lock had already moved
+  past `d25974c` to `3ca09c93` on 2026-11-02, whose own commit note records the
+  measured root cause.  There was no unpushed experiment left to decide about.
+  The one real mismatch was `drivers/NativeVirtioBlock` sitting on `98909eb`
+  while the lock pins `3d053518` -- the commit carrying `virtio_blk.read_back`,
+  which milestones.py's `p.virtio_blk_read_back` asks for.
+* **The refusal lifter landed** (device commit `2bb2d1e`).  Addendum AH lifted
+  ONE refusal of twelve and nothing moved, so this lifts all of them at once
+  and asks whether the refusals are the gate collectively.  Safe because a
+  refusing stub writes NOTHING -- `MOV w0,#0x2c7` and a RET -- so replacing it
+  with `MOV w0,#0` changes exactly one register and no out parameter.
+* **Two guard tests pinned the board's kernel-argument count and both were
+  right to go red.**  Both are fixed by moving the recorded fact from 26 to 28
+  and naming the two new arguments; removing either turns them red again.
+
+### DISCLOSED, and it is mine
+
+`test_the_pinned_board_line_still_diverges_from_the_delivered_payload` was
+**already red since `aae08cd` added `offline-legacy-slot-trace=1`**.  The tests
+run after that commit were the pin tests, and the kernel-args files were not
+among them.  A guard test that has been red for an interval is the same defect
+as no guard test at all.
+
+## Status
+
+Windows/real-guest: **the pre-flight is now a real instrument** -- it reads the
+file, assembles for the target the runner uses, checks the symbol table against
+the link invariant, and is mutation-tested four ways with all four caught.
+
+Builds: `41906787039` **FAILED** (six `adrp` errors); `41915052472` **FAILED**
+(kernel link, `__common` and `static` symbols); `41923913116` **FAILED** (a
+mistyped dispatch SHA, caught by the input-validation gate in 0.3 s);
+`41924165302` is dispatched on `630e141`.
+
+Onsite: N/A.
+
+**Nothing is measured on the guest yet.**  The instrument that would measure it
+has never linked.  M9, M9a, M9b and M8 remain unproven.
