@@ -104,9 +104,30 @@ MAX_KERNEL_LOG_BYTES = 16 << 20
 #: cannot grow without limit.
 MAX_CACHED_PAGES = 4096
 
-#: ``p_stat`` values.  An unknown value is reported as its number rather than
-#: guessed at, because a mislabelled state is worse than an unnamed one.
-PROC_STATES = {1: "idle", 2: "run", 3: "stop", 4: "zombie", 5: "reaped"}
+#: ``p_stat`` values, which are XNU's own (``bsd/sys/proc.h``):
+#:
+#:     #define SIDL    1   /* Process being created by fork.  */
+#:     #define SRUN    2   /* Currently runnable.              */
+#:     #define SSLEEP  3   /* Sleeping on an address.          */
+#:     #define SSTOP   4   /* Process debugging or suspension. */
+#:     #define SZOMB   5   /* Awaiting collection by parent.   */
+#:
+#: An unknown value is reported as its number rather than guessed at, because a
+#: mislabelled state is worse than an unnamed one.  **The mapping used to be
+#: wrong on three of the five entries** -- 3 was labelled "stop", 4 "zombie" and
+#: 5 "reaped" -- and it was wrong in the direction that matters: a reader who
+#: saw ``"zombie"`` and concluded "awaiting collection by its parent" was
+#: looking at a *suspended* process, and ``"reaped"`` was a corpse.  Found
+#: 2026-11-04 while reading a live guest's process table; the value this module
+#: was asked about that day (2 = SRUN) happened to be labelled correctly, which
+#: is the only reason the wrong labels had not already cost a conclusion.
+PROC_STATES = {
+    1: "sidl",
+    2: "run",
+    3: "sleep",
+    4: "stop",
+    5: "zombie",
+}
 
 #: AArch64 stage-1 translation, 4 KiB granules.  Level 1 indexes with 8 bits at
 #: shift 30; levels 2 and 3 with 9 bits at shifts 21 and 12.

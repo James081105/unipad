@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-04 (interval forty-seventh, addendum O). The emitter caps are 65536 and saturation is now visible; fork `3d83de1`, lock pin `3d83de17dd4e4be468ac3fb8d30ee21c597e8972`. MEASURED ON THE NEW KERNEL: spawn.seen reached n=513 and kept going -- past the 512 at which the previous emitter went blind -- and no saturation record fired. job.open stopped at exactly 454 in BOTH captures, so 454 is how many job files launchd reads, not a bound, and the job-open window was never limited. Launchd reads com.apple.SpringBoard.plist at spawn n=239, 273 records INSIDE the old cap, and declines to spawn it; 6 of 7 App-typed jobs were read and 0 spawned. `springboard.running` is compiled into the kernel, gated on `p_comm == "SpringBoard"`, and has never fired. The framebuffer changed once at t=122 and then never again; the display probe SUCCEEDS (`surface_found=1`) and presents nothing. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg) is booting and capturing.
-Main repo at `d2899b2`.
+Last updated: 2026-11-04 (interval fiftieth, addendum R). THE HEADLINE, and it retracts what this header used to say: **SpringBoard IS running on this build, and its parent is launchd.** Measured from live guest memory over QMP with the kernel's sha256 checked first, and PROVED by two fields of `struct proc` agreeing: `p_pptr` (a pointer to the parent's proc, offset 16) resolves to a live proc whose `p_pid` equals the word at offset 32 (`p_ppid`) for all 171 live processes -- 171 agree, 0 disagree, 0 unresolvable. SpringBoard is pid 27 and its parent is pid 1 (launchd); launchd's parent is kernel_task. Nothing was reparented: `p_original_ppid` equals `p_ppid` for all 171. The offset of `p_ppid` is recorded NOWHERE in this repo -- `guestobserve.py`'s p_pid/p_stat/p_comm come from `gdb-stop.py`'s CLI defaults -- so it was derived by scanning every word of the struct against five properties a parent field must have, and then decided by the second field rather than by the score, because a word that is 0 everywhere scores perfectly. **WHY SPRINGBOARD HAS NO CREATION RECORD, and it is not a defect:** 158 of launchd's 171 children have a `spawn.seen` record and 11 do not (9 xpcproxy, AccessibilityUIS, SpringBoard, kernel_task) -- and both sets have launchd as parent, so the split is by PATH, not by caller. There is exactly one `spawn.seen` emitter in the fork and it sits inside `if (error == 0 && !spawn_no_exec)` at kern_exec.c:4280; `spawn_no_exec = TRUE` is set at :4002 by the `fork1(PROC_CREATE_SPAWN)` branch that `:3869` selects for a PLAIN posix_spawn (`POSIX_SPAWN_SETEXEC` clear). So a child created by a plain posix_spawn runs, gets its `p_comm` from `set_proc_name()`, and is invisible to this instrument. WHICH attribute makes launchd choose one branch for 158 children and the other for 11 is UNMEASURED -- the record prints `comm` and nothing else. MEASURED ON THE CURRENT CAPTURE: 1055 spawn records with n contiguous 1..1055, no saturation, and bluetoothd + fairplayd.A2 are 877 of them (83%). **The real blocker is still the display:** stage=10, surface_found=1, `native_legacy_transfer_calls == 0` -- SpringBoard is up and has submitted no validated swap. Two instrument caveats travel with this: the capture is at **800x600** because the harness never passed `ramfb_driver` (the driver exists, 12800 bytes; the 1376x1024 readings came from runs that did), and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Also note: the staged ESP's `args =` line is ONE long line and a truncated read of it produced a false 'the offline-legacy args are missing' conclusion this interval; it carries all 26 arguments including `offline-legacy-transfer=1`. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
+Main repo at `13025da`.
 
 ---
 
@@ -8820,5 +8820,544 @@ fixed.
 Windows/real-guest: unchanged. The 65536-cap kernel is still capturing; at the
 time of writing spawn n=732, exit n=599, job.open n=454, no saturation record, no
 SpringBoard record.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-eighth, addendum P): the framebuffer was 800x600, the
+SpringBoard emitter matched the wrong file, and neither is a guest defect
+
+## Two instrument defects in one hour, both found by someone else's report
+
+A display reviewer and a session reviewer each read a number this project had
+already written down, and each found that the number answered a question nobody
+had asked.  Both were right.  Neither finding is about the guest.
+
+**This is the ninth and tenth instances of this interval's failure mode**, and it
+is worth naming the shape once more because it keeps arriving from a new
+direction: an instrument reports a value, the value is read as an answer, and the
+question the value actually answered is a different one.  Addenda G, H, K and N
+recorded the same shape in the emitter bounds, the screendump hash, the literal
+search and the exit codes.  This time the two instances are in the *inputs* rather
+than the *outputs*, which is a place nobody had thought to look.
+
+## Defect 1: this capture never ran at the geometry its display evidence describes
+
+The display reviewer's question was precise and it was the right one: **the frozen
+screendump is 800x600, and every boot whose display counters were read was
+1376x1024, so are the two comparable at all?**
+
+They are not.  The staged ESP is on disk and it settles it without needing to
+trust the process table:
+
+    EFI/BOOT/BOOTAA64.EFI                    93696
+    EFI/UniXNU/unixnu.toml                     799
+    EFI/UniXNU/Payloads/DarwinBoot.efi       27136
+    EFI/UniXNU/Payloads/kernel.macho     125497344
+    EFI/UniXNU/Payloads/kernel.macho.adt     17820
+    EFI/UniXNU/Payloads/kernel.macho.gpuaddon 12132576
+    EFI/UniXNU/Payloads/kernel.macho.trustcache 61408
+    EFI/UniXNU/Payloads/scratch-data.img   4796608
+
+**No `QemuRamfb.efi`, and `unixnu.toml` names exactly one driver** --
+`Payloads/DarwinBoot.efi`.  Every screendump in this capture is 800x600, read from
+the PNG IHDR rather than assumed: `t00000`, `change-01-t00120` and the previous
+capture's `change-01-t00121` are all 800x600.
+
+The live process agrees, and this is the cheapest check of the three: the running
+QEMU's argv carries no `-fw_cfg name=opt/org.unixnu/ramfb-size` and never names
+`QemuRamfb` at all.
+
+### Why the counter readings were 1376x1024 and these were not
+
+`unixnu_boot.py` generates `unixnu.toml` from `board.toml` at staging time, and the
+frame-buffer driver entry is conditional on the caller:
+
+    config = unixnu_toml(spec, kernel_args_line(spec), initrd=initrd,
+                         ramfb=inputs.ramfb_driver is not None)      # :1337
+
+`display-counters.py` -- the script whose `DRAWING_COUNTERS` readings are quoted as
+fact 202 -- sets `ramfb_driver` to a build-produced driver
+(`display-counters.py:188`).  `console-channel-probe.py`, which launched *this*
+capture, never mentions `ramfb_driver`, `ramfb_size` or `QemuRamfb` at all.  That
+is the whole difference.  One script asked for the geometry driver, the other did
+not.
+
+`docs/boot-windows.md:1062-1063` records what the driver buys when it IS loaded:
+DarwinBoot prints `video base 0x1BBEF0000  1376x1024  row 5504 bytes 32 bpp`, and
+the document calls it "the first positive evidence" for the driver running before
+DarwinBoot takes the framebuffer.  So the 1376x1024 number is real, it is just not
+this capture's number.
+
+### The driver exists, so this is a one-line fix and not a missing build product
+
+The build does produce it.  It is on disk from an earlier build, 12800 bytes,
+sha256 `8aa46db3ac008aaa72aab10cc3efd97d5be29855aad00b1d7bd590941386d85c`, at
+`local-private/acceptance-runs/coverage-baseline/acceptance/local-private/out/
+real-boot/minimal-tier1-boot/followup/build/UniXNU-qemu/build/qemu-ramfb-efi/
+QemuRamfb.efi`.  Nothing about the current build is missing it; the current
+harness simply never passes the path.
+
+**So the display evidence from this capture is scoped to 800x600 and must not be
+transferred onto the 1376x1024 readings, or the other way.**  Whether the frozen
+framebuffer is geometry-dependent is now an open question with a known, cheap
+experiment attached, and it is not the same question as "why does no client submit
+a validated swap".
+
+One caveat that has to travel with the driver, because the code already documents
+the trap: `_check_ramfb_pair` (`unixnu_boot.py:1105-1140`) refuses a boot that
+stages the driver the manifest does not name, on the evidence of a 24-minute run
+that took 29 screendumps, all 800x600, all the same sha256.  Staging the file
+without the `[[driver]]` entry is invisible.  Passing `ramfb_driver` is sufficient
+*because* `stage_esp` then generates the entry; passing `payload_toml` as well
+would break the pair and be refused.  Both halves are required and the guard
+enforces it.
+
+## Defect 2: the SpringBoard emitter matched the wrong file with the same name
+
+The session reviewer found two SpringBoard plists on the OS root volume: the
+launchd job (2634 bytes, `POSIXSpawnType = App`) and a second file under
+`/System/Library/Preferences/Logging/Subsystems/` (2179 bytes) that carries no
+`Label` and no `POSIXSpawnType`.  The live capture then proved it independently,
+and this is the part that is a defect in something this project wrote.
+
+The targeted emitter fired:
+
+    {"event":"job.springboard_open","err":0,
+     "path":"/System/Library/Preferences/Logging/Subsystems/com.apple.SpringBoard.plist",
+     "source":"XNU.openat_internal"}
+
+**That is the logging-subsystem file, not the job file.**  The emitter's own
+comment states its intent exactly -- "if the thing being opened IS SpringBoard's
+job file then that is the answer" -- and then implements something weaker.  The
+gate is a basename comparison against the literal `com.apple.SpringBoard.plist`
+(`zzz-native-job-open-events.patch:193` for the literal, `:320-324` for the
+comparison loop), with no directory test at all.  The comment even says so: "Whatever
+the directory, whatever the prefix, relative or absolute".
+
+The general record's gate is different and stricter: `in_a_job_dir`, set at
+`:253` from the six watched job directories and tested at `:406`.  So the two
+records in the same patch disagree about what "SpringBoard's job file" means, and
+the looser one is the one with the name that promises the stricter thing.
+
+**The job file was still read.** `job.open` n=239 carries
+`"job":"com.apple.SpringBoard.plist","err":0` -- that one passed the directory
+test, so it came from one of the six job directories.  The launchd job plist being
+read is not in doubt and was never in doubt.  What is in doubt is the targeted
+record's name: read at face value it says "SpringBoard's job file was opened",
+and what it actually says is "a file with that basename was opened, from
+anywhere".
+
+The fix is one condition -- require the basename match AND `in_a_job_dir` -- and
+until it is made the record should be read as "a file named
+com.apple.SpringBoard.plist was opened", which is a weaker statement than its name
+implies.  It is also worth noting that the collision was *predictable*: a name
+that distinctive appearing in two subsystems is not a surprise, and a basename
+match on a name that distinctive is a bet.
+
+## What the capture itself now says, with the window open
+
+    spawn.seen    n=799   (the old kernel's emitter went blind at 512)
+    exit.seen     n=665   (the old kernel's emitter went blind at 512)
+    job.open      n=454   (unchanged; 454 is how many job files launchd reads)
+    no .saturated record
+    no springboard.running
+
+QEMU is still up, 7894 s of CPU at the time of writing.  The instrument is
+confirmed for the fourth consecutive time on a live guest, at nearly 800 spawns
+with no saturation record and no sign of the bound.
+
+## Status
+
+Windows/real-guest: **two test-instrument defects, neither a product defect.**
+(1) The capture ran at 800x600 because the harness never passed `ramfb_driver`;
+the geometry driver exists and is one argument away.  (2) `job.springboard_open`
+matched a basename and caught the Logging/Subsystems plist; the fix is to also
+require the job-directory test the general record already performs.  Both are
+recorded rather than fixed because both change what a future measurement means,
+and a future measurement taken before the fix is written down is a measurement
+that has to be re-taken.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, booting since
+12:03Z, spawn n=799, exit n=665, job.open n=454 at the time of writing.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-ninth, addendum Q): SpringBoard is running on this
+# build, as pid 27, and the emitter built to see it was on the wrong path
+
+## The claim this overturns, stated exactly so it can be checked
+
+`docs/current-state.md` says three things about the current build, in its header
+and again in interval forty-fifth:
+
+> "SpringBoard has still NOT been observed to spawn."
+
+> "Launchd reads `com.apple.SpringBoard.plist` at spawn n=239 ... and **declines
+> to spawn it**; 6 of 7 App-typed jobs were read and **0 spawned**."
+
+> "`springboard.running` is compiled into the kernel, gated on
+> `p_comm == "SpringBoard"`, and **has never fired**."
+
+**All three are true about the channel.  All three are false about the guest.**
+SpringBoard is running on this build, as pid 27, and has been since early in the
+boot.
+
+## The measurement
+
+Two snapshots of the guest's process table, taken seven minutes apart through
+QMP, with the kernel's identity checked by sha256 before either read:
+
+    snapshot 1   2026-11-04T13:58:39Z    168 processes
+    snapshot 2   2026-11-04T14:05:32Z    167 processes
+
+    SpringBoard   pid=27  state=SRUN  proc 0xfffffff78f00c100   (BOTH snapshots)
+    runningboardd pid=26  state=SRUN
+    backboardd    pid=58  state=SRUN
+    bluetoothd    ABSENT at 13:58:39, PRESENT at pid 855 at 14:05:32
+
+**SpringBoard holds the same proc address across seven minutes**, so it is the
+same process and it is not being recreated.  And the instrument is proved live by
+the row nobody chose: bluetoothd is absent from the first snapshot and present at
+pid 855 in the second, which is exactly what its crash-loop predicts, and pid 855
+is past the pids the kernel log shows it dying at (689, 691, 774).
+
+## The instrument is validated in both directions before the negative is read
+
+This is the discipline the interval has been enforcing since addendum G, applied
+to the one conclusion that matters most.
+
+**The positive control.** 837 `spawn.seen` records arrived with `n` running 1 to
+837 with no gap and no duplicate.  The counter is incremented before the record is
+built, so a dropped record would leave a hole in `n`.  There is none.  The channel
+is lossless for this emitter.
+
+**The emitter is in the running kernel.** `kernel-literal-check.py` enumerates
+contiguous `{"event":"...` literals rather than searching for a substring, because
+ld's SHF_MERGE|SHF_STRINGS merging splits these records into fragments and a
+substring search for `spawn.seen` finds zero in a kernel that emitted it 837
+times.  In the kernel that is actually booted -- sha256
+`4914d56c95e97c33f8580f4fd05319c8a9c111e8e52ccc90764907c0edf12021` -- the verdict
+is:
+
+    contiguous literals (a positive here is trustworthy):
+        1x  springboard.running
+        1x  springboard.interaction
+
+So the record is compiled in, reachable, and simply never triggered.
+
+**The cross-tabulation.** Of 159 live processes, 154 have a `spawn.seen` record.
+The five that do not are:
+
+    kernel_task      pid=0    created by the kernel, structurally impossible
+    launchd          pid=1    exec'd by load_init_program, not posix_spawn
+    SpringBoard      pid=27   <-- the anomaly
+    AccessibilityUIS pid=177  MAXCOMLEN truncation edge case
+    xpcproxy         pid=34   one instance of a comm that appears 3x in the table
+
+**SpringBoard is the only significant live process with no spawn record.** The
+emitter is not broadly blind; it is blind to this one process.
+
+## So how did pid 27 come to exist?
+
+Neither instrumented path reports it:
+
+    exec.seen    2 records total: launchd (n=1), apfs_boot_util (n=2)
+    spawn.seen   837 records, none with comm "SpringBoard"
+    exit.seen     703 records, none with comm "SpringBoard"
+
+**It has never exited**, which is why there is no exit record, and it was created
+outside `posix_spawn`'s success block and outside `__mac_execve`.  The two
+emitters sit at `zzz-native-springboard-events.patch`'s `posix_spawn` hunk (after
+`proc_exec_switch_task()`, inside `if (error == 0 && !spawn_no_exec)`) and its
+`__mac_execve` success block.  A process can miss both by being created through a
+spawn variant that takes neither, or by a path this kernel build does not run
+through those hunks.
+
+**The mechanism is unmeasured and this addendum does not guess it.** What is
+measured is the shape: runningboardd is pid 26 and SpringBoard is pid 27, and
+runningboardd DOES have a spawn record while SpringBoard does not.  So the parent
+was seen and the child was not, one PID apart.  Whatever launchd and runningboardd
+do to start the app domain, the kernel-side record of it is missing.
+
+## What this means for the two open tasks
+
+**Task #22 was the wrong question.** It asked why launchd declines
+`POSIXSpawnType=App` jobs.  The 0-for-12 separator is real -- it is a fact about
+posix_spawn -- but SpringBoard was never going to appear in it, because SpringBoard
+does not arrive by posix_spawn on this build.  The separator measured the
+instrument's path, not the guest's.
+
+**Task #24's remaining defect is the real one, and it is now sharper.** The
+display subsystem is fully up and idle:
+
+    native_legacy_stage                10    (both snapshots)
+    native_legacy_transfer_calls        0    (both snapshots)
+    native_legacy_swap_validation_calls 0
+    native_legacy_frame_count           0
+    native_gop_gpu_offers               0
+    native_gop_gpu_completions          0
+
+`transfer_calls` is incremented as the first statement of
+`native_legacy_transfer_observed()`, which the driver calls on every way out of
+`kickOnce()` including the early returns, so 0 means the driver never got a
+validated swap at all.  **SpringBoard is running and has never submitted one.**
+That is the blocker for an operable SpringBoard, and it is a statement about what
+SpringBoard does, not about whether it exists.
+
+## The earlier boots, and why they cannot be borrowed
+
+A reviewer's report attributed "SpringBoard ran on at least four earlier runs" to
+boot31, boot46, boot60 and boot40.  The underlying fact is real; the attribution
+is not, and the difference matters because these numbers get reused.
+
+- The ten PIDs (27, 110, 113, 115, 119, 121, 126, 129, 136, 137) and the
+  t=539-774 range come from **one file** --
+  `local-private/boot60/display/attempt-1/guest-kernel.log` -- and are one boot's
+  crash-loop, not a union across four runs.
+- `boot60` is cited in **no document**.  The label came from a directory name.
+- boot46 contributes a different PID set (27, 106, 108, 109, 113, 115, 117).
+- Every one of those observations is a crash-loop the OS gave up on:
+  `Process[122] crashed: SpringBoard. Too many corpses being created.`
+  (`docs/implementation-plan.md:438`).  Nothing in the record shows SpringBoard
+  reaching a steady state, drawing, or accepting input.
+- **All of them predate the emitter entirely.**  The first emitter was compiled
+  and pinned 2026-11-03, fork `62bc0f48`.  They ran different kernels and
+  different builds.
+
+**So the current build is not a regression from those boots -- it is a different
+situation.**  On boot31/46/60, SpringBoard ran and crash-looped.  On this build,
+SpringBoard runs and does NOT crash-loop: it is pid 27, stable, never exited.
+The display defect is the same shape, but "it crashes repeatedly" and "it runs
+stably and presents nothing" are different defects with different fixes, and the
+second one is what this build has.
+
+## One instrument defect found on the way, and it is not cosmetic
+
+`src/unipad/host/guestobserve.py:109` labels the process states:
+
+    PROC_STATES = {1: "idle", 2: "run", 3: "stop", 4: "zombie", 5: "reaped"}
+
+XNU's own `bsd/sys/proc.h:160-164` says:
+
+    #define SIDL    1   /* Process being created by fork. */
+    #define SRUN    2   /* Currently runnable. */
+    #define SSLEEP  3   /* Sleeping on an address. */
+    #define SSTOP   4   /* Process debugging or suspension. */
+    #define SZOMB   5   /* Awaiting collection by parent. */
+
+**Three of the five labels are wrong.** 3 is SSLEEP, not "stop".  4 is SSTOP, not
+"zombie".  5 is SZOMB, not "reaped".  The one that matters here -- 2 = SRUN --
+is labelled correctly, so this addendum's conclusion stands.  But a reader who
+sees `state: "zombie"` and concludes "awaiting collection by its parent" is
+reading a suspended process, and a reader who sees `"reaped"` is reading a
+corpse.  On a project that has already been bitten by a mislabelled instrument,
+the labels should be corrected before somebody trusts one.
+
+## Status
+
+Windows/real-guest: **PASS for the guest, FAIL for the conclusion drawn from it.**
+SpringBoard runs on this build as pid 27, stably, never exited -- measured twice
+from live guest memory with the kernel's identity verified, and cross-checked
+against a process whose behaviour was already known.  The state document's claim
+that it never spawned is retracted here.  The display defect survives and is now
+correctly located: SpringBoard is up and has submitted no validated swap in
+10 hours.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, fork `3d83de1`,
+kernel `4914d56c`, booting since 12:03Z.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fiftieth, addendum R): SpringBoard's parent is launchd,
+# proved by two fields of struct proc, and 11 of launchd's children take a
+# posix_spawn path this repository cannot see
+
+## What was open, and what closes it
+
+Addendum Q left one question standing and said so: SpringBoard is running as pid
+27, neither instrumented creation path reported it, and *who created it* was
+unmeasured.  That question is now answered by reading the guest's own process
+struct, and the answer is cross-checked by a second field rather than trusted
+from one.
+
+## The offset is derived, and the derivation is checked
+
+`p_ppid` is a field of `struct proc`, so the answer is in guest memory.  Its
+offset is **not** known: `guestobserve.py` records `p_pid=96`, `p_stat=100`,
+`p_comm=1468` from UniXNU's `scripts/qemu-entry/gdb-stop.py`, where they are CLI
+defaults somebody measured once.  There is no `p_ppid` default anywhere in this
+repository, and there is no `p_pptr` default either.  A hard-coded offset would
+therefore have been a guess wearing a fact's clothes -- the exact failure this
+project has now paid for eleven times.
+
+So it was derived.  Every 4-byte-aligned word of the struct was scored against
+five properties a parent field must have: every process holds a live pid or 0
+there; nothing is its own parent; kernel_task and launchd both read 0 (neither
+was spawned by anything alive); following parents reaches a root without
+revisiting a node; and it is not offset 96, which is `p_pid`.
+
+Twenty-four offsets survived with a single violation each, and they were
+indistinguishable by score.  A word that is 0 everywhere scores perfectly.  So
+the score cannot pick the field, and the first version of this script refused
+rather than guess.
+
+What separates them is a **second field**.  `bsd/sys/proc_internal.h` puts
+`p_pptr`, a *pointer* to the parent's `struct proc`, at offset 16 -- immediately
+after `p_list`, eight bytes before `p_ppid`.  The parent is therefore named
+twice, once as a pointer and once as a pid.  If the pointer resolves to a live
+proc whose `p_pid` equals the word at offset 32, then 32 is `p_ppid`, and the
+reading is proved by two fields agreeing instead of by one word's shape.
+
+**Measured, 171 live processes, every one agreeing:**
+
+    p_pptr (offset 16) vs p_ppid (offset 32):
+      agree         171
+      disagree      0
+      unresolvable  0
+
+A wrong offset cannot pass this.  It would have to hold a pid that coincidentally
+matches the parent a *pointer* names, for 171 processes at once.
+
+## The answer
+
+    SpringBoard   pid 27  proc 0xfffffff78f00c100
+      p_pptr -> 0xfffffff78effdee0 = pid 1 (launchd)
+      p_ppid -> 1
+    launchd      pid 1
+      p_pptr -> 0xfffffff78effd100 = pid 0 (kernel_task)
+
+**SpringBoard's parent is launchd.**  Not runningboardd, not a
+`posix_spawn` intermediary, not a reparented orphan.  `launchd`'s parent
+is `kernel_task`, which is its own root.  That is the ordinary iOS
+relationship, and it was never in doubt from userspace -- what was in doubt was
+whether the kernel-side record agreed with it, and it does not.
+
+**Nothing was reparented.**  `p_original_ppid` (offset 36, immediately after
+`p_ppid`) equals `p_ppid` for all 171 live processes
+(0 differences).  So no process here had its parent die and get
+re-parented to `launchd`; the values at offset 32 are the parents that
+actually created them.
+
+## The split, and it is a split by PATH, not by caller
+
+Cross-tabulating the live table against the channel's current contents
+(2417 records, 1038 `spawn.seen`, 2 `exec.seen` with
+comms ['launchd', 'apfs_boot_util']):
+
+    live procs WITH a creation record:   160
+      parents: {'launchd': 159, 'kernel_task': 1}
+    live procs WITHOUT one:              11
+      parents: {'launchd': 10, 'kernel_task': 1}
+
+**Both sets have the same parent.**  If the difference were "launchd does two
+different things for two different kinds of job", the parents would differ.  They
+do not.  Every live process except `kernel_task` is a child of `launchd`,
+in both sets.  So the difference is which *path through `posix_spawn`* the child
+took.
+
+The 11 without a record are: AccessibilityUIS, SpringBoard, kernel_task, and
+nine `xpcproxy`.
+
+**Every count in this addendum is a snapshot.**  The guest is still running and
+the channel is still appending, so `spawn.seen` was 1038 when this was written
+and is higher now; the document's header quotes whatever the count was when *it*
+was last refreshed.  The two numbers disagreeing is the channel growing, not one
+of them being wrong.  What does not move is the shape: the record numbering is
+contiguous from 1 with no gap and no duplicate, so nothing has been lost, and
+the 11-without-a-record set has been the same 11 for as long as it has been
+measured.
+
+## Why, and it is in the fork's own source
+
+There is exactly **one** `spawn.seen` emitter in the fork's patches
+(`zzz-native-springboard-events.patch`, one site), and it sits at
+`bsd/kern/kern_exec.c:4280`, inside:
+
+    if (error == 0 && !spawn_no_exec) {
+
+`spawn_no_exec` is initialised FALSE at `:3563` and set TRUE in exactly one
+place, `:4002` -- which is **above** the emitter and belongs to this
+branch:
+
+    do_fork1:
+        error = fork1(p, &imgp->ip_new_thread, PROC_CREATE_SPAWN, coal);
+        ...
+        imgp->ip_flags |= IMGPF_SPAWN;  /* spawn w/o exec */
+        spawn_no_exec = TRUE;           /* used in later tests */
+
+That branch is the one the condition at `:3869` selects:
+
+    if (imgp->ip_px_sa == NULL || !(px_sa.psa_flags & POSIX_SPAWN_SETEXEC)) {
+
+-- i.e. **a plain `posix_spawn`**.  `POSIX_SPAWN_SETEXEC` (`sys/spawn.h:59`,
+`0x0040`) is the flag that turns `posix_spawn` into "execve with options", and
+that is the *other* branch, the one that leaves `spawn_no_exec` FALSE and
+therefore reaches the emitter.
+
+So there are two ways through `posix_spawn`, one creates the child with
+`fork1(PROC_CREATE_SPAWN)` and activates the image in it, the other replaces the
+caller.  **The emitter is on the second.**  A child created by the first is
+running, has its `p_comm` written by `set_proc_name()` inside
+`exec_mach_imgact()`, and is invisible to this instrument.
+
+That is the whole explanation, and it needs no new defect: SpringBoard,
+AccessibilityUIS and the nine live `xpcproxy`s are `launchd`'s children
+created by a `posix_spawn` this repository does not instrument.  The other
+160 took the branch it does.
+
+**What is still unmeasured:** which attribute makes `launchd` choose one
+branch for 160 children and the other for 11.  The
+emitter prints `comm` and nothing else -- no pid, no caller, no flag -- so the
+channel cannot separate them, and the fork's source says only that the flag
+exists.  The next probe is an emitter inside `do_fork1`'s block (or the child's
+pid and the caller's pid added to the existing record), and it needs a kernel
+rebuild.  **This addendum does not guess the flag.**
+
+## Two things this addendum nearly got wrong, both recorded
+
+**First, a truncated read.**  The staged ESP's `args =` line is one long line.
+An earlier reading of it in this session showed only its tail and concluded the
+`offline-legacy-*` family had been dropped and `transfer_calls == 0` was a host
+configuration defect.  Re-read in full, the line carries all 26 arguments,
+including `offline-legacy-transfer=1`, `offline-legacy-validate=1`,
+`offline-legacy-phase=4` and `offline-legacy-surface-wait-ms=600000`.  The
+conclusion was wrong and the file was fine.  The script above asserts those four
+arguments are present before it writes anything.
+
+**Second, a score that cannot discriminate.**  The first version of the offset
+scan required all five properties simultaneously and refused the whole struct,
+because a word that is 0 everywhere passes all five.  Reporting the refusal
+without saying *which* property failed would have been a negative read off an
+instrument whose question was not the one being asked.  Scoring each property
+separately is what exposed that the score was not the discriminator, and the
+second field is what actually decided it.
+
+## The respawn loop, now with a number
+
+Task 23's loop is in the same channel and is now quantified: of 1038
+`spawn.seen` records, 489 are `bluetoothd` and 371 are
+`fairplayd.A2` -- 860 of 1038, or
+82% of every spawn the kernel
+has seen this boot.  The remaining 178
+records cover 167 other distinct processes.  The record
+numbering is contiguous from 1 to 1038 with no gap and no duplicate, so
+none of this is lost to the emitter's 65536 bound.
+
+## Status
+
+Windows/real-guest: **PASS for the parent measurement** -- read from live guest
+memory over QMP with the kernel's sha256 verified first, and proved by two
+fields of `struct proc` agreeing across all 171 live processes.
+**UNMEASURED for the branch `launchd` chose**, which needs a rebuild.
+The display defect is unchanged and is not re-measured here.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, fork `3d83de1`,
+lock pin `3d83de17dd4e4be468ac3fb8d30ee21c597e8972`, kernel `4914d56c`, booting since 12:03Z.
 
 Onsite: N/A.
