@@ -8289,3 +8289,155 @@ complete, four artifacts uploaded. `boot-inputs` (310 MB) is downloading into
 soon as it lands, with the control above already recorded.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum K): the caps are in the kernel, the
+# display's root cause is a week old and half-fixed, and addendum J over-claimed
+
+## The new kernel carries all five saturation literals, with a control in both directions
+
+Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg) produced a kernel
+whose sha256 is `4914d56c95e97c33f8580f4fd05319c8a9c111e8e52ccc90764907c0edf12021`
+and whose size is 125497344 bytes -- the same size as the previous build's, which
+is not evidence of anything either way, because 55 lines of C can land inside
+existing padding.
+
+The check that IS evidence is the literal count, and it has now been run against
+both kernels:
+
+    kernel 41788097516 (pre-cap, sha256 bcb2a947...)   saturated = 0
+    kernel 41817661032 (this build, sha256 4914d56c...) saturated = 5
+
+And the five are complete, contiguous, NUL-terminated literals, not fragments:
+
+    {"event":"exec.saturated","source":"XNU.__mac_execve"}\n
+    {"event":"exit.saturated","source":"XNU.exit_with_reason"}\n
+    {"event":"spawn.saturated","source":"XNU.posix_spawn"}\n
+    {"event":"spawn_failed.saturated","source":"XNU.posix_spawn"}\n
+    {"event":"job_open.saturated","source":"XNU.openat_internal"}\n
+
+Each exactly once. **They are greppable precisely BECAUSE they are new** -- the
+emitters' ordinary literals get their tails merged with unrelated strings by ld,
+but a string with no shared tail has nothing to merge with. That is why the same
+kernel that carries all five saturation literals still counts `spawn.seen` zero
+times.
+
+`springboard.running` and `springboard.interaction` are still present once each in
+the new kernel. The SpringBoard emitters are still compiled in.
+
+The boot is live on this kernel as of 12:04Z. Its `diag.legacy_display_status` is
+byte-identical to the previous build's (`stage 10, surface_status 0, surface_found
+1, dt 1`), and `system.mount` reports the same volume UUID
+`8846FE78-2910-4297-AF97-D59BB6F8FC16`. The question this build exists to answer --
+whether the guest goes quiet or the emitter does -- is now measurable for the first
+time.
+
+## Addendum J over-claimed on the mechanism
+
+Addendum J wrote: "The harness carried a warning about this gate ... That warning
+is correct and it is now explained", and then presented the prefix/middle/suffix
+arrays and the linker's tail merging as the explanation.
+
+The explanation was already in the tree. The exec emitter's own comment in
+`zzz-native-springboard-events.patch` says, at length:
+
+> AND THE LITERAL IS NOT GREPPABLE IN THE IMAGE, which is measured and not
+> guessed. The once-per-boot version's `exec.first` literal counted ZERO as a
+> contiguous byte string in the kernel that carried it, because ld's
+> SHF_MERGE|SHF_STRINGS pass split the 30-byte string into a 16-byte head plus a
+> shared tail -- while the block-scope static `___mac_execve.native_first_exec_
+> reported` was absent from the previous kernel and present in that one.
+
+So the project knew, in the patch, a week ago. What addendum J actually
+contributed is narrower and still useful: it enumerated WHICH literals got split
+(`{"event":"exec.s`, `{"event":"exit.s,...lockf`, `{"event":"job.op`,
+`{"event":"spawn.`) and found that `springboard.running` did not. The enumeration
+is new; the mechanism was not, and saying it was is the same failure mode this
+whole interval is about -- presenting a re-derivation as a discovery.
+
+## The display's root cause is a week old, and half of it is fixed
+
+Addenda H, I and J each said some version of "the probe succeeded and the defect
+is downstream of it". That is true and it is also the second time this project has
+reached that sentence. `docs/boot-windows.md` sections 7.5.11 and 7.5.12, dated
+2026-10-28, already contain the whole chain.
+
+**7.5.11 recorded an indeterminacy.** `native_legacy_display_late_probe()` has two
+places it can return early, (A) the first probe released the object and (B) the
+five-second `waitForMatchingService` closed with the service absent, and the
+existing counters cannot tell them apart -- `pendingLegacyDisplay` is a
+file-linkage `static IOService *` with no symbol, and `native_legacy_surface_status`
+and `_found` live in .bss whose initial value is 0, so "assigned 0" and "never
+assigned" are the same reading.
+
+**7.5.12 resolved it with sampling frequency rather than a new counter.**
+`native_legacy_stage` stops at 3 when the first probe retains and jumps 3->7->8
+when it releases. One run at 1 s sampling:
+
+    t= 14.1s stage=0
+    t= 17.2s stage=3      <- the first probe RETAINED the object
+    t= 27.8s stage=8      <- the late probe ran and returned early
+
+So (A) is false -- `offline-legacy-phase=4` was parsed correctly. (B) is true: the
+late probe ran at t~27.8 s, its window closed at t~32.8 s, and
+`IOSurfaceRoot::installMemoryRegions()` lands at t=51.8 s in one run and t=86.1 s
+in another. A 34-second spread between two runs, so the ordering is not fixed.
+
+**And 7.5.12 killed the obvious fix.** Extending the wait to 90 s deadlocks: the
+probe blocks, `bsd_autoconf()` does not return, `mountroot` does not run,
+`IOSurfaceRoot` never installs, and the wait waits on the boot it is blocking. The
+evidence for that is an interleaving of `nx_mount` and
+`IOSurfaceRoot::installMemoryRegions()` 8 ms apart in the guest log -- which
+proves two lines are close in time and does NOT prove they are on the same thread.
+7.5.12 labels that inference as an inference.
+
+**The fix that landed is the other one.** `offline-legacy-start.patch` (patch 35
+of 57) moves the call past `IOSecureBSDRoot()`, to the point where the root volume
+is known to be up, so the wait returns at once because the service is already
+published. Its header records the measurement: the early probe retains the display
+object at t~17.2 s, the late probe ran at t~27.8 s, its wait closed at t~32.8 s
+with the service absent, and `IOSurfaceRoot::installMemoryRegions()` landed at
+t~51.8 s -- "So raising the timeout cannot help: it deadlocks."
+
+**And it worked.** Today's boot reports `surface_found: 1` where the 2026-10-28
+measurement recorded `native_legacy_surface_found = 0`. Same kernel path, same
+emitter, same field. The gate at (B) is now passing where it did not.
+
+**So the defect has moved, and addenda H/I/J were describing the NEW location
+without saying the old one was fixed.** The framebuffer still shows DarwinBoot's
+last frame, `native_gop_ready` was 0 in the October measurement, and today's
+harness decodes stage 10 as "the display started AND phase == 4:
+activeLegacyDisplay is set and the GOP presenter CAN BE BUILT" -- can be, not is.
+The open question is now one level down: the surface is found, and something
+between that and a presented frame still does not happen.
+
+There is no emitter for `native_legacy_frame_count` in the current patch set, so
+that counter cannot be read from the channel. The October measurement came from a
+diagnostic script reading .bss directly, not from the console.
+
+## The artifact download was 26x faster once the limit was identified
+
+One connection to GitHub's artifact CDN measured 47 KB/s, which is 89 minutes for
+the 310 MB boot-inputs bundle. The CDN answers 206 to a Range request, so the
+transfer splits eight ways: 807 KB/s overall, 26x.
+
+The first parallel run died at 25 of 38 parts with `403 544` on every remaining
+range. The SAS URL carries `se=<expiry>` and it was 11:44 -- three minutes after
+the URL was resolved. **A long parallel download outlives its own credential.**
+The downloader now re-resolves the URL when a range answers 403 and skips parts
+already complete, which is what let the second run finish the last 13 parts.
+
+`local-private/tmp/parallel-artifact.py`.
+
+## Status
+
+Windows/real-guest: the 65536-cap kernel is booted and capturing as of 12:04Z,
+with the caps verified present in the image by a check whose control ran in both
+directions. The display's upstream root cause is FIXED (`surface_found` 0 -> 1)
+and the remaining defect is one level below it.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, all 34 steps
+complete, four artifacts, boot inputs extracted and booting.
+
+Onsite: N/A.
