@@ -10987,3 +10987,99 @@ submodule declared no URL at all.
 
 It is corrected here rather than edited in place, because the addendum log is
 append-only and an edit would hide that the table was ever wrong.
+
+---
+
+# Interval 2026-11-05 (sixty-fourth, addendum AF): the two long captures ended, and the red one was not red
+
+## What the two tasks were, and how they ended
+
+| task | what it did | exit | what that means |
+|---|---|---|---|
+| `buizold0y` | booted the 65536-cap kernel and captured the channel | **1** | **not a failure** -- a designed refusal |
+| `bbywtnvm5` | watched for SpringBoard or emitter saturation | **0** | the watcher saw the channel stop |
+
+## The exit-1 run, read from its own log
+
+The capture log carries the sequence in order:
+
+```
+kernel sha256 verified: 4914d56...
+the kernel was handed off; capturing the channel
+    kept change-01-t00120.png for f54dadc0
+quiet for 1208s (>= 1200s); stopping the listen early
+the screen produced 2 distinct images over 170 dumps; changed=True
+Home changed the screen at least once: False
+REFUSED: F:\iosvirtual\local-private\boot53\longboot-input-run\guest-input.log already exists
+REFUSED: F:\iosvirtual\local-private\boot53\longboot-input-run\guest-input.timed.jsonl already exists
+```
+
+So the guest **booted**, the kernel's sha256 was verified before the
+handoff, the channel was captured, and the loop broke on its own
+**quiet-stop rule** -- 1208 s of silence against a 1200 s threshold,
+which is the rule that exists specifically so a still-booting TCG guest
+is never truncated by a hard deadline.
+
+Then it died.  Both refusals name the PREVIOUS build's files:
+
+* `present`: `longboot-input-run/guest-input.log`
+* `present`: `longboot-input-run/guest-input.timed.jsonl`
+
+`CAPTURE_DIR` was a hard-coded constant, and the capture refuses to
+overwrite an existing log -- which is the right default and the wrong one
+for a second run against a second build.  The run had already done its
+work; it just could not file it.
+
+## Why this is worth an addendum and not a shrug
+
+This log records one defect class over and over: **a value read as the
+answer to a different question.**  A counter that does not move read as
+"the loop has stopped"; a classifier matching a dead instruction tail
+read as "this slot refuses"; a hand-typed address with one digit too
+many read as "scanned 0 bytes".
+
+This is the same shape with an **exit code** standing in for the value.
+`exit 1` reads as "the run failed".  What it actually said was "I
+refuse to overwrite a file that belongs to a different build" -- and the
+refusal fired *after* the measurement it was supposed to protect had
+already been taken.  Reading the exit code and moving on would have
+discarded a successful capture and re-run four and a half hours of boot.
+
+## What the capture actually measured, which stands independently
+
+The screen produced **2 distinct images over 170 dumps** and Home never
+changed it:
+
+* `the screen produced 2 distinct images over 170 dumps; changed=True
+* `Home changed the screen at least once: False
+* the frozen hash `f54dadc0` appears 188 times in the log
+
+That is the same frozen image addendum AB recorded, and it is the same
+conclusion from a different kernel: the compositor is still not driving
+the display, and the Home key does not reach it.  Independent of the
+exit code, and independent of which build produced it.
+
+## The guest is gone, by design
+
+No `qemu-system-aarch64.exe` is running.  The capture owns the QEMU
+process it starts and kills it when the listen ends, so the quiet stop
+took the guest with it.  That is not a crash and there is nothing to
+diagnose -- but it does mean **every measurement in this interval's
+earlier addenda was taken against a guest that no longer exists**, and
+the next one needs a fresh boot against the new build.
+
+## The fix, and it is one line
+
+`UNIPAD_CAPTURE_DIR` now overrides `CAPTURE_DIR`, defaulting to the
+existing path so nothing that worked before changes behaviour.  The
+measurement script for the display experiment
+(`measure-display-refusal-experiment.py`) takes the scratch dir and QMP
+port as arguments for the same reason.
+
+## Status
+
+Windows/real-guest: **the capture's own measurements stand**; the run's
+exit code does not describe them.
+
+**Nothing here is evidence about the display experiment.**  The kernel
+that booted is `4914d56`, which predates it.
