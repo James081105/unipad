@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-04 (interval fifty-first, addendum S). THE HEADLINE, and it supersedes what this header used to lead with: **the display blocker now has a measured cause, and it is not a configuration defect.** The framebuffer's user client is the ORIGINAL Apple `IOMobileFramebufferUserClient` — the probe interposed it and saved the vtable slot it displaced, `0xfffffff005778d40`, which is the exact address `scripts/audit-mobile-graphics-userclient.py` extracts from the target's own `com.apple.iokit.IOMobileGraphicsFamily`, confirmed by five byte anchors re-read off the live kernel. **backboardd (pid 58) opened it and made 15 external calls; 11 returned `0xe00002c7` = `kIOReturnUnsupported` and one returned `0xe00002bc` = `kIOReturnError`.** Those refusals are NOT missing dispatch entries: the table at `0xfffffff005f354c0` has 90 rows, its null set is exactly [59,60,61,62,63,64,65,70,71] as the audit records, 81 of 90 rows carry a function, and every selector any client used is among them — so the method RAN and refused. The chain closes on this kernel's object: backboardd's client field `+0xd8` is `0xfffffff6a8afa000`, which is `native_legacy_object`. **SpringBoard (pid 27) never opened the framebuffer at all.** Selector 74's refusal is by design (`NativeLegacyDisplay.cpp:370-374` returns `kIOReturnUnsupported` with the comment "This backend implements no trace-key subscription contract", and its dispatch row `in=(1,0) out=(2,64)` is exactly that signature); the other eleven land in the original `IOMobileFramebufferLegacy` base, which this port does not override — and the fork says why at `NativeLegacyDisplay.cpp:85-87`: *"the platform subclass that normally writes it is not part of this port."* The driver itself is fully up: stage=10, surface_found=1, dt_attached=1, registration_calls=1, properties_length=576, pm_stage=4, and the GOP is mapped at physical `0x1BC7A0000` — DARWINBOOT's own `video base` — at 800x600 and 1920000 bytes. **Earlier finding, still standing:** SpringBoard IS running and its parent is launchd, proved by two fields of `struct proc` agreeing across all 171 live processes (`p_pptr` at offset 16 resolves to a live proc whose `p_pid` equals the word at offset 32; 171 agree, 0 disagree). SpringBoard has no `spawn.seen` record because 158 of launchd's 171 children take the `spawn_no_exec` branch at kern_exec.c:4002 and 11 do not, and the single emitter sits inside `if (error == 0 && !spawn_no_exec)` at :4280 — a split by PATH, not by caller, and not a defect. Three instrument caveats travel with all of this: `GuestObserver.translate()` walks `_TABLE_SHIFTS` from bit 30, so only bits 0..38 of an address reach an index and a mistyped high half is silently accepted; the capture is at **800x600** because the harness never passed `ramfb_driver`; and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
-Main repo at `8aa48f3`.
+Last updated: 2026-11-04 (interval fifty-first, addendum S). THE HEADLINE, and it retracts what this header used to say: **SpringBoard IS running on this build, and its parent is launchd.** Measured from live guest memory over QMP with the kernel's sha256 checked first, and PROVED by two fields of `struct proc` agreeing: `p_pptr` (a pointer to the parent's proc, offset 16) resolves to a live proc whose `p_pid` equals the word at offset 32 (`p_ppid`) for all 171 live processes -- 171 agree, 0 disagree, 0 unresolvable. SpringBoard is pid 27 and its parent is pid 1 (launchd); launchd's parent is kernel_task. Nothing was reparented: `p_original_ppid` equals `p_ppid` for all 171. The offset of `p_ppid` is recorded NOWHERE in this repo -- `guestobserve.py`'s p_pid/p_stat/p_comm come from `gdb-stop.py`'s CLI defaults -- so it was derived by scanning every word of the struct against five properties a parent field must have, and then decided by the second field rather than by the score, because a word that is 0 everywhere scores perfectly. **WHY SPRINGBOARD HAS NO CREATION RECORD, and it is not a defect:** 158 of launchd's 171 children have a `spawn.seen` record and 11 do not (9 xpcproxy, AccessibilityUIS, SpringBoard, kernel_task) -- and both sets have launchd as parent, so the split is by PATH, not by caller. There is exactly one `spawn.seen` emitter in the fork and it sits inside `if (error == 0 && !spawn_no_exec)` at kern_exec.c:4280; `spawn_no_exec = TRUE` is set at :4002 by the `fork1(PROC_CREATE_SPAWN)` branch that `:3869` selects for a PLAIN posix_spawn (`POSIX_SPAWN_SETEXEC` clear). So a child created by a plain posix_spawn runs, gets its `p_comm` from `set_proc_name()`, and is invisible to this instrument. WHICH attribute makes launchd choose one branch for 158 children and the other for 11 is UNMEASURED -- the record prints `comm` and nothing else. MEASURED ON THE CURRENT CAPTURE: 1388 spawn records with n contiguous 1..1388, no saturation, and bluetoothd + fairplayd.A2 are 1206 of them (86%). **The real blocker is still the display:** stage=10, surface_found=1, `native_legacy_transfer_calls == 0` -- SpringBoard is up and has submitted no validated swap. Two instrument caveats travel with this: the capture is at **800x600** because the harness never passed `ramfb_driver` (the driver exists, 12800 bytes; the 1376x1024 readings came from runs that did), and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Also note: the staged ESP's `args =` line is ONE long line and a truncated read of it produced a false 'the offline-legacy args are missing' conclusion this interval; it carries all 26 arguments including `offline-legacy-transfer=1`. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
+Main repo at `6f5176b`.
 
 ---
 
@@ -9633,5 +9633,109 @@ frame can be presented, or only some of them.
 
 Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, fork
 `3d83de1`, kernel `4914d56`, booting since 12:03Z.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fifty-second, addendum T): the display's vtable is 23 slots this port and 181 slots Apple's
+
+Addendum S concluded that the eleven `kIOReturnUnsupported` refusals
+land in the ORIGINAL `IOMobileFramebufferLegacy` base, which this port
+does not override.  That conclusion was read off
+`build-native-legacy-display.py`, which binds
+
+```python
+'__ZTV25IOMobileFramebufferLegacy': int(audit['legacy_vptr'], 16) - 16
+```
+
+-- the original class's own vtable, out of the target's kernelcache --
+and then asserts
+
+```python
+owned == sorted([0,1,7,14,84,86,87,141,155,184,188,288,290,296] + pure)
+```
+
+A claim about the build is not a claim about the running kernel.  This
+reads the display object's vtable out of guest memory and classifies
+every one of its 358 slots by the symbol its function pointer lands in.
+
+## The measurement
+
+- display object = `0xfffffff6a8afa000`, vptr = `0xfffffff0072066a0`
+- **23 slot(s) are this port's**: [0, 1, 7, 14, 84, 86, 87, 141, 155, 184, 188, 211, 213, 245, 246, 288, 290, 296, 306, 307, 337, 338, 345]
+- **181 slot(s) are the ORIGINAL family's**: the whole
+  run from 168 upward, minus the 14 the fork takes
+- **154 slot(s) are XNU core** (`IOService`, `OSObject`), all
+  below slot 168
+
+So of the 190 slots at or above 168 -- the API surface the
+original legacy class exposes -- **this port implements 14**.
+
+| | slots |
+|---|---|
+| this port | 23 |
+| the original `IOMobileFramebufferLegacy` | 181 |
+| XNU core | 154 |
+| total | 358 |
+
+## The two slots that were not in the build's list, and why they are there
+
+The measured set is `build-native-legacy-display.py`'s asserted owned
+set **plus 213 and 337**.  Those two are exactly the slots the
+generated `OriginalLegacyFramebufferABI.h` declares PURE VIRTUAL:
+
+```c
+virtual IOReturn supportedFrameInfo(uint32_t,uint32_t *,char *,uint32_t *)=0;   // slot 213
+virtual IOReturn collectCompletionReports(uint32_t,void *,uint32_t *,uint32_t)=0; // slot 337
+```
+
+and `NativeLegacyDisplay.cpp` implements both (`:370` and `:299`).  So
+they are the fork's, and the build's `owned` list simply does not name
+them because the script separates them into `pure`.  The measurement
+and the build agree once that separation is undone, which is a stronger
+check than a match would have been.
+
+## One instrument defect, recorded
+
+The first version of this reader classified slots with a fixed address
+window (`0xfffffff00bf66d00` to `0xfffffff00bf6c000`) and reported
+**zero** fork-owned slots out of 358 -- which would have read as "this
+port owns none of its own vtable".  Slot 0 is
+`__ZN19NativeLegacyDisplayD1Ev` at `0xfffffff00bf66e84`, which is
+inside the window's lower neighbour and outside the window itself.  A
+window is a guess about where code lives; naming the symbol the pointer
+lands in is not.  The reader now resolves each pointer to its owning
+symbol and only counts it as the fork's when that symbol is one of the
+fork's.
+
+## What this means for the blocker
+
+The eleven refusals are not eleven bugs.  They are the visible edge of
+a backend that implements 14 methods of a 190-method API, being asked
+for the rest by a compositor that expects all of them.  The fork's own
+source says the same thing at `NativeLegacyDisplay.cpp:85-87`:
+
+> *"...the platform subclass that normally writes it is not part of
+> this port, so without it the user client's wait (selector 6) answers
+> kIOReturnBusy forever and the compositor never presents."*
+
+That comment is about ONE method, and the port already works around it
+by calling the original state setter directly from
+`announcePoweredByFirmware()`.  The other eleven are the same shape of
+problem at eleven more call sites.
+
+## Status
+
+Windows/real-guest: **PASS** -- read from live guest memory over QMP
+with the kernel's sha256 verified first, and the measured owned set
+reconciles with the build's own assertion once the pure-virtual slots
+are accounted for.
+
+**The display defect's size is now measured, not guessed:** 14 of 190
+methods above vtable slot 167.  Whether a frame can be presented with
+fewer than all of them is UNMEASURED, and it is the next question.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
