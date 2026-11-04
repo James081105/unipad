@@ -7016,3 +7016,124 @@ host with room to write.
   reached, and that is a defect in this patch, not in launchd).
 * M13 (audio), network, launcher, performance: not started.  M14/M15: driver work
   does not exist.  WP00/WP01: blocked on `frozen: false`.
+
+
+---
+
+# Interval 2026-11-04 (forty-sixth, addendum A): where the console switch comes
+# from, and three suite failures that were all environment.
+
+## The switch, found
+
+The emitter sits behind `#if defined(XNU_NATIVE_VIRTIO_CONSOLE) &&
+XNU_NATIVE_VIRTIO_CONSOLE`.  The build script defaults that to **0**
+(`build-xnu-4k-baseline.sh:192`), and a grep of the entire repository -- every
+workflow, `scripts/macos/build-macos.sh`, the device repo, every script under
+`vendor/UniXNU/scripts/` -- finds **nothing that sets it to 1**.
+
+That looked like the emitter would be silently compiled out, which is outcome 3,
+cause 1: a six-hour capture that can only report absence.  So it was settled
+against the kernel that was actually built rather than by reasoning about which
+switch should have been flipped.
+
+**The fragments are in build 41775242423's kernel.**  `payload.img` at
+17935224..17935700 holds, as SHF_MERGE|SHF_STRINGS split fragments:
+
+    +17935232: seen","n,"comm":","source":"XNU.posix_sp
+    +17935280: failed","n":
+    +17935296: ,"errno","parent
+    +17935320: een","n"__mac_ex!
+    +17935344: {"event":"diag.owner_data_status","stage,"error","source":"XNU.native_owner_data
+    +17935440: {"event":"springboard.running",","comm":"SpringBoard","source":"XNU.posix_spawn"{"event":"spawn.
+    +17935552: XNU.__mac_execve{"event":"exec.s
+    +17935608:  ","code"
+    +17935632: {"event":"exit.s,"source":"XNU.exit_with_reason"lockf
+
+**`XNU.exit_with_reason` is behind the console macro**, and it is there.  So the
+switch was 1 for that build.  (This is also the third confirmation of the
+SHF_MERGE trap: `exit.seen` and `XNU.kern_exit` both have **zero** hits as
+contiguous literals on a kernel that provably emits 64 exit records.)
+
+**And the mechanism is `vendor/UniXNU/scripts/unixnu/kernel.py:11`:**
+
+    """CONFIG_XNU_* of the defconfig become XNU_* variables of the legacy kernel
+    build script."""
+
+`xnu_env()` walks the resolved defconfig and turns every `CONFIG_XNU_*` into an
+`XNU_*` environment variable.  `vendor/UniXNU-qemu/configs/qemu_root_defconfig:47`
+sets `CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=y`, so the second kernel build pass --
+workflow step 21, "Run macOS build again (qemu_root_defconfig, PRD 8.1 root
+chain)" -- builds with the switch **on**.  The first pass (step 14) uses the
+default defconfig and builds it **off**.
+
+So the emitter is compiled in, by a path that no comment in the build script
+records.  That gap is now closed in the patch's own comment, because a reader who
+greps for `XNU_NATIVE_VIRTIO_CONSOLE` and finds nothing will reasonably conclude
+the emitters are dead.
+
+**The check that settles it for the new kernel is
+`local-private/tmp/is-emitter-in-kernel.py`.**  It searches the fragments, not the
+literals, and it **validates the instrument first** by searching for four
+fragments the previous build provably contains -- refusing to report absence if
+the grep cannot see what it knows is there.  That is the same instrument error
+the project has now hit three times.
+
+## The three suite failures, all environment
+
+`local-private/boot53/unit-suite-rerun.txt` finished with three `FAILED` lines.
+None is a product defect, and each is attributed rather than waved at:
+
+### 1. `test_every_patch_applies_to_the_pinned_upstream_in_order` -- a truncated tarball
+
+    EOFError: Compressed file ended before the end-of-stream marker was reached
+
+The cached tarball was **3145728 bytes -- exactly 3.000000 MiB** -- and only
+16,921,003 bytes decompressed before the stream ended.  A round 3 MiB boundary is
+a truncation, not a coincidence.  The download happened at 06:05, while F: was
+filling toward 2.1 GB free.
+
+**Fixed.**  The corrupt tarball was deleted; the re-download produced
+**15,391,408 bytes** and the script reports "59 patches against XNU
+d8b80295118e / every patch applies, in the build's order".  That is an
+independent second confirmation of what `repro-patch-order.py` already proved,
+from a different code path.
+
+### 2. `test_the_cross_check_accepts_the_real_driver_status_output` -- a stale clone
+
+    vendor/UniXNU: the checkout is at bc210df66e5d2876c72a5cea42dcb7286ae79006
+    but the source lock pins 5a8bfaa6600605f58d5df487fefaccbe275a58cb
+
+`local-private/upstream/UniXNU` was two pins behind.  Not a defect in the test and
+not a defect in the lock -- a local clone that was never advanced.  It is exactly
+the version-consistency hazard the goal requires checking, and it was caught by a
+test that does nothing but compare two SHAs.
+
+**Fixed.**  Fetched and checked out `e6abdf28`; the test passes.
+
+### 3. `test_the_host_can_read_the_window_and_the_framebuffer_over_qmp` -- host RAM
+
+    qemu-system-aarch64.exe: cannot set up guest memory 'ram0': Invalid argument
+
+The test asks QEMU for `MEMORY_MIB` (6144) + `WINDOW_MIB` (2048) = **8.00 GiB**
+across two NUMA nodes.  The host has **15.8 GiB total and 4.8 GiB available**, and
+the 11 GiB in use belongs to the user's own applications -- WeChat, Edge,
+VS Code, two Claude processes.  **No stale QEMU is holding it**; the top twelve
+processes were checked and none is one.
+
+**Not fixed, and not fixable from here.**  This is a host-capacity condition, it
+predates this session, and `src/unipad/host/unixnu_boot.py` was last touched in
+`b28dc92`, which is not mine.  It is recorded as an environment failure and must
+not be reported as a product defect or as a regression.
+
+## The pattern, stated once more
+
+Three `F` marks appeared in the suite at ~8%, ~16% and ~16% while F: was at
+**2.1 GB free, 100% used**.  Two of the three final failures trace directly to
+that condition -- one a truncated download, one a stale clone that could not be
+fetched.  The third is host RAM.  **4.4 GB was reclaimed by name**, every
+candidate checked against `git grep` first so nothing a tracked doc, test or
+script cites was touched.
+
+The lesson this project keeps relearning: a red suite on a host that is out of
+disk or out of memory is a statement about the host, and the attribution has to
+happen before the report, not after.
