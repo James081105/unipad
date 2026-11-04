@@ -3,7 +3,7 @@
 本文件由 `scripts/windows/build-coverage-table.py` 生成，请勿手改；改代码后重新生成。数据来源是一次真实的 `unipad.acceptance` 运行，不是对进度的转述。
 
 - 运行 id：`coverage-matrix`
-- 写入时间：2026-11-01T15:23:27+00:00
+- 写入时间：2026-11-04T06:15:10+00:00
 - 门禁身份：`unipad.controller.verifier` v1.1.0
 - 主机：Microsoft Windows 11 CoreCountrySpecific (zh-CN)
 - 加速器：tcg
@@ -18,8 +18,8 @@
 | blocking_failures | M9:FAIL, M9a:FAIL |
 | reasons | blocking_failed:M9, blocking_failed:M9a |
 | verdict | FAIL |
-| 证据域 `host_real` | 118 |
-| 证据域 `onsite` | 8 |
+| 证据域 `host_real` | 129 |
+| 证据域 `onsite` | 13 |
 | 证据域 `simulation` | 1 |
 
 ## 门禁检查（M0–M15 / WP00–WP04 / P1）
@@ -27,7 +27,7 @@
 | 检查 | PRD | 需求 | 层级 | 实现状态 | Windows/模拟 | 运行器验证 | 现场（Windows 实测） | 证据路径 | 阻断原因 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `M0` | docs/PRD.md:206 | 依赖盘点与构建成立 | blocking | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/artifacts/m0/ai-smoke.json` | config/sources.lock.json is absent or unparseable, so there is no pinned source identity… |
-| `M10a` | docs/PRD.md:219 | IPA 接受和执行策略明确 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
+| `M10a` | docs/PRD.md:219 | IPA 接受和执行策略明确 | blocking | UNVERIFIED | NOT RUN | UNVERIFIED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
 | `M13` | docs/PRD.md:222 | PRD 6 M13, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M13 |
 | `M14` | docs/PRD.md:223 | PRD 6 M14, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M14 |
 | `M15` | docs/PRD.md:224 | PRD 6 M15, outside the first-release gate | advisory | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | probe_not_registered:M15 |
@@ -39,31 +39,31 @@
 | `P1-6` | docs/PRD.md:91 | 简洁的 Windows 启动器：开始、停止、导入 IPA、查看日志、恢复。 | advisory | UNVERIFIED | SIMULATION PASS | PASS | UNVERIFIED | `acceptance/scripts/launcher.cmd`, `acceptance/scripts/windows/UniPad-Launcher.ps1`, `acceptance/scripts/windows/Start-UniPad.ps1`, `acceptance/docs/launcher.md` | - |
 | `WP00` | docs/PRD.md:232 | 基线冻结：盘点 CPU/RAM/磁盘；获取候选仓库和锁文件；审计上游 AGENTS/贡献约定 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/host-inventory.json`, `acceptance/config/sources.lock.json`, `acceptance/local-private/upstream/UniXNU/.git/HEAD`, `acceptance/local-private/upstream/UniXNU-qemu/.git/HEAD` (+2 more) | sources.lock.json still declares frozen=false, so the pinned inputs are not a frozen base… |
 | `WP01` | docs/PRD.md:233 | 干净构建：先原样构建设备仓库最小配置；记录 bootstrap、ABI 与缓存前提 | advisory | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/config/sources.lock.json`, `acceptance/docs/kernel-build-windows.md` | sources.lock.json is not frozen, and the Windows cross-build chain still lacks iig, csh,… |
-| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+62 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
+| `WP02` | docs/PRD.md:234 | Windows UEFI：使用与候选版本匹配的固件和最小设备组合 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/local-private/boot33/display-counters/screen-after.ppm`, `acceptance/local-private/boot33/display-counters/screen-before.ppm` (+69 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
 | `WP03` | docs/PRD.md:235 | 引导交接：跑通 UniXNU 与 DarwinBoot，不同时加入 IPA/GPU 工作 | advisory | UNVERIFIED | FAIL | UNVERIFIED | BLOCKED | `acceptance/local-private/boot32/boot-inputs/UniXNU.efi`, `acceptance/local-private/boot10/esp/EFI/UniXNU/Payloads/DarwinBoot.efi`, `acceptance/local-private/boot33/display-counters/esp/EFI/UniXNU/Payloads/QemuRamfb.efi`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log` (+4 more) | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
 | `WP04` | docs/PRD.md:236 | 内核进入：固定 TCG CPU、GIC、时钟、内存与页配置；定位首次真实阻塞 | advisory | UNVERIFIED | SIMULATION PASS | PASS | PASS | `acceptance/config/machine.json`, `acceptance/local-private/tools/qemu/qemu-system-aarch64.exe`, `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/trace.log` (+2 more) | - |
 | `case1_start_new_qemu_process` | docs/PRD.md:172 | 在用户 Windows 本机启动一个全新的 QEMU 进程；保留实际配置与版本证据 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M1` | docs/PRD.md:207 | Windows TCG 启动 UEFI | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance/local-private/out/real-boot/prelink-substitution/followup/e1-edk2-boot/serial.log`, `acceptance/config/machine.json`, `acceptance/local-private/tools/qemu/qemu-system-aarch64.exe`, `acceptance/local-private/tools/qemu/share/edk2-aarch64-code.fd` | the target-guest boot chain does not exist on this host: no guest display has been witnes… |
 | `case2_reach_springboard` | docs/PRD.md:173 | 进入真实 SpringBoard，通过鼠标操作改变客体界面 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M2` | docs/PRD.md:208 | UniXNU 运行 | blocking | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
-| `case3_import_hello_ipa` | docs/PRD.md:174 | 在桌面启动后导入 HelloUniPad.ipa，记录输入包 SHA-256；先证明它此前未安装 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | sample_ipa_not_found:HelloUniPad.ipa |
+| `case3_import_hello_ipa` | docs/PRD.md:174 | 在桌面启动后导入 HelloUniPad.ipa，记录输入包 SHA-256；先证明它此前未安装 | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance-e2e/HelloUniPad.ipa.sha256`, `acceptance-e2e/sample-HelloUniPad.ipa.precheck.json` | blocked_by:case2_reach_springboard |
 | `M3` | docs/PRD.md:209 | DarwinBoot 完成交接准备 | blocking | PARTIAL | FAIL | BLOCKED | BLOCKED | `acceptance/local-private/boot32/boot-inputs/UniXNU.efi`, `acceptance/local-private/boot10/esp/EFI/UniXNU/Payloads/DarwinBoot.efi`, `acceptance/local-private/boot33/display-counters/esp/EFI/UniXNU/Payloads/QemuRamfb.efi` | no UniXNU kernel image built from the pinned sources exists on this host. This used to be… |
 | `case4_install_hello_ipa` | docs/PRD.md:175 | 完成包检查、传输、安装、注册；SpringBoard 出现真实图标，同时获得安装结果与 bundle ID | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M4` | docs/PRD.md:210 | XNU 进入并初始化关键底层 | blocking | PARTIAL | SIMULATION PASS | PASS | PASS | `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/trace.log`, `acceptance/local-private/boot41/xnu-records/guest.log`, `acceptance/absent/verification.json-6e937ad2e1c5f999.txt` | - |
+| `M4` | docs/PRD.md:210 | XNU 进入并初始化关键底层 | blocking | PARTIAL | SIMULATION PASS | PASS | PASS | `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/run.log`, `acceptance/local-private/out/real-boot/efi-build-windows/exp1/stock-entry/trace.log`, `acceptance/local-private/boot-mount-41316953324/root-mount/guest.log`, `acceptance/absent/verification.json-6e937ad2e1c5f999.txt` | - |
 | `case5_launch_hello_ipa` | docs/PRD.md:176 | 点击图标启动；获得对应进程或等效可信运行证据，并显示本次挑战值 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M5` | docs/PRD.md:211 | IOKit/平台层可用 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot40/iokit-records/guest.log` | - |
+| `M5` | docs/PRD.md:211 | IOKit/平台层可用 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot-mount-41316953324/root-mount/guest.log` | - |
 | `case6_tap_button_ten_times` | docs/PRD.md:177 | 连续点击按钮 10 次，画面计数正确变化；退出回主屏幕后能再次打开 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M6` | docs/PRD.md:212 | VirtIO Block 可读 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
-| `case7_notes_app_save_and_reopen` | docs/PRD.md:178 | 导入 UniPadNotes.ipa，输入本次生成的字符串并保存；关闭重开 App 后可读 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | sample_ipa_not_found:UniPadNotes.ipa |
-| `M7` | docs/PRD.md:213 | 正确 RootFS/SystemOS 可用 | blocking | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
+| `M6` | docs/PRD.md:212 | VirtIO Block 可读 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot51/install-thread-start-boot/guest-channel.log` | - |
+| `case7_notes_app_save_and_reopen` | docs/PRD.md:178 | 导入 UniPadNotes.ipa，输入本次生成的字符串并保存；关闭重开 App 后可读 | blocking | UNVERIFIED | FAIL | BLOCKED | BLOCKED | `acceptance-e2e/UniPadNotes.ipa.sha256`, `acceptance-e2e/sample-UniPadNotes.ipa.precheck.json` | blocked_by:case6_tap_button_ten_times |
+| `M7` | docs/PRD.md:213 | 正确 RootFS/SystemOS 可用 | blocking | NOT STARTED | NOT RUN | PASS | PASS | `acceptance/local-private/boot53/bounds64-input-run/guest-input.log` | - |
 | `case8_shutdown_and_reboot_from_disk` | docs/PRD.md:179 | 正常关机，结束 QEMU 进程，再从磁盘启动新进程；两款 App 和保存的字符串仍存在 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | BLOCKED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
-| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | BLOCKED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
+| `M8` | docs/PRD.md:214 | 原始用户态 launchd 运行 | blocking | NOT STARTED | NOT RUN | UNVERIFIED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
+| `M9b` | docs/PRD.md:217 | Data 持久化 | blocking | PARTIAL | NOT RUN | UNVERIFIED | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
 | `case9_three_cold_boots` | docs/PRD.md:180 | 重复冷启动流程三次，保存耗时和结果；测试失败时保留证据，不覆盖上次失败 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
 | `M9` | docs/PRD.md:215 | SpringBoard 可操作 | blocking | NOT STARTED | NOT RUN | FAIL | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
 | `M9a` | docs/PRD.md:216 | 软件/最小图形路径满足 UIKit | blocking | PARTIAL | NOT RUN | FAIL | BLOCKED | — | XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1… |
 | `case10_unsupported_platform_package` | docs/PRD.md:181 | 导入一个不支持的平台包，返回明确原因；已有可用系统和应用保持可恢复 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is… |
-| `M10` | docs/PRD.md:218 | IPA 安装 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
+| `M10` | docs/PRD.md:218 | IPA 安装 | blocking | UNVERIFIED | NOT RUN | BLOCKED | FAIL | `acceptance/local-private/boot51/install-thread-start-boot/guest-channel.log` | there is no real guest install service on this host: install_service_unavailable is injec… |
 | `M12` | docs/PRD.md:221 | 输入与应用交互 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
 | `M11` | docs/PRD.md:220 | IPA 启动 | blocking | UNVERIFIED | NOT RUN | BLOCKED | BLOCKED | — | there is no real guest install service on this host: install_service_unavailable is injec… |
 
@@ -73,11 +73,11 @@
 | --- | --- | --- | --- | --- |
 | `case1` | docs/PRD.md:172 | BLOCKED | case1_start_new_qemu_process:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system… | case1_start_new_qemu_process |
 | `case2` | docs/PRD.md:173 | BLOCKED | case2_reach_springboard:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system imag… | case2_reach_springboard |
-| `case3` | docs/PRD.md:174 | BLOCKED | case3_import_hello_ipa:sample_ipa_not_found:HelloUniPad.ipa | case3_import_hello_ipa |
+| `case3` | docs/PRD.md:174 | BLOCKED | case3_import_hello_ipa:blocked_by:case2_reach_springboard | case3_import_hello_ipa |
 | `case4` | docs/PRD.md:175 | BLOCKED | case4_install_hello_ipa:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system imag… | case4_install_hello_ipa |
 | `case5` | docs/PRD.md:176 | BLOCKED | case5_launch_hello_ipa:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image… | case5_launch_hello_ipa |
 | `case6` | docs/PRD.md:177 | BLOCKED | case6_tap_button_ten_times:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system i… | case6_tap_button_ten_times |
-| `case7` | docs/PRD.md:178 | BLOCKED | case7_notes_app_save_and_reopen:sample_ipa_not_found:UniPadNotes.ipa | case7_notes_app_save_and_reopen |
+| `case7` | docs/PRD.md:178 | BLOCKED | case7_notes_app_save_and_reopen:blocked_by:case6_tap_button_ten_times | case7_notes_app_save_and_reopen |
 | `case8` | docs/PRD.md:179 | BLOCKED | case8_shutdown_and_reboot_from_disk:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no… | case8_shutdown_and_reboot_from_disk |
 | `case9` | docs/PRD.md:180 | BLOCKED | case9_three_cold_boots:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image… | case9_three_cold_boots |
 | `case10` | docs/PRD.md:181 | BLOCKED | case10_unsupported_platform_package:host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no… | case10_unsupported_platform_package |
@@ -107,14 +107,12 @@
 - M1: the target-guest boot chain does not exist on this host: no guest display has been witnessed in a guest channel. The kernel image and XNU initialisation that used to be named here are no longer missing -- a prelinked UniXNU kernel is present and boots, and it initialises to the BSD stage (imple…
 - case2_reach_springboard: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - M2: no UniXNU kernel image built from the pinned sources exists on this host. This used to be true and was recorded as the reason several milestones were BLOCKED; it is no longer true -- a prelinked UniXNU kernel with the admission symbols emit_prelink.py requires is present and boots, and the prob…
-- case3_import_hello_ipa: sample_ipa_not_found:HelloUniPad.ipa
+- case3_import_hello_ipa: blocked_by:case2_reach_springboard
 - M3: no UniXNU kernel image built from the pinned sources exists on this host. This used to be true and was recorded as the reason several milestones were BLOCKED; it is no longer true -- a prelinked UniXNU kernel with the admission symbols emit_prelink.py requires is present and boots, and the prob…
 - case4_install_hello_ipa: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - case5_launch_hello_ipa: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - case6_tap_button_ten_times: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
-- M6: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
-- case7_notes_app_save_and_reopen: sample_ipa_not_found:UniPadNotes.ipa
-- M7: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
+- case7_notes_app_save_and_reopen: blocked_by:case6_tap_button_ten_times
 - case8_shutdown_and_reboot_from_disk: host_cannot_boot_a_guest: no built UniXNU kernel image (kernel.macho); no system image is configured (disks.system_image is null); no persistent Data image is configured; no guest install service is reachable; no SpringBoard process has been observed
 - M8: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
 - M9b: XNU has not initialised on this host: the firmware-free route reached the kernelcache EL1 entry and stopped on its first undefined instruction, which proves the CPU entered kernel code and proves nothing about page tables, exception vectors, the interrupt controller or the clock
