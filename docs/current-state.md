@@ -6,8 +6,8 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-04 (interval fifty-first, addendum S). THE HEADLINE, and it retracts what this header used to say: **SpringBoard IS running on this build, and its parent is launchd.** Measured from live guest memory over QMP with the kernel's sha256 checked first, and PROVED by two fields of `struct proc` agreeing: `p_pptr` (a pointer to the parent's proc, offset 16) resolves to a live proc whose `p_pid` equals the word at offset 32 (`p_ppid`) for all 171 live processes -- 171 agree, 0 disagree, 0 unresolvable. SpringBoard is pid 27 and its parent is pid 1 (launchd); launchd's parent is kernel_task. Nothing was reparented: `p_original_ppid` equals `p_ppid` for all 171. The offset of `p_ppid` is recorded NOWHERE in this repo -- `guestobserve.py`'s p_pid/p_stat/p_comm come from `gdb-stop.py`'s CLI defaults -- so it was derived by scanning every word of the struct against five properties a parent field must have, and then decided by the second field rather than by the score, because a word that is 0 everywhere scores perfectly. **WHY SPRINGBOARD HAS NO CREATION RECORD, and it is not a defect:** 158 of launchd's 171 children have a `spawn.seen` record and 11 do not (9 xpcproxy, AccessibilityUIS, SpringBoard, kernel_task) -- and both sets have launchd as parent, so the split is by PATH, not by caller. There is exactly one `spawn.seen` emitter in the fork and it sits inside `if (error == 0 && !spawn_no_exec)` at kern_exec.c:4280; `spawn_no_exec = TRUE` is set at :4002 by the `fork1(PROC_CREATE_SPAWN)` branch that `:3869` selects for a PLAIN posix_spawn (`POSIX_SPAWN_SETEXEC` clear). So a child created by a plain posix_spawn runs, gets its `p_comm` from `set_proc_name()`, and is invisible to this instrument. WHICH attribute makes launchd choose one branch for 158 children and the other for 11 is UNMEASURED -- the record prints `comm` and nothing else. MEASURED ON THE CURRENT CAPTURE: 1388 spawn records with n contiguous 1..1388, no saturation, and bluetoothd + fairplayd.A2 are 1206 of them (86%). **The real blocker is still the display:** stage=10, surface_found=1, `native_legacy_transfer_calls == 0` -- SpringBoard is up and has submitted no validated swap. Two instrument caveats travel with this: the capture is at **800x600** because the harness never passed `ramfb_driver` (the driver exists, 12800 bytes; the 1376x1024 readings came from runs that did), and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Also note: the staged ESP's `args =` line is ONE long line and a truncated read of it produced a false 'the offline-legacy args are missing' conclusion this interval; it carries all 26 arguments including `offline-legacy-transfer=1`. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
-Main repo at `6f5176b`.
+Last updated: 2026-11-04 (interval fifty-second, addendum T). THE HEADLINE, and it retracts what this header used to say: **SpringBoard IS running on this build, and its parent is launchd.** Measured from live guest memory over QMP with the kernel's sha256 checked first, and PROVED by two fields of `struct proc` agreeing: `p_pptr` (a pointer to the parent's proc, offset 16) resolves to a live proc whose `p_pid` equals the word at offset 32 (`p_ppid`) for all 171 live processes -- 171 agree, 0 disagree, 0 unresolvable. SpringBoard is pid 27 and its parent is pid 1 (launchd); launchd's parent is kernel_task. Nothing was reparented: `p_original_ppid` equals `p_ppid` for all 171. The offset of `p_ppid` is recorded NOWHERE in this repo -- `guestobserve.py`'s p_pid/p_stat/p_comm come from `gdb-stop.py`'s CLI defaults -- so it was derived by scanning every word of the struct against five properties a parent field must have, and then decided by the second field rather than by the score, because a word that is 0 everywhere scores perfectly. **WHY SPRINGBOARD HAS NO CREATION RECORD, and it is not a defect:** 158 of launchd's 171 children have a `spawn.seen` record and 11 do not (9 xpcproxy, AccessibilityUIS, SpringBoard, kernel_task) -- and both sets have launchd as parent, so the split is by PATH, not by caller. There is exactly one `spawn.seen` emitter in the fork and it sits inside `if (error == 0 && !spawn_no_exec)` at kern_exec.c:4280; `spawn_no_exec = TRUE` is set at :4002 by the `fork1(PROC_CREATE_SPAWN)` branch that `:3869` selects for a PLAIN posix_spawn (`POSIX_SPAWN_SETEXEC` clear). So a child created by a plain posix_spawn runs, gets its `p_comm` from `set_proc_name()`, and is invisible to this instrument. WHICH attribute makes launchd choose one branch for 158 children and the other for 11 is UNMEASURED -- the record prints `comm` and nothing else. MEASURED ON THE CURRENT CAPTURE: 1415 spawn records with n contiguous 1..1415, no saturation, and bluetoothd + fairplayd.A2 are 1233 of them (87%). **The real blocker is still the display:** stage=10, surface_found=1, `native_legacy_transfer_calls == 0` -- SpringBoard is up and has submitted no validated swap. Two instrument caveats travel with this: the capture is at **800x600** because the harness never passed `ramfb_driver` (the driver exists, 12800 bytes; the 1376x1024 readings came from runs that did), and `job.springboard_open` matched a basename so it fired on the Logging/Subsystems plist, not the launchd job. Also note: the staged ESP's `args =` line is ONE long line and a truncated read of it produced a false 'the offline-legacy args are missing' conclusion this interval; it carries all 26 arguments including `offline-legacy-transfer=1`. Build `exp-2026-11-04-emitter-caps` (run 41817661032, M7/tcg).
+Main repo at `8bbf583`.
 
 ---
 
@@ -9735,6 +9735,103 @@ are accounted for.
 **The display defect's size is now measured, not guessed:** 14 of 190
 methods above vtable slot 167.  Whether a frame can be presented with
 fewer than all of them is UNMEASURED, and it is the next question.
+
+Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
+
+Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (fifty-third, addendum U): the screen is still the boot menu, and the swap selector could not be named
+
+## The screen, because a counter is not a screen
+
+`screendump` over the live QMP connection: a P6 PPM, 800x600, 480000 pixels, 1440015 bytes.  The dominant colours are:
+
+| colour | pixels | share |
+|---|---|---|
+| `0b0c0f` | 288876 | 60.18% |
+| `000000` | 68860 | 14.35% |
+| `00ff00` | 30000 | 6.25% |
+| `0000ff` | 30000 | 6.25% |
+| `ff00ff` | 30000 | 6.25% |
+| `989898` | 17924 | 3.73% |
+| `2a5bd7` | 6580 | 1.37% |
+| `7c838d` | 3262 | 0.68% |
+
+A solid green band across the top, a magenta band under it, a black
+panel on the left, a dark field everywhere else, one blue selector
+element and a little grey text.  That is the UniXNU boot menu, not a
+SpringBoard frame.  It is the same screen the prior intervals
+photographed, and it agrees with every counter on the page: no frame
+has been presented.
+
+## Which selector submits a swap: UNMEASURED, with the bound stated
+
+`native_legacy_swap_validation_calls == 0` only means something once it
+is known whether backboardd ever asked for a swap.  The dispatch table
+gives a function per selector, and those functions are the original
+family's, so the question is answerable in principle: decode each one
+and find the display vtable slot it drives.
+
+On ARM64 a 64-bit `LDR (immediate)` is
+
+```c
+0xF9400000 | (imm12 << 10) | (Rn << 5) | Rt     // byte offset = imm12 * 8
+```
+
+so an immediate at or above 168 is a vtable slot load and
+one below it is a struct field load.  Every one of the
+81 live dispatch functions was read to 512 bytes
+and decoded.
+
+**No dispatch function loads any swap-path slot.**  The swap path's
+entry points are slots 249 (getDisplayDimensions), 288 (startHardware), 290 (kickSwapQueue), 295 (completeCurrentSwap), 296 (validateSwap), 337 (collectCompletionReports)
+and none of them appears anywhere in the decode.  The only slots at or
+above 168 that appear at all are [218, 223, 224, 225, 226, 228].
+
+What the functions DO load is the provider field at byte offset 0xd8 --
+imm12 = 27, which the audit's own anchor
+(`006d40f9` = `ldr x0,[x8,#0xd8]`) names -- plus small struct fields at
+0x8, 0x20, 0x48, 0xe8 and a handful of others.  So the provider is
+loaded and then a function is called, and the virtual dispatch happens
+inside that function, past the end of what a fixed-length scan can see.
+
+**This is a negative with a bound, not an answer.**  It says: within
+512 bytes of each dispatch function, no swap-path slot is
+loaded.  It does NOT say the swap path is unreachable.  A `BL` to a
+shared helper that does the dispatch would be invisible to this
+instrument, and there is at least one such helper -- `externalMethod`
+itself loads slot 182 the same way before dispatching.
+
+## Two decoder defects, both recorded
+
+The first version divided `imm12` by 8 and filtered on
+`imm12 % 8 == 0`.  That threw away every real load: `ldr x0,[x8,#0xd8]`
+has imm12 = 27, and 27 % 8 != 0.  Every selector then reported "slot
+0" and none reported a swap-path slot, which reads exactly like a real
+negative.  It was an instrument defect.
+
+The second version printed every immediate as a slot, so "slot 1" and
+"slot 4" appeared on nearly every row.  Those are byte offsets 0x8 and
+0x20 -- struct fields, not vtable entries.  Separating the two by the
+168 boundary is what makes the remaining negative
+meaningful, and even then it is bounded by the read length.
+
+## Status
+
+Windows/real-guest: **PASS for the screen** -- read off the live QMP
+connection, 800x600, and it is the boot menu.  **UNMEASURED for the
+swap selector**, bounded as above.
+
+The display defect's shape is now fully measured and none of it is a
+configuration defect: the driver is up, the GOP is mapped at the right
+physical address, backboardd really does drive the framebuffer, and the
+port answers 11 of its 15 calls with `kIOReturnUnsupported` because it
+implements 14 of the 190 methods the original legacy class exposes.
+Which of those 14 the compositor needs before it will submit a swap is
+the open question, and it is not answerable from the dispatch code
+alone.
 
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
