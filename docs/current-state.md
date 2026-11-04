@@ -10696,3 +10696,105 @@ counted, and none of them belongs to this port yet.
 Build: `exp-2026-11-04-emitter-caps`, kernel `4914d56`.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-05 (sixty-second, addendum AD): the experiment is designed and saved, and it cannot be delivered -- the driver source is pinned to an upstream commit
+
+## The experiment, and where it is
+
+Addendum AC named the cheapest falsifiable experiment: make the two
+fork-owned deliberate refusals return success instead of
+`kIOReturnUnsupported` -- `supportedFrameInfo` (selector 74) and
+`collectCompletionReports` (selector 33) -- rebuild, and watch whether
+backboardd proceeds past its capability probe.
+
+Both changes are written and both are semantically honest: "no trace
+keys" and "no completion reports" are true of a GOP-backed backend,
+and `kIOReturnSuccess` with `*count = 0` says exactly that, where
+`kIOReturnUnsupported` says "I do not implement this".
+
+The patch is saved at `local-private/tmp/patches/
+display-refusal-experiment.patch` -- 51 lines, 2931 bytes,
+two return statements changed and the rest comments explaining why.
+
+## Why it cannot be delivered as it stands
+
+The file is `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`, and
+`drivers/NativeMobileDisplay` is a **submodule**:
+
+| | |
+|---|---|
+| gitlink in `vendor/UniXNU` | `eb9c949164` |
+| checked-out HEAD | `eb9c949164` |
+| `sources.lock.json` pin | `eb9c949164` |
+| `.gitmodules` URL | `(not found)` |
+| lock `frozen` | False |
+
+All three of gitlink, HEAD and lock pin agree at `eb9c949` -- the
+divergence an older lock revision recorded is gone.  So the submodule is
+consistently pinned, and that is exactly the problem: **the pin names an
+upstream commit, and there is nowhere to put a different one.**
+
+**Its only remote is upstream.**  There is no fork of
+`UniXNU/NativeMobileDisplay` under this account, so a commit there cannot
+be pushed anywhere the build can fetch it.  And the build does not read
+this working tree at all -- it checks out the pinned commits fresh, so an
+uncommitted edit here is invisible to it even before the remote question
+arises.
+
+## The path that exists, and it is precedented
+
+The lock records exactly this operation being done for a different
+driver:
+
+> *"...plus the `.gitmodules` URL that makes that commit fetchable on a
+> runner.  ... the announcement itself had never been committed
+> anywhere."*
+
+That was `drivers/NativeVirtioConsole`.  The shape of the work is:
+
+1. fork `UniXNU/NativeMobileDisplay` under this account;
+2. commit the two-line change there and push;
+3. point `vendor/UniXNU/.gitmodules`'s `NativeMobileDisplay` URL at the
+   fork;
+4. bump the gitlink in `vendor/UniXNU` to the new commit;
+5. push `vendor/UniXNU` to `James081105/UniXNU`;
+6. move `config/sources.lock.json`'s `unixnu` pin and its submodules
+   entry;
+7. dispatch `build-macos` with `-f stage=M7 -f payload_target=tcg`.
+
+**Step 1 creates a new public repository under this account.**  That is
+outward-facing and not reversible by deleting a commit, so it is recorded
+here rather than done silently.  Everything after it is ordinary
+development the project has already performed once.
+
+## The alternative, and it is the better instrument anyway
+
+`LegacyDisplayProbe.cpp` lives in `vendor/UniXNU-qemu/package/`, and
+`vendor/UniXNU-qemu`'s remote is `https://github.com/James081105/UniXNU-qemu` --
+**this account's own repo.**  Anything written there is deliverable with
+one commit and one pin bump.
+
+And that is where addendum AB's decisive instrument belongs: interpose
+the DISPLAY's vtable the way the probe already interposes the client's,
+and count calls per slot.  That answers the question the two-line
+experiment only guesses at -- which of the 61 refusing slots backboardd
+actually drives -- and it needs no new method implemented at all.
+
+A thunk is straightforward on ARM64: `x16`/`x17` are intra-procedure-call
+scratch, so a naked stub can increment a counter and `br` to the original
+without disturbing the arguments in `x0`-`x7` or the return in `x0`.
+
+## Status
+
+Windows/real-guest: **PASS for the diagnosis** -- gitlink, HEAD, remotes
+and `.gitmodules` all read, and the nested tree verified back at its
+documented state so the saved patch is the only copy of the change.
+
+**BLOCKED for delivery, deliberately.**  The experiment is designed,
+saved, and one fork away from runnable.  Which of the two paths to take
+-- fork the driver repo, or write the interposer in the device repo -- is
+a decision about a new public repository, and it is the user's.
+
+Onsite: N/A.
