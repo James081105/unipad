@@ -8652,3 +8652,83 @@ Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, booting since
 12:03Z and still capturing.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum N): both emitters passed 512, and
+# addendum F's conclusion was true even though its method was not
+
+## exit.seen passed 512 too, so both process emitters are confirmed
+
+Addendum M recorded spawn.seen reaching n=513. exit.seen followed:
+
+    spawn.seen    n=671   (the old kernel's emitter went blind at 512)
+    exit.seen     n=538   (the old kernel's emitter went blind at 512)
+    job.open      n=454   (unchanged -- it was never capped)
+
+**Both process emitters that went blind on the previous kernel are now recording
+past their bounds.** The fix is confirmed twice over, on two independent code
+paths, on a real guest. No saturation record has fired on either.
+
+## The respawn loop did continue, which makes addendum F's conclusion true
+
+With the window open, the two loops are visible past the point where the old
+instrument stopped:
+
+                        previous capture   this capture
+    bluetoothd spawns        214              294
+    fairplayd.A2 spawns      131              204
+    com.apple.datami           5                7
+    containermanager          2                2
+    cfprefsd                  2                2
+    locationd                 2                2
+
+**So addendum F's claim that the loop "has not stopped" was correct, and addendum
+G's retraction of it was also correct.** G retracted the METHOD -- the claim was
+read off the instrument's bound, which is not evidence about the guest -- and the
+method was indeed wrong. The conclusion happened to be right.
+
+That distinction has to be stated, because the easy version ("F was wrong, G fixed
+it") is its own small dishonesty. G did not correct a false claim about the guest;
+it withdrew an unfounded one. Two intervals later the claim is founded, by a
+different instrument, and it stands.
+
+## The exit-code histogram on the larger window
+
+    256   297 exits   (bluetoothd: WIFEXITED, status 1)
+      0   238 exits   (fairplayd.A2: WIFEXITED, status 0)
+      1     2 exits   (MSUEarlyBootTask, launchd: killed by SIGHUP)
+   3328     1 exit    (prng_seedctl: WIFEXITED, status 13)
+
+**`code 6` is gone.** The previous capture carried one exit with code 6 --
+transparencyd, killed by SIGABRT -- and this capture, with 25 more exit records,
+does not. A single SIGABRT that does not recur is noise, not a finding, and it
+should not have been listed alongside the two loops as though it were a third.
+
+The two loops themselves are unchanged in character: bluetoothd still exits with
+status 1 and fairplayd.A2 still exits with status 0. That is a failure loop and a
+clean-completion loop respectively, and they remain two different defects.
+
+## What is still open
+
+- No springboard.running and no springboard.interaction, now over 671 spawns and
+  538 exits. The separator holds with both windows open.
+- No App- or Background-typed job has spawned at any point in either capture.
+- The mechanism by which launchd declines an App-typed job it has read is still
+  unmeasured. The separator is now confirmed three ways -- the larger window, the
+  job.open total that was never a bound, and the 0-for-6 on the read subset -- and
+  the cause is none of them.
+- The display probe succeeds (`surface_found=1`) and nothing presents. That is
+  the leading candidate for what backboardd needs and does not have.
+
+## Status
+
+Windows/real-guest: PASS for the instrument, twice. Both process emitters recorded
+past the values at which the previous kernel went blind, with no saturation
+record. FAIL still for SpringBoard, with the window now ruled out from three
+independent directions.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, booting since
+12:03Z, spawn n=671, exit n=538, job.open n=454 at the time of writing.
+
+Onsite: N/A.
