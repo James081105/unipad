@@ -11083,3 +11083,150 @@ exit code does not describe them.
 
 **Nothing here is evidence about the display experiment.**  The kernel
 that booted is `4914d56`, which predates it.
+
+---
+
+# Interval 2026-11-05 (sixty-fifth, addendum AG): the coverage matrix named a blocker that was already closed
+
+## The claim, and why regenerating the table found it
+
+Requirement (1) asks for a coverage table whose old conclusions are
+verified before they are reused.  Regenerating it for this interval is
+what surfaced this -- and the table did not merely go stale, it was
+**actively wrong in the direction that hides progress.**
+
+Four rows read, in the 阻断原因 column:
+
+> *the guest never reported XNU's own page tables, exception vectors and
+> interrupt state ... so a guest that has been up longer than that no
+> longer carries them, whatever its CPU is doing*
+
+for `M8`, `M9`, `M9a` and `M9b`.
+
+## The claim is false, and it is checkable in one command
+
+`local-private/boot-mount-41316953324/root-mount/guest.log` (1440 bytes) carries:
+
+| record | occurrences |
+|---|---|
+| `xnu.page_tables` | 1 |
+| `xnu.exception_vectors` | 1 |
+| `xnu.interrupts` | 1 |
+
+And the gate's own predicate, run against its own default view:
+
+```python
+>>> milestones._xnu_initialisation(milestones._snapshot(view))
+True
+```
+
+**True.**  The three probes find the records with `scope=onsite` and a
+witness of the form `path:line:event`.  So the blocker was **closed**, and
+the row said it was open.
+
+## Where the wrong string came from
+
+`CheckResult.fields` cleared the statically declared `CheckDef.blocker`
+only for a non-BLOCKED verdict that already held ONSITE evidence:
+
+```python
+blocker = self.check.blocker
+if blocker is None and self.verdict.kind == VerdictKind.BLOCKED:
+    blocker = self.verdict.reasons[0]
+if self.verdict.kind != VerdictKind.BLOCKED and any(
+    ref.scope == EvidenceScope.ONSITE for ref in self.verdict.evidence):
+    blocker = None
+```
+
+An UNVERIFIED or FAIL verdict with no ONSITE evidence therefore kept the
+declared text.  The docstring above it says the blocker is *"reported only
+while that state is actually blocked"* -- the code did not implement its
+own docstring.
+
+**8 of 40 rows carried a declared blocker their verdict does not support:**
+
+| check | verdict | what the row claimed | what the verdict says |
+|---|---|---|---|
+| `M0` | UNVERIFIED | evidence_absent:m0.clean_build_artifacts… | `evidence_absent:m0.clean_build_artifacts` |
+| `M10a` | UNVERIFIED | evidence_absent:m10a.signature,m10a.entitlem… | `evidence_absent:m10a.signature,m10a.entitlem` |
+| `WP02` | UNVERIFIED | evidence_absent:wp02.run_directory,wp02.cont… | `evidence_absent:wp02.run_directory,wp02.cont` |
+| `WP03` | UNVERIFIED | evidence_absent:wp03.unixnu_run_evidence,wp0… | `evidence_absent:wp03.unixnu_run_evidence,wp0` |
+| `M8` | UNVERIFIED | evidence_absent:m8.original_launchd,m8.later… | `evidence_absent:m8.original_launchd,m8.later` |
+| `M9b` | UNVERIFIED | evidence_absent:m9b.written,m9b.normal_shutd… | `evidence_absent:m9b.written,m9b.normal_shutd` |
+| `M9` | FAIL | refused:m9.veto.homescreen_screenshot_only:只… | `refused:m9.veto.homescreen_screenshot_only:只` |
+| `M9a` | FAIL | refused:m9a.veto.wallpaper_only:只显示桌面壁纸… | `refused:m9a.veto.wallpaper_only:只显示桌面壁纸` |
+
+### The two that were worst
+
+`M9` and `M9a` are **FAIL because an explicit PRD veto fired** -- the
+gate correctly refuses homescreen-screenshot-only and wallpaper-only
+evidence, and the veto text is the verdict's own first reason.  The row
+reported them BLOCKED by the XNU gap.  Both statements were on the same
+line and only one of them was used by the code.
+
+`M8` and `M9b` are `evidence_absent:...` -- branch (3) of
+`milestones.evaluate`, which is **reachable only when `unmet_blockers` is
+empty**.  So the run's own verdict proves no blocker fired, while the
+bundle's four-field row names one.
+
+## Why this is the same defect class as everything else here
+
+This log records one failure mode repeatedly: **a value read as the answer
+to a different question.**  A counter that does not move read as "the loop
+has stopped"; a classifier matching a dead instruction tail read as "this
+slot refuses"; an exit code read as "the run failed".
+
+This instance is a **statically declared string read as a measured
+result.**  `CheckDef.blocker` is a statement about what *would* block the
+check.  It was printed as though it were what *did* block it, on rows
+where the gate had measured otherwise.
+
+And it hid real progress: the XNU initialisation blocker -- the one that
+has gated `M8` and `M9b` since the first guest boot -- is satisfied.  A
+reader trusting the table would have gone looking for a kernel problem
+that is not there.
+
+## The fix, and what it deliberately does not change
+
+A `BLOCKED` verdict keeps the declared text, because for those rows it is
+the better of the two: `M1`'s declaration explains the missing boot chain
+where `verdict.reasons[0]` is only `blocked_by:M0`, and `WP00`'s
+declaration is the full reason where `reasons[0]` prefixes it with the
+blocker id.  `PASS` reports nothing.  Everything else reports the reason
+that decided it.
+
+**The overall verdict does not move.**  Still FAIL, still
+`blocking_failures: M9, M9a`, because `release_verdict()` reads
+`MilestoneResult.verdict.kind` and never touches `FourFields`.  What
+changes is the attribution, and that is the whole point: the gate fails
+for the reasons it actually failed on.
+
+Teeth-checked by rebuilding all forty `CheckResult`s from the recorded
+bundle: **exactly the eight unsupported rows change**, and every genuinely
+BLOCKED row keeps its declared text byte for byte.
+
+### Not fixed, and recorded rather than hidden
+
+`FourFields.onsite_status` derives `BLOCKED` from a non-empty blocker:
+
+```python
+if (self.blocker or "").strip():
+    return "BLOCKED"
+return "UNVERIFIED"
+```
+
+so those eight rows still read `BLOCKED` in the 现场 column while
+`MilestoneResult.onsite_status` says `UNVERIFIED` for the same checks.
+**The two disagree and the bundle reports the `FourFields` one.**  Fixing
+it means changing a derivation documented as shared by the p1, e2e and
+milestone sources -- a different change from the misattribution, and one
+that deserves its own review rather than being folded into this commit.
+
+## Status
+
+Windows: **PASS** -- the predicate evaluated against the live view, the
+records grepped from the file on disk, the eight rows enumerated from the
+run's own bundle, and the fix teeth-checked against all forty rows.
+
+**The display experiment is still unmeasured.**  The build is in flight
+and nothing here says backboardd gets past its probe.
