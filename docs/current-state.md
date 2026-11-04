@@ -10242,16 +10242,25 @@ Every one of the four writers:
 - is in **no** `__ZTV` symbol in this kernel, and
 - has **zero** `BL` callers in the family's window *or* the fork's text.
 
-So the swap-enqueue code is reached only **indirectly** -- a register
-loaded from a table or a vtable whose symbol this kernel does not carry,
-then a `BR`.  A scan that follows `BL` cannot see that edge, which is
-why addendum V's walk reached the swap-path *slots* but could not say
-which selector *submits*, and why this scan finds the writers but cannot
-name their callers.
+So the swap-enqueue code is reached **indirectly**.  A scan that follows `BL`
+cannot see that edge, which is why addendum V's walk reached the swap-path
+*slots* but could not say which selector *submits*, and why this scan finds the
+writers but cannot name their callers.
+
+**A correction to the mechanism, because the first guess was wrong.**  The first
+version of this note said the register was "loaded from a table or a vtable
+whose symbol this kernel does not carry".  It is not.  All 370 `__ZTV` symbols
+in this kernel were read and searched for the four writers as *values*, and none
+contains any of them; and a qword scan of the whole family window found **zero**
+references to any of the four.  So the address is **computed**, not loaded -- an
+`ADRP`/`ADD` pair or an offset from a base outside the scanned windows, then a
+`BLR`.  That is a different thing to look for, and a reader sent hunting through
+vtables would find nothing, which is why the guess is corrected here rather than
+left to mislead.
 
 **This closes the question's mechanism and leaves the question open.**
 Which selector submits a swap at run time is UNMEASURED, and the reason
-is now known rather than assumed: the dispatch is indirect, so no
+is now known rather than assumed: the dispatch is a computed address, so no
 static analysis of this shape can answer it.  Answering it needs a
 run-time instrument -- interposing the display's vtable the way
 `LegacyDisplayProbe.cpp` already interposes the client's -- which is a
