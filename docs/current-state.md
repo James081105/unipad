@@ -7137,3 +7137,478 @@ script cites was touched.
 The lesson this project keeps relearning: a red suite on a host that is out of
 disk or out of memory is a statement about the host, and the attribution has to
 happen before the report, not after.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh): the emitter produced its first real guest
+# records, and they point at the two-volume split.
+
+## What happened
+
+Build `41788097516`'s `boot-inputs` were booted under
+`local-private/tmp/capture-springboard-boot.py` (six-hour listen budget).  The
+kernel came up, the APFS volume mounted, and **`openat_internal()` emitted its
+first records**:
+
+    {"event":"job.open","n":1,"job":"com.apple.jetsamproperties.NonUI.plist","err":2,"source":"XNU.openat_internal"}
+    {"event":"job.open","n":2,"job":"com.apple.jetsamproperties.J120.plist","err":0,"source":"XNU.openat_internal"}
+
+Snapshot kept at `local-private/boot53/job-open-first-records.txt` (63 lines, the
+whole channel log at the time of writing).
+
+## Why this settles more than the emitter
+
+**The emitter works, end to end.**  Patch -> `vfs_syscalls.o` -> `openat_internal`
+-> virtio console -> host log, with the filename and the errno intact.  That is
+the whole chain the six-hour capture was built to test, and it is now proven on a
+real guest rather than argued from a fragment grep.
+
+**And the guest is booting real userland.**  The same log carries 14 `exit.seen`
+records naming real iPadOS daemons -- `fsck`, `mount`, `seputil`,
+`mobile_obliterator`, `apfs_boot_util`, `MSUEarlyBootTask`, `cc_fips_test`,
+`keybagd`, `usermanagerd`, `dirs_cleaner`, `xpcroleaccountd`,
+`init_featureflag` -- plus `exec.seen n=1 comm=launchd` and a `dyld.cache_read`.
+That is further into userspace than any previous interval reached.
+
+## The finding: `err:2` on one jetsam plist and `err:0` on the next
+
+`err:2` is **ENOENT**.  launchd asked for `com.apple.jetsamproperties.NonUI.plist`
+and the file was not there; the very next open, for `J120.plist`, succeeded.
+
+`local-private/boot53/which-volume-owns-launchdaemons.txt` already had the
+explanation on disk, and it says so in its own last paragraph:
+
+    volume        bytes      LaunchDaemons  NanoLaunchDaemons  LaunchAgents
+    OS root     6,077,580,800      545              5              21
+    SystemOS    3,303,014,400       21              0               4
+
+    BOTH volumes carry the directory name.  Which one the guest's
+    launchd reads is NOT settled by this scan -- it is settled by the
+    mount order, and a union at / makes the answer order-dependent.
+
+**The guest mounted exactly ONE volume, readonly, at `/`** --
+`8846FE78-2910-4297-AF97-D59BB6F8FC16`, reported by
+`XNU.native_owner_cache_prepare`.  So one of those two LaunchDaemons sets is
+reachable and the other is not, and which jobs exist is a property of the mount,
+not of the kernel.
+
+That is the strongest available explanation for the `POSIXSpawnType=App` anomaly
+this interval inherited: `LimitLoadFromHardware` was refuted earlier, and
+`POSIXSpawnType=App` itself remains a correlation (7/7 vs 0/92) rather than a
+cause.  A volume split produces the same shape -- jobs that exist in the file
+list but never spawn -- without needing launchd to discriminate on the key at
+all.  **It is now the lead hypothesis and it is testable: the emitter reports
+errno, so an ENOENT on a job plist is a volume gap and a launchd refusal is not.**
+
+## What is NOT settled, stated so it is not mistaken for settled
+
+* **Which of the two volumes `8846FE78-...` is.**  Not yet determined.  Until it
+  is, "the ENOENT is a volume gap" is a hypothesis with a mechanism, not a
+  measurement.
+* **Why only 2 job.open records against 12+ spawned daemons.**  Two candidate
+  causes, not yet distinguished: launchd may still be in early startup and have
+  not reached bulk job discovery, or it may open most job plists with
+  `openat(dirfd, "name.plist")`, which passes a RELATIVE pathname that the
+  emitter's six-prefix filter drops.  The jetsam opens matched, so at least some
+  opens carry the full path.  Distinguishing these needs one more emitter
+  revision that records the path it was given, not just whether it matched.
+* **Whether the boot reaches SpringBoard.**  The capture is still running.
+
+## Status
+
+Code: COMPLETE for the emitter and the tooling fix.
+Windows/real-guest: PASS for the emitter (records above), IN PROGRESS for the
+six-hour capture.
+Onsite: N/A.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum B): 54 daemons, and a live control
+# that breaks the tie between the two candidate causes.
+
+## The boot went much further than the first snapshot suggested
+
+`local-private/boot53/spawn-failed-input-run-scratch/guest-channel.log` at
+08:50 carried **54 `spawn.seen` records / 49 distinct comms**:
+
+    notifyd, UserEventAgent, IOMFB_FDR_Loader, timed, driverkitd, configd,
+    logd, fseventsd, thermalmonitord, mediaserverd, mtmergeprops, mobiletimerd,
+    logd_helper, containermanager, sleepd, DumpPanic, fairplayd.A2,
+    AppleCredentialManager, distnoted, remoted, ptpd, rapportd, amfid, keybagd,
+    wifid, watchdogd, MobileGestaltHelper, runningboardd, cfprefsd, locationd,
+    bluetoothd, usermanagerd, backboardd, CommCenter, sharingd, imagent, lsd,
+    powerd, com.apple.datami, audiomxd, liveactivitiesd, biomesyncd,
+    identityservicesd, apsd, lockdownd, contextstored, chronod, iconservicesd,
+    ACCHWComponent
+
+`backboardd`, `runningboardd`, `lockdownd`, `apsd` and `CommCenter` are all up.
+That is a real iPadOS userland, deeper than any previous interval reached, and it
+is the substrate the `App` question has to be answered against.
+
+## `LimitLoadFromHardware` is REFUTED, and now by a live control
+
+`local-private/boot53/launchd-discriminator.txt` already had the distribution:
+
+    --- LimitLoadFromHardware ---
+      RAN      : 91x ABSENT, 1x {"osenvironment": ["diagnostics"]}
+      NOT RAN  : 425x ABSENT, 1x {"osenvironment": ["diagnostics"]}
+
+    jobs sharing LimitLoadFromHardware={"osenvironment": ["diagnostics"]}:
+      1 others; of those, 1 spawned
+        RAN     com.apple.logd.plist
+
+So across the 518 readable job plists the key appears exactly twice: once in
+`com.apple.logd.plist`, which RAN, and once in `com.apple.SpringBoard.plist`,
+which did not.  A key that appears in one job that ran and one that did not is
+neither necessary nor sufficient, and the static version of that argument was
+already enough to demote it.
+
+**The live boot settles it.**  `logd` is in this very boot's spawn list (n=11),
+and SpringBoard is not.  Same boot, same key, same value, opposite outcomes.  A
+cause that produces both outcomes in one run is not a cause.
+
+## `POSIXSpawnType=App` remains a perfect separator, and the mechanism is still
+## unknown
+
+    jobs sharing POSIXSpawnType="App":
+      6 others; of those, 0 spawned
+        not-ran com.apple.TextInput.kbd.plist
+        not-ran com.apple.assistivetouchd.plist
+        not-ran com.apple.bluetoothuiservice.plist
+        not-ran com.apple.checkerboard.plist
+        not-ran com.apple.commandandcontrol.plist
+        not-ran com.apple.fullkeyboardaccess.plist
+
+7 of 7 `App` jobs did not spawn; 0 of 92 that did spawn carry the type.  The live
+boot adds 54 spawns and **0** of the 21 that could be matched to a job plist is
+an `App` job (19 `Standard`, 2 `Interactive`).
+
+Two honest caveats, because the separator is a correlation and not yet a
+mechanism:
+
+* **The decisive cell is n=1.**  The 5 `App` jobs that the enumeration found all
+  carry `RunAtLoad=False`, so none of them would spawn at boot regardless of
+  type.  SpringBoard is the only `App` job with `RunAtLoad=True` in the readable
+  set.  So "7/7" is really "1 decisive case plus 6 that were never going to run".
+* **The 6 peers are all UI/scene services** -- keyboard, assistive touch,
+  bluetooth UI, checkerboard, command-and-control, full keyboard access.  They
+  are the kind of job that runs *inside* a UI session, not at boot.  That is
+  consistent with launchd declining to launch `App` jobs before a session
+  exists, and it is also consistent with the guest simply never establishing
+  whatever a `App` launch requires.  Distinguishing those needs launchd's own
+  reasoning, which is closed source.
+
+## What the emitter has and has not settled
+
+**Settled.**  SpringBoard's job file is readable: `job.springboard_open` reported
+`err:0`.  So the file exists on the mounted volume and launchd opened it.  The
+failure is a load decision made AFTER the open, not a missing file and not a
+wrong volume.
+
+**Not settled, and it is the emitter's own gap.**  Only 3 generic `job.open`
+records fired against 54 spawns, and all three are `com.apple.jetsamproperties`
+plists.  Reading the patch explains it: the generic record's directory test is a
+**prefix match on the full path** against six literals that all begin with `/`,
+so an `openat(dirfd, "com.apple.foo.plist")` -- a relative path, which is how a
+directory walk opens each entry -- is dropped.  The targeted SpringBoard record
+compares the **basename**, which is why it fired when the generic one did not.
+
+So the generic record is measuring "opens by absolute path" and not "opens".  The
+next emitter revision has to record the path it was actually given, or drop the
+prefix requirement, before the generic count means anything.
+
+## Status
+
+Code: COMPLETE for the emitter and the tooling fix.
+Windows/real-guest: PASS for the emitter (54 spawns, 3 job.open, 1
+job.springboard_open), IN PROGRESS for the six-hour capture.
+Onsite: N/A.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum C): `App` is not special.  `App`
+# AND `Background` are both zero-for-92.
+
+## The table that settles the shape of the question
+
+`local-private/boot53/launchd-discriminator.txt`, on the 518 readable job plists
+(92 spawned, 426 did not):
+
+    --- POSIXSpawnType ---
+      RAN      : 35xInteractive, 29xABSENT, 28xAdaptive
+      NOT RAN  : 207xABSENT, 165xAdaptive, 41xInteractive, 7xApp, 5xBackground
+
+Every spawn type that launched, launched:
+
+    Standard (absent)  29 ran / 207 not-ran
+    Adaptive           28 ran / 165 not-ran
+    Interactive        35 ran /  41 not-ran
+    App                 0 ran /   7 not-ran     <-- zero
+    Background          0 ran /   5 not-ran     <-- zero
+
+**`App` and `Background` are the only two types with zero launches.**  That is
+12 jobs, none of which ran, against 92 that did.
+
+This is a better result than the one interval 45 carried, and it changes the
+question.  "Why does launchd decline `POSIXSpawnType=App`?" is the wrong shape:
+it implies launchd singles out `App`.  It does not single out `App` -- it
+declines `App` and `Background` alike, and those are precisely the two
+**session-scoped** spawn types.  `Standard`, `Adaptive` and `Interactive` are
+boot-scoped, and all three launched.
+
+So the question is: **what does a session-scoped launch require that this guest
+never provides?**  And the honest answer is that it is not yet known, with one
+structural observation that fits everything measured:
+
+    `POSIXSpawnType=App` jobs are, on iPadOS, the jobs that establish the UI
+    session.  SpringBoard is one.  loginwindow is one.  Both are `App`.  A
+    session-scoped job that requires a session, to establish the session, cannot
+    bootstrap itself -- so SOMETHING has to break that cycle, and on a real
+    device it does.  In this guest it does not, and 12 jobs sit unlaunched.
+
+## The live boot, against that table
+
+54 spawns, and **0** of the 21 that could be matched to a job plist is an `App`
+or `Background` job (19 `Standard`, 2 `Interactive`).  `backboardd`,
+`runningboardd`, `logd`, `configd`, `notifyd` and `lockdownd` are all still
+running.  So the substrate an `App` launch would need IS up, and the `App` jobs
+still do not start.  That rules out "runningboardd had not come up yet" as the
+whole story, and it is why the mechanism is recorded as unknown rather than
+guessed.
+
+## Three keys that are 0-for-92 and all sit on SpringBoard
+
+    _LimitLoadFromClarityMode   0/92 RAN    1/426 NOT RAN   (SpringBoard has it)
+    EmbeddedHomeScreen          0/92 RAN    3/426 NOT RAN   (SpringBoard has it)
+    POSIXSpawnType=App          0/92 RAN    7/426 NOT RAN   (SpringBoard has it)
+
+Recorded because they are the same shape and because the temptation is to treat
+all three as causes.  `EmbeddedHomeScreen` and `_LimitLoadFromClarityMode` are
+almost certainly *consequences* of being a home-screen app rather than causes --
+`_LimitLoadFromClarityMode` is a single job, and a key that appears once cannot
+separate anything.  `POSIXSpawnType=App` is the one with a mechanism that fits
+and 12 jobs behind it.
+
+## The other anomaly in the same log, recorded so it is not lost
+
+    exit.seen n=5 comm=launchd code=1
+
+PID-1-shaped launchd exits with code 1, early -- right after `fsck`, `mount`,
+`seputil` and `mobile_obliterator`, and BEFORE `apfs_boot_util`.  Then 58 daemons
+are spawned, none of them by a `launchd` that `exec.seen` or `spawn.seen` ever
+records.  Either a second launchd was started by a path neither emitter watches,
+or the spawns come from a process the emitters do not attribute.
+
+Not explained, and explicitly not assumed benign.  It is the most likely place
+the "who launches the `App` jobs" answer lives, and it is the next thing to look
+at once the emitter records what it is actually being handed.
+
+## Status
+
+Code: COMPLETE for the emitter and the tooling fix.
+Windows/real-guest: PASS for the emitter (58 spawns, 3 job.open, 1
+job.springboard_open), IN PROGRESS for the six-hour capture.
+Onsite: N/A.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum D): the general record works, and
+# it just located SpringBoard's plist somewhere the prefix list does not cover.
+
+## The measurement that corrected the measurement
+
+At 08:50 the capture had produced THREE `job.open` records against 105 spawns,
+and this interval concluded the emitter's six-prefix filter was dropping relative
+opens -- that `openat(dirfd, "com.apple.foo.plist")` was passing a path the
+prefix test could not match.  An emitter revision was written on that premise.
+
+**At 09:15 the same log carried 154 `job.open` records against 222 spawns.**
+
+    154 records; errno distribution {0: 152, 2: 2}
+    the two ENOENTs: com.apple.jetsamproperties.NonUI.plist, com.apple.bootpd.plist
+    the last ones: com.apple.wifi.wapic, com.apple.devicecheckd,
+                   com.apple.imtransferagent, com.apple.softposreaderd,
+                   com.apple.SafariBookmarksSyncAgent, com.apple.textunderstandingd,
+                   com.apple.sntpd, com.apple.dt.automationmode-writer,
+                   com.apple.privacyaccountingd, com.apple.inboxupdaterd,
+                   com.apple.pluginkit.pkd, com.apple.eyereliefd
+
+So the general record was measuring opens correctly all along.  The boot had
+simply not reached bulk job discovery yet when it was sampled.  **The premise of
+the emitter revision written this interval is refuted, and the revision has been
+rewritten rather than committed.**
+
+This is the fifth time this project has measured too early and read the result as
+a defect in the instrument.  The others: the QMP client that never sent
+qmp_capabilities, the pytest argv that made eight mutants report "killed" with no
+output, the four SHF_MERGE fragment greps, and the gate that reported PARTIAL on
+a kernel with the emitter compiled in.  The lesson is the same each time and is
+worth stating once more: **a low count on a live boot is a statement about the
+boot's progress until proven otherwise.**
+
+## What the 154 records DID find, which is better than what was being looked for
+
+`com.apple.SpringBoard.plist` is **NOT** in the general list.  The targeted
+basename record fired with `err:0`.  The general record requires the FULL path to
+begin with one of six literals:
+
+    /System/Library/LaunchDaemons/
+    /System/Library/LaunchAgents/
+    /System/Library/NanoLaunchDaemons/
+    /private/preboot/System/Library/LaunchDaemons/
+    /private/preboot/System/Library/LaunchAgents/
+    /private/preboot/System/Library/NanoLaunchDaemons/
+
+**So launchd opened a file whose basename is `com.apple.SpringBoard.plist`,
+successfully, from a directory that is none of those six.**
+
+Two of the other `App` jobs were opened normally and ARE in the general list:
+
+    com.apple.assistivetouchd.plist    OPENED (n=65, err=0)
+    com.apple.bluetoothuiservice.plist OPENED (n=125, err=0)
+
+and so were two `Background` jobs (`com.apple.OTACrashCopier.plist` n=138,
+`com.apple.IOAccelMemoryInfoCollector.plist` n=98).  So the type is not what keeps
+a plist out of the general list -- the DIRECTORY is, for SpringBoard specifically.
+
+That is the first hard evidence for the two-volume split
+`which-volume-owns-launchdaemons.txt` predicted:
+
+    volume        bytes            LaunchDaemons  NanoLaunchDaemons  LaunchAgents
+    OS root     6,077,580,800          545              5              21
+    SystemOS    3,303,014,400           21              0               4
+
+    BOTH volumes carry the directory name.  Which one the guest's launchd reads
+    is NOT settled by this scan -- it is settled by the mount order, and a union
+    at / makes the answer order-dependent.
+
+**Where SpringBoard's plist actually lives is now the open question, and it is
+answerable:** the emitter's `probe` buffer already holds the full 256-byte path;
+the general record just does not emit it.  The revised emitter puts the full path
+in the targeted SpringBoard record, which is bounded to one emission and can
+therefore afford 255 bytes.
+
+## The emitter revision, rewritten on the measured premise
+
+The version written on the refuted premise widened the general record's gate to
+`in_a_job_dir || launchd_is_the_caller` and added `abs` and `comm` fields.  Both
+were answering "does launchd use relative opens", and the answer is no -- 152 of
+154 opens matched an absolute prefix.  So the widening is dropped and the revision
+becomes the single change the data asks for: **the targeted SpringBoard record
+carries the full path it was handed.**
+
+## Status
+
+Code: emitter revision 2 rewritten and installed; the whole 57-patch set still
+applies in order to the pristine tree; the patch's own line-number citations all
+resolve.
+Windows/real-guest: PASS for the emitter (222 spawns, 154 job.open, 1
+job.springboard_open), IN PROGRESS for the six-hour capture.
+Onsite: N/A.
+
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum E): the 453-record capture found
+# SpringBoard's plist in the general list after all, and it was opened TWICE
+
+## Addendum D is retracted, and so is what was committed on it
+
+Addendum D read the channel log at 154 `job.open` records and concluded:
+
+    `com.apple.SpringBoard.plist` is NOT in the general list.
+
+The same log, read at **453** records, carries
+
+    {"event":"job.open","n":239,"job":"com.apple.SpringBoard.plist","err":0,
+     "source":"XNU.openat_internal"}
+
+at line index 628 of 1254, 585 lines after the first `job.open` record, at the
+moment `spawn.seen` had reached n=236 (the next spawn is n=237, misagent).
+
+So the statement was true of the sample and false of the boot. **This is the
+sixth time this project has measured too early and read the result as a fact
+about the guest** -- after the QMP client that never sent qmp_capabilities, the
+pytest argv that made eight mutants report "killed" with no output, the four
+SHF_MERGE fragment greps, the gate that reported PARTIAL on a kernel with the
+emitter compiled in, and addendum D's own 154-record sample.
+
+A patch header and a lock note were committed on addendum D's reading. They are
+corrected by follow-up commits, not amended: the history of being wrong is the
+part worth keeping, and `git push --force` on a branch the build fetches by SHA
+is how a build gets the wrong tree.
+
+## What the two records actually say, which is better than either reading
+
+There are TWO opens, and the emitter's two records saw different ones:
+
+| record | line index | when | gate it passed |
+|---|---|---|---|
+| `job.springboard_open` err:0 | 78 | ~35 opens into job discovery, between spawn n=17 and n=21 | **basename only** |
+| `job.open` n=239 err:0 | 628 | 585 lines later, between spawn n=236 and n=237 | **full path under one of six dirs** |
+
+The targeted record is bounded to one emission, so it fired on the FIRST open
+and is spent by the second. The general record needs the full path to begin
+with one of six literals, so it fired only on the second. **The two records are
+not in conflict; they are two opens, and the code says so by construction.**
+
+## And SpringBoard is not the only job opened twice
+
+Eight job files are opened more than once in this boot, and six of them show
+the same early-plus-late shape:
+
+    com.apple.jetsamproperties.J120.plist   n=2, 3, 27
+    com.apple.ftp-proxy-embedded.plist      n=4, 5, 253
+    com.apple.bluetoothd.plist              n=7, 214
+    com.apple.locationd.plist               n=9, 293
+    com.apple.iomfb_fdr_loader.plist        n=10, 347
+    com.apple.triald.plist                  n=59, 203
+    com.apple.dhcp6d.plist                  n=303, 452, 453
+    bootps.plist                            n=450, 451
+
+So a double open is a pattern, not an anomaly -- launchd walks its job list more
+than once, or there is more than one job directory in play.
+
+**What distinguishes SpringBoard is that its EARLY open is not in the general
+list and the other six early opens are.** bluetoothd's n=7, locationd's n=9,
+iomfb_fdr_loader's n=10, triald's n=59 and ftp-proxy-embedded's n=4 all matched
+a watched prefix. SpringBoard's did not. That is the one fact the 453 records
+establish that the 154 could not, and it is exactly the fact revision 3's path
+field names.
+
+## The question the emitter was built for is now answered
+
+The lock note named the fork: "If the SpringBoard record is present with err=0,
+the defect is downstream of the open."
+
+**Both records are present with err=0.** launchd reads SpringBoard's job file,
+successfully, twice, from two different paths -- and 442 spawns and 158 distinct
+comms later there is still no SpringBoard-shaped comm among them.
+
+So the defect is downstream of the open. It is not a missing file, not a
+permission problem, not a path launchd cannot reach. It is what launchd decides
+about a job it has read.
+
+That returns the lead to the one hypothesis that has survived every refutation:
+`POSIXSpawnType=App` and `Background` are the two session-scoped spawn types,
+they are 0-for-92 between them (7 App and 5 Background, none ran), and the three
+types that did launch are boot-scoped. The `LimitLoadFromHardware` explanation
+stays refuted by the logd control, and the type is still not sufficient on its
+own -- assistivetouchd and bluetoothuiservice are also App-typed and their
+plists ARE opened, so the directory is not what separates them from SpringBoard
+either.
+
+## Status
+
+Code: emitter revision 3 installed and pinned (fork a4428fc, lock
+5c2a88f); its header and the lock note are corrected by follow-up commits
+recording this retraction.
+Windows/real-guest: PASS for the measurement (453 job.open, 442 distinct jobs,
+1 targeted + 1 general SpringBoard open, both err:0, 442 spawns, no
+SpringBoard comm). IN PROGRESS for the six-hour capture, live at 09:55 with
+roughly 4.7 hours of budget left.
+Onsite: N/A.
