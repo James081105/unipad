@@ -11477,3 +11477,38 @@ read to confirm the change is in the kernel that booted.
 **The "none" result is withdrawn.**  It was an instrument defect, not a
 finding, and it would have discarded the subclass-override plan for no
 reason.
+
+
+---
+
+## Correction to addendum AH's commit, recorded the same interval
+
+Commit `2b7415f` states *"the full gate suite (143 tests) passes"*. **The number
+is wrong and the claim behind it was never verified.** 143 came from a
+single-process run of the suite that the host's memory reclaimer killed at 96%,
+twice -- so the number was a partial count read off a run that did not finish,
+and "it got to 96% with no failures" is not evidence about the last 4%.
+
+The suite has since been run in five chunks (`local-private/tmp/run-gate-chunked.py`),
+one pytest process at a time so each finishes and releases before the next
+starts. **All five chunks exited 0, and 375 tests ran** -- not 143:
+
+| chunk | tests |
+|---|---|
+| `test_p0p1_gate_record.py` | 31 |
+| `test_p0p1_gate_main.py` | 91 |
+| `test_p0p1_gate_milestones.py` | 98 |
+| `test_p0p1_gate_e2e.py` + `test_p0p1_gate_p1.py` | 128 |
+| `test_coverage_table.py` + `test_acceptance_registry.py` + `test_acceptance_main_report.py` | 27 |
+| **total** | **375** |
+
+The substantive claim -- that the suite is green against the committed tree --
+holds. The count does not, and a count read off an unfinished run is the same
+defect class as everything else in this log: a number presented as a
+measurement that was never taken.
+
+Two other things the same host event cost, both recovered: the boot/capture
+process was killed mid-run (the guest died with it, which is by design -- the
+capture owns the QEMU it starts), and `/f/unipad-tmp` is down to 8.2 GB with no
+`pytest-*` basetemp left to reclaim, so the disk pressure is separate from the
+memory pressure and was not the cause.
