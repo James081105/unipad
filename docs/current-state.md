@@ -7837,3 +7837,139 @@ The fix is not a larger number. Two changes, both small:
 
 Until both land, no long capture on this kernel can distinguish "the guest stopped"
 from "the emitter stopped", and every negative read off one is worthless.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum H): the prediction came true, the
+# freeze is measured directly, and one of my own baselines was from another boot
+
+## G's prediction was confirmed by G's own arithmetic
+
+Addendum G ended with a measurement, not a guess: spawn.seen had saturated at 512
+after roughly 90 minutes, and `job.open and exit.seen have 58 and 79 records
+left, so the capture goes silent within about 137 more records and then
+contributes nothing for the remaining four hours`.
+
+That is what happened. The census taken at 10:58Z, with the channel's last write
+at 10:50:02Z:
+
+    spawn.seen        512   last record n=511, at line 1399   SATURATED
+    exit.seen         512   last record n=512, at line 1532   SATURATED
+    job.open          454   last record n=454, at line 1353   58 of headroom left
+    exec.seen           2   last record n=2,   at line 58
+
+exit.seen went blind 133 lines after spawn.seen did, and the channel has been
+silent for 8 minutes 38 seconds at the time of the census. Nothing has been
+written since. This is the confirmation: the emitter's bound, not the guest,
+ended the measurement, and it ended it at the record count G predicted.
+
+**What the capture established, and what it did not.** It established that at the
+moment the exit emitter went blind, the respawn cycle was still running --
+bluetoothd exit n=508, fairplayd.A2 exit n=512, alternating to the last record.
+It did not establish anything about the guest after 10:50. Under the throttled
+~20-60 s cycle G measured, 8m38s of silence would have produced roughly ten to
+twenty-five more exits. Their absence is equally consistent with the loop having
+stopped and with the emitter having stopped. The two are indistinguishable, which
+is the entire content of this addendum and of G.
+
+## The framebuffer: measured directly, and a baseline of mine was from another boot
+
+The claim inherited from earlier intervals is "the framebuffer has not changed
+since t=121". Until now it rested on a hash timeline: a screendump every 120 s,
+hashed, deleted unless it was the first or its hash differed from the previous
+one. `shots/` holds exactly two files, `t00000.png` and `change-01-t00121.png`,
+so exactly one change was ever recorded.
+
+A hash timeline has two failure modes and this one had both available. The
+harness could have died, in which case "no new files" is a fact about the
+harness; and the baseline hash could have come from somewhere other than this
+boot. Both needed checking before the claim could be used.
+
+**The harness is alive.** PID 39124, `capture-springboard-boot.py`, created
+16:37:57 local, with a 21600 s budget. It has been running 2h27m and still has
+about 3.5 hours left. Its QMP port is 15919 and its chardev log is the same
+`guest-channel.log` QEMU writes directly, so the channel records do not depend on
+the harness at all.
+
+**The screen was measured directly.** A screendump was taken through QMP on the
+live guest, after first sending `qmp_capabilities` -- because a client that never
+negotiates gets an error back and reads it as "screendump is unavailable", which
+cost this project days once already. The guest answered: `query-status` running,
+`screendump` returned `{}`, 1440015 bytes, P6 800x600.
+
+**And then I made the mistake.** I hashed that dump, compared it against
+`8833260ecd372e44f0c0bc52260880f7a31905b1b6ffcba50cb25709aedae4a0` -- the last
+value in the timeline -- saw a mismatch, and stated that the screen had CHANGED.
+
+The baseline was wrong. `8833260e...` is the last entry in
+`local-private/boot53/spawn-failed-capture.log`, whose last write is 03:12Z, five
+and a half hours before this boot's QEMU started at 08:38Z. It is the PREVIOUS
+boot's timeline. This boot's own recorded hashes live in a background task's
+stdout that is not on disk.
+
+So the correct measurement is not a hash comparison at all. It is a pixel
+comparison against this boot's own image, which the harness kept precisely
+because its hash differed from the first dump:
+
+    old change-01-t00121.png (this boot, t=121s)   800x600
+    new live screendump        (this boot, t=8820s) 800x600
+    0 of 480000 pixels differ (0.000%)
+
+The conversion to PNG was checked by decoding it back and comparing the raster
+byte-for-byte before anything was reported, because "the screen shows the
+bootloader menu" would otherwise be a statement about my converter. Decode-back
+is identical.
+
+**The framebuffer has not changed. It is frozen on the UniXNU EFI boot menu**,
+showing `DARWINBOOT: inputs validated: exiting boot services`, `DARWINBOOT:
+hand-off to the kernel`, the green bar across the top that the menu itself says
+means the kernel entry code ran, and the selected entry `QEMU virt: source 4K
+XNU`. The kernel spawned 512 processes behind that image.
+
+This is the ninth or tenth time this interval's failure mode has appeared, and it
+is the first time it was mine rather than the instrument's: a number compared
+against the wrong provenance, believed long enough to be stated as a finding, and
+caught only because the next check was a pixel diff rather than another hash.
+
+## What the guest itself says about the display, which is a better lead than "frozen"
+
+There is exactly one display record in the whole capture, at channel-log line 42,
+very early in boot:
+
+    {"event":"diag.legacy_display_status","stage":10,"surface_status":0,
+     "surface_found":1,"dt":1,"source":"XNU.LegacyDisplayProbe"}
+
+`surface_found` is 1 and `dt` is 1. So the legacy display probe found a surface
+and found the device tree. It did not fail. Nothing drew to the surface
+afterwards, or what it drew went somewhere the ramfb is not.
+
+That reframes task #24 from "the framebuffer is frozen" -- which is a symptom --
+to "the probe succeeded and nothing took the surface". The green bar in the
+frozen image is the bootloader's own indicator that the kernel entry code ran, so
+the hand-off is not in doubt either. What is missing is between the probe and a
+console that owns the framebuffer.
+
+An investigator is reading the emitter, the code path after it, and whether a
+driver matching QEMU's `ramfb` exists in the tree at all. Its report lands in the
+next interval.
+
+## Status
+
+Code: emitter revision 4 installed and pinned. Fork `3d83de1`, lock pin
+`3d83de17dd4e4be468ac3fb8d30ee21c597e8972`, both pushed. All five caps at 65536,
+five saturation blocks, four `char text[4]` grown to 8. Validated by compiling
+the four kern_exec/kern_exit emitter blocks with MSVC `/W3 /WX` and running them
+past their caps: 262148 records, 0 invalid, each emitter at exactly 65536, each
+saturation record exactly once.
+
+Windows/real-guest: FAIL for the capture, and now for a stated reason rather than
+an inferred one. spawn.seen and exit.seen both saturated at 512; job.open has 58
+records left and will go silent. The capture is blind and is contributing nothing
+but CPU. PASS for the framebuffer measurement, which is now direct: 0 of 480000
+pixels differ between t=121 and t=8820.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, stage M7, target tcg,
+dispatched on lock commit 620f440 at 10:56Z. The push-triggered preflight run
+41817495435 cross-checks `unixnu_commit` against the lock on the same ref.
+
+Onsite: N/A.
