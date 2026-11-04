@@ -8441,3 +8441,126 @@ Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, all 34 steps
 complete, four artifacts, boot inputs extracted and booting.
 
 Onsite: N/A.
+
+---
+
+# Interval 2026-11-04 (forty-seventh, addendum L): the window was never what hid
+# SpringBoard, and the targeted emitter was matching a logging plist
+
+## Launchd reads SpringBoard's plist at spawn n=239, which is inside the old cap
+
+The 65536-cap kernel booted at 12:03Z and is capturing. At spawn n=241 the channel
+carries:
+
+    {"event":"job.open","n":239,"job":"com.apple.SpringBoard.plist","err":0,
+     "source":"XNU.openat_internal"}
+
+The previous capture carried the identical record at spawn n=236. Two boots, two
+builds, the same job file read at the same point in the spawn sequence, err:0.
+
+**So addendum G's caveat was the wrong caveat for this job.** It said the 0-for-12
+negative was unfalsifiable because "a job that spawns after record 512 is
+invisible, and session-scoped jobs are exactly the jobs that launch LATE".
+SpringBoard's plist is read at n=239 -- 273 records inside the old cap of 512. The
+window was never what hid it. Launchd reads the file, early, and does not spawn it.
+
+That does not make the caveat wrong in general. It makes it wrong HERE, and the
+distinction matters: the honest statement for SpringBoard is now "launchd read the
+job and declined it", not "we could not see far enough".
+
+## The App separator sharpens from 0-for-12 to 0-for-6-read, and splits in two
+
+Cross-tabulating the 518 job plists on the volume against the new capture, with
+the instrument limits addendum F's own tooling documents (a comm is at most
+MAXCOMLEN+1 = 16 chars; a job.open's `job` field is the basename launchd passed to
+openat, not necessarily the Label; matching a comm to a Label is a heuristic):
+
+    POSIXSpawnType   spawned   not   total
+    Adaptive            35    158     193
+    AdaptiveUtility      0      1       1
+    App                  0      7       7
+    Background           0      5       5
+    Interactive         29     47      76
+    unset               25    211     236
+
+**These are a snapshot at spawn n=260, not a final count** -- the capture is live
+and the "read" column grows as launchd works through the volume. What is stable
+across the whole run so far is the spawned column: no App- or Background-typed job
+has spawned at any point.
+
+The number that matters is not the total, it is how many were READ:
+
+    App-typed, plist opened by launchd: 6 of 7   (SpringBoard, TextInput.kbd,
+        assistivetouchd, bluetoothuiservice, checkerboard, fullkeyboardaccess)
+    App-typed, never opened:            1       (commandandcontrol)
+    App-typed, spawned:                 0
+
+    Background-typed, plist opened:     1 of 5
+    Background-typed, spawned:          0
+
+**So the two types fail at different points.** App-typed jobs are READ and then
+DECLINED -- 0-for-6 on jobs launchd actually considered. Background-typed jobs are
+mostly never read at all, which is an earlier failure and a different one.
+Reporting them as one "0-for-12 separator" hid that.
+
+## Four other gates are refuted, with far larger numbers than before
+
+Each was re-measured on the new window, and each is now refuted by a margin that
+the old capped window could not provide:
+
+    UserName              56 mobile-user jobs SPAWNED
+    RunAtLoad=true        29 spawned
+    MachServices present  84 spawned
+    LimitLoadFromHardware only 2 jobs carry it, both under an osenvironment
+                          condition, 0 spawned -- too small to be a separator
+
+`POSIXSpawnType in {App, Background}` remains the only clean separator: 0-for-12,
+0-for-6 on the read subset, and nothing else in the plist correlates.
+
+## The targeted SpringBoard emitter was matching a logging plist
+
+The job-open patch added a `path` field, and it has immediately identified a false
+positive that addendum F could not see. The targeted emitter's record is:
+
+    {"event":"job.springboard_open","err":0,
+     "path":"/System/Library/Preferences/Logging/Subsystems/com.apple.SpringBoard.plist",
+     "source":"XNU.openat_internal"}
+
+That is a LOGGING SUBSYSTEM configuration, not the launchd job at
+/System/Library/LaunchDaemons/com.apple.SpringBoard.plist. The emitter's gate is a
+basename match on `com.apple.SpringBoard.plist`, and the first file with that
+basename to be opened through a watched directory is the logging one.
+
+The previous capture's targeted record carried no path field, so addendum F could
+only say "basename gate only" and "the targeted record is bounded to one emission,
+so it fired on the first open and was spent by the second". Both are true. What F
+did not know, and could not have known, is that the first open was a different
+FILE. Any reader who took "SpringBoard's plist was opened at capture line 78,
+early in boot" as launchd considering SpringBoard was reading a logging config.
+
+The launchd job itself is the `job.open n=239` record above, which is the
+full-path gate and is not ambiguous.
+
+## Status
+
+Windows/real-guest: the 65536-cap kernel is live and capturing as of 12:03Z, spawn
+counter at n=241 and climbing. The App separator is CONFIRMED as not a window
+artefact for SpringBoard specifically: the plist is read at n=239, 273 records
+inside the old cap, and declined.
+
+Answered by this addendum:
+- #22 sharpened materially. Launchd reads com.apple.SpringBoard.plist at spawn
+  n=239 in both captures and never spawns it. At spawn n=260, 6 of 7 App-typed
+  jobs had been read and 0 spawned; 1 of 5 Background-typed jobs had been read
+  and 0 spawned. Four other candidate gates are refuted with 56, 29, 84 and 2
+  jobs respectively.
+
+Still open:
+- WHY launchd declines an App-typed job it has just read. The separator is
+  measured; the mechanism is not.
+- #23 the two respawn loops, pending the bluetoothd-loop investigator.
+
+Build: `exp-2026-11-04-emitter-caps`, run 41817661032, M7/tcg, caps verified in
+the image, booting since 12:03Z.
+
+Onsite: N/A.
