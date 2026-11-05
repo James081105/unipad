@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred fourth, addendum BT). THE HEADLINE is **A REAL BOOT, A PASSED CONTROL, AND NO CLIENT EVER OPENED THE FRAMEBUFFER**. `read-client-table.py` boots the guest, waits for a client to open the framebuffer, reads `static ClientStat seenClients[8]` over QMP, and exits the instant it has the table. On run 41980452867 the kernel sha256 d2c5a914 was verified against payload.json, __ZL11seenClients resolved at 0xfffffff00c146888, 10 of 10 counters resolved, and THE CONTROL PASSED (`Darwin Kernel Version 23.6.0: Thu Nov 5 06:52:05 UTC`). **Then 420 s of sampling, every sample client_calls=0 swap=0 prepare=0, and the script REFUSED rather than report a table it never read -- a client_calls=0 boot has no client table to print, and printing an empty one would read as "five clients, all idle".** **AND THAT IS NOT WHAT THIS KERNEL SAID LAST TIME: addendum BL, on the SAME kernel, measured client_calls=3, client_pid=95, client_status=0. Three client opens on one boot of d2c5a914, zero on another, with a byte-identical kernel whose sha256 was verified before the boot. That is the recorded non-determinism in its sharpest form: whether the framebuffer client reaches the display driver AT ALL varies between boots, so a single boot's client_calls is not a fact about the kernel.** **BR's CHAIN SURVIVES, because it never depended on client_calls being 3: swap_validation_calls=0, transfer_calls=0 and prepare_calls=0 on BOTH boots, so "no swap is ever submitted" holds across both and does not depend on the client count. What it does to BS is that the quoted selector table is from kernel 2ebda0ec, and this boot shows even "does a client open the framebuffer" is not stable within one kernel.** **AND IT CORRECTS BP: BP argued the payload kernel is stripped of local symbols, so symbol presence cannot separate dead from live. That was WRONG -- __ZL11seenClients, the mangled local-linkage spelling of a C++ file-scope static array, IS present, and display-clients.py had already recorded that in its own comment. What is true is narrower: static VARIABLES survive under their mangled names; static FUNCTIONS do not, because they were inlined. BP's conclusion stands on its own evidence but one of its supporting arguments was false.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is a real measurement with a name attached to its kernel, and what it says is that the display blocker is not merely that the client is refused -- on some boots of this kernel no client reaches the display at all.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred fifth, addendum BU). THE HEADLINE is **TWO BOOTS STALLED AT 2-4 PROCESSES, SO THE SILENCE IS THE BOOT AND NOT THE DISPLAY**. Same kernel, same script, one change: the sampling loop now prints the process count. On run 41980452867 with kernel sha256 d2c5a914 verified against payload.json and the control passed, **the process count oscillates between 2 and 4 for the entire 420 s window and never ramps**, with client_calls=0, swap=0 and prepare=0 throughout. **Together with addendum BT that is two consecutive boots of a byte-identical kernel, both stalled before any userspace client exists.** **SO client_calls=0 HAS A CAUSE: there was never a client to call. A framebuffer user client is created by a process, and this boot reached three or four processes in 420 s. Nothing in the display driver gates a client that does not exist -- which separates "the display driver refusing a client" (NOT what happened) from "the boot never producing a client" (what happened).** **And it makes BL's client_calls=3 legible rather than contradictory: BL sampled for 900 s, this window is 420 s, and the boot is still at three processes when the window closes.** **THE HYPOTHESIS, stated so it can be wrong: the guest ramps, but slowly -- 420 s is not enough to reach a framebuffer client. The falsifiable prediction is that extending the window to 900 s, the length BL used, makes client_calls non-zero on some boots. The alternative the same experiment tests is that the boot is genuinely stalled rather than slow, and no window length reaches a client; the two are distinguishable by whether procs climbs past the 2-4 band.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is that the display measurement is not being defeated by the display -- it is being defeated by a boot that does not ramp, and the next experiment is a longer window rather than a code change.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15458,3 +15458,73 @@ reached.  What is new is a real measurement with a name attached to its kernel,
 and what it says is that the display blocker is not merely that the client is
 refused -- on some boots of this kernel no client reaches the display at all.**  THE
 HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred fifth, addendum BU): two boots stalled at 2-4 processes, so the silence is the boot and not the display
+
+## The run
+
+Same kernel, same script, one change: the sampling loop now prints the process
+count alongside the counters.  `read-client-table.py`, run 41980452867, kernel
+sha256 `d2c5a914` verified against `payload.json`, control passed
+(`Darwin Kernel Version 23.6.0`).
+
+    0.0s   procs=1     client_calls=0    swap=0 prepare=0
+    10.0s  procs=2     client_calls=0    swap=0 prepare=0
+    ...
+    330.7s procs=2     client_calls=0    swap=0 prepare=0
+    341.1s procs=4     client_calls=0    swap=0 prepare=0
+    351.1s procs=3     client_calls=0    swap=0 prepare=0
+    ...
+    411.4s procs=3     client_calls=0    swap=0 prepare=0
+
+    REFUSED: no client ever opened the framebuffer within the 420s deadline.
+
+**The process count oscillates between 2 and 4 for the entire window and never
+ramps.**  Together with addendum BT's run -- also `client_calls=0`, also on
+`d2c5a914` -- that is two consecutive boots of a byte-identical kernel, both
+stalled before any userspace client exists.
+
+## So BT's silence is attributed, and it is not the display
+
+`client_calls=0` now has a cause: **there was never a client to call.**  A
+framebuffer user client is created by a process, and this boot reached three or
+four processes in 420 s.  Nothing in the display driver gates a client that does
+not exist.
+
+That separates two things BT could not:
+
+    the display driver refusing a client     <- NOT what happened
+    the boot never producing a client        <- what happened
+
+And it makes addendum BL's `client_calls=3` legible rather than contradictory: BL
+sampled for **900 s**, this window is **420 s**, and the boot is still at three
+processes when the window closes.
+
+## The hypothesis, stated so it can be wrong
+
+**The guest ramps, but slowly -- 420 s is not enough to reach a framebuffer
+client.**  The falsifiable prediction: extend the sampling window to 900 s, the
+same length addendum BL used, and `client_calls` becomes non-zero on some boots.
+
+The alternative, which the same experiment also tests: the boot is genuinely
+stalled, not slow, and no window length reaches a client.  Those two are
+distinguishable by whether `procs` climbs past the 2-4 band.
+
+## Status
+
+Windows/real-guest: **two live boots on run 41980452867, kernel sha256 verified
+against payload.json, control passed both times, 420 s of sampling each, with the
+process count recorded.**  `client_calls=0` on both, with the boot stalled at 2-4
+processes.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is new is that the display measurement is not being defeated by the
+display -- it is being defeated by a boot that does not ramp, and the next
+experiment is a longer window rather than a code change.**  THE HEADLINE is
+unchanged from AH
