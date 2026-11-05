@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-fifth, addendum BK). THE HEADLINE is **THE SCREEN WAS MEASURED AND LOOKED AT, AND THE DISPLAY STOPS AT STAGE 10**. `screen-vs-springboard.py` boots the guest, walks allproc and screendumps every 10 s: **65 screendumps over 650 s, ONE distinct frame, and SpringBoard appeared at t=411.6s with the framebuffer unchanged 240 s later.** **And the frame was LOOKED AT, not just hashed** -- the recorded fact is that 39 minutes of sha256 once said "the display froze" while one PNG said it was the boot menu. The PNG is the UniXNU boot menu: green/magenta/blue banner, "Booting QEMU virt: source 4K XNU in 1s", "drivers 1 loaded / 0 failed". **So the sentence repeated for fifteen addenda is now measured AND seen.** **THE SCREENDUMP IS READING THE RIGHT BUFFER: the guest's own serial log says `video base=0x1BC7A0000 display=1 row=3200 width=800 height=600 depth=32`, the same geometry as the screendump -- so the guest's display path is simply not writing it. But the 800x600 is itself the finding: `QemuRamfb.efi` sizes the ramfb via `-fw_cfg name=opt/org.unixnu/ramfb-size`, and `unixnu.toml` names exactly ONE driver, `Payloads/DarwinBoot.efi`. `_check_ramfb_pair` refuses a boot that stages it anyway, because a 24-minute run already measured that a staged driver with no `[[driver]]` entry is a file nothing opens (29 screendumps, all 800x600, one sha256). **So the geometry cannot be fixed from the host -- it needs a payload build whose unixnu.toml names the driver. The guest is running at 800x600 on a 1376x1024 panel, and that is a build change, not a measurement problem.** **WHERE THE DISPLAY PATH ACTUALLY STOPS: `{"event":"diag.legacy_display_status","stage":10,"surface_status":0,"surface_found":1,"dt":1}` -- the surface WAS found and the device tree DID attach, and the probe stopped at stage 10. That is the first point in this chain where the display path has a NUMBERED place it stopped rather than a silence to interpret, and what stage 10 needs is in LegacyDisplayProbe.cpp.** **TWO DEFECTS IN MY OWN SCRIPT, both of which would have lied: the first screendump attempt opened a SECOND QMP connection while the first was held, so every dump failed with "no qmp greeting within 60s" -- which reads exactly like a guest with no framebuffer; and that broken run STILL PRINTED A VERDICT, "THE SCREEN DID NOT CHANGE", derived from 34 failed reads and zero frames. A confident negative from an instrument that never produced a frame is worse than no verdict.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The screen is the UniXNU boot menu, now measured and seen rather than inferred from a hash, and the display path has a numbered place it stopped: stage 10, surface found, device tree attached.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-sixth, addendum BL). THE HEADLINE is **THE DISPLAY IS FULLY UP, WAS CALLED THREE TIMES, AND NEVER GOT A SWAP**. `read-display-counters.py` reads 27 `native_legacy_*` counters out of a live guest's kernel memory over QMP; all 27 resolved and the control passed. **THE DRIVER IS NOT HALF-UP: stage=10, which LegacyDisplayProbe.cpp:803 defines as the SUCCESS terminal state (`activeLegacyDisplay=display; activeGOPNub=nub`), init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4 with pm_status=0.** **AND THE WHOLE DOWNSTREAM CHAIN WAS NEVER ENTERED: the panic string at LegacyDisplayProbe.cpp:685 names the order the display path runs in -- `stage=%u PM=%u swap=%u/%u copy=%08x bytes=%llu retire=%u handoff=%u/%u` -- and PM ran to stage 4 while swap_validation_calls, transfer_calls, transfer_status (-1), transfer_bytes, retirement_calls and retired_frames are ALL still at the initial values their declarations set. That is "never invoked", not "returned zero".** **A CLIENT DID CALL THE DISPLAY, THREE TIMES, FROM PID 95, SUCCESSFULLY (client_calls=3, client_status=0) -- so the driver is reachable and answers. What never happened is a SWAP SUBMISSION.** **This settles task #27 with a measurement rather than a theory: the swap is not rejected, not failing validation, not erroring on the copy -- it is never submitted. Combined with addendum BK (148 screendumps over 1500 s, SpringBoard alive, one distinct frame) the two facts are the same fact from two sides: nothing writes the framebuffer because nothing ever asks the display to write it.** **It does not settle WHO pid 95 was or why it stopped at three calls: this boot stalled at three processes (the recorded non-determinism), so the pid is from an early state. THE NEXT MEASUREMENT IS THE SAME COUNTERS ON A BOOT THAT RAMPS -- one run of the same script, no build.** **And the geometry problem from BK is untouched: native_legacy_gop_width=800 and gop_height=600 on a panel unixnu_boot.SCREEN calls 1376x1024, and unixnu.toml names only Payloads/DarwinBoot.efi so QemuRamfb.efi cannot size it from this host. The display is presenting at the wrong size even if a swap were submitted.** **The instrument's guard earned its place: every counter that can mean "never invoked" carries that initial in the source and the script reads the initials from the same table, and a counter absent from the kernel prints ABSENT FROM KERNEL rather than 0 -- which is the distinction task #32 has asked for since it opened, and it fell out of this measurement rather than being bolted on.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display driver is fully up and reachable, and the swap that would put anything on the screen is never submitted.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14578,3 +14578,95 @@ Onsite: N/A.
 reached.  The screen is the UniXNU boot menu, now measured and seen rather than
 inferred from a hash, and the display path has a numbered place it stopped:
 stage 10, surface found, device tree attached.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-sixth, addendum BL): the display is fully up, was called three times, and never got a swap
+
+## The measurement
+
+`local-private/tmp/read-display-counters.py` boots the guest and reads 27
+`native_legacy_*` counters out of kernel memory over QMP.  All 27 resolved, the
+control passed (`version` is the kernel's own string), and the final values are:
+
+    native_legacy_stage                 10     <- the SUCCESS terminal state
+    native_legacy_init_result            1     <- init() returned success
+    native_legacy_start_result           1     <- start() returned success
+    native_legacy_surface_found          1
+    native_legacy_dt_attached            1
+    native_legacy_pm_stage               4     <- power management ran
+    native_legacy_pm_calls               4
+    native_legacy_pm_status              0     <- success
+    native_legacy_client_calls           3     <- a client DID call it
+    native_legacy_client_pid            95
+    native_legacy_client_status          0     <- and the call succeeded
+    native_legacy_registration_calls     1
+    native_legacy_unit_scale_status      0
+
+    native_legacy_swap_validation_calls  0     <- STILL AT ITS INITIAL
+    native_legacy_swap_validation_result 0
+    native_legacy_transfer_calls         0     <- STILL AT ITS INITIAL
+    native_legacy_transfer_status       -1     <- STILL AT ITS INITIAL
+    native_legacy_transfer_bytes         0     <- STILL AT ITS INITIAL
+    native_legacy_retirement_calls       0     <- STILL AT ITS INITIAL
+    native_legacy_retired_frames         0     <- STILL AT ITS INITIAL
+
+`LegacyDisplayProbe.cpp:803` is what stage 10 means: `activeLegacyDisplay=display;
+activeGOPNub=nub;`.  The driver is registered, started, powered, and holding a
+live nub.  It is not half-up.
+
+**And the whole downstream chain was never entered.**  The panic string at
+`LegacyDisplayProbe.cpp:685` names the order the display path runs in:
+
+    stage=%u PM=%u swap=%u/%u copy=%08x bytes=%llu retire=%u handoff=%u/%u
+
+PM ran to stage 4.  Swap validation, the copy/transfer, retirement and the
+handoff did not run at all -- every one of their counters is still at the initial
+value its declaration sets, which is what "never invoked" means here rather than
+"returned zero".
+
+**A client did call the display, three times, from pid 95, successfully.**  So
+the driver is reachable and answers.  What never happened is a *swap submission*.
+
+## What that settles, and what it does not
+
+It settles task #27's question with a measurement rather than a theory: the swap
+is not being rejected, not failing validation, not erroring on the copy.  **It is
+never submitted.**  Combined with addendum BK -- 148 screendumps over 1500 s with
+SpringBoard alive and one distinct frame -- the two facts are the same fact from
+two sides: nothing writes the framebuffer because nothing ever asks the display to
+write it.
+
+It does not settle WHO pid 95 was or why it stopped at three calls.  This boot
+stalled at three processes (the recorded non-determinism), so the pid is from an
+early state and the three calls are from early in the boot.  **The next
+measurement is the same counters on a boot that ramps**, which is one run of the
+same script away and needs no build.
+
+And it does not touch the geometry problem from addendum BK: `native_legacy_gop_width`
+is 800 and `native_legacy_gop_height` is 600, on a panel `unixnu_boot.SCREEN`
+calls 1376x1024, and `unixnu.toml` names only `Payloads/DarwinBoot.efi` so
+`QemuRamfb.efi` cannot size it from this host.  **The display is presenting at the
+wrong size even if a swap were submitted.**
+
+## The instrument's own guard, and it earned its place
+
+Every counter that can mean "never invoked" is declared with that initial value in
+the source, and the script reads those initials from the same table rather than
+assuming.  A counter absent from the kernel prints `ABSENT FROM KERNEL` instead of
+0 -- which is the distinction task #32 has been asking for since it was opened,
+and it fell out of this measurement rather than being bolted on.
+
+## Status
+
+Windows/real-guest: **27 display counters read from a live guest's kernel memory
+over QMP, on a build made this interval (`d2c5a914`, run 41980452867).**  The
+driver reached its success terminal state and no swap was ever submitted.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, completed successfully.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The display driver is fully up and reachable, and the swap that would
+put anything on the screen is never submitted.**  THE HEADLINE is unchanged from AH
