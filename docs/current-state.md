@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-fourth, addendum AZ). THE HEADLINE is **LAUNCHD NEVER ATTEMPTS THE SPAWN, AND THE INSTRUMENT WAS ALREADY THERE**. Everything so far rested on "no `spawn.seen` for SpringBoard, so launchd declined it" -- but the emitter's own comment says it is PLACED INSIDE `if (error == 0 && !spawn_no_exec)`, so the success record only fires when posix_spawn SUCCEEDED. "No spawn.seen" is equally consistent with "launchd never called posix_spawn" and with "launchd called it and the kernel rejected it" -- different failures with different fixes, and every interval so far has been reading the first. **The same patch already carried the plug**: a failure-path emitter, `spawn.failed` with the errno and the parent's comm, placed before the `if (imgp != NULL)` cleanup so it covers all ~26 `goto bad` paths, and its comment names the exact ambiguity and says the errno alone separates the two. **The plug is verified to be in this kernel**: the block opens the SAME `XNU_OWNER_CACHE_MOUNT` guard as the `spawn.seen` block in the same file, that macro is live because `spawn.seen` fires 512 times, and a literal only that block contains (`spawn_failed.saturated`) is present once. The contiguous-literal count is explicitly NOT the evidence -- `spawn.seen` reads 0 as contiguous bytes while the guest emits 512 of them, because ld's SHF_MERGE|SHF_STRINGS pass splits them, which is fact 228's shape again. **THE MEASUREMENT: 0 `spawn.failed` records against 512 successful spawns in the deepest capture, and 0 in two more.** So the kernel is rejecting nothing: **launchd never calls posix_spawn for SpringBoard at all.** The decision is made entirely inside launchd's userspace job state machine, before any syscall -- nothing in this project's kernel can be changed to make it happen, because the spawn is never attempted. **That also costs the next measurement: it cannot be a kernel emitter on the spawn path, because that path is never reached.** The cheapest instrument that bears on it is whether runningboardd -- the entitled spawn driver that has to ASK for an App job -- is actually running its code or is alive and blocked; RunningBoard's first act as process manager is kernel-visible (`memorystatus`, `task_policy`), so an emitter there separates "runningboardd never asks" from "runningboardd asks and launchd refuses". **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-fifth, addendum BA). THE HEADLINE is **THE ANOMALOUS SET IS 8, NOT "EVERY App JOB", AND FIVE OF THE ORIGINAL THIRTEEN SPAWN IN THE DEEPER BOOT**. `launchd-discriminator.txt` lists 13 RunAtLoad=true jobs whose daemon did not spawn and concludes POSIXSpawnType=App is a perfect separator (7 of 7 App jobs absent, 0 of 92 spawners carrying the type) -- but that split was computed against a boot with 92 spawned daemons, and the deepest capture on record has 161. Re-running the same 13 against it: **five spawn**, including AppleCredentialManagerDaemon (Interactive, root), containermanagerd (Interactive), accessoryupdaterd (Adaptive, _accessoryupdater), familynotificationd (Adaptive) and identityservicesd (Interactive) -- the very types the separator called safe. **The anomalous set is 8, not 13, and it is not a clean type split.** Three of the eight carry a visible per-job reason a QEMU guest cannot satisfy: iomfb_bics_daemon (LimitLoadToSessionType=System), safetyalertsd (LimitLoadToHardware={targettype:[D16,D17,D20,...]}) and sntpd (UserName=_sntpd). What remains is five -- SpringBoard, checkerboard, ClarityBoard, OTACrashCopier, axassetsd -- and the first three are exactly the three jobs carrying `EmbeddedHomeScreen`, the key the home-screen claim at 0x100007b64 gates on, while the last two are `ProcessType=Background` and **0 of 5 Background jobs spawn anywhere on the volume**. **So POSIXSpawnType=App remains a correlation, exactly as the state document has said since the discriminator was first written, and this interval's launchd parser work does not change that** -- the parser at 0x100003d8c and the marshaller at 0x100020d90 are real and now mapped, but the fork in that road is not where the eight jobs are being lost. **The next measurement is the five, not the seven: the home-screen claim for the three EmbeddedHomeScreen jobs, and whatever keeps Background jobs from spawning for the other two.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13453,6 +13453,83 @@ refuses".  That is a build, which is the normal cost here.
 Windows/real-guest: **the three captures are real guest output** from the
 virtio channel on builds `exp-2026-11-05-slot-lift` (run 41937843171, kernel
 `75dab4f1`) and earlier.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-fifth, addendum BA): the anomalous set is 8, not "every App job"
+
+## What was re-checked, and why
+
+`launchd-discriminator.txt` lists 13 `RunAtLoad=true` jobs whose daemon did not
+spawn, and concludes `POSIXSpawnType=App` is a perfect separator: 7 of 7 `App`
+jobs did not spawn, 0 of 92 that did spawn carry the type.  That split was
+computed against a boot with 92 spawned daemons.
+
+The deepest capture on record has **161 spawned comms**.  Re-running the same 13
+against it:
+
+    SPAWNED  com.apple.AppleCredentialManagerDaemon   Interactive  root
+    SPAWNED  com.apple.accessoryupdaterd              Adaptive     _accessoryupdater
+    SPAWNED  com.apple.containermanagerd              Interactive  -
+    SPAWNED  com.apple.familynotificationd            Adaptive     mobile
+    SPAWNED  com.apple.identityservicesd              Interactive  mobile
+    ABSENT   com.apple.ClarityBoard                   -
+    ABSENT   com.apple.OTACrashCopier                 Background   mobile
+    ABSENT   com.apple.SpringBoard                    App          mobile
+    ABSENT   com.apple.accessibility.axassetsd        Background   mobile
+    ABSENT   com.apple.checkerboard                   App          mobile
+    ABSENT   com.apple.iomfb_bics_daemon              Background   LimitLoadToSessionType=System
+    ABSENT   com.apple.safetyalertsd                  Adaptive     LimitLoadToHardware={targettype:[D16,D17,D20,...]}
+    ABSENT   com.apple.sntpd                          Interactive  _sntpd
+
+**Five of the thirteen spawn in the deeper boot**, including two `Interactive`
+and two `Adaptive` -- the very types the separator said were safe.  The
+anomalous set is **8**, not 13, and it is not a clean type split.
+
+## What the 8 actually look like
+
+Three of them carry a visible per-job reason a QEMU guest cannot satisfy:
+
+    iomfb_bics_daemon   LimitLoadToSessionType = System
+    safetyalertsd       LimitLoadToHardware = {targettype: [D16, D17, D20, ...]}
+    sntpd               UserName = _sntpd
+
+Those three are explained without any theory about spawn types.  What remains is
+five: **SpringBoard, checkerboard, ClarityBoard, OTACrashCopier, axassetsd** --
+and the first three are exactly the three jobs carrying `EmbeddedHomeScreen`,
+which is the key the home-screen claim at `0x100007b64` gates on.  The last two
+are `ProcessType=Background`, and across the whole volume **0 of 5 `Background`
+jobs spawn**.
+
+So the honest shape is:
+
+* `Background` jobs do not spawn at all -- 0 of 5, and 3 of the 8.
+* the three `EmbeddedHomeScreen` jobs do not spawn -- and the claim function
+  already explains why the SECOND and third would not.
+* three more fail for reasons visible in their own plists.
+* `App` is NOT a separator on this evidence: the 13-job set contained two `App`
+  jobs and both are still absent, but it also contained five jobs that DO spawn,
+  of types `Interactive` and `Adaptive`.
+
+**`POSIXSpawnType=App` remains a correlation, exactly as the state document has
+said since the discriminator was first written, and this interval's launchd
+parser work does not change that.**  It is worth having read the parser -- the
+code at `0x100003d8c` and the marshaller at `0x100020d90` are real and now
+mapped -- but the fork in that road is not where the eight jobs are being lost.
+
+## Status
+
+Windows/real-guest: **the join is a host-side read of a real capture** from
+`longboot-input-run` (1516 records, 512 spawns, 454 `job.open`) against the
+parsed job table.
 
 Build: none this interval.
 
