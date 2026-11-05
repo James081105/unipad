@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty third, addendum DG). THE HEADLINE is **THE CATALOG IS WALKABLE END TO END -- 2184 DIR_RECs, A PASSING CONTROL, WORKING DIRECTORY LISTINGS -- AND IOMobileFramebuffer IS NOT IN THIS VOLUME**. Every child of the volume omap root 782657 was followed (36 leaves, 3,916 mapped blocks, 3,848 of them HASHED|NOHEADER leaves) and every record decoded with the two confirmed key formats: type histogram {XATTR 2145, SIBLING_LINK 240, DIR_REC 2184, FILE_INFO 247822}, 2184 DIR_RECs with name_len == klen-12, and **CONTROL: clean ASCII after one NUL: 2184 OF 2184**. 691 distinct parent obj_ids, 289 distinct names, and the names are real (AccessibilityBundles, Accounts, Assets.car, AuthenticationServices.framework, Background Images, BluetoothUIService, Caches, CertificateWarning.html, CodeResources, Composite.wav, CoreServices, zh_CN.lproj, pt_PT.lproj...). **AND DIRECTORY LISTINGS WORK: matching the parent obj_id in the key against the file_id in the value gives real listings. PrivateFrameworks (DIR_REC under obj_id 25, file_id 748) holds 19 entries -- AuthenticationServicesCore, MobileSafari, MobileSafariSwift, MobileSafariUI, PasswordManagerUI, PlugInKitDaemon, SafariCore, SafariFoundation, SafariShared, SafariSharedUI, VisualTestKit, WebApp, WebBookmarks, WebBookmarksSwift, WebCore, WebGPU, WebInspector, WebKitLegacy and WebUI .framework -- a real directory listing read out of the cryptex.** **THE NEGATIVE RESULT, AND IT IS A REAL ONE: searching all 289 distinct names gives IOMobile 0, Framebuffer 0, AGX 0, IOAccelerator 0, SpringBoard 0, kext 0, GPU 3 (GPUExtension.appex, WebGPU.framework, com.apple.WebKit.GPU) and Metal 1 (default.metallib). So IOMobileFramebuffer is NOT IN THIS VOLUME, and because the instrument is sound -- 2184 of 2184 names decode and the directory listing reproduces a coherent set of Safari frameworks -- this is a MEASURED ABSENCE, NOT A READER FAILURE. That matters for task #38: the kext binary is not in the SystemOS cryptex, and the next artifact is the OS root volume (044-76040-038.raw), which the project's own walker has already read 373 plists from and where IOHIDFamily and IOUSBHostFamily were found.** **ONE CAVEAT RECORDED RATHER THAN SMOOTHED OVER: 2,184 DIR_RECs out of 252,391 records is a low ratio -- a real filesystem's catalog is mostly directory entries -- so the 3,848 leaves walked likely include leaves that are not catalog leaves and the DIR_REC set may be incomplete. The absence of IOMobileFramebuffer is therefore STRONG BUT NOT CONCLUSIVE, and the cheap confirmation is to repeat the walk on the OS root volume, where the framework's plist has already been located.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty fourth, addendum DH). THE HEADLINE is **THE OS ROOT VOLUME'S GEOMETRY IS SOLVED (BASE = 17408), ITS CATALOG USES THE SAME KEY FORMAT, AND THE OMAP TREE IS THREE LEVELS DEEP**. The OS root volume 044-76040-038.raw is not a container at byte 0: its APFS container superblock is at BYTE 17408, with nx_block_size 4096, nx_block_count 1,483,776, nx_omap_oid 15897 and nx_fs_oid[0] 1026. **AND BLOCK 15897 IS AN OBJECT OF TYPE 0x0B OMAP -- the exact block an earlier teammate's walker refused with "block 15897 is not the container omap". That refusal was a BASE ERROR, not a property of the volume: with BASE = 0 the reader looked at byte 15897, mid-block; with BASE = 17408 it is the container omap.** **THE FULL CHAIN RESOLVES: container superblock (NXSB at BASE 17408) -> nx_omap_oid 15897 (OMAP, tree root 15898) -> volume oid 1026 -> block 15896 (APSB) -> apfs_omap_oid 67545 (OMAP, tree root 67578) -> catalog root oid 1028 -> block 65684 (flags 0x0001, level 3, 6 keys).** **AND THE OS VOLUME'S CATALOG USES THE SAME KEY FORMAT AS THE CRYPTEX: the catalog root 65684's keys decode as apfs_drec_hashed_key, confirmed the same way -- type=9 obj=1 name_len=12 name='private-dir' (identical to the cryptex), plus dalDerogatoryRaceOpinion.cat and 20433_GID1-... So the decoder validated on the cryptex transfers directly.** **WHY THE FIRST WALK FOUND ZERO LEAVES, AND IT IS A REAL BUG: the volume omap root 67578 is at LEVEL 2 with 4 children, and those children are LEVEL-1 nodes (flags 0x0004, 140 keys each) whose children are the leaves. The leaf collector walked exactly one level and assumed the children were leaves, as they were in the cryptex -- but the cryptex's volume omap root was level 1 and this one is level 2. So zero leaves were collected and zero records decoded: a WALKER DEFECT, not a property of the volume.** **THE FIX: make the leaf collection recursive, exactly as the omap_lookup helper already is -- descend while btn_level > 0 and BTNODE_LEAF is clear, collect only when both hold. The child-pointer read must also take 8 BYTES for a non-leaf value, not 16, the same `len = node_is_leaf(node) ? 16 : 8` rule apfsprogs states for omap values. Then re-run; the controls carry forward unchanged (C1 container magic at BASE, C2 the volume superblock's APSB and its omap being an OMAP, C3 every DIR_REC name clean ASCII after one NUL, C4 a non-zero catalog root).** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18938,6 +18938,88 @@ already been located.
 
 Windows/real-guest: **none this interval -- every number above is a read of the
 cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty fourth, addendum DH): the OS root volume's geometry is solved, and the omap tree is three levels deep
+
+## The geometry, and it settles a two-day-old refusal
+
+The OS root volume `044-76040-038.raw` is **not** a container at byte 0.  Its APFS
+container superblock is at **byte 17408**:
+
+    BASE           = 17408
+    nx_block_size  = 4096
+    nx_block_count = 1,483,776
+    nx_omap_oid    = 15897
+    nx_fs_oid[0]   = 1026
+
+And **block 15897 is an object of type `0x0B` OMAP.**  That is the exact block an earlier
+teammate's walker refused with *"block 15897 is not the container omap"* -- and the refusal
+was a **BASE error**, not a property of the volume.  With `BASE = 0` the reader looked at
+byte 15897, which is mid-block; with `BASE = 17408` it is the container omap.
+
+The full chain now resolves:
+
+    container superblock (NXSB, BASE 17408)
+      -> nx_omap_oid 15897 (OMAP, tree root 15898)
+        -> volume oid 1026 -> block 15896 (APSB)
+          -> apfs_omap_oid 67545 (OMAP, tree root 67578)
+            -> catalog root oid 1028 -> block 65684 (flags 0x0001, level 3, 6 keys)
+
+## And the OS volume's catalog uses the same key format as the cryptex
+
+The catalog root 65684's keys decode as **`apfs_drec_hashed_key`**, confirmed the same way
+the cryptex's were:
+
+    [0] type=9 obj=1    name_len=12  name='private-dir\0'      <- identical to the cryptex
+    [1] type=9          name_len=29  name='dalDerogatoryRaceOpinion.cat'
+    [2] type=9          name_len=30  name='20433_GID1-5472754E6574...'
+
+So the decoder validated on the cryptex transfers directly, and the OS volume is readable
+with it.
+
+## Why the first walk found zero leaves, and it is a real bug
+
+The volume omap root 67578 is at **level 2** with 4 children, and those children are
+**level-1 nodes** (`flags 0x0004`, 140 keys each), whose children are the leaves:
+
+    volume omap root 67578: level 2, 4 keys
+      [0] oid=1028   -> child 67586  (type 0x03 BTREE_NODE, level 1, 140 keys)
+      [1] oid=13616  -> child 67587
+      [2] oid=26595  -> child 67595
+      [3] oid=38873  -> child 67598
+
+The leaf collector walked exactly one level (root -> children) and assumed the children
+were leaves, as they were in the cryptex.  **They are not: the cryptex's volume omap root
+was level 1, this one is level 2.**  So zero leaves were collected and zero records decoded
+-- a walker defect, not a property of the volume.
+
+## The fix, concretely
+
+Make the leaf collection recursive, exactly as the `omap_lookup` helper already is: descend
+while `btn_level > 0` and `BTNODE_LEAF` is clear, and collect only when both hold.  The
+child-pointer read must also take **8 bytes** for a non-leaf value, not 16 -- the same
+`len = node_is_leaf(node) ? 16 : 8` rule that apfsprogs states for omap values.
+
+Then re-run the walk.  The controls already in the script carry forward unchanged: C1 the
+container magic at BASE, C2 the volume superblock's `APSB` and its omap being an OMAP, C3
+every DIR_REC name clean ASCII after one NUL, C4 a non-zero catalog root.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the OS
+volume file's own objects against apfsprogs' authoritative header.**
 
 Build: none this interval.
 
