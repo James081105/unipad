@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred first, addendum BQ). THE HEADLINE is **EVERY CONSOLE EMITTER IS BUILT, SO EVERY CONSOLE SILENCE IS "NOT MEASURED"**. BP established that searching the image for an emitter's literal is positive-only, because ld's SHF_MERGE|SHF_STRINGS pass splits a literal into a shared head and tail. **The sound route was in the patch's structure all along: a `#if defined(MACRO)` block compiles or does not compile AS A UNIT, so if any emitter in a block has its literal in the image, every emitter in that block is compiled. `spawn.saturated` is BUILT (its literal is passed whole to native_console_report, so it survives the merge pass); `spawn.seen` is twenty lines earlier in the same #XNU_OWNER_CACHE_MOUNT block; therefore spawn.seen is built.** **TWELVE OF TWELVE: exec.saturated, exit.saturated, spawn.saturated, spawn_failed.saturated and springboard.fork1 are BUILT by literal; exec.first, exec.seen, exit.seen, fork1.spawn, spawn.failed, spawn.seen and springboard.running are BUILT BY GUARD BLOCK, with both guard macros proved compiled by siblings whose literals are present.** **WHAT THAT SETTLES IS THE WHOLE OF TASK #32: no console-emitter silence anywhere in this project's record is "never built" -- every one is a real "not measured". The distinction now holds for both halves: display counters are proved live from the linked call graph over BOTH trees (BO) with ABSENT FROM KERNEL reported separately from 0, and console emitters are proved built by literal or by guard block (BQ).** **AND IT CONFIRMS RATHER THAN OVERTURNS THE do_fork1 WORK: spawn.seen is a sound instrument, it sits inside `if (error == 0 && !spawn_no_exec)`, and spawn_no_exec is TRUE on the do_fork1 path -- which is exactly why POSIXSpawnType=App jobs leave no spawn.seen record and needed the springboard.fork1 emitter to be seen at all.** **THE TWO GATES HAD THE SAME SHAPE OF DEFECT, caught two ways: check-counter-hooks.py was scoped to ONE of two linked trees and reported six live hooks dead (fixed by widening the scope); check-console-emitters-built.py was scoped to the ARTIFACT when the answer was in the PATCH's structure (fixed by reasoning about the guard block and refusing to print a negative the method cannot support). A gate that reports a confident negative it cannot support is worse than no gate, and both were caught by asking whether a known-true case survives the same check.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now settled is narrower than the goal and firmer than anything before it: every instrument this project reads is built, so every silence in the record is a real silence about the guest and not an artifact of the build.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred second, addendum BR). THE HEADLINE is **THE WHOLE DISPLAY FAILURE, GATE BY GATE, IN SOURCE**. The swap path in NativeLegacyDisplay.cpp is: `newUserClient` (:398, which calls client_enter at :399) -> `validateSwap` (:314, an override, which calls swap_validation_observed at :365) -> `kickSwapQueue` (:137, an override) -> `kickOnce` (:147, which calls transfer_observed at :181). **EVERY LINK HAS A MEASURED COUNTER AND THEY ALL AGREE: client_calls=3, client_pid=95, client_status=0 -- the client reaches the display and is answered. swap_validation_calls=0 -- validateSwap NEVER RAN, because the :365 call sits outside the boot-arg's `if` so a zero means the function was never entered. transfer_calls=0, transfer_status=-1, transfer_bytes=0 -- kickOnce never got past GATE 2. retirement_calls=0, retired_frames=0 -- no frame was retired. And stage=10, init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4, pm_status=0, gop_width=800, gop_height=600 -- the driver itself is fully up.** **AND GATE 1 IS NOT THE BLOCKER: the measured boot's own kernel_args carries offline-legacy-transfer=1 and offline-legacy-validate=1, and stage=10 with pm_stage=4 means logicalPM, bootMapping and primary were all established during init, so kickOnce passes its first gate. GATE 2 IS THE BLOCKER AND IT IS BLOCKED BY STEP 2: `isValidated(request)` is true only for a request validateSwap accepted and addValidated-ed, and swap_validation_calls=0 means that never happened, so kickOnce returns at :151 on every invocation forever.** **SO THE FAILURE IS ONE SENTENCE AND IT IS NOT ABOUT THE HOOK: the client creates a user client three times and NEVER SUBMITS A SWAP. With no swap submitted, validateSwap never runs, nothing is ever validated, and kickOnce returns at its second gate on every call. Nothing downstream can run, which is why the framebuffer never changes. This is BL's "the swap is never submitted" with the mechanism filled in, and BM's "the hooks are dead code" refuted twice over.** **THE INSTRUMENTATION GAP: there is NO counter on kickSwapQueue or on kickOnce's two gates, so the guest cannot distinguish (a) the family never calls kickSwapQueue, from (b) it calls it and kickOnce returns at GATE 1, from (c) it calls it and kickOnce returns at GATE 2. The existing counters start counting at transfer_observed, which is AFTER both gates, so transfer_calls=0 is consistent with all three and the derivation picks (c) BY ELIMINATION rather than by measurement. An emitter on the kick path would settle it directly and is the one measurement that would say whether the family is kicking at all.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display failure is now derived end to end in source and is one sentence long: the client never submits a swap. What is not yet measured is whether the family ever kicks the queue at all, because no counter watches the kick path.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15157,3 +15157,112 @@ reached.  What is now settled is narrower than the goal and firmer than anything
 before it: every instrument this project reads is built, so every silence in the
 record is a real silence about the guest and not an artifact of the build.**  THE
 HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred second, addendum BR): the whole display failure, gate by gate, in source
+
+## The chain
+
+`local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`,
+read top to bottom along the swap path:
+
+    1.  newUserClient(task,security,type,client)          :398
+            native_legacy_client_enter(task,type);         :399   <- client_calls++
+            status = family::newUserClient(...)            :400
+            native_legacy_client_observed(status,...)      :401   <- client_status
+
+    2.  validateSwap(request)                             :314   (an override)
+            enabled = PE_parse_boot_argn("offline-legacy-validate")   :322
+            if(enabled==1 && logicalPM && primary && bootMapping && request) { ... }
+            if(accepted) addValidated(request); else removeValidated(request);   :363
+            native_legacy_swap_validation_observed(accepted,reason,request,surface);  :365
+                                                                        <- swap_validation_calls++
+
+    3.  kickSwapQueue()                                   :137   (an override)
+            if(kicking){rekick=true;return;}
+            do { rekick=false; kickOnce(); gpuBypass=false; } while(rekick && !transferred);
+
+    4.  kickOnce()                                        :147
+            enabled = PE_parse_boot_argn("offline-legacy-transfer")     :148
+            if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary) return;   :149  GATE 1
+            request = pendingSwapRequest();
+            if(!request || !isValidated(request)) return;               :151  GATE 2
+            ... native_legacy_transfer_observed(kIOReturnSuccess,request,blankLength);  :181
+                                                                        <- transfer_calls++
+
+## Every link has a measured counter, and they all agree
+
+    client_calls = 3, client_pid = 95, client_status = 0
+        -> newUserClient ran three times, from pid 95, successfully.
+           The client reaches the display and is answered.
+
+    swap_validation_calls = 0
+        -> validateSwap NEVER RAN.  The :365 call is outside the boot-arg's
+           `if`, so a zero means the function was never entered at all.
+
+    transfer_calls = 0, transfer_status = -1, transfer_bytes = 0
+        -> kickOnce never got past GATE 2.
+
+    retirement_calls = 0, retired_frames = 0
+        -> no frame was ever retired, which is what a transfer would have caused.
+
+    stage = 10, init_result = 1, start_result = 1, surface_found = 1,
+    dt_attached = 1, pm_stage = 4, pm_status = 0, gop_width = 800, gop_height = 600
+        -> the driver itself is fully up.  Nothing is half-initialised.
+
+**And GATE 1 is not the blocker.**  The measured boot's own `kernel_args` carries
+`offline-legacy-transfer=1` and `offline-legacy-validate=1`, and `stage=10` with
+`pm_stage=4` means `logicalPM`, `bootMapping` and `primary` were all established
+during init.  So `kickOnce` passes its first gate.
+
+**GATE 2 is the blocker, and it is blocked by step 2.**  `isValidated(request)`
+is true only for a request that `validateSwap` accepted and `addValidated`-ed.
+`swap_validation_calls = 0` means that never happened for any request.  So
+`kickOnce` returns at :151 on every invocation, forever, no matter how often it is
+called.
+
+## So the failure is one sentence, and it is not about the hook
+
+**The client creates a user client three times and never submits a swap.**  With
+no swap submitted, `validateSwap` never runs, nothing is ever validated, and
+`kickOnce` returns at its second gate on every call.  Nothing downstream of that
+can run, which is why the framebuffer never changes.
+
+This is BL's "the swap is never submitted" with the mechanism filled in, and it is
+BM's "the hooks are dead code" refuted twice over -- once by BO's scope fix and
+once by this chain, in which the hooks are the load-bearing links.
+
+## The instrumentation gap this exposes, and it is the next measurement
+
+**There is no counter on `kickSwapQueue` or on `kickOnce`'s two gates.**  So the
+guest cannot distinguish:
+
+    (a) the family never calls kickSwapQueue at all, from
+    (b) the family calls it and kickOnce returns at GATE 1, from
+    (c) the family calls it and kickOnce returns at GATE 2.
+
+The counters that exist start counting at `transfer_observed`, which is *after*
+both gates.  So `transfer_calls = 0` is consistent with all three, and the
+derivation above picks (c) by elimination -- GATE 1 is ruled out by the boot args
+and `stage=10` -- rather than by measurement.
+
+**An emitter on the kick path would settle it directly**, and it is the one
+measurement that would say whether the family is kicking at all.  That is a code
+change in the driver, a build, and a boot; the code change is the part that can
+be done now, and it is prepared rather than left to be rediscovered.
+
+## Status
+
+Windows/real-guest: **none this interval -- the chain is source, and every link
+in it is tied to a counter already read off a live guest.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The display failure is now derived end to end in source and is one
+sentence long: the client never submits a swap.  What is not yet measured is
+whether the family ever kicks the queue at all, because no counter watches the
+kick path.**  THE HEADLINE is unchanged from AH
