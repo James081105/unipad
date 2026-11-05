@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eightieth, addendum AV). THE HEADLINE is **RUNNINGBOARDD CARRIES THE ENTITLEMENT, AND THE TRUST-CACHE INSTRUMENT DOES NOT WORK YET**. Addendum AU redirected task #33 out of launchd to whatever receives `process-type = 256`. That receiver is `/usr/libexec/runningboardd`, extracted this interval (72,912 bytes, Mach-O 64, 2 chunks) with a full code signature -- and **its entitlements blob contains both `com.apple.private.spawn-driver` and `com.apple.private.xpc.allowed-launch-types`**, plus 33 others. So the binary that receives launchd's request is signed with exactly the entitlement it needs. **The obvious follow-up -- does the guest's kernel GRANT them, i.e. is the cdhash in the trust cache -- is a broken instrument and is recorded as one**: neither the staged `kernel.macho.trustcache` nor `static-trustcache.bin` contains the cdhash of launchd, configd or runningboardd, and **the control refutes the result, because launchd demonstrably RAN** (`exec.seen n=1 comm=launchd` is in the capture this analysis rests on). Four cdhash variants were tried; the static cache's structure was decoded exactly (24-byte header, 2478 entries of [20-byte hash][4-byte flags], reproducing its length) so the cache parses and the hashes are simply not the ones computed. **The hypothesis "runningboardd runs without spawn-driver and so cannot drive App spawns" is still open, still plausible, and still untested** -- and note it may be moot: if the guest's AMFI is not enforcing, entitlements come from the on-disk signature and the cache is irrelevant. **What is left of task #33 is now bounded and no longer depends on the cache: read what runningboardd does with `process-type = 256`, in a 72,912-byte binary, with the two tools already built and validated.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-first, addendum AW). THE HEADLINE is **THE DYLD SHARED CACHE IS NOT ON THE VOLUME THE GUEST MOUNTS**, and it is the first candidate that would explain the whole App-job anomaly at once. Following addendum AV's redirect: `/usr/libexec/runningboardd` is a STUB -- 72,912 bytes but `__text` is 60 bytes, four `objc_msgSend` calls -- whose strings name `/System/Library/PrivateFrameworks/RunningBoard.framework/RunningBoard` (`PROJECT:RunningBoard-874.140.4`). The framework directory holds only `Info.plist` and `_CodeSignature`, which first read as "the stub loads a file that is not there, so there is no spawn driver" -- **and the control refutes it: 2029 of 2037 PrivateFrameworks directories have no standalone executable, because on iOS system frameworks live in the dyld shared cache. That layout is normal, and the hollow-process reading is withdrawn.** **But the cache itself is absent**: `/System/Library/dyld` and `/System/Library/Caches/com.apple.dyld` are both ABSENT (Caches holds only apticket.der, com.apple.factorydata and com.apple.kernelcaches), and a full catalog scan for any name containing dyld or shared_cache returns exactly ONE hit -- the `/usr/lib/dyld` directory. The guest DID read a cache (`dyld.cache_read` from `XNU._shared_region_map_and_slide`) and 146 of 161 daemons are alive with backboardd doing real work, so a cache reaches the guest from somewhere this scan did not look; the unexamined candidate is the SystemOS cryptex, which this host has and the guest does not mount at `/`. **This is a lead, not a conclusion.** The measurement that settles it: find the cache the guest actually maps and ask whether RunningBoard is in it. If it is, the search continues inside the framework. **If it is not -- or the cache is partial -- runningboardd's dlopen fails, there is no spawn driver, and every POSIXSpawnType=App job is refused for that one reason, which would explain the whole anomaly including the five App jobs with no EmbeddedHomeScreen.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13098,6 +13098,83 @@ Open, and now the whole of it:
 
 Windows/real-guest: **the entitlement list is a host-side read of the binary
 extracted from the volume the guest mounts.**  Nothing measured on the guest.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has
+still never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-first, addendum AW): the dyld shared cache is not on the volume the guest mounts
+
+## Following AV's redirect, three steps
+
+Addendum AV ended: the receiver of launchd's `process-type = 256` is
+`runningboardd`, and its entitlements are correct.  This interval followed that
+through.
+
+**Step 1 -- `/usr/libexec/runningboardd` is a stub.**  72,912 bytes, but
+`__text` is **0x3c = 60 bytes**: four `objc_msgSend` calls and a `ret`.  Its
+strings name what it loads:
+
+    /System/Library/PrivateFrameworks/RunningBoard.framework/RunningBoard
+    /System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices
+    @(#)PROGRAM:runningboardd  PROJECT:RunningBoard-874.140.4
+
+So the spawn-driver logic is not in the binary launchd spawns; it is in a
+framework the stub loads.
+
+**Step 2 -- and the framework directory has no executable.**  That looked like
+the answer: the stub loads a file that is not there, so runningboardd is hollow
+and cannot drive App spawns.  **It is not the answer, and the control is why.**
+
+Of the 2037 directories under `/System/Library/PrivateFrameworks`,
+**2029 have no standalone executable** -- only 8 do.  On iOS system frameworks
+live in the dyld shared cache, so a framework directory holding just
+`Info.plist` and `_CodeSignature` is the NORMAL layout, not a gap.  The
+"hollow process" reading is refuted and is withdrawn.
+
+**Step 3 -- but the cache itself is not there either.**  If the frameworks live
+in the shared cache, the cache has to be somewhere.  It is not:
+
+    /System/Library/dyld                          ABSENT
+    /System/Library/Caches/com.apple.dyld         ABSENT
+      (/System/Library/Caches holds only apticket.der,
+       com.apple.factorydata and com.apple.kernelcaches)
+
+A full catalog scan for any name containing `dyld` or `shared_cache` returns
+**exactly one hit: the `/usr/lib/dyld` directory itself.**  There is no
+`dyld_shared_cache_*` file anywhere on the volume the guest mounts at `/`
+(UUID `8846FE78-2910-4297-AF97-D59BB6F8FC16`).
+
+## What that does and does not mean
+
+The guest DID read a dyld cache -- `dyld.cache_read` from
+`XNU._shared_region_map_and_slide` is in the capture -- and 146 of 161 daemons
+are alive with backboardd making real framebuffer calls.  **So a cache reaches
+the guest from somewhere this scan did not look**, and the volume mounted at `/`
+is not the only source.  The other candidate is the SystemOS cryptex
+(`044-76034-038.dmg`), which this host has and which the guest does not mount at
+`/` -- and the recorded fact that job plists for daemons that spawned live on the
+OS root volume, not the cryptex, does NOT extend to the dyld cache.
+
+**So this is a lead, not a conclusion.**  What would settle it is one
+measurement: find the cache the guest actually maps, and ask whether
+`RunningBoard` is in it.  If it is, the stub loads fine and the search continues
+inside the framework.  **If it is not -- or if the cache is a partial one -- then
+runningboardd's `dlopen` fails, there is no spawn driver, and every
+`POSIXSpawnType=App` job is refused for that one reason.**  That would explain
+the whole anomaly at once, including why the five `App` jobs with no
+`EmbeddedHomeScreen` also never spawned.
+
+## Status
+
+Windows/real-guest: **host-side catalog reads of the volume the guest mounts.**
+Nothing measured on the guest this interval.
 
 Build: none.
 
