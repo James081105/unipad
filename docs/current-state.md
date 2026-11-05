@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty second, addendum CV). THE HEADLINE is **THE KEY ENCODING IS CORRECTED AND CONFIRMED ON THE ROOT, BUT THE LEAVES REACHED ARE NOT DEMONSTRABLY CATALOG LEAVES**. CU parsed keys as type = obj_id_and_type & 0xF with obj_id = obj_id_and_type >> 4 and got 67 identical type-1 records. **THE ENCODING IS THE OTHER WAY ROUND: raw.h:553-556 defines APFS_OBJ_ID_MASK 0x0fffffffffffffff, APFS_OBJ_TYPE_MASK 0xf000000000000000 and APFS_OBJ_TYPE_SHIFT 60 -- the type is the TOP four bits and the object id the low sixty. I had it inverted.** **AND THE CORRECTION IS CONFIRMED ON A REAL RECORD: the catalog root's key at 0x78 is 01 00 00 00 00 00 00 90 | 0c 8c | "private-dir", which decodes as obj_id_and_type=0x9000000000000001, type = 9 = APFS_TYPE_DIR_REC, obj_id = 1 = the volume's ROOT directory, name_len = 12, name = "private-dir". apfs_drec_key is {apfs_key_header hdr; __le16 name_len; u8 name[0]} (raw.h:623-627) and the record decodes exactly -- a real filesystem entry, confirming both the encoding and the struct.** **BUT THE LEAVES REACHED ARE NOT DEMONSTRABLY CATALOG LEAVES: re-parsing leaf 781228 with the corrected encoding gives 67 keys of 16 bytes each, every one carrying the same first eight bytes, obj_id_and_type=0xd000000000000061, type = 13 = APFS_TYPE_FILE_INFO, obj_id = 97, followed by 8 varying bytes. APFS_TYPE_FILE_INFO keys are apfs_key_header alone -- 8 bytes, not 16 -- so a 16-byte FILE_INFO key fits no key struct in raw.h and the second eight bytes are unexplained.** **AND THE LEVEL CHAIN IS STILL UNEXPLAINED: the catalog root reads btn_level=3 while the blocks reached as its children read btn_level=0, and a level-3 root's children must be level 2. Well-formed leaves at the wrong level are evidence that those blocks are NOT this root's children. So one of two things is true and this interval does not distinguish them: (1) the hashed child reference's oid is not at offset 0 of the 40-byte value, so I resolved the wrong oids and landed on unrelated leaves; or (2) the root's btn_level is misread.** **SO THE ROUTE REACHES A PAIR OF WELL-FORMED LEAVES BUT NOT DEMONSTRABLY THE CATALOG'S, AND READS NO FILE RECORD. VERIFIED: container geometry, container omap and its tree, volume superblock by magic, volume omap, the omap lookup (used three times successfully), the catalog root's header, and newly the catalog KEY ENCODING and apfs_drec_key, confirmed on a real DIR_REC named private-dir under obj_id 1. NOT VERIFIED: that 781228/781229 are the catalog root's children, the level chain, and any file name beyond the root directory's own entries.** **THE NEXT ACTION: the root is now a working instrument -- it decoded a real DIR_REC -- so use it to settle which children it names. Dump all 40 bytes of both child references and check whether the oid is at offset 0, 8 or 32 (the hash is 32 bytes and the oid 8, so there are only a few orderings), then resolve each candidate and REQUIRE the child's btn_level to be exactly root_level - 1. That single check distinguishes the two hypotheses and it is cheap.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty third, addendum CW). THE HEADLINE is **THE OMAP IS UNAMBIGUOUS, AND THE RUN IS ONE ROOT PLUS 70 LEAVES -- A TWO-LEVEL TREE WHOSE ROOT CLAIMS LEVEL 3**. CV left two hypotheses for the level contradiction. **THE FIRST IS DEAD: the child-reference oid IS at offset 0. All 40 bytes of both references were dumped and the only 8-byte window in range is offset 0 -- offsets 8, 16, 24 and 32 all read above the block count -- giving oid 3720 and oid 3719.** **AND THE OMAP HAS EXACTLY ONE ENTRY PER OID: leaf 782659 holds 70 entries, oids 1214 through 1284 consecutive, every one at xid=13, mapping to blocks 770807 through 770877 consecutive. No duplicate oids, no stale xids, one candidate per lookup, so resolving 3719 and 3720 is not a guess -- each has exactly one entry at xid=13 pointing at 781228 and 781229.** **AND THE SHAPE OF THE RUN IS THE NEW CLUE: 770808 (oid 1216, the catalog root) has flags 0x0019 level 3 nkeys 2 and is the ONLY non-leaf in a run of 71 consecutive blocks; the other 70 are level-0 leaves (770809 nkeys 67, 770810 nkeys 59, 781228 and 781229 nkeys 67). 781228's eight header bytes are BYTE-IDENTICAL to 770809's (1a 00 00 00 43 00 00 00), so the omap's children are the same kind of leaf as the root's own siblings. A tree with one non-leaf root and seventy leaves is TWO LEVELS DEEP, so its root should read btn_level=1; it reads 3.** **SO THE REMAINING HYPOTHESIS IS NARROWED TO ONE: CV's second hypothesis, that the root's btn_level is misread, is the only live one, and it has a specific shape -- either btn_level is not a plain depth counter in this tree, or the field is not at +0x22 for this node. The first is testable against the run's shape: if 770808 is a two-level root then whatever the level field means, the tree is root-plus-leaves and the leaves are directly readable.** **WHAT THAT MEANS FOR TASK #38: the route to file records no longer depends on the child pointers at all. The omap gives oids 1217..1284 -> blocks 770809..770877 DIRECTLY, and those are leaves reachable without resolving any child pointer. Reading their records is the next step and needs only the leaf key parse, which CV already fixed and confirmed on the root's private-dir DIR_REC. BUT the leaves' 16-byte keys of type 13 (FILE_INFO) with obj_id 97 still fit no struct in raw.h, so that parse is still wrong and no file name has been read.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17988,6 +17988,93 @@ oid is at offset 0, offset 8, or offset 32** -- the hash is 32 bytes and the oid
 there are only a few orderings.  Then resolve each candidate and require the child's
 `btn_level` to be exactly `root_level - 1`.  That single check distinguishes the two
 hypotheses above, and it is cheap.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty third, addendum CW): the omap is unambiguous, and the run is one root plus 70 leaves -- a two-level tree whose root claims level 3
+
+## The omap is now proven unambiguous, which closes CV's first hypothesis
+
+Addendum CV left two hypotheses for the level contradiction: the child-reference oid
+might not be at offset 0, or the root's level might be misread.  Both are now testable,
+and the first is dead.
+
+**The oid is at offset 0.**  All 40 bytes of both child references were dumped; the only
+8-byte window in range is offset 0 (offsets 8, 16, 24 and 32 all read as values above the
+block count):
+
+    [0] 88 0e 00 00 00 00 00 00 | ef 51 e1 14 ... 5f 79 b9 64     oid = 3720
+    [1] 87 0e 00 00 00 00 00 00 | b9 60 12 aa ... 2f 26 0d 41     oid = 3719
+
+**And the omap has exactly one entry per oid.**  Leaf 782659 holds 70 entries, oids
+**1214 through 1284 consecutive**, every one at `xid = 13`, mapping to blocks
+**770807 through 877 consecutive**:
+
+    [ 0] oid=1214  xid=13  paddr=770807
+    [ 1] oid=1216  xid=13  paddr=770808      <- the catalog root
+    [ 2] oid=1217  xid=13  paddr=770809
+    ...
+    [69] oid=1284  xid=13  paddr=770877
+
+No duplicate oids, no stale xids, one candidate per lookup.  So resolving 3719 and 3720
+through the omap is not a guess: each has exactly one entry, at `xid=13`, pointing at
+781228 and 781229.
+
+## And the shape of the run is the new clue
+
+Reading the headers across that run:
+
+    block 770807 (oid 1214)  flags 0x0002  level 0  nkeys 0     <- LEAF only
+    block 770808 (oid 1216)  flags 0x0019  level 3  nkeys 2     <- ROOT|HASHED|NOHEADER
+    block 770809 (oid 1217)  flags 0x001a  level 0  nkeys 67
+    block 770810 (oid 1218)  flags 0x001a  level 0  nkeys 59
+    block 781228 (oid 3719)  flags 0x001a  level 0  nkeys 67
+    block 781229 (oid 3720)  flags 0x001a  level 0  nkeys 67
+
+**770808 is the only non-leaf block in a run of 71 consecutive blocks; the other 70 are
+level-0 leaves.**  And **781228's eight header bytes are byte-identical to 770809's**
+(`1a 00 00 00 43 00 00 00`), so the omap's children are the same kind of leaf as the
+root's own siblings.
+
+A tree with one non-leaf root and seventy leaves is **two levels deep**.  Its root should
+read `btn_level = 1`.  It reads **3**.
+
+## So the remaining hypothesis is narrowed to one
+
+CV's second hypothesis -- the root's `btn_level` is misread -- is now the only live one,
+and it has a specific shape: **either `btn_level` is not a plain depth counter in this
+tree, or the field is not at `+0x22` for this node.**
+
+The first is testable against the run's shape: if 770808 is a two-level root, then
+whatever the level field means, the tree is root-plus-leaves and the leaves are directly
+readable.  **The 70 sibling leaves are already located** -- 770809..770877, each a
+`flags 0x001a` level-0 node with 59-67 keys -- and they are reachable without resolving
+any child pointer at all, because the omap names them directly.
+
+## What that means for task #38
+
+The route to file records no longer depends on the child pointers.  The omap gives
+oids 1217..1284 → blocks 770809..770877 directly, and those are leaves.  Reading their
+records is the next step, and it needs only the leaf key parse -- which CV already fixed
+and confirmed on the root's `private-dir` DIR_REC.
+
+**But the leaves' 16-byte keys of type 13 (FILE_INFO) with obj_id 97 still fit no struct
+in raw.h**, so that parse is still wrong and no file name has been read.
 
 ## Status
 
