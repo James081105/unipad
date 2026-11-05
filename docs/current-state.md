@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred fifth, addendum BU). THE HEADLINE is **TWO BOOTS STALLED AT 2-4 PROCESSES, SO THE SILENCE IS THE BOOT AND NOT THE DISPLAY**. Same kernel, same script, one change: the sampling loop now prints the process count. On run 41980452867 with kernel sha256 d2c5a914 verified against payload.json and the control passed, **the process count oscillates between 2 and 4 for the entire 420 s window and never ramps**, with client_calls=0, swap=0 and prepare=0 throughout. **Together with addendum BT that is two consecutive boots of a byte-identical kernel, both stalled before any userspace client exists.** **SO client_calls=0 HAS A CAUSE: there was never a client to call. A framebuffer user client is created by a process, and this boot reached three or four processes in 420 s. Nothing in the display driver gates a client that does not exist -- which separates "the display driver refusing a client" (NOT what happened) from "the boot never producing a client" (what happened).** **And it makes BL's client_calls=3 legible rather than contradictory: BL sampled for 900 s, this window is 420 s, and the boot is still at three processes when the window closes.** **THE HYPOTHESIS, stated so it can be wrong: the guest ramps, but slowly -- 420 s is not enough to reach a framebuffer client. The falsifiable prediction is that extending the window to 900 s, the length BL used, makes client_calls non-zero on some boots. The alternative the same experiment tests is that the boot is genuinely stalled rather than slow, and no window length reaches a client; the two are distinguishable by whether procs climbs past the 2-4 band.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is that the display measurement is not being defeated by the display -- it is being defeated by a boot that does not ramp, and the next experiment is a longer window rather than a code change.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred sixth, addendum BV). THE HEADLINE is **THE SWAP/WAIT SELECTOR IS NEVER CALLED, AND THAT IS THE FROZEN SCREEN**. BU's hypothesis -- the guest ramps but slowly and 420 s is not enough -- is CONFIRMED: on run 41980452867 with kernel sha256 d2c5a914 verified against payload.json and the control passed, procs goes 1 -> 2 stalled, then 40 at 471.5s, 57, 71, and 134 at 501.9s, and a client opens the framebuffer at t=624.9s. **Every earlier client_calls=0 reading was a window that closed before the guest got there.** **WHAT THE CLIENT DID, MEASURED: client_calls=3, client_pid=86, client_status=0, client_class='IOMobileFramebufferUserClient', stage=10 (the success terminal state), slot_armed_count=358 (the display's vtable is FULLY lifted), while swap_validation_calls=0, prepare_calls=0 and transfer_calls=0 are all STILL AT THEIR INITIALS.** **Three clients read out of static ClientStat seenClients[8] at 0xfffffff00c146888 (stride 2312): C0 pid 58 with 9 calls and 3 fails across selectors 8, 15, 22, 29, 33, 57, 74, 79, 88; C1 pid 95 with 2 calls across selectors 8 and 28; C2 pid 86 with ZERO calls -- it opened the framebuffer and called NOTHING. Eleven selector calls in total, four refused, and SELECTOR 6, THE SWAP/WAIT SELECTOR, IS NOT AMONG THEM. No client ever calls it.** **So BR's chain is closed at both ends by measurement rather than by elimination: the swap/wait selector is never invoked, so validateSwap is never entered, so nothing is ever validated, so GATE 2 never opens. And slot_armed_count=358 means this is NOT an instrumentation gap -- the display's own vtable is fully traced, the client reaches it, calls it eleven times, and never asks it to swap.** **AND THE TWO KERNELS DIFFER, which BS could not see: the saved table from kernel 2ebda0ec had selector 6 called once successfully; on d2c5a914 it is never called at all. BS was right to refuse to read the older table as a property of this one.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now measured rather than derived is the specific thing the guest never does: no client ever calls the swap/wait selector, on a boot that ramped, on the current kernel, with the display fully up and its vtable fully traced.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15528,3 +15528,101 @@ reached.  What is new is that the display measurement is not being defeated by t
 display -- it is being defeated by a boot that does not ramp, and the next
 experiment is a longer window rather than a code change.**  THE HEADLINE is
 unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred sixth, addendum BV): the swap/wait selector is never called, and that is the frozen screen
+
+## The run, and the hypothesis it settled
+
+BU's hypothesis was that the guest ramps but slowly and 420 s is not enough.  The
+same script with a 900 s window, on run 41980452867, kernel sha256 `d2c5a914`
+verified against `payload.json`, control passed:
+
+    0s-460s    procs 1 -> 2, stalled
+    471.5s     procs=40
+    481.6s     procs=57
+    491.7s     procs=71
+    501.9s     procs=134      <- the boot ramps
+    ...
+    624.9s     a client opened the framebuffer; seenClientCount=3
+
+**The boot ramps at about 470 s and the framebuffer client arrives at about
+625 s.**  So BU's hypothesis is confirmed and its rival is refuted: the boot is
+slow, not stalled, and 420 s simply cannot see a client.  Every earlier
+`client_calls=0` reading was a window that closed before the guest got there.
+
+## What the client did, measured on this kernel
+
+    native_legacy_client_calls     3
+    native_legacy_client_pid       86
+    native_legacy_client_status    0
+    native_legacy_client_class     b'IOMobileFramebufferUserClient'
+    native_legacy_stage            10          <- the success terminal state
+    native_legacy_slot_armed_count 358         <- the display's vtable is fully lifted
+
+    native_legacy_swap_validation_calls  0    <- STILL AT ITS INITIAL
+    native_legacy_prepare_calls          0    <- STILL AT ITS INITIAL
+    native_legacy_transfer_calls         0    <- STILL AT ITS INITIAL
+
+Three clients, read out of `static ClientStat seenClients[8]` at
+`0xfffffff00c146888`, stride 2312:
+
+    C0  pid=58   object=0xfffffff520d79b80   calls=9   fails=3
+    C1  pid=95   object=0xfffffff520d7a200   calls=2   fails=1
+    C2  pid=86   object=0xfffffff520d7a880   calls=0   fails=0   <- opened it, called NOTHING
+
+    C0 (pid 58): selector   8 SUCCESS
+                 selector  15 0xe00002bc
+                 selector  22 SUCCESS
+                 selector  29 0xe00002c7
+                 selector  33 SUCCESS   collectCompletionReports (slot 337)
+                 selector  57 0xe00002c7
+                 selector  74 SUCCESS   supportedFrameInfo (slot 213)
+                 selector  79 SUCCESS
+                 selector  88 SUCCESS
+    C1 (pid 95): selector   8 SUCCESS
+                 selector  28 0xe00002f0
+
+**Eleven selector calls in total, four of them refused, and selector 6 -- the
+swap/wait selector -- is not among them.  No client ever calls it.**
+
+## So the mechanism is measured, not inferred
+
+BR's chain was derived in source and said `kickOnce` returns at GATE 2 because
+`isValidated(request)` is never true.  This run supplies the missing link from the
+other end: **the swap/wait selector is never invoked by any client**, so
+`validateSwap` is never entered, so nothing is ever validated, so GATE 2 never
+opens.  The chain is now closed at both ends by measurement rather than by
+elimination.
+
+And `slot_armed_count = 358` matters: the display's own vtable is fully lifted,
+every one of the 358 slots traced.  So this is not an instrumentation gap.  The
+client reaches the display, calls it eleven times, and never asks it to swap.
+
+## And the two kernels differ, which BS could not see
+
+The saved table from kernel `2ebda0ec` (run 41880912125) had
+
+    selector 6: calls=1 fails=0 status=SUCCESS
+
+On this kernel, `d2c5a914`, **selector 6 is never called at all.**  So the two
+builds genuinely differ in whether the swap/wait selector is reached, and BS was
+right to refuse to read the older table as a property of this one.
+
+## Status
+
+Windows/real-guest: **a live guest on run 41980452867, kernel sha256 verified
+against payload.json, control passed, 900 s of sampling, the boot observed ramping
+from 2 to 134 processes, and the client table read out of kernel memory with its
+class name and every selector recorded.**  The swap/wait selector is never called.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is now measured rather than derived is the specific thing the guest
+never does: no client ever calls the swap/wait selector, on a boot that ramped, on
+the current kernel, with the display fully up and its vtable fully traced.**  THE
+HEADLINE is unchanged from AH
