@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty first, addendum CU). THE HEADLINE is **THE CATALOG'S CHILDREN ARE VIRTUAL OIDS AND DO RESOLVE TO WELL-FORMED LEAVES, BUT THE RECORD PARSE IS WRONG**. CT ended with the catalog root's children reading as entirely zero blocks and blamed the reader. The falsifiable hypothesis: the catalog tree is a VIRTUAL object (apfs_root_tree_type is 0x2, not 0x40000002), so the oids in its hashed child references are virtual oids needing one more omap hop, exactly as apfs_root_tree_oid itself did. **CONFIRMED: virtual oid 3719 resolves through the volume omap (782657 -> 781118) to block 781228, and 3720 to 781229; both are flags 0x001a (LEAF|HASHED|NOHEADER), level 0, nkeys 67, table_space {0,576} -- well-formed leaves, and adjacent blocks matching adjacent oids. So CT's "the reader is wrong" was itself wrong: the reader was right and the oids needed one more hop. A ZERO BLOCK IS NOT EVIDENCE OF A BAD READER; IT IS EVIDENCE OF AN UNRESOLVED VIRTUAL OID.** **AND THE CATALOG ROOT REALLY IS A CATALOG NODE: its key area holds the ASCII string "private-dir" at 0x78, a real APFS directory entry name, so the node at 770808 is genuinely a catalog node and the key-area parse is correct. Its 40-byte values are {oid, 32-byte hash}, the HASHED child-reference format the root's APFS_BTNODE_HASHED flag implies.** **BUT TWO THINGS ARE INCONSISTENT AND UNRESOLVED: (1) THE LEVELS DO NOT CHAIN -- the root reads btn_level=3 but its children read btn_level=0, and a level-3 root's children must be level 2, so either the level read is wrong or the omap resolution landed on the wrong blocks despite their plausible shape; (2) THE LEAF RECORDS DO NOT PARSE AS FILE RECORDS -- leaf 781228 has 67 keys of 16 bytes each in a 1072-byte key area, and every one parses as type 1 with an IDENTICAL obj_id and an empty name, which is not a catalog of files, so the leaf's key layout is not the j_key+name shape assumed even though the root's key area clearly contains a name.** **SO THE ROUTE REACHES CATALOG LEAVES BUT READS NO FILE RECORD AND DOES NOT REACH IOMobileFramebuffer.framework. VERIFIED: container geometry, container omap and its tree, the volume superblock by magic, the volume omap, the omap lookup (now used three times successfully), the catalog root's header, its key area containing a real directory name, and the resolution of its two children to well-formed leaves. NOT VERIFIED: the level chain, the leaf record layout, and therefore any file name or path.** **THE NEXT ACTION: the root's key area is the instrument that works -- it produced "private-dir" -- so use it to fix the leaf parse rather than assuming j_key. Read apfs_j_key and the APFS_TYPE_* constants from raw.h (the authority, as with every other correction this interval) and check the leaf's 16-byte keys against them, then re-read the 67 records looking for IOMobileFramebuffer. THE CONTROL: whatever key shape explains the root's 24-byte and 16-byte keys must also explain the leaf's 16-byte keys.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty second, addendum CV). THE HEADLINE is **THE KEY ENCODING IS CORRECTED AND CONFIRMED ON THE ROOT, BUT THE LEAVES REACHED ARE NOT DEMONSTRABLY CATALOG LEAVES**. CU parsed keys as type = obj_id_and_type & 0xF with obj_id = obj_id_and_type >> 4 and got 67 identical type-1 records. **THE ENCODING IS THE OTHER WAY ROUND: raw.h:553-556 defines APFS_OBJ_ID_MASK 0x0fffffffffffffff, APFS_OBJ_TYPE_MASK 0xf000000000000000 and APFS_OBJ_TYPE_SHIFT 60 -- the type is the TOP four bits and the object id the low sixty. I had it inverted.** **AND THE CORRECTION IS CONFIRMED ON A REAL RECORD: the catalog root's key at 0x78 is 01 00 00 00 00 00 00 90 | 0c 8c | "private-dir", which decodes as obj_id_and_type=0x9000000000000001, type = 9 = APFS_TYPE_DIR_REC, obj_id = 1 = the volume's ROOT directory, name_len = 12, name = "private-dir". apfs_drec_key is {apfs_key_header hdr; __le16 name_len; u8 name[0]} (raw.h:623-627) and the record decodes exactly -- a real filesystem entry, confirming both the encoding and the struct.** **BUT THE LEAVES REACHED ARE NOT DEMONSTRABLY CATALOG LEAVES: re-parsing leaf 781228 with the corrected encoding gives 67 keys of 16 bytes each, every one carrying the same first eight bytes, obj_id_and_type=0xd000000000000061, type = 13 = APFS_TYPE_FILE_INFO, obj_id = 97, followed by 8 varying bytes. APFS_TYPE_FILE_INFO keys are apfs_key_header alone -- 8 bytes, not 16 -- so a 16-byte FILE_INFO key fits no key struct in raw.h and the second eight bytes are unexplained.** **AND THE LEVEL CHAIN IS STILL UNEXPLAINED: the catalog root reads btn_level=3 while the blocks reached as its children read btn_level=0, and a level-3 root's children must be level 2. Well-formed leaves at the wrong level are evidence that those blocks are NOT this root's children. So one of two things is true and this interval does not distinguish them: (1) the hashed child reference's oid is not at offset 0 of the 40-byte value, so I resolved the wrong oids and landed on unrelated leaves; or (2) the root's btn_level is misread.** **SO THE ROUTE REACHES A PAIR OF WELL-FORMED LEAVES BUT NOT DEMONSTRABLY THE CATALOG'S, AND READS NO FILE RECORD. VERIFIED: container geometry, container omap and its tree, volume superblock by magic, volume omap, the omap lookup (used three times successfully), the catalog root's header, and newly the catalog KEY ENCODING and apfs_drec_key, confirmed on a real DIR_REC named private-dir under obj_id 1. NOT VERIFIED: that 781228/781229 are the catalog root's children, the level chain, and any file name beyond the root directory's own entries.** **THE NEXT ACTION: the root is now a working instrument -- it decoded a real DIR_REC -- so use it to settle which children it names. Dump all 40 bytes of both child references and check whether the oid is at offset 0, 8 or 32 (the hash is 32 bytes and the oid 8, so there are only a few orderings), then resolve each candidate and REQUIRE the child's btn_level to be exactly root_level - 1. That single check distinguishes the two hypotheses and it is cheap.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17894,6 +17894,105 @@ shape that does both.
 
 Windows/real-guest: **none this interval -- every number above is a read of the
 cryptex file's own objects against apfsprogs' authoritative header and reader.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty second, addendum CV): the key encoding is CORRECTED and confirmed on the root, but the leaves reached are not demonstrably catalog leaves
+
+## The encoding error, found and fixed
+
+Addendum CU parsed the leaf's keys as `type = obj_id_and_type & 0xF` with
+`obj_id = obj_id_and_type >> 4`, and got 67 identical records of type 1, which it
+reported as "not a catalog of files".
+
+**The encoding is the other way round.**  From raw.h:553-556:
+
+    #define APFS_OBJ_ID_MASK    0x0fffffffffffffffULL
+    #define APFS_OBJ_TYPE_MASK  0xf000000000000000ULL
+    #define APFS_OBJ_TYPE_SHIFT 60
+
+**The type is the TOP four bits; the object id is the low sixty.**  I had it inverted.
+
+## And the correction is confirmed on a real record
+
+The catalog root's key area, decoded with the correct encoding:
+
+    0x0078  01 00 00 00 00 00 00 90 | 0c 8c | 70 72 69 76 61 74 65 2d 64 69 72 00
+
+    obj_id_and_type = 0x9000000000000001
+      type   = 0x9000000000000001 >> 60 = 9  = APFS_TYPE_DIR_REC
+      obj_id = 0x9000000000000001 & mask   = 1  = the volume's ROOT directory
+    name_len = 0x000c = 12
+    name     = "private-dir"
+
+`apfs_drec_key` is `{ apfs_key_header hdr; __le16 name_len; u8 name[0]; }` (raw.h:623-627),
+and the record decodes exactly: **a DIR_REC under the root directory, named
+`private-dir`.**  That is a real filesystem entry, and it confirms both the encoding and
+the struct.
+
+## But the leaves reached are not demonstrably catalog leaves
+
+Re-parsing leaf 781228 with the corrected encoding: 67 keys of **16 bytes** each, and
+every one carries the *same* first eight bytes:
+
+    obj_id_and_type = 0xd000000000000061
+      type = 13 = APFS_TYPE_FILE_INFO
+      obj_id = 97
+    ... followed by 8 varying bytes (00 80 21 01 00 00 00 01, 00 c0 21 01 ...)
+
+`APFS_TYPE_FILE_INFO` keys are `apfs_key_header` alone -- **8 bytes, not 16**.  So a
+16-byte key of type FILE_INFO does not fit any key struct in raw.h, and the second eight
+bytes are unexplained.
+
+## And the level chain is still unexplained
+
+The catalog root reads `btn_level = 3`; the blocks reached as its children read
+`btn_level = 0`.  A level-3 root's children must be level 2.  Addendum CU resolved oids
+3719/3720 through the omap and got well-formed leaves, but **well-formed leaves at the
+wrong level are evidence that those blocks are not this root's children.**
+
+So one of two things is true, and this interval does not distinguish them:
+
+1. The hashed child reference's oid is not at offset 0 of the 40-byte value, so I
+   resolved the wrong oids and landed on unrelated leaves.
+2. The root's `btn_level` is misread.
+
+Both are open.  **The route reaches *a* pair of well-formed leaves, but not demonstrably
+the catalog's, and it reads no file record.**
+
+## What is verified and what is not
+
+**Verified:** the container geometry, the container omap and its tree, the volume
+superblock by magic, the volume omap, the omap lookup (used three times successfully),
+the catalog root's own header, and -- newly -- **the catalog key encoding and
+`apfs_drec_key`, confirmed on a real DIR_REC named `private-dir` under obj_id 1.**
+
+**Not verified:** that blocks 781228/781229 are the catalog root's children, the level
+chain, and any file name beyond the root directory's own entries.
+
+## The next action, concretely
+
+The root is now a working instrument: it decoded a real DIR_REC.  Use it to settle which
+children it names.  **Dump all 40 bytes of both child references and check whether the
+oid is at offset 0, offset 8, or offset 32** -- the hash is 32 bytes and the oid 8, and
+there are only a few orderings.  Then resolve each candidate and require the child's
+`btn_level` to be exactly `root_level - 1`.  That single check distinguishes the two
+hypotheses above, and it is cheap.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
 
 Build: none this interval.
 
