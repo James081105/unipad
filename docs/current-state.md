@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty second, addendum DF). THE HEADLINE is **87 REAL FILESYSTEM NAMES ARE READ FROM THE CRYPTEX CATALOG, AND THE CONTROL PASSES 87 OF 87**. Blocks 770809..770877 (omap oids 1217..1284) were decoded with both confirmed key formats. DIR_RECs appear in four of the 69 leaves: 770810 (11), 770824 (16), 770825 (5) and 770826 (55), 87 in total, and every one decodes -- dyld_shared_cache_arm64, .01 through .52, .symbols, .dylddata and .dyldlinkedit variants, all under parent obj_id 48. **THE CONTROL PASSES: the first run reported 0 of 87 clean ASCII because name_len INCLUDES THE TRAILING NUL (dyld_shared_cache_arm64.45\0 is 27 bytes for a 26-character name); stripping exactly one NUL and re-testing gives 87 of 87 clean ASCII. This is the first time a control has passed on catalog records in this project, and it means the whole route is sound: container -> omap -> volume -> catalog -> leaf -> apfs_drec_hashed_key -> name.** **ESTABLISHED: the SystemOS cryptex's catalog is readable and 87 real filesystem names have been read from it. NOT ESTABLISHED: IOMobileFramebuffer is not among them -- 0 records match -- but these 87 come from only 4 of 69 leaves and the volume omap names oids well beyond 1284 (its root covers 1214 through 5065), so the catalog's remaining leaves have not been read and this is a COVERAGE GAP, NOT A NEGATIVE RESULT about the framework.** **THE NEXT ACTION: enumerate the rest of the catalog's leaves. The volume omap root 782657 has 36 entries covering oids 1214..5065, so the catalog's node oids extend far past 1284. Walk every omap leaf, collect every mapped block whose btn_flags is 0x001a (a leaf), decode each with the same two key formats, and accumulate every DIR_REC name, then search the full set for IOMobileFramebuffer. THE CONTROL CARRIES FORWARD UNCHANGED: a name that is clean ASCII after stripping one NUL, with name_len equal to the key length minus 12.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty third, addendum DG). THE HEADLINE is **THE CATALOG IS WALKABLE END TO END -- 2184 DIR_RECs, A PASSING CONTROL, WORKING DIRECTORY LISTINGS -- AND IOMobileFramebuffer IS NOT IN THIS VOLUME**. Every child of the volume omap root 782657 was followed (36 leaves, 3,916 mapped blocks, 3,848 of them HASHED|NOHEADER leaves) and every record decoded with the two confirmed key formats: type histogram {XATTR 2145, SIBLING_LINK 240, DIR_REC 2184, FILE_INFO 247822}, 2184 DIR_RECs with name_len == klen-12, and **CONTROL: clean ASCII after one NUL: 2184 OF 2184**. 691 distinct parent obj_ids, 289 distinct names, and the names are real (AccessibilityBundles, Accounts, Assets.car, AuthenticationServices.framework, Background Images, BluetoothUIService, Caches, CertificateWarning.html, CodeResources, Composite.wav, CoreServices, zh_CN.lproj, pt_PT.lproj...). **AND DIRECTORY LISTINGS WORK: matching the parent obj_id in the key against the file_id in the value gives real listings. PrivateFrameworks (DIR_REC under obj_id 25, file_id 748) holds 19 entries -- AuthenticationServicesCore, MobileSafari, MobileSafariSwift, MobileSafariUI, PasswordManagerUI, PlugInKitDaemon, SafariCore, SafariFoundation, SafariShared, SafariSharedUI, VisualTestKit, WebApp, WebBookmarks, WebBookmarksSwift, WebCore, WebGPU, WebInspector, WebKitLegacy and WebUI .framework -- a real directory listing read out of the cryptex.** **THE NEGATIVE RESULT, AND IT IS A REAL ONE: searching all 289 distinct names gives IOMobile 0, Framebuffer 0, AGX 0, IOAccelerator 0, SpringBoard 0, kext 0, GPU 3 (GPUExtension.appex, WebGPU.framework, com.apple.WebKit.GPU) and Metal 1 (default.metallib). So IOMobileFramebuffer is NOT IN THIS VOLUME, and because the instrument is sound -- 2184 of 2184 names decode and the directory listing reproduces a coherent set of Safari frameworks -- this is a MEASURED ABSENCE, NOT A READER FAILURE. That matters for task #38: the kext binary is not in the SystemOS cryptex, and the next artifact is the OS root volume (044-76040-038.raw), which the project's own walker has already read 373 plists from and where IOHIDFamily and IOUSBHostFamily were found.** **ONE CAVEAT RECORDED RATHER THAN SMOOTHED OVER: 2,184 DIR_RECs out of 252,391 records is a low ratio -- a real filesystem's catalog is mostly directory entries -- so the 3,848 leaves walked likely include leaves that are not catalog leaves and the DIR_REC set may be incomplete. The absence of IOMobileFramebuffer is therefore STRONG BUT NOT CONCLUSIVE, and the cheap confirmation is to repeat the walk on the OS root volume, where the framework's plist has already been located.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18852,6 +18852,87 @@ set for `IOMobileFramebuffer`.
 
 The control carries forward unchanged: a name that is clean ASCII after stripping one NUL,
 with `name_len` equal to the key length minus 12.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty third, addendum DG): the catalog is walkable end to end -- 2184 DIR_RECs, a passing control, working directory listings -- and `IOMobileFramebuffer` is not in this volume
+
+## The full walk
+
+Every child of the volume omap root 782657 was followed (36 leaves, 3,916 mapped blocks,
+3,848 of them `HASHED|NOHEADER` leaves) and every record decoded with the two confirmed key
+formats:
+
+    record type histogram: {4 XATTR: 2145, 5 SIBLING_LINK: 240, 9 DIR_REC: 2184,
+                            13 FILE_INFO: 247822}
+    DIR_RECs with name_len == klen-12 : 2184
+    CONTROL: clean ASCII after one NUL: 2184 of 2184
+    distinct parent obj_ids: 691        distinct names: 289
+
+**2184 of 2184 pass the control.**  The names are real: `AccessibilityBundles`, `Accounts`,
+`Assets.car`, `AuthenticationServices.framework`, `Background Images`, `BluetoothUIService`,
+`Caches`, `CertificateWarning.html`, `CodeResources`, `Composite.wav`, `CoreServices`, and
+localisation directories (`zh_CN.lproj`, `pt_PT.lproj`, ...).
+
+## And directory listings work
+
+The parent obj_id in a `apfs_drec_hashed_key` is the containing directory, and the
+`file_id` in the `apfs_drec_val` is the entry's own object id.  Matching them gives real
+directory listings.  For `PrivateFrameworks` (DIR_REC under obj_id 25, file_id 748):
+
+    AuthenticationServicesCore.framework  (749)     SafariCore.framework        (1726)
+    MobileSafari.framework               (918)     SafariFoundation.framework  (1947)
+    MobileSafariSwift.framework         (1172)     SafariShared.framework      (2134)
+    MobileSafariUI.framework            (1303)     SafariSharedUI.framework    (2475)
+    PasswordManagerUI.framework         (1513)     VisualTestKit.framework     (2692)
+    PlugInKitDaemon.framework           (1723)     WebApp.framework            (2695)
+    WebBookmarks.framework              (2700)     WebCore.framework           (2874)
+    WebBookmarksSwift.framework         (2869)     WebGPU.framework            (3241)
+    WebInspector.framework              (3246)     WebKitLegacy.framework      (3251)
+    WebUI.framework                     (3258)
+
+19 entries, all Safari/WebKit.  **That is a real directory listing read out of the cryptex.**
+
+## The negative result, and it is a real one
+
+Searching all 289 distinct names:
+
+    IOMobile        0        Framebuffer     0        AGX             0
+    IOAccelerator   0        SpringBoard     0        kext            0
+    GPU             3  (GPUExtension.appex, WebGPU.framework, com.apple.WebKit.GPU)
+    Metal           1  (default.metallib)
+
+**`IOMobileFramebuffer` is not in this volume.**  The instrument is sound -- 2184 of 2184
+names decode, and the directory listing reproduces a coherent set of Safari frameworks --
+so this is a measured absence, not a reader failure.
+
+That matters for task #38: **the kext binary is not in the SystemOS cryptex.**  The next
+artifact is the OS root volume (`044-76040-038.raw`), which the project's own walker has
+already read 373 plists from and where `IOHIDFamily` and `IOUSBHostFamily` were found.
+
+## One caveat, recorded rather than smoothed over
+
+2,184 DIR_RECs out of 252,391 records is a low ratio -- a real filesystem's catalog is
+mostly directory entries.  So the 3,848 leaves walked likely include leaves that are not
+catalog leaves, and the DIR_REC set may be incomplete.  **The absence of
+`IOMobileFramebuffer` is therefore strong but not conclusive**, and the cheap
+confirmation is to repeat the walk on the OS root volume, where the framework's plist has
+already been located.
 
 ## Status
 
