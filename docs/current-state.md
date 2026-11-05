@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred sixteenth, addendum CF). THE HEADLINE is **THE PID DISCREPANCY IS RESOLVED, AND FACT 202 CORROBORATES THE BLOCKER FROM THE METAL SIDE**. Fact 202 recorded `client_pid=74`; BY measured 86 (IOMFB_FDR_Loader); CD measured backboardd at 58. **Fact 202 carries the reconciling evidence in the same measurement: `native_qemu_metal_owners = 1801675106 = b'back'` -- backboardd holds the window. So fact 202's client_pid=74 WAS BACKBOARDD. The pid that is backboardd is 74 on that boot and 58 on the one CD measured, and BY's 86 was a different process on a boot whose channel was truncated before backboardd spawned. The pids are not stable across boots -- exactly what addendum BS recorded.** **AND FACT 202 CORROBORATES THE BLOCKER FROM THE METAL SIDE, INDEPENDENTLY: it read native_gop_wait_stats[0]=0 and got a three-part answer on two independent boots -- (1) the Metal plugin loaded, opened the accelerator, and is HELD BY BACKBOARDD (owners=b'back', grants=1); (2) it never asked the presenter for a frame (handoff_probes=0, handoff_opens=0, handoff_calls=0, scanout_maps=0, wait_stats[0]=0); (3) the display driver never produced a validated swap (prepare=0, retirement=0, transfer=0). (2) is upstream of (3) and both are zero -- the same conclusion CD reached from the client-table side, arrived at from the GPU side, on different boots.** **AND FACT 202's Y1 INDEPENDENTLY CONFIRMS HOW TO READ THE ZERO: native_legacy_swap_validation_observed increments REGARDLESS of outcome, so swap_validation_calls=0 means "no swap was ever submitted for validation", corroborated by swap_accepted_count=0 AND swap_rejected_count=0 both being zero. That forecloses the reading "a swap was submitted and rejected" -- if one had been, swap_rejected_count would be non-zero.** **WHAT THE TWO DIRECTIONS TOGETHER SETTLE: client side (CD) -- backboardd opens the framebuffer, calls nine selectors, is refused three, registers no notification port, never calls selector 6; GPU side (202) -- the Metal plugin is loaded and held by backboardd but its scanout thread never reaches the presenter's hand-off. Both consistent with one cause: no swap is ever submitted, so nothing downstream can run.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is firmer is that two independent directions, on different boots, agree on one cause -- and that the pid that looked like a discrepancy was backboardd all along.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred seventeenth, addendum CG). THE HEADLINE is **CE IS REFUTED -- 60 LIFTABLE, 0 ALMOST-LIFTABLE, AND THE 60 MATCHES THE MEASUREMENT**. `classify-display-slots.py` reads the display's vtable straight out of the kernel file: a teammate established it is a STATIC INITIALISER (`__ZTV19NativeLegacyDisplay` at 0xfffffff007206690) so no boot and no build are needed, and caught the off-by-two -- `_ZTV` points 16 bytes before the address point, so reading from the symbol shifts every slot index by +2. **TWO VALIDATIONS: 3 of 3 fork-declared methods land at their declared slots (288 startHardware, 290 kickSwapQueue, 296 validateSwap), and the offline classifier finds EXACTLY 60 liftable slots against a `slot_lifted_count` of 60 measured on a live guest -- so the vtable read is right and the classifier logic is transcribed faithfully.** **AND THE HYPOTHESIS FAILS: SKIPPED despite a 0x2c7 tail = 0. No slot in the display's vtable contains `MOV w0,#0x2c7 ... RET` without also being a bare stub, so CE's proposed change would lift nothing, slot_lifted_count would stay at 60, and the falsification CE itself named is what happened. CE IS REFUTED and task #39 is closed as refuted.** **WHAT THAT ELIMINATES IS THE USEFUL PART: the four surviving refusals (12, 15, 29, 57 -- CD measured backboardd hit 15, 29 and 57) DO NOT COME FROM THE DISPLAY'S VTABLE. All 358 slots have been read and there is nothing left in them to lift. So the refusals come from the CLIENT's vtable (which interpose() wraps at slots 168 and 175 -- and CD measured that backboardd registered NO notification port, so slot 175 was never exercised) or from a family helper reached directly. The teammate's selector bridge was the instrument for that and it FAILED ITS OWN VALIDATION -- slot 182 in 0 of 81 selectors, and following a BL landed in a degenerate sweep of `ldr x16,[x16,#imm]` over consecutive offsets, which is data decoded as instructions. Reporting that failure rather than a number was correct, and task #38 still has no instrument.** **ONE HYPOTHESIS ELIMINATED FOR THE COST OF A FILE READ -- possible only because the vtable is static data in the image rather than something only a running guest holds, which nobody knew until the teammate looked.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16566,3 +16566,88 @@ Onsite: N/A.
 reached.  What is firmer is that two independent directions, on different boots,
 agree on one cause -- and that the pid that looked like a discrepancy was
 backboardd all along.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred seventeenth, addendum CG): CE is refuted -- 60 liftable, 0 almost-liftable, and the 60 matches the measurement
+
+## The instrument, and the two validations that make it believable
+
+`local-private/tmp/classify-display-slots.py` reads the display's vtable straight
+out of the kernel file.  A teammate established that it is a **static initialiser**
+-- `__ZTV19NativeLegacyDisplay` at `0xfffffff007206690` -- so no boot and no build
+are needed, and caught the off-by-two that makes it usable: `_ZTV` points 16 bytes
+before the address point, so reading from the symbol shifts every slot index by +2.
+
+Two independent validations, and the script refuses to print anything if the first
+one fails:
+
+    slot 288 = NativeLegacyDisplay::startHardware()      OK
+    slot 290 = NativeLegacyDisplay::kickSwapQueue()      OK
+    slot 296 = NativeLegacyDisplay::validateSwap(...)    OK
+
+**3 of 3 fork-declared methods land at their declared slots.**  And then the one
+that matters:
+
+    the current classifier would lift : 60
+    slot_lifted_count measured on a live guest : 60
+
+**The offline classifier reproduces the measured count exactly.**  So the vtable
+read is right, the classifier logic is transcribed faithfully, and the number the
+kernel produced at runtime is the number this file read predicts.
+
+## And the hypothesis fails
+
+    SKIPPED despite a 0x2c7 tail : 0
+
+**No slot in the display's vtable contains `MOV w0,#0x2c7 ... RET` without also
+being a bare stub.**  So CE's proposed change -- relax the classifier to scan for
+the tail regardless of an earlier `BL` -- would lift nothing, `slot_lifted_count`
+would stay at 60, and the falsification CE itself named is what happened.
+
+**CE is refuted.**  Task #39 is closed as refuted rather than left looking
+plausible.
+
+## What that eliminates, and it is the useful part
+
+The four surviving refusals -- `12`, `15`, `29`, `57`, of which CD measured
+backboardd hit `15`, `29` and `57` -- **do not come from the display's vtable.**
+Not as liftable stubs, and not as almost-liftable ones either.  The display's 358
+slots have been read in full and there is nothing left in them to lift.
+
+That is a real narrowing.  The refusals must come from somewhere else:
+
+    the CLIENT's vtable, which `interpose()` wraps at slots 168 and 175
+        (`externalMethod` and `registerNotificationPort`) -- and note CD measured
+        that backboardd registered NO notification port at all, so slot 175 was
+        never even exercised;
+    or a family helper the dispatch reaches directly, outside the vtable.
+
+The teammate's selector bridge was the instrument for that and **it failed its own
+validation** -- it found slot 182 in 0 of 81 selectors, and following a `BL` landed
+in a degenerate sweep of `ldr x16,[x16,#imm]` over consecutive offsets, which is
+data being decoded as instructions.  Reporting that failure rather than a number
+was correct, and it means task #38 still has no instrument.
+
+## What this interval bought, stated plainly
+
+One hypothesis eliminated for the cost of a file read.  The reason that was
+possible is that the vtable turned out to be static data in the image rather than
+something only a running guest holds -- which nobody knew until the teammate
+looked, and which is why the offline reader was worth building before spending a
+build on the change CE proposed.
+
+## Status
+
+Windows/real-guest: **none this interval -- the refutation is an offline read of
+the kernel file, validated against a count measured on a live guest.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  CE is refuted and #39 is closed as refuted: the display's vtable holds
+nothing left to lift, so the four surviving refusals come from somewhere else --
+most likely the client's own vtable, which CD showed was never even exercised past
+the open.**  THE HEADLINE is unchanged from AH
