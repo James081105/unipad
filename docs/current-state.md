@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty fourth, addendum CN). THE HEADLINE is **CM IS WITHDRAWN -- CL WAS RIGHT, AND MY CORRECTION USED THE WRONG FIELD OFFSET**. CM "corrected" CL's claim that the cryptex's container omap is at block 782662, on the ground that its type reads 0xe (FSTREE) rather than 0x0B (OMAP). **CM was reading the wrong field: the object type is at +0x18, not +0x10, as a qword whose high half carries flag bits (0x40000000 = OBJ_VIRTUAL, 0x80000000 = OBJ_EPHEMERAL). Masked, block 0 = 0x01 NX_SUPERBLOCK, block 782662 = 0x0B OMAP, block 782663 = 0x02 BTREE -- exactly what om_tree_oid=782663 predicted and exactly what CL claimed. The 0x0e at +0x10 is a different field entirely.** **AND THE "NO BTRE MAGIC" DOUBT WAS ALSO WRONG: APFS btree_node_phys has NO magic field; +0x20 is btn_flags(2)/btn_level(2), so 07 00 00 00 reads as flags=0x0007 (BTNODE_ROOT|BTNODE_LEAF|BTNODE_FIXED_KV_SIZE) and level=0 -- precisely a root leaf node, which is what the omap's tree root should be. I was looking for a magic that does not exist in the format.** **SO CM IS WITHDRAWN IN FULL AND CL STANDS: BASE=0, block_size=4096, omap at block 782662, btree root at 782663 -- all verified against the object-type constants with block 0 as the known-value control.** **THE LESSON, the third this interval and the sharpest: CM corrected CL by looking up a constant and finding CL's wrong -- and CM's own constant was attached to the wrong field. Looking up the constant is necessary but not sufficient; the field offset has to be right too, and the check for that is a known-value control. Block 0 is that control: whatever offset you read the type from must yield 0x01 for the container superblock. I ran that control only AFTER writing CM.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty fifth, addendum CO). THE HEADLINE is **THE CRYPTEX OMAP TREE ROOT IS LOCATED, ITS ENTRY COUNT IS NOT, AND HERE IS THE HANDOFF**. The SystemOS cryptex is a raw APFS container with no wrapper: NXSB at 32, nx_block_size 4096, nx_block_count 806,400 (= file size / 4096 exactly), nx_omap_oid 782662. With the object type read at +0x18 (a qword whose high half is flag bits), validated against block 0 as the known-value control: block 0 = 0x01 NX_SUPERBLOCK, block 782662 = 0x0B OMAP, block 782663 = 0x02 BTREE. The omap's own om_tree_oid (+0x30) is 782663, so the chain superblock -> omap -> btree root is located and internally consistent, and the btree root reads btn_flags=0x0007 and btn_level=0 -- a root leaf node, exactly right for an omap tree root. **NOT VERIFIED, and it is the next thing to check: the entry count. btn_nkeys reads as 1, which is wrong for a container omap, and my "TOC" read was invalid -- +0x2C is btn_table_space (a uint16), not the TOC's location. So do not trust nkeys=1.** **THE HANDOFF: task #38 needs names for the 181 original-family display-vtable slots, which need the IOMobileFramebuffer binary, which is not on the OS root volume (verified twice with a sound control) and is presumably in this cryptex or the IPSW's kernelcache.im4p. The cryptex's container level is now solved: BASE=0, block_size=4096, omap at block 782662, btree root at 782663. Resume by repointing local-private/tmp/enumerate-launchd-jobs.py at 044-76034-038.dmg with the object type read at +0x18 and masked with 0xFF, validated against block 0 yielding 0x01 -- that walker already recovers 373 plists from the OS volume's catalog nodes.** **WHAT MUST NOT BE REPEATED: three corrections this interval came from verifying a reading against a field, a boot, or a document without first proving the instrument on a known answer. Block 0 is the control for the cryptex; a known-present record is the control for a console channel; a named process in its own sample is the control for a pid.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17248,3 +17248,101 @@ Onsite: N/A.
 reached.  CM is withdrawn and CL is restored: the cryptex's omap is at block 782662
 and its btree at 782663, both verified against the object-type enum with block 0 as
 the control.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty fifth, addendum CO): the cryptex omap tree root is located, its entry count is not, and here is the handoff
+
+## What is verified
+
+The SystemOS cryptex (`044-76034-038.dmg`, 3,303,014,400 bytes) is a raw APFS
+container with no wrapper:
+
+    magic @32            NXSB
+    nx_block_size        4096
+    nx_block_count       806,400      (= file size / 4096, exactly)
+    nx_omap_oid          782662
+
+And with the object type read at `+0x18` (a qword whose high half is flag bits),
+validated against block 0 as the known-value control:
+
+    block 0      raw 0x80000001  -> type 0x01  NX_SUPERBLOCK   <- the control
+    block 782662 raw 0x4000000b  -> type 0x0B  OMAP
+    block 782663 raw 0x40000002  -> type 0x02  BTREE
+
+The omap's own `om_tree_oid` (`+0x30`) is **782663**, and that block is a `BTREE`.
+So the chain superblock -> omap -> btree root is located and internally consistent.
+
+The btree root node reads `btn_flags = 0x0007` and `btn_level = 0` at `+0x20`, which
+is `BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE` at level 0 -- a root leaf
+node, exactly right for an omap tree root.  (Addendum CM doubted this because it
+looked for a `BTRE` magic; APFS has no such field, and `+0x20` is
+`btn_flags`/`btn_level`.)
+
+## What is NOT verified, and it is the next thing to check
+
+**The entry count.**  I read `btn_nkeys` as **1**, which is wrong for a container
+omap -- it should hold hundreds of entries.  And my "TOC" read was invalid: I took
+`+0x2C` as the TOC offset, but `+0x2C` is `btn_table_space` (a uint16 giving the
+space reserved for the TOC), not the TOC's location.  The TOC's location is
+derived, not stored.
+
+**So do not trust `nkeys = 1`.**  Either my `btn_nkeys` offset is also wrong, or the
+node is not what I think.  Both are open, and both are the same class of error that
+produced CM: reading a struct field without a known-value control.
+
+The control for this one: a container omap tree root must have a `btn_nkeys` large
+enough that its TOC fits in `btn_table_space`, and the TOC entries must point into
+the node's data area.  If they do not, the offset is wrong.
+
+## The handoff, and the exact resume commands
+
+**The task.**  Task #38: identify which selector submits a swap.  It needs names for
+the 181 original-family slots in the display's vtable, which need the
+`IOMobileFramebuffer` binary, which is not on the OS root volume (verified twice,
+with a sound control) and is presumably in this cryptex or in the IPSW's
+`kernelcache.im4p`.
+
+**Where it stands.**  The cryptex's container level is solved: `BASE = 0`,
+`block_size = 4096`, omap at block **782662**, btree root at **782663**.  The route
+is alive again after CM wrongly killed it and CN restored it.
+
+**The next action, concretely.**  Finish reading the omap tree root's struct
+correctly -- get `btn_nkeys` and the TOC location right, with the control above --
+then walk the tree to map virtual oids to physical blocks, then find the volume's
+root directory, then look for
+`System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/`.  The OS volume's
+walker (`local-private/tmp/enumerate-launchd-jobs.py`) already does the equivalent
+walk on `044-76040-038.raw` and recovered 373 plists from catalog nodes; the same
+walker pointed at the cryptex with the geometry above is the shortest path.
+
+**Resume command.**
+
+    cd F:\iosvirtual
+    python local-private/tmp/enumerate-launchd-jobs.py
+
+with `RAW` repointed at
+`vendor/UniXNU/.cache/firmware/target-volumes/044-76034-038.dmg` and the object type
+read at **`+0x18`** with the flag mask `& 0xFF`, validated against block 0 yielding
+`0x01`.
+
+**What must not be repeated.**  Three corrections this interval came from verifying
+a reading against a field, a boot, or a document without first proving the
+instrument on a known answer.  Block 0 is the control for the cryptex; a
+known-present record is the control for a console channel; a named process in its
+own sample is the control for a pid.
+
+## Status
+
+Windows/real-guest: **none this interval -- everything above is a read of the
+cryptex file's own objects.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
