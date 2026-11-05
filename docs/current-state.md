@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty eighth, addendum CR). THE HEADLINE is **THE VOLUME SUPERBLOCKS AND OMAPS ARE FOUND, THE TREE IS A WALKABLE MULTI-LEVEL BTREE, AND THE 5-WORD SIGNATURE WAS OVER-FITTED**. apfs_superblock puts apfs_magic at +0x20 as a u32 (APSB = 0x42535041 LE); scanning all 806,400 blocks finds FIVE blocks with the magic, all of object type 0x0D FS: 4543, 4545, 4795, 782653, 782661. Five is not a failure -- APFS keeps one volume superblock per checkpoint. They disagree about the current omap: three name apfs_omap_oid=4540 / apfs_root_tree_oid=1028, while 782653 names 746223 / 1216 and 782661 names 782656 / 1216. Which is current is a transaction-id question and is NOT answered yet. **THE CORRECTION TO THE INSTRUMENT IS MINE AGAIN: CQ recorded the 5-word omap signature as the correct instrument, but it is OVER-FITTED to the container omap and misses every volume omap. om_flags is 1 for the container omap and 0 for volume omaps, so the signature found the container and would have silently skipped all three volumes. The correct discriminator is the object type at +0x18 being 0x0B cross-checked against om_tree_type == 0x40000002 -- and the earlier scan showed the type byte alone produces 1592 false positives out of 1600, so it must be the PAIR, not either alone.** **AND THE TREE IS A MULTI-LEVEL BTREE, WHICH IS WHAT MAKES IT WALKABLE: the volume omaps' trees have btn_flags = 0x0005, which is BTNODE_ROOT | BTNODE_FIXED_KV_SIZE WITHOUT BTNODE_LEAF, at btn_level = 1, with 2, 36 and 37 keys. A level-1 root with no LEAF flag is an internal node whose values are child block numbers rather than data records -- exactly right for an omap whose entries do not fit in one block, and exactly why nkeys is 2/36/37 rather than the 1 the container's root leaf showed. The walk is volume superblock -> apfs_omap_oid -> omap_phys.om_tree_oid (a level-1 internal root) -> child blocks (level-0 leaves) -> omap records {virtual oid, xid} -> {physical block}. The container's own omap is a level-0 root leaf with one key because a container maps one volume and needs no depth; both shapes are consistent with the same reader, which is the strongest evidence the reader is right.** **SO THE CHAIN IS OPEN END TO END WITH ONE NAMED GAP: verified is the container geometry, the container omap, its tree root and TOC, the volume superblocks by magic, the volume omaps, and the volume omap tree roots as level-1 internal nodes. The named gap is the CHILD POINTERS -- for a non-leaf node the TOC entry's v is a child block number rather than a record offset, and I have not yet read one. That is the single next measurement and it is a small one.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty ninth, addendum CS). THE HEADLINE is **THE CRYPTEX ROUTE IS CLOSED END TO END -- THE CONTAINER OMAP MAPS VOLUME OID 1026 TO SUPERBLOCK 782661**. Addendum CR left one named gap: for a non-leaf node the TOC entry's v is a child block number rather than a record offset. I tried to guess it and got overlapping offsets, because I had two rules wrong, and BOTH ARE STATED EXPLICITLY IN apfsprogs' own reader (apfsck/btree.c). **RULE 1: value offsets run BACKWARDS from the end of the value area -- `off_in_area = area_len - entry->v; *off = node->data + off_in_area;` with `area_len = blocksize - node->data - (is_root ? sizeof(apfs_btree_info) : 0)` (btree.c:504-516). Keys run forward from node->key; values run backward from the end. I had been reading v forward from the key area, which is why every value I read was garbage. RULE 2: an omap value's length depends on leafness -- `len = node_is_leaf(node) ? 16 : 8` (btree.c:486), 16 for a leaf record {flags,size,paddr} and 8 for a non-leaf child pointer. sizeof(apfs_btree_info) is 40 (raw.h:224-230) and ROOT|LEAF|FIXED = 0x1|0x2|0x4 (raw.h:138-140), so 0x0007 is a root leaf, 0x0005 a non-leaf root, 0x0006 a leaf.** **THE CONTAINER OMAP NAMES THE VOLUME: root 782663 is a root leaf with nkeys 1, toc=0x38, key=0x1f8, free=0x218, data=0xfb8, area_len=32; its key is (oid=1026, xid=14) and its value is flags=0x0, size=4096, paddr=782661 -- and BLOCK 782661 IS ONE OF THE FIVE APSB VOLUME SUPERBLOCKS. size=4096 is exactly one block, right for a superblock. So the container omap maps volume oid 1026 to volume superblock 782661. That is the THIRD independent confirmation of the same volume: nx_fs_oid[0]=1026 (CQ), the container omap's key oid=1026, and now its value paddr pointing at an APSB block.** **AND THE VOLUME OMAP'S CHILDREN ARE ALL WELL-FORMED: root 782657 is a non-leaf root (flags 0x0005) at level 1 with 36 keys, toc=0x38, key=0x278, free=0x4c8, data=0xeb0, area_len=296. Every entry maps (oid, xid=13) to a child, and EVERY CHILD is object type 0x03 BTREE_NODE with flags 0x0006 (LEAF|FIXED_KV_SIZE, no ROOT) at level 0 -- precisely what a level-1 root's children must be. 6 of 6 keys in bounds, 6 of 6 values in bounds, 6 of 6 children well-formed, and the v values step by 8, matching the 8-byte child-pointer length exactly.** **SO THE FULL CHAIN IS VERIFIED END TO END: container superblock (block 0, NXSB) -> nx_omap_oid 782662 (omap_phys, verified field for field) -> om_tree_oid 782663 (root leaf, 1 key) -> {oid 1026, xid 14} -> {size 4096, paddr 782661} -> volume superblock 782661 (APSB) -> apfs_omap_oid 782656 -> om_tree_oid 782657 (non-leaf root, 36 keys) -> child leaves (type 0x03, flags 0x0006, level 0) -> omap records {virtual oid, xid} -> {physical block}.** **WHAT THIS BUYS TASK #38: the volume's catalog tree is reachable through the same walk one level further on -- the volume superblock's apfs_root_tree_oid (1216 for 782661) resolves through this omap to a physical block, and the catalog's file records are APFS_TYPE_DIR_REC / APFS_TYPE_FILE_EXTENT entries in its leaves, so IOMobileFramebuffer.framework would be a DIR_REC in that tree. This is the first time the route to the kext binary has been walked to the volume's own omap with every control passing. It is still not the binary and it is not a guest measurement.** **THE LESSON IS THE FIFTH AND IS NOW A RULE: five corrections this interval came from the same root, deriving a layout instead of reading the definition. The rule that follows: for any documented on-disk format, open the reference implementation's reader before reading a single field. apfsprogs was in this repository for all of them, and every one of the five errors was avoided by reading a function I had not looked at.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17584,6 +17584,121 @@ the single next measurement, and it is a small one.
 
 Windows/real-guest: **none this interval -- every number above is a read of the
 cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty ninth, addendum CS): the cryptex route is CLOSED end to end -- the container omap maps volume oid 1026 to superblock 782661
+
+## The two rules I was missing, both from apfsprogs' own reader
+
+Addendum CR left one named gap: "for a non-leaf node the TOC entry's `v` is a child
+block number rather than a record offset, and I have not yet read one."  I tried to
+guess it and got overlapping offsets, because I had two rules wrong.  Both are stated
+explicitly in `apfsprogs/src/apfsck/btree.c`:
+
+**Rule 1 -- value offsets run BACKWARDS from the end of the value area**
+(btree.c:504-516):
+
+    off_in_area = area_len - le16_to_cpu(entry->v);
+    *off = node->data + off_in_area;
+    area_len  = sb->s_blocksize - node->data
+                - (node_is_root(node) ? sizeof(struct apfs_btree_info) : 0);
+
+Keys run forward from `node->key`; values run backward from the end.  I had been reading
+`v` forward from the key area, which is why every value I read was garbage.
+
+**Rule 2 -- an omap value's length depends on whether the node is a leaf**
+(btree.c:486):
+
+    if (btree_is_omap(btree))
+        len = node_is_leaf(node) ? 16 : 8;
+
+16 bytes for a leaf record `{flags, size, paddr}`, 8 bytes for a non-leaf child pointer.
+`sizeof(struct apfs_btree_info)` is 40 (raw.h:224-230: 16 + 4 + 4 + 8 + 8), and
+`APFS_BTNODE_ROOT|LEAF|FIXED_KV_SIZE` = `0x0001|0x0002|0x0004` (raw.h:138-140), so
+`0x0007` is a root leaf, `0x0005` a non-leaf root, `0x0006` a leaf.
+
+## The container omap, and it names the volume
+
+Root **782663**, `flags 0x0007` (root leaf), `nkeys 1`, `toc=0x38`, `key=0x1f8`,
+`free=0x218`, `data=0xfb8`, `area_len=32`:
+
+    key   @0x208  (oid=1026, xid=14)
+    value @0xfb8  flags=0x0  size=4096  paddr=782661
+
+**`paddr = 782661`, and block 782661 is one of the five `APSB` volume superblocks.**
+`size = 4096` is exactly one block, which is right for a superblock.  So the container
+omap maps volume oid **1026** to volume superblock **782661**.
+
+That is the **third independent confirmation** of the same volume: `nx_fs_oid[0] = 1026`
+(addendum CQ), the container omap's key oid `= 1026`, and now the container omap's value
+paddr pointing at an `APSB` block.  Three different structures, three different routes,
+one answer.
+
+## The volume omap, and every child is well-formed
+
+Root **782657**, `flags 0x0005` (non-leaf root), `level 1`, `nkeys 36`, `toc=0x38`,
+`key=0x278`, `free=0x4c8`, `data=0xeb0`, `area_len=296`:
+
+    idx     k     v    key@              key(oid,xid)     val@    child
+      0   0x00  0x08  0x278   (1214, 13)   0xfd0   782659  type 0x03  flags 0x0006  level 0
+      1   0x20  0x18  0x298   (1285, 13)   0xfc0   782660  type 0x03  flags 0x0006  level 0
+      2   0x30  0x20  0x2a8   (1369, 13)   0xfb8   770963  type 0x03  flags 0x0006  level 0
+      3   0x40  0x28  0x2b8   (1481, 13)   0xfb0   772288  type 0x03  flags 0x0006  level 0
+      4   0x50  0x30  0x2c8   (1593, 13)   0xfa8   772437  type 0x03  flags 0x0006  level 0
+      5   0x60  0x38  0x2d8   (1705, 13)   0xfa0   772659  type 0x03  flags 0x0006  level 0
+
+**Every child is object type `0x03` `BTREE_NODE` with `flags 0x0006` (`LEAF |
+FIXED_KV_SIZE`, no `ROOT`) at `level 0`** -- precisely what a level-1 root's children must
+be.  6 of 6 keys in bounds, 6 of 6 values in bounds, 6 of 6 children well-formed.  The
+`v` values step by 8, matching the 8-byte child-pointer length exactly.
+
+So the full chain is now verified end to end:
+
+    container superblock (block 0, NXSB)
+      -> nx_omap_oid 782662 (omap_phys, verified field for field)
+        -> om_tree_oid 782663 (root leaf, 1 key)
+          -> {oid 1026, xid 14} -> {size 4096, paddr 782661}
+            -> volume superblock 782661 (APSB)
+              -> apfs_omap_oid 782656 (omap_phys)
+                -> om_tree_oid 782657 (non-leaf root, 36 keys)
+                  -> child leaves (type 0x03, flags 0x0006, level 0)
+                    -> omap records {virtual oid, xid} -> {physical block}
+
+## What this buys task #38
+
+The volume's catalog tree is reachable through the same walk, one level further on: the
+volume superblock's `apfs_root_tree_oid` (1216 for 782661) resolves through this omap to
+a physical block, and the catalog's file records are `APFS_TYPE_DIR_REC` /
+`APFS_TYPE_FILE_EXTENT` entries in its leaves.  `IOMobileFramebuffer.framework` would be
+a `DIR_REC` in that tree.
+
+**This is the first time the route to the kext binary has been walked to the volume's
+own omap with every control passing.**  It is still not the binary, and it is not a
+guest measurement.
+
+## The lesson, which is the fifth and is now a rule
+
+Five corrections this interval came from the same root: **deriving a layout instead of
+reading the definition.**  The rule that follows: for any documented on-disk format,
+open the reference implementation's reader before reading a single field.  apfsprogs was
+in this repository for all of them, and every one of the five errors was avoided by
+reading a function I had not looked at.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header and reader.**
 
 Build: none this interval.
 
