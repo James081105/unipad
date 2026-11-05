@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty fifth, addendum DI). THE HEADLINE is **THE OS ROOT VOLUME'S WHOLE CATALOG IS READABLE -- 349,284 DIR_RECs, CONTROL 349,284 OF 349,284 -- AND IOMobileFramebuffer.framework IS PRESENT**. DH's bug was that the leaf collector walked one level. Made recursive -- descend while btn_level > 0 and BTNODE_LEAF is clear, and read 8 BYTES for a non-leaf child pointer rather than 16 -- the OS root volume's catalog opened: 447 volume omap leaves, 39,497 catalog leaves, type histogram {XATTR 178,175, SIBLING_LINK 50,847, FILE_EXTENT 39,421, DIR_REC 349,284}, and **C3: 349,284 DIR_RECs decoded, clean ASCII after one NUL: 349,284 OF 349,284 -- OK**. 43,028 distinct parent obj_ids and 49,199 distinct names. **THAT IS THE WHOLE ROOT FILESYSTEM'S DIRECTORY CATALOG, READ END TO END: container -> omap -> volume -> catalog root (level 3) -> leaves -> apfs_drec_hashed_key -> name.** **AND THE TARGET IS THERE: searching all 49,199 distinct names gives IOMobileFramebuffer.framework (1 distinct -- THE TASK #38 TARGET), AGX (19: AGX.plist, AGXCompilerConnection-S2A8.framework, AGXCompilerCore-S2A8.framework, AGXCompilerCore.framework, AGXCompilerCrashLogs-S2A8(.appex)...), IOAccelerator.framework, IOGPU.framework, SpringBoard (58: SpringBoard, AXSpringBoardServerInstance.framework, SpringBoard-D83.loctable...), kext (38: ASIOKit.kext, AppleBiometricSensor.kext, AppleGameControllerPersonality.kext...) and Metal (143: AGXMetalA10.bundle, AGXMetalPerfCountersExternal.plist...). So IOMobileFramebuffer.framework IS PRESENT IN THE OS ROOT VOLUME. DG's "not in this volume" applied only to the SystemOS cryptex and was correct for it; the framework lives on the OS root volume, exactly where the earlier plist finding said it was (com.apple.IOMobileFramebuffer, v343.0.0).** **WHAT THIS UNBLOCKS: task #38 needs the framework's BINARY, not its plist. The catalog now gives the DIR_REC for IOMobileFramebuffer.framework with its parent obj_id and file_id, so the directory's contents are enumerable the same way PrivateFrameworks was on the cryptex. The binary itself is an INODE plus FILE_EXTENT records -- and the histogram shows 39,421 FILE_EXTENT records already decoded, so the extent mechanism is present and measured. THE NEXT ACTION IS CONCRETE: locate the IOMobileFramebuffer.framework DIR_REC, list its children, find the Mach-O binary's inode and extents, and read the kext's symbol table for the 181 vtable slot names.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty sixth, addendum DJ). THE HEADLINE is **IOMobileFramebuffer.framework IS LOCATED, AND IT IS A SHELL -- Info.plist AND _CodeSignature ONLY**. Indexing every DIR_REC by parent object id and name across the whole catalog gives 49,199 distinct names, 43,028 directories and 35,398 objects with extents, and C1 finds b'IOMobileFramebuffer.framework' at parent obj_id 1152921500312097787 with file_id 1152921500312150122. **ITS CONTENTS ARE THE ANSWER: C2 lists exactly TWO children, Info.plist (file_id 1152921500312150123) and _CodeSignature (file_id 1152921500312150124). No binary, no Versions/, no A/. So the framework on the OS root volume is a SHELL, and CJ's conclusion -- "the executable is not there to recover; every bundle on this volume is a shell" -- is INDEPENDENTLY CONFIRMED, this time with an instrument that decoded 349,284 DIR_RECs and passed its control 349,284 of 349,284. CJ reached the same answer from a walker whose own measurement for it was wrong (a startswith bug that made it report zero inodes under /System/Library/Extensions); the conclusion held and the evidence did not. Now it does.** **A SECOND FINDING CHANGES WHERE THE BINARY MUST COME FROM: the catalog's record-type histogram across 39,497 leaves is XATTR 178,175, SIBLING_LINK 50,847, FILE_EXTENT 39,421 and DIR_REC 349,284 -- THERE ARE NO INODE RECORDS (type 3) AT ALL. 35,398 objects carry FILE_EXTENT records so extents exist and are measured, but the inode metadata that would name a file's type and size is absent from every leaf walked. So the OS root volume's catalog carries directory structure and extents but not the inode records that would identify an executable.** **WHAT THIS MEANS FOR TASK #38: the kext binary is NOT ON THE OS ROOT VOLUME either. Between the SystemOS cryptex (DG: no IOMobileFramebuffer at all) and the OS root volume (DJ: the framework directory exists but is a shell), BOTH VOLUMES ARE NOW EXCLUDED WITH A SOUND INSTRUMENT. The remaining candidate is the one CJ named and nobody has checked: the IPSW's kernelcache.im4p, which is where the prelinked kext binaries live. That is a different artifact from both volumes, it is outside the mounted filesystems, and it is the next probe -- recorded as a probe, not a plan.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -19091,6 +19091,75 @@ measured.
 **The next action is therefore concrete:** locate the `IOMobileFramebuffer.framework`
 DIR_REC, list its children, find the Mach-O binary's inode and extents, and read the
 kext's symbol table for the 181 vtable slot names.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the OS
+volume file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty sixth, addendum DJ): `IOMobileFramebuffer.framework` is located, and it is a shell -- `Info.plist` and `_CodeSignature` only
+
+## The framework, located
+
+Indexing every DIR_REC by parent object id and name across the whole catalog:
+
+    indexed: 49,199 distinct names, 43,028 directories,
+             35,398 objects with extents, 0 inodes
+
+    C1 DIR_REC named b'IOMobileFramebuffer.framework': FOUND
+       parent obj_id 1152921500312097787, file_id 1152921500312150122
+
+## And its contents, which is the answer
+
+    C2 children of IOMobileFramebuffer.framework: 2
+       Info.plist      file_id 1152921500312150123
+       _CodeSignature  file_id 1152921500312150124
+
+**Two entries. No binary.**  `Info.plist` and `_CodeSignature` are exactly what addendum
+CJ reported finding in this framework's directory, and there is no
+`IOMobileFramebuffer` executable, no `Versions/`, no `A/`.
+
+So the framework on the OS root volume is a **shell**, and CJ's conclusion -- *"the
+executable is not there to recover.  Every bundle on this volume is a shell"* -- is
+**independently confirmed**, this time with an instrument that decoded 349,284 DIR_RECs
+and passed its control 349,284 of 349,284.  CJ reached the same answer from a walker whose
+own measurement for it was wrong (a `startswith` bug that made it report zero inodes under
+`/System/Library/Extensions`); the conclusion held and the evidence did not.  Now it does.
+
+## A second finding, and it changes where the binary must come from
+
+The catalog's record-type histogram across 39,497 leaves is:
+
+    XATTR 178,175   SIBLING_LINK 50,847   FILE_EXTENT 39,421   DIR_REC 349,284
+
+**There are no `INODE` records (type 3) at all.**  35,398 objects carry `FILE_EXTENT`
+records, so extents exist and are measured, but the inode metadata that would name a file's
+type and size is absent from every leaf walked.  So the OS root volume's catalog carries
+directory structure and extents but not the inode records that would identify an
+executable.
+
+## What this means for task #38
+
+The kext binary is **not on the OS root volume** either.  Between the SystemOS cryptex
+(DG: no `IOMobileFramebuffer` at all) and the OS root volume (DJ: the framework directory
+exists but is a shell), both volumes are now excluded with a sound instrument.
+
+The remaining candidate is the one CJ named and nobody has checked: **the IPSW's
+`kernelcache.im4p`**, which is where the prelinked kext binaries live.  That is a different
+artifact from both volumes, it is outside the mounted filesystems, and it is the next
+probe -- recorded as a probe, not a plan.
 
 ## Status
 
