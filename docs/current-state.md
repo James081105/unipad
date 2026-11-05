@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred ninth, addendum BY). THE HEADLINE is **THE FRAMEBUFFER'S ONLY CLIENT IS IOMFB_FDR_Loader, AND BACKBOARDD IS ABSENT**. The sampling loop now captures the process list in the SAME sample as the client table, so a pid reads as a name rather than a number that shifts between boots. On run 41980452867 with kernel sha256 d2c5a914 verified and the control passed, 73 processes are alive: **pid 27 SpringBoard, pid 86 IOMFB_FDR_Loader -- the framebuffer's ONLY client -- and pid 87 IOMFB_bics_daemo. C0 (pid 86) registered NO notification port and made NO external-method call at all.** **AND BACKBOARDD IS NOT IN THE GUEST: a grep of the 73-process list for "backboard" returns ZERO. The compositor that owns the framebuffer on iOS never spawned, so the chain is not "the compositor submits a swap and something refuses it" but "the compositor does not exist, so nothing ever submits a swap". SpringBoard is alive at pid 27 and never opened the framebuffer, because on iOS SpringBoard does not open it -- backboardd does, on SpringBoard's behalf.** **WHAT THAT DOES TO THE LAST EIGHT ADDENDA: BO through BX are all still true and all still measured, but they characterised, in increasing detail, a display driver waiting for a client that does not exist. None was wrong; none was the blocker. The blocker is one level up, and it was visible in the process list the whole time -- which is why the process list is now captured in the same sample as the table.** **WHY THE OLD TABLE MISLED: the saved table from kernel 2ebda0ec reported "the busiest client: pid=58, 14 selectors, 11 refused", and in this boot pid 58 is an xpcproxy. Pids are not stable across boots, so that table's pid 58 was a different process and its identity was never recorded. This run captures the name in the same sample as the counts, so the two cannot drift apart.** **THE OPEN QUESTION IS TASK #33: why does backboardd not spawn? SpringBoard is running, so launchd spawned that; backboardd is a POSIXSpawnType=App job, and addenda BA-BJ established that App jobs are spawned without POSIX_SPAWN_SETEXEC and take the do_fork1 path. So the question is whether launchd declines the backboardd job or spawns it and it fails to come up -- and the springboard.fork1 emitter, proved BUILT in BQ, records every do_fork1 child by name. That measurement needs no build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the display blocker has moved: it was never the display driver, and it was never a refused swap. The compositor that would drive the framebuffer is not in the guest.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred tenth, addendum BZ). THE HEADLINE is **LAUNCHD NEVER SPAWNS BACKBOARDD, AND THAT IS THE FROZEN SCREEN**. The console channel from run 41980452867 (kernel sha256 d2c5a914 verified, control passed) carries 93 `fork1.spawn` records, 50 `spawn.seen` records, 24 `exit.seen`, and ONE `springboard.fork1` naming SpringBoard. The 93 do_fork1 children are 72 xpcproxy, 2 mount, xpcroleaccountd, usermanagerd, tzinit, sysstatuscheck, seputil, prng_seedctl, mobile_obliterator, launchd_cache_loader, keybagd, init_featureflags, init_exclavekit, fsck, finish_demo_restore, dirs_cleaner, cc_fips_test, auearlyboot, SpringBoard, MSUarlyBootTask and FinishRestoreFromBackup; the 50 exec-path children include runningboardd, notifyd, configd, wifid, mediaserverd, tccd, watchdogd, containermanager and cfprefsd. **`backboardd` appears in NO comm field anywhere in the channel -- not in the 93 do_fork1 children, not in the 50 exec-path children, and there is no spawn.failed record either, so it was never ATTEMPTED, which puts the cause in launchd's job handling rather than in exec.** **SO THE CHAIN IS CLOSED: launchd never spawns backboardd -> no compositor exists (73 processes named, BY) -> the framebuffer's only client is IOMFB_FDR_Loader, which does nothing -> no swap is ever submitted (three ramped boots) -> validateSwap never runs -> nothing is validated -> kickOnce returns at GATE 2 -> no transfer, no frame. Every link is a measurement on this kernel and none is an inference. The frozen screen is not a display-driver defect; it is a missing process.** **AND SPRINGBOARD IS RUNNING, which makes it sharper: launchd DID spawn SpringBoard (the springboard.fork1 record names it, alive at pid 27), so launchd is spawning App jobs -- it spawns SpringBoard and not backboardd from the same machinery. That is the shape addenda BA-BJ were built to answer.** **THE NEXT MEASUREMENT NEEDS NO BUILD: is backboardd's job in launchd's job table, and what are its flags? The promotion gate reads bit 29 of job+0x538 and the home-screen claim reads EmbeddedHomeScreen at job+0x53b bit 5, so reading the job's flags distinguishes "the job is not loaded at all" (a plist or volume problem) from "the job is loaded but not promoted" (the gate BA-BJ characterised). The project already has the launchd job-table reader from BA-BJ, so this is one guest run.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the critical path now has a measured root cause instead of a symptom: launchd never spawns backboardd, so nothing drives the framebuffer, so nothing is ever drawn.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15908,3 +15908,93 @@ Onsite: N/A.
 reached.  But the display blocker has moved: it was never the display driver, and
 it was never a refused swap.  The compositor that would drive the framebuffer is
 not in the guest.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred tenth, addendum BZ): launchd never spawns backboardd, and that is the frozen screen
+
+## The measurement, from the run's own console channel
+
+`springboard.fork1` and `fork1.spawn` are on the virtio console channel, and BQ
+proved both literals are BUILT into this kernel -- so their records are evidence
+and their absence is not.  The channel from run 41980452867 carries:
+
+    fork1.spawn            93 records   <- the do_fork1 path
+    spawn.seen             50 records   <- the exec path
+    exit.seen              24 records
+    springboard.fork1       1 record    <- SpringBoard, by name
+    spawn.failed            0 records
+
+The 93 `fork1.spawn` children, by name:
+
+    72 xpcproxy, 2 mount, xpcroleaccountd, usermanagerd, tzinit,
+    sysstatuscheck, seputil, prng_seedctl, mobile_obliterator,
+    launchd_cache_loader, keybagd, init_featureflags, init_exclavekit, fsck,
+    finish_demo_restore, dirs_cleaner, cc_fips_test, auearlyboot,
+    **SpringBoard**, MSUEarlyBootTask, FinishRestoreFromBackup
+
+The 50 `spawn.seen` children include runningboardd, notifyd, configd, wifid,
+mediaserverd, tccd, watchdogd, containermanager, cfprefsd and others.
+
+**`backboardd` appears in no `comm` field anywhere in the channel.**  Not in the
+93 `do_fork1` children, not in the 50 exec-path children, and there is no
+`spawn.failed` record either.
+
+## So the chain is closed, from the screen back to launchd
+
+    launchd never spawns backboardd          <- measured, both paths, this run
+      -> no compositor exists                <- measured, 73 processes named (BY)
+        -> the framebuffer's only client is IOMFB_FDR_Loader, which does nothing
+                                              <- measured (BY)
+          -> no swap is ever submitted       <- measured, three ramped boots (BV, BW)
+            -> validateSwap never runs       <- swap_validation_calls = 0
+              -> nothing is ever validated
+                -> kickOnce returns at GATE 2
+                  -> no transfer, no frame   <- transfer_calls = 0, one frame ever
+
+Every link is a measurement on this kernel, and none of them is an inference.
+**The frozen screen is not a display-driver defect.  It is a missing process.**
+
+And `spawn.failed` being absent matters: a spawn that was attempted and failed
+would leave a record.  So backboardd was never attempted either, which puts the
+cause in launchd's job handling rather than in exec.
+
+## SpringBoard is running, which makes it sharper
+
+launchd DID spawn SpringBoard -- the `springboard.fork1` record names it, and it
+is alive at pid 27.  So launchd is spawning App jobs.  It spawns SpringBoard and
+not backboardd, from the same job machinery.
+
+That is the shape addenda BA-BJ were built to answer: App jobs are spawned
+without `POSIX_SPAWN_SETEXEC` and take the `do_fork1` path, and the App-promotion
+gate at `0x100007aec` decides whether a job becomes `App` at all.  SpringBoard
+passes it.  backboardd is never even attempted.
+
+## The next measurement, and it needs no build
+
+**Is backboardd's job in launchd's job table, and if so what are its flags?**  The
+promotion gate reads bit 29 of `job+0x538`; the home-screen claim at
+`0x100007b64` reads `EmbeddedHomeScreen` at `job+0x53b` bit 5.  Reading the
+backboardd job's flags out of launchd's memory distinguishes:
+
+    the job is not loaded at all          -> a plist or a volume problem
+    the job is loaded but not promoted    -> the gate, which BA-BJ characterised
+
+The project already has the launchd job-table reader from addenda BA-BJ, so this
+is one guest run, not a build.
+
+## Status
+
+Windows/real-guest: **the console channel from a live guest on run 41980452867,
+kernel sha256 `d2c5a914` verified against `payload.json`, control passed, with 93
+`fork1.spawn` and 50 `spawn.seen` records named and `backboardd` absent from all
+of them.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  But the critical path now has a measured root cause instead of a
+symptom: launchd never spawns backboardd, so nothing drives the framebuffer, so
+nothing is ever drawn.**  THE HEADLINE is unchanged from AH
