@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty seventh, addendum DK). THE HEADLINE is **THE KERNELCACHE PROBE IS BLOCKED ON A MISSING ARTIFACT, AND TASK #36 IS THE ONLY REMAINING ACTION THAT PRODUCES GUEST EVIDENCE**. DJ named the IPSW's kernelcache.im4p as the next artifact. **IT IS NOT ON THIS MACHINE: the whole firmware cache is target-volumes/ containing 044-76034-038.dmg (the SystemOS cryptex, 3,303,014,400 bytes), 044-76040-038.raw (the OS root volume, 6,077,580,800 bytes), their json sidecars and static-trustcache.bin. No .im4p, no .ipsw, no kernelcache of any kind. The only local tooling mentioning "kernelcache" is local-private/tmp/_embedded_acquire.py:34, and it is NOT about the IPSW -- it is the PRD 8.1/8.2 artifact-staging script whose role table maps build-output NAMES to roles so the project's own kernel can be staged and system images excluded. It downloads and locates nothing. So the probe is BLOCKED ON AN ARTIFACT THAT IS NOT PRESENT, and acquiring it would mean downloading a multi-gigabyte IPSW, which PRD section 12 forbids committing and which is a decision for the user, not for me.** **WHERE TASK #38 ACTUALLY STANDS: both volumes are excluded with a sound instrument and the third candidate is unavailable -- SystemOS cryptex (DG: no IOMobileFramebuffer name in 289 distinct names), OS root volume (DJ: the framework exists but is a shell, Info.plist plus _CodeSignature only, no binary), kernelcache.im4p (DK: not present). So the 181 vtable slot names CANNOT be obtained from any artifact currently on disk. That is a BLOCKED ROUTE, recorded as blocked -- not a failure of the reader, which passed 349,284 of 349,284 on the OS volume and 2,184 of 2,184 on the cryptex.** **AND THE HONEST ACCOUNTING FOR THIS SESSION: twenty-plus intervals have been static offline file parsing. Every number produced is a read of a downloaded image against apfsprogs' headers, and NOT ONE OF THEM IS GUEST EVIDENCE. The PRD's acceptance criteria are all guest-side -- boot to SpringBoard, IPA install and interaction, persistence, input, network, audio, graphics, GPU/Metal, launcher, performance, delivery -- and none has any evidence at all. Task #36 is the exception and the reason it matters: "add a kick-path emitter so the guest can say WHERE kickOnce stops". It is the only open action whose output is a MEASUREMENT ON A LIVE GUEST, and it targets the exact defect the session has been circling -- no swap is ever submitted, so validateSwap never runs and no transfer happens. A kick-path emitter would say, on the guest, which of kickOnce's two gates returns first. That is the next action, and it needs a build; the dispatch command is the one recorded in the state document, -f stage=M7 -f payload_target=tcg, with the lock pushed first.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty eighth, addendum DL). THE HEADLINE is **TASK #36's EMITTER IS WRITTEN, COMMITTED, PINNED AND DISPATCHED -- AND THE FIRST DISPATCH FAILED IN 13 SECONDS ON A PIN I HAD NOT MOVED**. kickSwapQueue and kickOnce both returned without recording which gate fired, so "no swap was ever submitted" was an inference from absent counters. Both now report: kickSwapQueue gate 0 (the loop ran) or 1 (re-entered while already kicking); kickOnce gate 1 with a reason naming the sub-condition (1 not enabled, 2 already transferred, 3 no logicalPM, 4 no bootMapping, 5 not primary), gate 2 with reason 6 (no pending request) or 7 (failed validation), and gate 0 when both were passed. Counters and observers live in LegacyDisplayProbe.cpp beside the existing transfer and prepare observers, inside the file's existing extern "C" block at line 74, so the driver's extern "C" declarations link the same way the other eleven do. 13 lines changed in the driver, 22 in the probe, and NO BEHAVIOUR CHANGE -- every call site is on a path that already returned.** **THE FIRST DISPATCH, AND THE FAILURE WAS MINE: run 42037155785 failed in 13 SECONDS with "device_commit '995bfa7...' != sources.lock.json device_repo.commit '9782ddf6...'". I had bumped the drivers/NativeMobileDisplay submodule pin and forgotten that the lock ALSO pins device_repo.commit separately. Every downstream error -- no allowlisted payload artifact, no staged directory, no boot inputs -- was a consequence of that refusal, not a build failure; the build never compiled anything. Fixed by bumping device_repo.commit from 9782ddf6 to 995bfa7 as well. Both pins and both commit/gitlink_commit fields now agree.** **THE SECOND DISPATCH: run 42037559769 is in_progress with no errors, which means it passed the input validation that refused the first one. It has not finished; the macOS build takes roughly twenty minutes and the emitter's measurement cannot be read until it has. The three commits it builds are unipad bb0505d (the two lock pins), UniXNU-qemu 995bfa7 (package/LegacyDisplayProbe.cpp, the counters) and GopFramebuffer ad73ad0 (NativeLegacyDisplay.cpp, the call sites) on branch feat/kick-path-emitter.** **WHAT THE MEASUREMENT WILL ANSWER: when the build lands and the guest is booted, native_legacy_kick_once_gate and native_legacy_kick_once_reason will say WHICH of kickOnce's two gates returns first and WHY. That converts the session's standing conclusion -- no swap is ever submitted, so validateSwap never runs -- from an inference into a measurement, or refutes it. It will NOT render a frame, install an IPA, or touch any other PRD acceptance criterion; those still have no evidence at all.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -19241,6 +19241,82 @@ Windows/real-guest: **none this interval -- the probe could not run because the 
 is absent.**
 
 Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty eighth, addendum DL): task #36's emitter is written, committed, pinned and dispatched -- and the first dispatch failed in 13 seconds on a pin I had not moved
+
+## The code, and it is small
+
+`kickSwapQueue` and `kickOnce` both returned without recording which gate fired, so
+"no swap was ever submitted" was an inference from absent counters.  Both now report:
+
+    kickSwapQueue -> gate 0 (the loop ran) or 1 (re-entered while already kicking)
+    kickOnce     -> gate 1 with a reason naming the sub-condition that fired
+                    (1 not enabled, 2 already transferred, 3 no logicalPM,
+                     4 no bootMapping, 5 not primary)
+                    gate 2 with reason 6 (no pending request) or 7 (failed validation)
+                    gate 0 when both gates were passed
+
+Counters and observers live in `LegacyDisplayProbe.cpp` beside the existing transfer and
+prepare observers, inside the file's existing `extern "C" {` block at line 74, so the
+driver's `extern "C"` declarations link the same way the other eleven do.
+
+13 lines changed in the driver, 22 in the probe.  **No behaviour change**: every call site
+is on a path that already returned.
+
+## The first dispatch, and the failure was mine
+
+Run `42037155785` failed in **13 seconds**:
+
+    ##[error]device_commit '995bfa7...' != sources.lock.json device_repo.commit '9782ddf6...'
+
+I had bumped the `drivers/NativeMobileDisplay` submodule pin and forgotten that the lock
+**also** pins `device_repo.commit` separately.  Every downstream error -- "no allowlisted
+payload artifact", "no staged directory", "no boot inputs found" -- was a consequence of
+that refusal, not a build failure.  The build never compiled anything.
+
+Fixed by bumping `device_repo.commit` from `9782ddf6` to `995bfa7` as well, and noting in
+the lock why.  Both pins and both `commit`/`gitlink_commit` fields now agree.
+
+## The second dispatch, and where it stands
+
+Run **`42037559769`** is `in_progress` with no errors, which means it passed the input
+validation that refused the first one.  It has not finished; the macOS build takes roughly
+twenty minutes, and the emitter's measurement cannot be read until it has.
+
+The three commits it builds:
+
+    unipad                      bb0505d   the two lock pins
+    UniXNU-qemu                 995bfa7   package/LegacyDisplayProbe.cpp (the counters)
+    GopFramebuffer              ad73ad0   NativeLegacyDisplay.cpp (the call sites)
+                                 on branch feat/kick-path-emitter
+
+## What the measurement will answer, and what it will not
+
+When the build lands and the guest is booted, `native_legacy_kick_once_gate` and
+`native_legacy_kick_once_reason` will say **which** of `kickOnce`'s two gates returns
+first, and **why**.  That converts the session's standing conclusion -- no swap is ever
+submitted, so `validateSwap` never runs -- from an inference into a measurement, or
+refutes it.
+
+It will not render a frame, install an IPA, or touch any other PRD acceptance criterion.
+Those still have no evidence at all.
+
+## Status
+
+Windows/real-guest: **none this interval -- the build is still running and the guest has
+not been booted.**  The emitter is built but unmeasured.
+
+Build: dispatched, `42037559769`, in progress.
 
 Onsite: N/A.
 
