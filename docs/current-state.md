@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty fifth, addendum CO). THE HEADLINE is **THE CRYPTEX OMAP TREE ROOT IS LOCATED, ITS ENTRY COUNT IS NOT, AND HERE IS THE HANDOFF**. The SystemOS cryptex is a raw APFS container with no wrapper: NXSB at 32, nx_block_size 4096, nx_block_count 806,400 (= file size / 4096 exactly), nx_omap_oid 782662. With the object type read at +0x18 (a qword whose high half is flag bits), validated against block 0 as the known-value control: block 0 = 0x01 NX_SUPERBLOCK, block 782662 = 0x0B OMAP, block 782663 = 0x02 BTREE. The omap's own om_tree_oid (+0x30) is 782663, so the chain superblock -> omap -> btree root is located and internally consistent, and the btree root reads btn_flags=0x0007 and btn_level=0 -- a root leaf node, exactly right for an omap tree root. **NOT VERIFIED, and it is the next thing to check: the entry count. btn_nkeys reads as 1, which is wrong for a container omap, and my "TOC" read was invalid -- +0x2C is btn_table_space (a uint16), not the TOC's location. So do not trust nkeys=1.** **THE HANDOFF: task #38 needs names for the 181 original-family display-vtable slots, which need the IOMobileFramebuffer binary, which is not on the OS root volume (verified twice with a sound control) and is presumably in this cryptex or the IPSW's kernelcache.im4p. The cryptex's container level is now solved: BASE=0, block_size=4096, omap at block 782662, btree root at 782663. Resume by repointing local-private/tmp/enumerate-launchd-jobs.py at 044-76034-038.dmg with the object type read at +0x18 and masked with 0xFF, validated against block 0 yielding 0x01 -- that walker already recovers 373 plists from the OS volume's catalog nodes.** **WHAT MUST NOT BE REPEATED: three corrections this interval came from verifying a reading against a field, a boot, or a document without first proving the instrument on a known answer. Block 0 is the control for the cryptex; a known-present record is the control for a console channel; a named process in its own sample is the control for a pid.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty seventh, addendum CQ). THE HEADLINE is **THE TWO CLAIMS I WAS ABOUT TO RECORD ARE BOTH WRONG -- THE AUTHORITATIVE HEADER WAS IN THE REPO ALL ALONG, AND THE VOLUME OID MATCHES**. After CO I measured the omap tree root once more, drafted the result as an addendum CP, then checked the premise before recording it -- and the check refuted it, so CP was never appended. The draft said btn_table_space = 0 cannot be right and that om_count reading 0 meant the omap read had failed a control. **BOTH WERE WRONG. btn_table_space is not a uint16; it is `struct apfs_nloc { __le16 off; __le16 len; }` -- I read the `off` half and stopped, and the `len` half is 448, a perfectly good TOC size for a 4096-byte node. There was never a zero. And there is NO om_count field in apfs_omap_phys; the field at +0x24 is om_snap_count, and zero is the CORRECT value for a container omap. I invented a field, read zero, and called the zero a control failure.** **THE ROOT IS THE SAME ONE A FOURTH TIME: I derived struct offsets by hand instead of reading the definition. The authoritative header was in this repository the whole time at local-private/tmp/apfsprogs/src/include/apfs/raw.h -- apfs_omap_phys at raw.h:94-105, apfs_omap_val at raw.h:122-126, apfs_nloc at raw.h:152-155, apfs_btree_node_phys at raw.h:177-187, apfs_nx_superblock at raw.h:952 with nx_fs_oid at raw.h:985. THE LESSON IS NOW SHARPER THAN "prove the instrument": for a documented on-disk format the definition IS the instrument, and hand-deriving offsets is guessing.** **MEASURED AGAINST THE AUTHORITATIVE STRUCT: block 782662's omap_phys matches field for field (om_flags=1, om_snap_count=0, om_tree_type=0x40000002, om_snapshot_tree_type=0x40000002, om_tree_oid=782663, om_snapshot_tree_oid=0), so the draft's "this read failed a control" is withdrawn. Block 782663's btree_node_phys gives btn_flags=0x0007, btn_level=0, btn_nkeys=1, btn_table_space {off=0, len=448}, btn_free_space {off=32, len=3488}; with apfsprogs' own formulas (apfsck/btree.c:338-340) toc=0x38, key=0x1f8, data area [0x1f8, 0x1000). TOC[0] = {k=0x10, v=0x20}, and the only reading that puts both in range is relative to the key-area start, giving a key at 0x208 of oid=1026, xid=14.** **AND THE CONTAINER NAMES THE VOLUME DIRECTLY, WHICH CONFIRMS THE KEY INDEPENDENTLY: nx_fs_oid[100] at +0xB8 has exactly ONE non-zero entry, fs[0] oid = 1026 -- and the omap key I read independently is oid = 1026. That exact match between two structures read by two different routes confirms the TOC is at 0x38, the key area at 0x1f8, and the kvoff k/v are relative to the key-area start. It also says the container has exactly one volume, virtual oid 1026, which is why om_snap_count is 0 and one omap entry is the right count.** **STILL NOT ESTABLISHED, and now exactly one thing: the omap VALUE's target. apfs_omap_val is confirmed at raw.h:122-126 as {u32 ov_flags; u32 ov_size; u64 ov_paddr} so the layout is not in doubt; the only non-zero 16 bytes below the key are at 0x1f8 giving ov_flags=0x0010ffff (not a valid mask), ov_size=0, ov_paddr=13 -- and BLOCK 13 IS TYPE 0x0C CHECKPOINT_MAP, NOT 0x0D FS. The TOC says v=0x20, pointing at 0x218, which is all zeros. The chain is verified container -> omap -> tree root -> TOC -> KEY and stops at the value.** **TWO SCANS NOW RECORDED AS INSTRUMENT FAILURES: enumerating omaps by the object-type byte at +0x18 gives 1600 hits of which 1592 are FALSE POSITIVES (that byte is validated only on blocks 0, 782662, 782663); and enumerating by "+0x30 points at a btree root" gives 152 hits whose +0x20..+0x2c words are mostly ASCII strings (Instrook, ProtocolCount, WEAKDAY_SPEAK, /rnkmk, entnatHlahtlUa). Only FIVE blocks carry the full 5-word omap signature and 782662 is one -- the others (4538, 4546, 6050, 782654) are unexamined. So the correct instrument is the 5-word signature, not either scan alone.** **THE RESUME PATH: scan for a block whose +0x20 is the APSB magic and whose +0x18 type is 0x0D FS (my earlier scan covered only blocks 0..64 and found none, which is NOT a negative about the container) -- that block is the volume superblock ov_paddr should name. Then read apfs_superblock's apfs_root_tree_oid and apfs_omap_oid from raw.h, again by reading the struct rather than deriving it. The OS volume's walker (local-private/tmp/enumerate-launchd-jobs.py) already recovers 373 plists from 044-76040-038.raw and repointing it at this container is the shortest path to IOMobileFramebuffer.framework.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17336,6 +17336,164 @@ own sample is the control for a pid.
 
 Windows/real-guest: **none this interval -- everything above is a read of the
 cryptex file's own objects.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty seventh, addendum CQ): the two claims I was about to record are both wrong -- the authoritative header was in the repo all along
+
+## The error, and it is the same one a fourth time
+
+After addendum CO I measured the omap tree root once more, drafted the result as an addendum CP, and then **checked the premise before recording it -- and the check refuted it.**  CP was therefore never appended; what follows is the correction of a claim that exists only in that draft.
+
+The draft said two things, and **both were wrong**:
+
+1. *"`btn_table_space = 0` cannot be right ... either block 782663 is not the omap's
+   btree, or the struct offsets are still wrong."*
+2. *"`om_count` reads 0 ... so `om_tree_oid = 782663` comes from a struct read that has
+   already failed one control."*
+
+**`btn_table_space` is not a `uint16`.  It is a `struct apfs_nloc { __le16 off;
+__le16 len; }`.**  I read the `off` half and stopped.  The `len` half is **448**, which
+is a perfectly good TOC size for a 4096-byte node.  There was never a zero.
+
+**And there is no `om_count` field in `apfs_omap_phys` at all.**  The field at `+0x24`
+is `om_snap_count`, and **zero is the correct value for a container omap**.  I invented
+a field, read zero, and called the zero a control failure.
+
+Both errors have one root, and it is the fourth instance of the same root this
+interval: **I derived struct offsets by hand instead of reading the definition.**  The
+authoritative header was in this repository the entire time:
+
+    local-private/tmp/apfsprogs/src/include/apfs/raw.h
+
+`struct apfs_omap_phys` (raw.h:94-105) and `struct apfs_btree_node_phys`
+(raw.h:177-187), with `struct apfs_nloc` at raw.h:152-155.  Everything the draft needed was
+there.  **The lesson is now sharper than "prove the instrument": for a documented
+on-disk format, the definition is the instrument, and hand-deriving offsets is
+guessing.**
+
+## What the authoritative structs give, measured
+
+`apfs_omap_phys` at block **782662**, field by field against raw.h:
+
+    +0x20  om_flags               1            OK
+    +0x24  om_snap_count          0            CORRECT for a container, not an error
+    +0x28  om_tree_type           0x40000002   physical btree -- OK
+    +0x2c  om_snapshot_tree_type  0x40000002   physical btree -- OK
+    +0x30  om_tree_oid            782663       -> block 782663
+    +0x38  om_snapshot_tree_oid   0
+
+**Every field matches the authoritative struct.**  The draft's claim that this read
+"failed a control" is withdrawn.
+
+`apfs_btree_node_phys` at block **782663**, with apfsprogs' own formulas
+(apfsck/btree.c:338-340, `toc = sizeof(node) + table_space.off`,
+`key = toc + table_space.len`):
+
+    btn_flags         0x0007   ROOT | LEAF | FIXED_KV_SIZE
+    btn_level         0
+    btn_nkeys         1
+    btn_table_space   off=0  len=448
+    btn_free_space    off=32 len=3488
+    btn_key_free_list off=0  len=16
+    btn_val_free_list off=16 len=16
+
+    toc = 0x38 + 0    = 0x38      (448 bytes, 112 fixed-KV slots)
+    key = 0x38 + 448  = 0x1f8     (data area [0x1f8, 0x1000), 3592 bytes)
+
+`TOC[0]` reads `{k=0x10, v=0x20}`, and the **only** reading that puts both inside the
+data area is **relative to the key-area start**:
+
+    key   at 0x1f8 + 0x10 = 0x208 :  oid = 1026, xid = 14
+    value at 0x1f8 + 0x20 = 0x218 :  all zeros
+
+**The key reads plausibly and non-trivially** -- oid 1026, xid 14, both well-formed.
+So the TOC is located and the omap tree root is readable.  **The draft's "the TOC
+control fails" is withdrawn.**
+
+## And the container names the volume directly, which confirms the key independently
+
+`apfs_nx_superblock` (raw.h:952) carries `nx_fs_oid[APFS_NX_MAX_FILE_SYSTEMS]` at
+`+0xB8` (raw.h:985).  Read from block 0:
+
+    nx magic @32       NXSB
+    nx_omap_oid        782662
+    nx_fs_oid[100]     1 non-zero ->  fs[0] oid = 1026
+    nx_xp_desc_base    30064771072
+    nx_xp_data_base    0
+
+**`nx_fs_oid[0] = 1026`, and the omap key I read independently is `oid = 1026`.**  That
+is an exact match between two different structures read by two different routes, and it
+confirms three things at once: the TOC is at `0x38`, the key area is at `0x1f8`, and the
+kvoff `k`/`v` are **relative to the key-area start**.  It also says the container has
+**exactly one volume**, virtual oid 1026 -- which is why `om_snap_count` is 0 and why
+one omap entry is the right count.
+
+So the draft is wrong at every level, and the route is further along than CO, CL or
+CN ever established.
+
+## What is still NOT established, and it is now exactly one thing
+
+**The omap value's target.**  `apfs_omap_val` is confirmed at raw.h:122-126 as
+`{ u32 ov_flags; u32 ov_size; u64 ov_paddr; }` -- my reading used exactly that layout,
+so the layout is not in doubt.  The only non-zero 16 bytes below the key are at `0x1f8`:
+
+    ff ff 10 00 00 00 00 00  0d 00 00 00 00 00 00 00
+    ov_flags = 0x0010ffff   ov_size = 0   ov_paddr = 13
+
+`ov_flags = 0x0010ffff` is not a valid flag mask and **block 13 is type `0x0C`
+CHECKPOINT_MAP, not `0x0D` FS**, so this is not the volume superblock and the value is
+not yet correctly located.  The TOC says `v = 0x20`, which points at `0x218` -- and that
+is all zeros.
+
+So the chain is verified container -> omap -> tree root -> TOC -> **key**, and stops at
+the value.  That is much further than the draft claimed, which was that the tree root
+itself was unreadable.
+
+## The two scans that are now recorded as instrument failures
+
+Worth writing down because both produced confident-looking numbers:
+
+- **Enumerating omaps by the object-type byte at `+0x18` gives 1600 hits, of which
+  1592 are false positives.**  That byte is validated only on blocks 0, 782662 and
+  782663; across the volume it is not a calibrated discriminator.
+- **Enumerating omaps by "the qword at `+0x30` points at a btree root" gives 152 hits,
+  of which the `+0x20..+0x2c` words of most are ASCII strings** (`Instrook`,
+  `ProtocolCount`, `WEAKDAY_SPEAK`, `/rnkmk`, `entnatHlahtlUa`).  Only **five** blocks
+  carry the full 5-word omap signature, and 782662 is one of them -- the other four
+  (4538, 4546, 6050, 782654) are unexamined.
+
+So the correct instrument is the **5-word signature**, not either scan alone.  Record
+that before anyone reuses either.
+
+## The resume path, which is now short
+
+1. **Find the volume superblock by its magic, not by the type byte.**  Scan for a block
+   whose `+0x20` is `APSB` (the volume superblock's magic) and whose `+0x18` type is
+   `0x0D` FS.  My earlier scan covered only blocks 0..64 and found none, which is not a
+   negative about the container.  That block is the value `ov_paddr` should name.
+2. Then read `apfs_superblock`'s `apfs_root_tree_oid` and `apfs_omap_oid` from raw.h --
+   again by reading the struct, not deriving it -- and the volume's file tree becomes
+   reachable.
+3. The OS volume's walker (`local-private/tmp/enumerate-launchd-jobs.py`) already does
+   the equivalent walk on `044-76040-038.raw` and recovered 373 plists; repointing it at
+   this container with the geometry above is the shortest path to
+   `IOMobileFramebuffer.framework`.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
 
 Build: none this interval.
 
