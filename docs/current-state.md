@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval seventy-eighth, addendum AT). THE HEADLINE is **TWO RED TESTS, TWO DIFFERENT ATTRIBUTIONS**, and PRD requirement 6 is the reason the distinction matters. The full suite came back red on two tests. **(1) was mine and the gate was right to catch it**: committing the wide-mode lifter to `unipad/qemu-metal-bridge-stubs` moved `vendor/UniXNU-qemu` to 9a784bf off the lock's pin 9782ddf, and the lock names the last commit a build was VERIFIED against. Resolved without weakening anything: the work now lives on `unipad/qemu-metal-bridge-stubs-wide` at 9a784bf and the pinned branch is back at 9782ddf with a clean tree. **Worth noting: this is a different test reading a different checkout than the one AR recorded -- test_p0p1_gate_main reads local-private/upstream/UniXNU-qemu and labels it vendor/UniXNU-qemu, while this one really reads vendor/UniXNU-qemu. Two tests, two checkouts, one label, which is why fixing the mirror did not fix this one.** **(2) is an environment problem, now measured rather than argued**: QMP `pmemsave` returns ENOENT for a file whose parent directory exists, because the pinned QEMU cannot open a path containing the non-ASCII characters in this host's account name -- the same test passes unchanged under `--basetemp=.scratch/pt-ascii`. Fixed in the test with `_qemu_facing_dir()`, which uses pytest's `tmp_path` when it is ASCII and otherwise the repository's untracked `.scratch/`; nothing about the measurement changes, only the spelling of the path. **The pre-flight and its mutation suite now say SKIPPED rather than PASSED when the file under test has no wide mode** -- with the checkout back on the narrow-only pin, the wide cases were a green check on a mode the binary does not have, which is the same defect as a green check on a broken binary. Six of seven mutations caught, the seventh inapplicable and saying so. **Also: F: was at 6.2 GB and C: at 5.9 GB; reclaimed 3.0 GB of stale `*-input/unixnu-out` build output and 3.3 GB of stale pytest temp, by name, keeping every log and manifest.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is task #33.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eightieth, addendum AV). THE HEADLINE is **RUNNINGBOARDD CARRIES THE ENTITLEMENT, AND THE TRUST-CACHE INSTRUMENT DOES NOT WORK YET**. Addendum AU redirected task #33 out of launchd to whatever receives `process-type = 256`. That receiver is `/usr/libexec/runningboardd`, extracted this interval (72,912 bytes, Mach-O 64, 2 chunks) with a full code signature -- and **its entitlements blob contains both `com.apple.private.spawn-driver` and `com.apple.private.xpc.allowed-launch-types`**, plus 33 others. So the binary that receives launchd's request is signed with exactly the entitlement it needs. **The obvious follow-up -- does the guest's kernel GRANT them, i.e. is the cdhash in the trust cache -- is a broken instrument and is recorded as one**: neither the staged `kernel.macho.trustcache` nor `static-trustcache.bin` contains the cdhash of launchd, configd or runningboardd, and **the control refutes the result, because launchd demonstrably RAN** (`exec.seen n=1 comm=launchd` is in the capture this analysis rests on). Four cdhash variants were tried; the static cache's structure was decoded exactly (24-byte header, 2478 entries of [20-byte hash][4-byte flags], reproducing its length) so the cache parses and the hashes are simply not the ones computed. **The hypothesis "runningboardd runs without spawn-driver and so cannot drive App spawns" is still open, still plausible, and still untested** -- and note it may be moot: if the guest's AMFI is not enforcing, entitlements come from the on-disk signature and the cache is irrelevant. **What is left of task #33 is now bounded and no longer depends on the cache: read what runningboardd does with `process-type = 256`, in a 72,912-byte binary, with the two tools already built and validated.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -12922,3 +12922,187 @@ Onsite: N/A.
 
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is
 task #33.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (seventy-ninth, addendum AU): the flag leaves as `process-type`, and the gate is across the message
+
+## Where addendum AS's redirect landed
+
+AS ended: bit 12 of `job+0x538` is write-only in launchd's `__text`, so its
+consumer is not a branch in this binary, and the stronger candidate is that the
+flag leaves the process in a marshalled spawnattr -- supported by launchd
+carrying the string
+
+    failed to marshall spawnattrs: offset = %u, left = %lu, expected = %lu
+
+**That candidate is now confirmed, and the exit has a name.**
+
+At `0x100020d90` launchd serialises a job into an XPC dictionary.  The fields it
+writes, in order:
+
+    key                source
+    0x10005d0c6        a string (the job's label)
+    'process-type'     [job + 0x358]      <-- the spawn-type CODE
+    'keep-alive'       tst [job + 0x538], #0xc
+    0x10005d0e6        ubfx [job + 0x538], #4, #1
+    0x10005d0f2        ubfx [job + 0x538], #8, #1
+    0x10005d106        [job + 0x164]
+
+**`process-type` carries the raw code, and for an `App` job that code is
+`0x100` = 256.**  So what crosses the message is not a flag bit at all -- it is
+the integer 256, under a key the receiver must interpret.  Bit 12 was a marker
+inside launchd; the thing that matters is the code it guards.
+
+This is the whole of AS's redirect, answered: the consumer is not a branch in
+launchd because the value is not consumed in launchd.
+
+## What this says about where the gate is
+
+`process-type = 256` is sent to something else.  On iOS that something is the
+spawn driver, and the spawn driver is what decides whether an application job
+runs.  launchd's part -- parse the plist, classify the job, marshal the request
+-- is done and measured.  The refusal, if there is one, is on the far side.
+
+Two consequences for task #33, and the second is the useful one:
+
+* **the search moves out of launchd.**  Reading more of `launchd`'s branches
+  cannot find a consumer that is not in `launchd`;
+* **the target is named.**  `/usr/libexec/runningboardd` is on the same volume,
+  is extractable with the decoder built this interval, and is a far smaller
+  binary than launchd.  The question is what it does with `process-type = 256`.
+
+## A lead that was chased and demoted, with the reason
+
+launchd also carries `EmbeddedHomeScreen` and
+
+    Service tried to claim home screen from: %s
+
+and the claim function at `0x100007b64` is fully readable:
+
+    ldrb w8, [x0, #0x53b]          ; bit 5 = "is the embedded home screen"
+    tbz  w8, #0x5, ->return        ; not one: nothing to claim
+    ldr  x8, [x1, #0x48]           ; who holds the home screen now
+    cbz  x8, ->claim               ; nobody: take it
+    ...  log "Service tried to claim home screen from: %s" at severity 3
+    and  x8, x8, #0xffffffffdfffffff   ; CLEAR bit 34 of the claimant's flags
+
+So a second home-screen service is refused and has bit 34 cleared.  That is a
+real mechanism and bit 34 is a real consumed bit -- which is worth recording,
+because AS's "write-only" reading was about bit 12 and must not be generalised
+to the field.
+
+**But it cannot be the common gate.**  Of the seven `App` jobs, only three carry
+`EmbeddedHomeScreen` (SpringBoard, checkerboard, ClarityBoard).  **The other
+four -- TextInput.kbd, assistivetouchd, bluetoothuiservice, fullkeyboardaccess --
+carry no such key and also never spawned.**  A mechanism that requires the key
+cannot explain jobs that do not have it.  The common factor is the `App` spawn
+type, which is what `process-type = 256` carries.
+
+The load order also argues against it: SpringBoard's plist is opened at n=239,
+checkerboard's at n=384 and ClarityBoard's at n=394, so SpringBoard claims
+first and wins.  Recorded so the lead is not re-chased from scratch.
+
+## Status
+
+Windows/real-guest: **host-side static analysis of launchd extracted from the
+volume the guest mounts.**  Nothing measured on the guest this interval.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven.  Task #33's next step
+is now concrete and bounded: extract `/usr/libexec/runningboardd` and find what
+it does with `process-type = 256`.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eightieth, addendum AV): runningboardd carries the entitlement, and the trust-cache instrument does not work yet
+
+## The receiver, extracted, and it is entitled
+
+`/usr/libexec/runningboardd` extracted with the decoder built this interval:
+**72,912 bytes, Mach-O 64, 2 chunks** -- and it carries a full code signature
+(LC_CODE_SIGNATURE, 23,200 bytes, SuperBlob magic `0xfade0cc0`, 5 blobs).
+
+Its **entitlements blob (type 0x5, 2,595 bytes) contains both keys that matter**:
+
+    com.apple.private.spawn-driver
+    com.apple.private.xpc.allowed-launch-types
+
+plus 33 others (`com.apple.private.memorystatus`,
+`com.apple.private.jetsam.modify-priority`, `com.apple.private.task_policy`,
+`com.apple.private.xpc.launchd.app-server`, `seatbelt-profiles`, ...).  So the
+binary that receives launchd's `process-type = 256` is **signed with the
+entitlement that lets it be the spawn driver**.  That is a real, measured fact
+and it is the reason this binary is the right target.
+
+CodeDirectory: version `0x20400`, hashType 2 (SHA-256), hashSize 32, 7 special
+slots, 131 code slots, codeLimit 72,640.
+
+## The instrument I could not make work, and the control that refuted it
+
+The obvious next question is whether the guest's kernel GRANTS those
+entitlements, which on XNU means the cdhash must be in the trust cache.  Two
+caches are on this host:
+
+    local-private/boot53/slot-lift-scratch/esp/EFI/UniXNU/Payloads/
+        kernel.macho.trustcache                     61,408 bytes
+    vendor/UniXNU/.cache/firmware/target-volumes/
+        static-trustcache.bin                       59,496 bytes
+
+**Neither contains the cdhash of `launchd`, `configd` or `runningboardd`.**  And
+that result is void, because of the control: **`launchd` demonstrably ran on the
+guest** -- `exec.seen n=1 comm=launchd source=XNU.__mac_execve` is in the very
+capture this analysis is built on -- so whatever the rule is, a binary that ran
+must satisfy it.  A check that says `launchd` is untrusted is not measuring the
+rule.
+
+Four cdhash variants were tried (whole CodeDirectory under SHA-1 and SHA-256,
+and CodeDirectory from `version` onward under both); none appears in either
+cache.  The static cache's structure was decoded -- 24-byte header
+(version 2, uuid `c0fb7965-...`, count 2478) then 2478 entries of
+`[20-byte hash][4-byte flags]`, which reproduces its length exactly -- so the
+cache parses and the hashes are simply not the ones being computed.
+
+**Recorded as a broken instrument, not as a finding.**  The hypothesis
+"runningboardd runs without `com.apple.private.spawn-driver` and therefore
+cannot drive App spawns" is still open, still plausible, and still untested.
+What would settle it is a cdhash that reproduces a known-present answer --
+launchd's -- and until one does, no conclusion may be drawn from either cache.
+
+## Where task #33 actually stands
+
+Settled and measured:
+
+* launchd parses the job, classifies it, and marshals
+  `process-type = <code>` into an XPC dictionary at `0x100020d90`; for an App
+  job the code is `0x100` = 256 (addendum AU).
+* `runningboardd` is the receiver and its signature carries both
+  `com.apple.private.spawn-driver` and
+  `com.apple.private.xpc.allowed-launch-types`.
+
+Open, and now the whole of it:
+
+* **does the guest grant those entitlements?**  The trust-cache route needs a
+  working cdhash first.  A second route exists and does not: if the guest's AMFI
+  is not enforcing, entitlements come from the on-disk signature and the cache
+  is irrelevant -- in which case the entitlement question is settled the other
+  way and the search moves to what runningboardd DOES with `process-type = 256`.
+* **what does runningboardd do with 256?**  It is 72,912 bytes and the same two
+  tools read it.  That is the next measurement, and it no longer depends on the
+  trust cache.
+
+## Status
+
+Windows/real-guest: **the entitlement list is a host-side read of the binary
+extracted from the volume the guest mounts.**  Nothing measured on the guest.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has
+still never spawned.**  THE HEADLINE is unchanged from AH
