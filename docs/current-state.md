@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred eighteenth, addendum CH). THE HEADLINE is **CF's PID-RESOLUTION CLAIM IS WITHDRAWN -- I CARRIED A PID ACROSS BOOTS, WHICH IS WHAT BS WARNED ABOUT**. CF read that fact 202 carries both `native_qemu_metal_owners = 1801675106 = b'back'` and `client_pid=74` and concluded they were "in the same measurement". **Fact 202's own text introduces `client_pid=74` as 第二次启动 -- the SECOND BOOT. The owners reading is from the first, so a pid from one boot cannot be carried onto a name from another. That is the exact error addendum BS recorded and I repeated three addenda later: I wrote the warning "pids are not stable across boots" and then violated it.** **THE HONEST STATUS OF FACT 202's client_pid=74 IS UNKNOWN -- that boot's process list was never captured. Independently, pid 74 is PerfPowerService in both boots where a named list exists, which is not evidence about fact 202's boot.** **WHAT SURVIVES IS BETTER GROUNDED THAN WHAT CF SAID: the byte decoding checks out (1801675106 = 0x6b636162, little-endian 62 61 63 6b = b'back'; big-endian would be b'kcab'), but the four-byte width is not what makes it decisive -- the symbol is `volatile char native_qemu_metal_owners[9][17]`. What makes it decisive is the invariant at QemuMetalAccelerator.cpp:158-161: `server = !strncmp(name,"backboardd",...)` and then the loop touches SLOT 0 AND NOTHING ELSE, every other process starting at slot 1. Slot 0 <==> backboardd. Fact 181 already recorded this on 2026-10-31; CF restated the conclusion without the ground.** **AND THE FRAGILITY: nothing in the value `back` distinguishes backboardd from backlightd -- a real daemon in backboardd's own MachServices. The disambiguation comes ENTIRELY from the slot-0 invariant, not from the bytes; the full 17-byte name is in the same symbol and was not read.** **AND "PIDS ARE NOT STABLE" IS STRONGER THAN CF CLAIMED: not two data points but two boots of the IDENTICAL kernel (both run 41980452867, both verifying sha256 d2c5a914), which makes the test stricter than across kernels. Of 72 pids in both, 59 keep the same name (82%) and 13 differ (18%), eleven of them xpcproxy -> real daemon, with the mechanism visible: run7 holds 25 xpcproxy pids, run8 holds 17, because xpcproxy is a per-request proxy launchd respawns constantly. Scope stated because it bounds the claim: these are the only two named process lists in the tree, so the figure is two boots -- enough to refute "pids are stable", not enough to quantify a rate.** **WHAT SURVIVES FROM CD, UNCHANGED: backboardd is a framebuffer client -- run8's C0, pid 58, 9 calls with 3 failures, refused on selectors 15, 29 and 57, no notification port, never selector 6. That measurement named its own process in its own sample and does not depend on any of this.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CF's headline is withdrawn.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred nineteenth, addendum CI). THE HEADLINE is **CF's INFERENCE FAILS TWICE, AND CH ONLY FIXED THE FIRST FAILURE**. CH withdrew CF's pid step because fact 202 puts the owners reading and `client_pid=74` in different boots. A teammate then found a second defect that survives even if the boot attribution is granted. **The two symbols are written by DIFFERENT USER CLIENTS ON DIFFERENT SERVICES: `native_qemu_metal_owners` at QemuMetalAccelerator.cpp:164, inside `AGXDeviceUserClient::start(IOService*)` (:151) -- the AGX / GPU Metal user client; `native_legacy_client_pid` at LegacyDisplayProbe.cpp:368, inside `native_legacy_client_enter(task_t,uint32_t)` -- the display's user-client interpose path. So "backboardd holds the Metal window" and "pid 74 is the framebuffer user client" are claims about different objects and neither implies the other. A process can hold the Metal slot and never open the framebuffer -- which run7 shows: pid 86 held a framebuffer client with ZERO calls while the Metal window was held elsewhere.** **SO CF's INFERENCE FAILS TWICE: different boots AND different client relationships. CH fixed the first and missed the second, and the second would have been enough alone. Same shape as the recorded ci-input-vs-lock-mismatch-was-silent -- a green comparison of two things that were never the same thing.** **AND THE POSITIVE CLAIM GOT STRONGER: the teammate's background grep found backlightd in ZERO process lists anywhere under local-private, so the one name sharing the `back` prefix is not merely ruled out by the slot-0 invariant -- it is not running in any captured boot.** **NET, AND IT IS A NARROW WITHDRAWAL: withdrawn is the single step "fact 202's client_pid=74 was backboardd" -- that pid comes from a boot whose process list was never captured, and even within a boot it could not have been matched to a Metal-owner reading. It stays UNKNOWN. STANDS and is directly measured: backboardd is the framebuffer client (run8's C0, pid 58, 9 calls / 3 failures, refused on 15/29/57, no notification port, never selector 6). STANDS: pids are not stable across boots (13 disagreements of 72 shared pids, identical kernel). STANDS, better grounded: backboardd holds the Metal window, via the slot-0 invariant and with backlightd absent from every captured process list.** **THE LESSON, which cost two addenda: I read a fact's summary, saw two numbers that looked like they belonged together, and built a bridge. The fact's own text separated them by a semicolon and a boot label, and the symbols turned out to be written by different drivers for different services. Two numbers in one document are not two numbers in one measurement -- and the check is to read the write sites, not the summary.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CF is now withdrawn correctly rather than partially.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16754,3 +16754,86 @@ Onsite: N/A.
 reached.  CF's headline is withdrawn: fact 202's `client_pid=74` is UNKNOWN, not
 resolved, and the reason is an error I had already written a warning about.**  THE
 HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred nineteenth, addendum CI): CF's inference fails twice, and CH only fixed the first failure
+
+## The second defect, and it is the fundamental one
+
+CH withdrew CF's step "fact 202's `client_pid=74` was backboardd" because fact 202
+puts the owners reading and that pid in **different boots**.  A teammate found a
+second defect that survives even if the boot attribution is granted outright.
+
+The two symbols are written by **different user clients on different services**:
+
+    native_qemu_metal_owners    QemuMetalAccelerator.cpp:164
+                                inside AGXDeviceUserClient::start(IOService*)  (:151)
+                                -- the AGX / GPU Metal user client
+
+    native_legacy_client_pid    LegacyDisplayProbe.cpp:368
+                                inside native_legacy_client_enter(task_t,uint32_t)
+                                -- the display's user-client interpose path
+
+So "backboardd holds the Metal window" and "pid 74 is the framebuffer user client"
+are claims about **different objects**, and neither implies the other.  A process can
+hold the Metal accelerator slot and never open the framebuffer at all -- which is
+exactly what run7 shows: pid 86 held a framebuffer client with **zero calls** while
+the Metal window was held elsewhere.
+
+**So CF's inference fails twice**: the readings come from different boots, *and* they
+measure different client relationships.  CH fixed the first and missed the second,
+and the second would have been enough on its own.
+
+This is the same shape as the recorded
+`ci-input-vs-lock-mismatch-was-silent`: a green comparison of two things that were
+never the same thing.  There the mismatch was input-versus-lock; here it is
+GPU-client-versus-display-client.
+
+## And the positive claim got stronger, from the other direction
+
+The teammate's background grep finished: **`backlightd` appears in zero process lists
+anywhere under `local-private`.**  So the one name sharing the `back` prefix is not
+merely ruled out by the slot-0 invariant -- it is not running in any captured boot.
+The "backboardd holds the Metal window" claim is better supported than four bytes can
+show, on two independent grounds.
+
+## Net, and it is a narrow withdrawal
+
+**Withdrawn:** the single step "fact 202's `client_pid=74` was backboardd".  That pid
+comes from a boot whose process list was never captured, and even within a boot it
+could not have been matched to a Metal-owner reading.  It stays **UNKNOWN**.
+
+**Stands, and is directly measured:** backboardd is the framebuffer client -- run8's
+C0, pid 58, 9 calls with 3 failures, refused on selectors 15, 29 and 57, no
+notification port, never selector 6.  That measurement named its own process in its
+own sample and depends on none of this.
+
+**Stands:** pids are not stable across boots -- 13 disagreements among 72 shared pids
+on two boots of the identical kernel.
+
+**Stands, better grounded:** backboardd holds the Metal window -- via the slot-0
+invariant at `QemuMetalAccelerator.cpp:158-161`, with `backlightd` absent from every
+captured process list.
+
+## The lesson, which is the recorded one and cost me two addenda
+
+I read a fact's summary, saw two numbers that looked like they belonged together, and
+built a bridge between them.  The fact's own text separated them by a semicolon and a
+boot label, and the two symbols turned out to be written by different drivers for
+different services.  **Two numbers in one document are not two numbers in one
+measurement** -- and the check is to read the write sites, not the summary.
+
+## Status
+
+Windows/real-guest: **none this interval -- the correction comes from reading fact
+202's own text and the two write sites in the drivers.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  CF is now withdrawn correctly rather than partially: the pid step fails on
+two independent grounds, and everything else in it stands.**  THE HEADLINE is
+unchanged from AH
