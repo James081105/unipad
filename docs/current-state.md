@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty sixth, addendum CZ). THE HEADLINE is **THE STALE-XID HYPOTHESIS IS DEAD, AND THE NON-LEAF INVENTORY SHOWS A LEVEL-3 ROOT WITH ONLY LEVEL-1 CHILDREN**. CY proposed the omap lookup picks a stale entry when an oid appears at several xids. Three omap leaves were enumerated in full: leaf 781118 (oids 3609..3720, 112 keys), leaf 782659 (oids 1214..1284, 70 keys) and leaf 782022 (oids 4505..4616, 112 keys). **ZERO DUPLICATE OIDS AND EVERY ENTRY AT xid 13, so there is no stale entry to pick and the lookup is not the problem. CY's proposed cause is dead.** **AND THE NON-LEAF INVENTORY IS THE REAL FINDING: the mapped blocks' levels are {0:67, 1:2, 3:1} in leaf 782659, {0:110, 1:2} in leaf 781118 and {0:111, 1:1} in leaf 782022. The only non-leaf, non-root blocks in the whole volume are at LEVEL 1: oid 1216 -> 770808 flags 0x0019 LEVEL 3 (the catalog root), oid 1278 -> 770871, oid 1279 -> 770872, oid 3635 -> 781144, oid 3697 -> 781206 and oid 4565 -> 782082, all flags 0x0018 LEVEL 1. THERE ARE NO LEVEL-2 NODES ANYWHERE, so a level-3 root's children cannot be level 2 because there are none to be. The level field is not behaving as a plain depth counter, and CY's second hypothesis -- that the root's btn_level is misread -- is the only one left standing.** **WHAT THE TREE'S SHAPE ACTUALLY IS: the catalog's own oid range is 1214..1284 and within it there is one level-3 root, two level-1 nodes and sixty-six level-0 leaves -- a three-tier tree whose root reports level 3 instead of 2. Combined with the catalog root's two child references resolving to level-0 leaves (oids 3719 and 3720), the consistent reading is that the root's children ARE leaves, the tree is two tiers, and btn_level is off by one or means something else. Under that reading 781228/781229 ARE catalog leaves and the {16-byte key, 35-byte value} shape is shared by more than one tree.** **THAT IS WEAKER THAN CX'S AND CONTRADICTS IT: CX claimed the 16/35 shape belongs to the extentref and snap_meta trees and therefore that 781228/781229 are not catalog leaves. This interval's inventory does not support that -- the extentref root (oid 4542) maps to a level-0 leaf too, exactly as the catalog's children do, so "resolves to a level-0 leaf" distinguishes nothing.** **SO THE OPEN QUESTION IS NARROWER THAN EITHER CX OR CZ STATED: is the {16-byte key, 35-byte value} shape the catalog's or another tree's? The decisive test is no longer about levels or omaps -- both are now clean -- but about the records. The catalog root's key area decoded private-dir as a DIR_REC under obj_id 1, so a catalog leaf must contain DIR_REC keys with type 9 in the top four bits; leaf 781228's 67 keys all read type 13. If the catalog's leaves hold DIR_RECs and 781228 holds none, 781228 is not a catalog leaf.** **THE NEXT ACTION: fix the leaf key parse using the root as the instrument, as CV did. The root's keys are 24 and 16 bytes and decode as apfs_drec_key (8 + 2 + name); the leaf's keys are 16 bytes starting with a constant qword. Find the key struct in raw.h whose length is 16 and whose first field is obj_id_and_type -- apfs_file_extent_key is 8 + 8 = 16 and is the obvious candidate, with the second qword being phys_block_num. Test it: if the leaf's second qword is a block number rising by 16384 per record, these are FILE_EXTENT records and the block is an extent-bearing tree, not the catalog.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty seventh, addendum DA). THE HEADLINE is **THE LEAF RECORD FORMAT IS MEASURED IN FULL AND REMAINS UNIDENTIFIED -- AND 781228 IS NOT A CATALOG LEAF**. CZ proposed apfs_file_extent_key for the 16-byte leaf keys; raw.h:580-583 defines it as {apfs_key_header hdr; __le64 logical_addr} = 16 bytes, the right length, but the measured second qword does not decode as a plain logical address. **THE RECORDS MEASURED IN FULL: leaf 781228 has 67 records, each a 16-byte key of a CONSTANT first qword 0xd000000000000061 plus a second qword stepping by exactly 0x4000 = 16384 bytes (range 0x0100000001218000..0x0100000001320000), and a 35-byte value of a CONSTANT 3-byte prefix 04 00 20 plus 32 bytes that are distinct in all 67 of 67 records.** **WHAT THAT RULES IN AND OUT: it RULES OUT A FILE CATALOG -- a catalog leaf's keys must include names, as the root's own keys did decoding private-dir, and these carry no name and a constant first qword, so 781228 is not a catalog leaf. It RULES OUT apfs_file_extent_key as literally defined -- the second qword's low 32 bits do step by 16384, which is extent-like, but its high 32 bits are a constant 0x01000000 which a logical_addr should not carry. And it is CONSISTENT WITH A HASHED INDEX -- the node carries APFS_BTNODE_HASHED, each value holds 32 distinct bytes with a constant 3-byte prefix, the shape of a per-record hash, and combined with a constant key prefix and a stepping second field this looks like an allocated sequentially-addressed structure with a hash per record, not a name-keyed one.** **SO THE ANSWER TO THE QUESTION CX, CY AND CZ HAVE BEEN CIRCLING IS: 781228 IS NOT A CATALOG LEAF, AND THE CATALOG'S OWN LEAVES HAVE NOT BEEN FOUND. That is a negative result with a sound instrument and worth more than the three previous intervals' guesses -- the geometry is exact (67 x 16 = key area, 67 x 35 = value area, no remainder), the reader is validated, and the record shape simply is not a catalog's.** **THE NEXT ACTION CHANGES DIRECTION: stop trying to identify these leaves. The catalog root is known and its key area works, so enumerate its children properly rather than guessing their oids from a 40-byte value whose format is unconfirmed. Concretely, scan the omap for blocks whose btn_flags is 0x0019 (ROOT|HASHED|NOHEADER, non-leaf) -- there is exactly one in the volume, the catalog root at 770808 -- and for blocks whose flags are 0x0018 (non-leaf, level 1), of which there are five at oids 1278, 1279, 3635, 3697 and 4565. READ THOSE FIVE LEVEL-1 NODES' KEYS AND SEE WHETHER ANY DECODES AS A DIR_REC WITH A NAME. If one does, that node is in the catalog and its children are the catalog's leaves. That is a bounded five-block search with a decisive test and does not depend on the child-reference format at all.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18350,6 +18350,101 @@ length is 16 and whose first field is `obj_id_and_type`** -- `apfs_file_extent_k
 8 + 8 = 16 and is the obvious candidate, with the second qword being `phys_block_num`.
 Test it: if the leaf's second qword is a block number that rises by 16384 per record,
 these are FILE_EXTENT records and the block is an extent-bearing tree, not the catalog.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty seventh, addendum DA): the leaf record format is measured in full and remains unidentified
+
+## The candidate struct, and why it fits only partly
+
+CZ proposed `apfs_file_extent_key` for the 16-byte leaf keys.  Its definition
+(raw.h:580-583) is:
+
+    struct apfs_file_extent_key {
+        struct apfs_key_header hdr;      /* obj_id_and_type */
+        __le64 logical_addr;
+    } __packed;
+
+That is 8 + 8 = **16 bytes**, the right length.  But the measured second qword does not
+decode as a plain logical address, so the struct is only partly right.
+
+## The records, measured in full
+
+Leaf 781228, 67 records.  Every record has exactly this shape:
+
+    key (16 bytes)   61 00 00 00 00 00 00 d0 | 00 80 21 01 00 00 00 01
+                     ^ constant across all 67   ^ steps by 0x4000 per record
+
+    value (35 bytes) 04 00 20 | e7 33 a7 1d 9e dc e0 6e a1 f6 94 34 1e
+                      ^ constant   ^ 32 bytes, distinct in all 67 of 67
+
+    qword 0 of the key : 0xd000000000000061   constant, 67 of 67
+    qword 1 of the key : 0x0100000001218000 .. 0x0100000001320000
+                         steps of exactly 0x4000 = 16384 bytes
+    value prefix       : 04 00 20            constant, 67 of 67
+    value tail         : 32 bytes, 67 distinct of 67
+
+## What that rules in and what it rules out
+
+**Rules out a file catalog.**  A catalog leaf's keys must include names -- the root's own
+keys did, decoding `private-dir`.  These keys carry no name and a constant first qword,
+so this is not the volume's file catalog and **781228 is not a catalog leaf**.
+
+**Rules out `apfs_file_extent_key` as literally defined.**  The second qword's low 32
+bits do step by 16384, which is extent-like.  But its high 32 bits are a constant
+`0x01000000`, which a `logical_addr` should not carry.  So either the field is not
+`logical_addr`, or the key is not laid out as `{hdr, logical_addr}`.
+
+**Consistent with a hashed index.**  The node carries `APFS_BTNODE_HASHED`, and each value
+holds 32 distinct bytes with a constant 3-byte prefix -- the shape of a per-record hash.
+Combined with a constant key prefix and a monotonically stepping second field, this looks
+like an allocated, sequentially-addressed structure with a hash per record, not a
+name-keyed one.
+
+## The honest position
+
+**The leaf record format is now measured completely and is still unidentified.**  Every
+field is characterised -- constant or stepping, distinct or repeated -- and none of it
+matches a catalog record.  So the answer to the question CX, CY and CZ have been circling
+is: **781228 is not a catalog leaf, and the catalog's own leaves have not been found.**
+
+That is a negative result with a sound instrument, and it is worth more than the three
+previous intervals' guesses.  The geometry is exact (67 x 16 = key area, 67 x 35 = value
+area, no remainder), the reader is validated, and the record shape simply is not a
+catalog's.
+
+## The next action, and it changes direction
+
+Stop trying to identify these leaves.  The catalog root is known and its key area works.
+**The next action is to enumerate the catalog root's children properly rather than
+guessing their oids from a 40-byte value whose format is unconfirmed.**
+
+Concretely: the catalog root (oid 1216, block 770808) has 2 keys.  Its children are
+wherever its child references point, and the reference format is the one unconfirmed
+thing.  So instead, **scan the omap for blocks whose `btn_flags` is `0x0019`**
+(`ROOT|HASHED|NOHEADER`, non-leaf) -- there is exactly one in the volume, the catalog root
+at 770808 -- and for blocks whose flags are `0x0018` (non-leaf, level 1), of which there
+are five at oids 1278, 1279, 3635, 3697 and 4565.  **Read those five level-1 nodes' keys
+and see whether any decodes as a DIR_REC with a name.**  If one does, that node is in the
+catalog and its children are the catalog's leaves.
+
+That is a bounded, five-block search with a decisive test, and it does not depend on the
+child-reference format at all.
 
 ## Status
 
