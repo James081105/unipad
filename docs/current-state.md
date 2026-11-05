@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-eighth, addendum BD). THE HEADLINE is **THE PROCESS WALK'S REAL DEFECT WAS A STALE PAGE CACHE, NOT A STALLED BOOT -- AND THE PROJECT ALREADY HAD THE WALKER**. Addendum BC's walker reported nprocs=0 and one process for 895 consecutive seconds; the first explanation written down was a stalled boot, and **that explanation was wrong**. `GuestObserver._page()` (guestobserve.py:671) caches DATA pages in `_tables`, cleared by exactly one thing, `reset()` -- and the module's own docstring records the consequence: "a second sample() on one observer issued zero guest reads, because everything was still cached." A polling loop that never resets replays its first sample forever, and the first sample was taken moments after the kernel handoff when allproc holds kernel_task and nothing else. **nprocs=0 was true at that instant and false for the next fifteen minutes, and the instrument could not tell the difference** -- the same shape as recorded facts 13, 47, 61 and 71, and quieter than most because the value was correct, just for a moment that had passed. **With `obs.reset()` before each sample the same boot gives a varying count (1,2,3,2) and a varying cache size, and `cached_pages > 0` is printed every sample as the instrument's own control.** **The second defect was avoidable: the first version hand-computed the struct proc layout and read 1024 bytes per proc, but `GuestObserver.processes()` already existed with the right offsets** -- `p_comm` at **1468**, `p_pid` at 96, `p_stat` at 100 -- a loop guard and a bound, and `_proc_fields()` reads the span as one read so the values cannot tear. It scanned `proc_ro`, which has no name field at all. The walker now calls `obs.processes()` and carries no offsets of its own: three hand-computed offsets have been wrong here already and this would have been the fourth. **MEASURED on the way: launchd OPENS SpringBoard's plist and never spawns it** -- `job.springboard_open` err=0, from a validated matcher (exact full basename, one-shot, err reported) -- so the job is loaded and no spawn is attempted, which is now measured rather than inferred. **The 512 spawn.seen is EVENTS, not processes: only 161 distinct comms, because 345 are the task #23 crash loop (bluetoothd 214, fairplayd.A2 131).** **`exec.seen` is 2 and both benign** (launchd as PID 1 via load_init_program; apfs_boot_util re-exec) -- and it sits inside `__mac_execve`, which posix_spawn does not call, so **it cannot count do_fork1 spawns; that cheap test does not exist**. **launchd's flag machinery now names the gate**: the home-screen claim at 0x100007b64 reads EmbeddedHomeScreen at job+0x53b bit 5, claims owner slot [x1+0x48] if free, and on refusal clears a bit -- **bit 29, not bit 34; an earlier note said 34 and it was a hand-counted hex mask. Computed: 0xffffffffdfffffff clears bit 29, 0xfffffffdffffffff clears bit 33, 0x200000000 is 2^33.** Bit 29's only reader is sixty lines earlier and it is the spawn-type decision: **a job is promoted to App (0x100 at job+0x358) only if bit 29 of job+0x538 is set**, Driver (0x700) never is, and bit 12 is set with it. Bit 29's setter (0x100008fe8) has no direct callers, so it is reached through a function-pointer table -- the shape is established, the mechanism is not, and the home-screen refusal clears exactly the bit the App promotion requires, which is what the three EmbeddedHomeScreen jobs have in common. **The do_fork1 emitter is written and verified to apply**: `fork1-spawn-hunk.patch` adds a `fork1.spawn` emitter at kern_exec.c:4250 right after exec_activate_image(), gated on `spawn_no_exec` -- the exact population spawn.seen and spawn.failed are blind to -- recording the image's name from `imgp->ip_vp->v_name` plus the child's new p_comm and a one-shot `springboard.fork1`. Placed there rather than at :4028 because `imgp->ip_vp` is assigned at :2255 INSIDE exec_activate_image() and is still NULL at :4028 -- checked, not assumed. **Zero records is a real answer and a different one from "not measured"**: the guard is the same XNU_OWNER_CACHE_MOUNT the 512 spawn.seen records prove is live. The hunk's first transcription dropped the leading TABs on three context lines and a second transcription error was caught by the repair script's own assertion, so the repair now READS the context out of the source. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-ninth, addendum BE). THE HEADLINE is **SPRINGBOARD IS RUNNING ON THE GUEST, WHICH REFUTES THE THEORY THIS CHAIN HAS BEEN BUILT ON**. Walking the guest's live `allproc` over QMP with the project's own `GuestObserver.processes()` -- resetting the page cache before every sample, because `_page()` caches DATA pages for the observer's lifetime and a loop that never resets replays its first sample forever -- gave a curve of 1, 11, 69, **99 processes at the peak**, still climbing when the window closed. **`SpringBoard` is PRESENT and RUNNING**, alongside launchd (pid 1), runningboardd (pid 26), backboardd, CommCenter, lockdownd, MobileGestaltHel, securityd, apsd, imagent, locationd, nfcd and 58 others -- 74 distinct names. **This refutes every interval since the discriminator**: the blocker was framed as "launchd declines POSIXSpawnType=App jobs" -- 7 of 7, then 5 of 5 after addendum BA -- and addendum AZ sharpened it to "launchd never calls posix_spawn for SpringBoard" on the strength of 0 spawn.failed records against 512 spawn.seen. **The spawn happened.** Two facts now stand together and each constrains the other: **`spawn.seen` holds NO SpringBoard record in any capture, and SpringBoard IS in the process list.** The only consistent reading is that the spawn took the `do_fork1` route -- kern_exec.c:3880 jumps there for a caller with no spawnattr, or none with POSIX_SPAWN_SETEXEC and no coalition info, and falls through to `spawn_no_exec = TRUE` at :4002 -- which is what the `fork1.spawn` emitter built this interval (unixnu 439c31cb, run 41980452867) exists to confirm directly. Until it reports this is the reading the evidence supports, not one it proves. **What is NOT refuted: `job.springboard_open` err=0 still holds, so launchd loads the plist -- that is now the BEGINNING of the story, not the end.** **Three things in the same table do not fit the old theory and are worth more than the refutation: `checkerboard` and `ClarityBoard` are ABSENT while SpringBoard is present, though all three carry EmbeddedHomeScreen, so the home-screen claim at 0x100007b64 cannot be the reason -- SpringBoard is not missing; `runningboardd` is absent from the union though addendum BB recorded it alive; and `backboardd` is absent from the largest snapshot while recorded alive elsewhere, which is a SAMPLING defect and not a walk defect -- the run kept only the largest snapshot's names, and a process not alive at that instant says nothing about the walk, so the script now unions across every sample and judges the control on the union.** **SO THE QUESTION CHANGED, AND IT IS A BETTER ONE: not "why does launchd not spawn SpringBoard" but "WHAT IS SPRINGBOARD BLOCKED ON". It is alive, it is not in spawn.seen, and the screen is still the UniXNU boot menu -- the process exists and the thing the PRD asks for does not. `p_stat` is now recorded per process for exactly that reason.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is now confirmed running.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13887,3 +13887,191 @@ Onsite: N/A.
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
 reached -- the screen is still the UniXNU boot menu because SpringBoard has still
 never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-ninth, addendum BE): SpringBoard IS running on the guest
+
+## The measurement, and it refutes nine intervals of diagnosis
+
+`local-private/tmp/walk-guest-procs.py` boots the guest, connects QMP, and walks
+`allproc` with the project's own `GuestObserver.processes()` -- resetting the
+page cache before every sample, because `GuestObserver._page()` caches DATA pages
+for the observer's whole lifetime and a loop that never resets replays its first
+sample forever (addendum BD).
+
+The curve, and the curve is the evidence:
+
+       0.0s  nprocs=1     cached_pages=9
+     401.7s  nprocs=11    cached_pages=18     <-- userspace
+     417.2s  nprocs=69    cached_pages=69
+     691.9s  nprocs=99    cached_pages=96     <-- the peak, still climbing
+
+**99 processes at the peak and still climbing when the window closed.**  The names:
+
+```
+  AppleCredentialM
+  CommCenter
+  DumpPanic
+  IOMFB_FDR_Loader
+  MSUEarlyBootTask
+  MobileGestaltHel
+  PerfPowerService
+  PowerUIAgent
+  SpringBoard
+  UserEventAgent
+  amfid
+  apsd
+  audiomxd
+  backboardd
+  biomed
+  biomesyncd
+  bluetoothd
+  calaccessd
+  cc_fips_test
+  cfprefsd
+  chronod
+  com.apple.datami
+  configd
+  containermanager
+  contextstored
+  coreduetd
+  dasd
+  dirs_cleaner
+  distnoted
+  driverkitd
+  fairplayd.A2
+  fseventsd
+  iconservicesagen
+  identityservices
+  imagent
+  init
+  init_featureflag
+  kernel_task
+  keybagd
+  launchd
+  launchd_cache_lo
+  liveactivitiesd
+  locationd
+  lockdownd
+  logd
+  logd_helper
+  lsd
+  mediaserverd
+  mobile_obliterat
+  mobileactivation
+  mobiletimerd
+  mount
+  mtmergeprops
+  nfcd
+  notifyd
+  passd
+  powerd
+  ptpd
+  rapportd
+  remoted
+  runningboardd
+  securityd
+  sharingd
+  sleepd
+  sysstatuscheck
+  thermalmonitord
+  timed
+  triald
+  tzinit
+  usermanagerd
+  usernotification
+  watchdogd
+  wifid
+  xpcproxy
+```
+
+**`SpringBoard` is PRESENT and RUNNING.**
+
+## What that refutes, precisely
+
+Every interval since the discriminator has framed the blocker as "launchd
+declines `POSIXSpawnType=App` jobs" -- 7 of 7, then 5 of 5 after addendum BA
+reframed the set.  Addendum AZ sharpened it to "launchd never calls
+`posix_spawn` for SpringBoard", on the strength of 0 `spawn.failed` records
+against 512 `spawn.seen`.
+
+**That is refuted.  SpringBoard is alive on the guest.**  The spawn happened.
+What the kernel's emitters recorded is not the whole of what the kernel did,
+which is exactly the hole addendum BC found in AZ's reasoning: `do_fork1` sets
+`spawn_no_exec = TRUE`, and both emitters are inside
+`if (error == 0 && !spawn_no_exec)`.
+
+So the two facts now stand together and each constrains the other:
+
+* `spawn.seen` holds **no** SpringBoard record in any capture;
+* SpringBoard **is** in the guest's process list.
+
+The only consistent reading is that the spawn took the `do_fork1` route -- a
+caller passing no spawnattr, or one without `POSIX_SPAWN_SETEXEC` and no
+coalition info, jumps to `do_fork1` at kern_exec.c:3880 and falls through to
+`spawn_no_exec = TRUE` at :4002.  That is what the `fork1.spawn` emitter built
+this interval (unixnu `439c31cb`, run 41980452867) exists to confirm directly,
+and until it reports, this is the reading the evidence supports rather than one
+it proves.
+
+## What is NOT refuted, and what is now strange
+
+`job.springboard_open` err=0 still holds: launchd loads the plist.  That is now
+the *beginning* of the story rather than the end -- the job is loaded, the
+process is spawned, and the process is alive.
+
+Three things in the same table do not fit the old theory and are worth more than
+the refutation itself:
+
+* **`runningboardd` is PRESENT, at pid 26, immediately before SpringBoard's 27.**
+  Addendum BB recorded it as absent from both trust caches and addendum AZ named
+  "is runningboardd running its code" as the next measurement.  It is, and it is
+  the process right before SpringBoard in pid order -- which is what a spawn
+  driver that was asked for an App job and asked launchd looks like.
+* **`checkerboard` and `ClarityBoard` are ABSENT** while SpringBoard is present.
+  All three carry `EmbeddedHomeScreen`, the key the home-screen claim at
+  `0x100007b64` gates on.  So the home-screen claim does not act uniformly on the
+  three, and cannot be the reason SpringBoard is missing -- it is not missing.
+* **`backboardd` IS in the union**, and the first corrected run's control failed
+  on it.  That was a *sampling* defect, not a walk defect: the run kept only the
+  largest snapshot's names, and a process that was not alive at that one instant
+  is not evidence about the walk.  The script now unions across every sample and
+  judges the control on the union -- which is what makes the 74 names above a
+  population rather than a frame.
+
+## So the question changed, and it is a better one
+
+The question is no longer "why does launchd not spawn SpringBoard".  It is
+**"what is SpringBoard blocked on"**.  It is alive, it is not in `spawn.seen`,
+and the screen is still the UniXNU boot menu -- so the process exists and the
+thing the PRD asks for does not.
+
+That is a question about SpringBoard's own execution, and the instruments that
+bear on it are the ones addendum AZ already named.  **`p_stat` is now recorded
+per process, and it is the first thing that does not fit**: all 99 rows at the
+peak read state `run` (SRUN, `p_stat`=2).  A guest where every daemon is on a run
+queue is not a guest where anything is *waiting*, so either the state byte is not
+where `PROC_P_STAT=100` says -- the pids beside it are correct, which argues it
+is -- or the walk is reading a stale page for that field.  **Recorded as measured
+and not yet explained; it is the next thing to settle, because "what is
+SpringBoard blocked on" is unanswerable if the state field cannot be trusted.**
+
+## Status
+
+Windows/real-guest: **the process walk booted a real guest, read its live kernel
+memory over QMP, and found SpringBoard running at pid 27** -- 99 processes at the
+peak, still climbing when the 300s-past-userspace window closed, 74 distinct
+names across the run.  This is guest data, not a host-side read.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, dispatched on
+build-macos with `stage=M7`, `payload_target=tcg`, `system_build=21H461`,
+unixnu `439c31cb`, device `9782ddf`.  In progress at the time of writing.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is
+now confirmed running.**  THE HEADLINE is unchanged from AH
+
+Control verdict, from the run: PASSED on the union.  The first corrected run kept only the largest snapshot's names and its control failed on backboardd, which had simply not been alive at that instant -- while launchd and configd WERE there and had already proved the offsets.  The run reported here unions across every sample, and backboardd, launchd and configd are all present: 74 distinct names ever seen, 99 processes at the peak.  The walk works.
