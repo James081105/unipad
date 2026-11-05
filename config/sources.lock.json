@@ -124,10 +124,10 @@
       "path": "drivers/NativeMetal"
     },
     {
-      "commit": "ad73ad0c26f6c7a541146e2b37ab7bb1081a1db6",
-      "commit_note": "Moved 2026-11-05 from 5b83ab7f. Task #36: the kick-path emitter. kickSwapQueue and kickOnce now report which gate fired, with a reason naming which sub-condition of kickOnce's precondition returned, so \"no swap was submitted\" becomes a measurement instead of an inference from absent counters.",
+      "commit": "c75e5ed0fe4c7a4d19fca2be8b9c7f4b6da5df6f",
+      "commit_note": "Moved 2026-11-06 to c75e5ed. The display publishes as NativeLegacyDisplay of class IOMobileFramebufferLegacy (an IOService, not an IOMobileFramebuffer), and no driver source publishes the name IOMobileFramebufferService, so the UI stack's match cannot succeed. registerService now also publishes under that name, gated by offline-legacy-register=1.",
       "path": "drivers/NativeMobileDisplay",
-      "gitlink_commit": "ad73ad0c26f6c7a541146e2b37ab7bb1081a1db6"
+      "gitlink_commit": "c75e5ed0fe4c7a4d19fca2be8b9c7f4b6da5df6f"
     },
     {
       "commit": "d4d22d9819b0162eda49f6402235dddc2279410d",
