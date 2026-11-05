@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-second, addendum BH). THE HEADLINE is **THE DUPLICATED PIDS ARE TWO DIFFERENT STRUCTS, NOT ONE PROC TWICE**. Addendum BG could not choose between "the walk read the wrong struct" and "the walk visited one proc twice", because the script discarded the one field that separates them -- `GuestObserver.processes()` returns a `Process` carrying `address`. It now prints it, and pid 68 appears at **0xfffffff348a67cc0 (dasd) and 0xfffffff348983880 (xpcproxy): two different addresses.** So the walk read two different `struct proc`s and `processes()`' loop guard did not fail: **the "visited one proc twice" branch is CLOSED.** What is left is that two distinct structs in the allproc chain both carry 68 at offset 96, and since a pid is unique while its proc is allocated, at most one of them is a live proc read correctly. **THE ADDRESSES NARROW IT FURTHER: every duplicated pair has one member in each of two clusters -- 0xfffffff34894xxxx-3498xxxx (biomed, audiomxd, and the xpcproxy rows) and 0xfffffff348a6xxxx-34a8xxxx (dasd, securityd, mobileactivation, runningboardd at 0xfffffff348a77880, SpringBoard at 0xfffffff348a84cc0). xpcproxy is 38 of the 112 rows and concentrates in the first cluster, which is consistent with the PROC_P_COMM=1468 / PROC_SPAN=1485 overrun hypothesis -- but it still does not explain a duplicated pid, because p_pid sits at offset 96, 1372 bytes inside the same span, and would be unaffected by an overrun at the far end. So there are two defects and the second is still unexplained.** **The third possibility the addresses make plausible: the chain contains a proc FREED while the walk was in flight. The walk takes seconds over 112 structs, the guest forks continuously, and a freed proc keeps its old p_pid until its slot is reused -- so a row read from a freed proc carries a stale pid and a stale name, and two such rows could collide. TESTABLE CHEAPLY: walk twice back to back and compare. If the duplicated pids MOVE between the two walks it is a race in the walk; if they are IDENTICAL both times it is a layout error and the offsets are wrong.** **WHAT SURVIVES ALL OF IT: the SpringBoard finding does not depend on any of this. SpringBoard appears exactly once, at 0xfffffff348a84cc0, pid 27, and 0 of the 53 spawn.seen comms names it -- a duplicated pid elsewhere cannot make that row wrong.** **And the two instruments still disagree widely: spawn.seen's counter says 70 events across 53 distinct comms while the process list holds 112 rows and 80 distinct names, so the do_fork1 population is at least 42 and SpringBoard is in it.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is confirmed running at pid 27.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-third, addendum BI). THE HEADLINE is **`springboard.fork1` FIRED -- LAUNCHD DOES SPAWN SPRINGBOARD, ON THE ROUTE NO EMITTER COULD SEE**. The record is `{"event":"springboard.fork1","vname":"SpringBoard","source":"XNU.posix_spawn.do_fork1"}` and it settles the question nine intervals have been circling. **Addendum AZ's conclusion is WITHDRAWN OUTRIGHT, not re-scoped: it is not that launchd never calls posix_spawn for SpringBoard, it is that the call it makes is invisible to the emitter AZ was reading.** At kern_exec.c:3880 a caller passing no spawnattr -- or one without POSIX_SPAWN_SETEXEC and no coalition info -- jumps to `do_fork1` and falls through to `spawn_no_exec = TRUE` at :4002, and both `spawn.seen` and `spawn.failed` are inside `if (error == 0 && !spawn_no_exec)`. **WHY spawn.seen NEVER SHOWED IT, AND IT IS NOT SUBTLE: the same boot read from the same channel gives 34 `spawn.seen` (notifyd, logd, configd, runningboardd at n=26, mediaserverd, powerd, biomed, WirelessRadioMan, IOMFB_bics_daemo) against 90 `fork1.spawn` (69 xpcproxy, SpringBoard, usermanagerd, keybagd, mount x2, fsck, seputil, mobile_obliterator, MSUEarlyBootTask, FinishRestoreFromBackup). THE do_fork1 ROUTE CARRIES 90 OF 124 SPAWNS -- THE MAJORITY -- and the two routes are not random: runningboardd is in spawn.seen, SpringBoard is in fork1.spawn, same caller, same syscall, different spawnattr.** **That is the mechanism behind the correlation addendum BA called "a correlation, exactly as the state document has said since the discriminator was first written": POSIXSpawnType=App jobs are spawned WITHOUT POSIX_SPAWN_SETEXEC, so they take do_fork1 and leave no spawn.seen record. It was a correlation and a mechanism at the same time, and the emitter that could tell them apart did not exist until this interval.** **It also explains the 69 xpcproxy rows and the eight duplicated pids from addenda BG/BH: that population is spawned by the same route, rapidly, 69 of them, which is what makes a walk in flight see some freed mid-traversal -- so the duplicated pids are now a RACE IN THE WALK rather than a layout error.** **THE EMITTER PROVED ITSELF ON THE WAY: `vname` and `comm` disagree exactly as the struct says they should -- vname="mobile_obliterator" against comm="mobile_obliterat", because p_comm is char[MAXCOMLEN+1] with MAXCOMLEN 16 while imgp->ip_vp->v_name is not truncated. A wrong field would not produce that pair.** **And the pre-flight that saved this build is recorded: the hunk's first transcription dropped its opening #if line and **git apply --check ACCEPTED the broken patch**, because git apply verifies context bytes and not C -- it would have applied and failed the kernel link 40 minutes in. Only the compile check caught it, and the added block compiles clean with -Wall -Werror under both aarch64 targets.** **SO THE SPAWN QUESTION IS SETTLED AND THE NEXT ONE IS NOT: SpringBoard is spawned AND alive (pid 27, with 116-125 processes on the guest), and the screen is still the UniXNU boot menu. The blocker is no longer the spawn -- it is whatever SpringBoard does after it, and the instruments that bear on that are the ones this interval just proved work: name the binary at the point of interest, and read the guest's own state rather than inferring it from a silence.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is now proven spawned AND proven alive.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14322,3 +14322,95 @@ Onsite: N/A.
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
 reached -- the screen is still the UniXNU boot menu even though SpringBoard is
 confirmed running at pid 27.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-third, addendum BI): `springboard.fork1` fired
+
+## The record
+
+    {"event":"springboard.fork1","vname":"SpringBoard","source":"XNU.posix_spawn.do_fork1"}
+
+One line, and it settles the question nine intervals have been circling.
+**launchd calls `posix_spawn` for SpringBoard, and the call takes the `do_fork1`
+route** -- a caller passing no spawnattr, or one without `POSIX_SPAWN_SETEXEC` and
+no coalition info, jumps to `do_fork1` at kern_exec.c:3880 and falls through to
+`spawn_no_exec = TRUE` at :4002.  Both `spawn.seen` and `spawn.failed` are inside
+`if (error == 0 && !spawn_no_exec)`, so neither can see it.
+
+**Addendum AZ's conclusion is withdrawn outright, not re-scoped.**  It is not that
+launchd never calls `posix_spawn` for SpringBoard; it is that the call it makes is
+invisible to the emitter AZ was reading.
+
+## Why `spawn.seen` never showed it, and it is not subtle
+
+The same boot, read from the same channel:
+
+    spawn.seen      34   notifyd, logd, configd, runningboardd, mediaserverd,
+                         powerd, biomed, WirelessRadioMan, IOMFB_bics_daemo, ...
+    fork1.spawn     90   69 xpcproxy, SpringBoard, usermanagerd, keybagd,
+                         mount x2, fsck, seputil, mobile_obliterator,
+                         MSUEarlyBootTask, FinishRestoreFromBackup, ...
+
+**The `do_fork1` route carries 90 of 124 spawns on this boot -- the majority.**
+And the two routes are not random: `runningboardd` is in `spawn.seen` at n=26,
+SpringBoard is in `fork1.spawn`.  Same caller, same syscall, different spawnattr.
+
+That is the mechanism behind the correlation addendum BA called "a correlation,
+exactly as the state document has said since the discriminator was first written":
+**`POSIXSpawnType=App` jobs are spawned without `POSIX_SPAWN_SETEXEC`**, so they
+take `do_fork1` and leave no `spawn.seen` record.  It was a correlation and a
+mechanism at the same time, and the emitter that could tell them apart did not
+exist until this interval.
+
+It also explains the 69 `xpcproxy` rows in the process table from addenda BG and
+BH.  Those were the population the duplicated pids came from, and they are
+spawned by the same route -- rapidly, 69 of them -- which is what makes a walk in
+flight see some of them freed mid-traversal.  **That is now the leading
+explanation for the eight duplicated pids, and it is a race in the walk rather
+than a layout error.**
+
+## What the emitter itself proved on the way
+
+The `vname` and `comm` fields disagree in exactly the way the struct says they
+should, which is the check that the field is the right one:
+
+    vname="mobile_obliterator"    comm="mobile_obliterat"
+
+`p_comm` is `char[MAXCOMLEN + 1]` with `MAXCOMLEN` 16, so the proc name is
+truncated and `imgp->ip_vp->v_name` is not.  A wrong field would not produce that
+pair.
+
+And the pre-flight that kept this build from being wasted is worth recording:
+**the hunk's first transcription dropped its opening `#if` line and
+`git apply --check` accepted the broken patch**, because `git apply` verifies
+context bytes and not C.  It would have applied and failed the kernel link 40
+minutes in.  Only the compile check caught it, and the added block compiles clean
+with `-Wall -Werror` under both aarch64 targets.
+
+## So the question is settled, and the next one is not
+
+SpringBoard is spawned.  It is alive -- pid 27 in addendum BE, and 116-125
+processes on the guest at the time of this run.  The screen is still the UniXNU
+boot menu.
+
+**The blocker is no longer the spawn.  It is whatever SpringBoard does after it.**
+The instruments that bear on that are the ones this interval just proved work:
+name the binary at the point of interest, and read the guest's own state rather
+than inferring it from a silence.
+
+## Status
+
+Windows/real-guest: **a real guest, booted on a kernel built this interval
+(`d2c5a914`, run 41980452867), emitting a record that names SpringBoard on the
+`do_fork1` route.**  The kernel's sha256 was verified against the payload's own
+declaration before booting, and the emitter's literals were confirmed present in
+this kernel and absent from the previous one.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, completed successfully.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is now
+proven spawned AND proven alive.**  THE HEADLINE is unchanged from AH
