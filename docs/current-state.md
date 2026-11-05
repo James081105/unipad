@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-third, addendum BI). THE HEADLINE is **`springboard.fork1` FIRED -- LAUNCHD DOES SPAWN SPRINGBOARD, ON THE ROUTE NO EMITTER COULD SEE**. The record is `{"event":"springboard.fork1","vname":"SpringBoard","source":"XNU.posix_spawn.do_fork1"}` and it settles the question nine intervals have been circling. **Addendum AZ's conclusion is WITHDRAWN OUTRIGHT, not re-scoped: it is not that launchd never calls posix_spawn for SpringBoard, it is that the call it makes is invisible to the emitter AZ was reading.** At kern_exec.c:3880 a caller passing no spawnattr -- or one without POSIX_SPAWN_SETEXEC and no coalition info -- jumps to `do_fork1` and falls through to `spawn_no_exec = TRUE` at :4002, and both `spawn.seen` and `spawn.failed` are inside `if (error == 0 && !spawn_no_exec)`. **WHY spawn.seen NEVER SHOWED IT, AND IT IS NOT SUBTLE: the same boot read from the same channel gives 34 `spawn.seen` (notifyd, logd, configd, runningboardd at n=26, mediaserverd, powerd, biomed, WirelessRadioMan, IOMFB_bics_daemo) against 90 `fork1.spawn` (69 xpcproxy, SpringBoard, usermanagerd, keybagd, mount x2, fsck, seputil, mobile_obliterator, MSUEarlyBootTask, FinishRestoreFromBackup). THE do_fork1 ROUTE CARRIES 90 OF 124 SPAWNS -- THE MAJORITY -- and the two routes are not random: runningboardd is in spawn.seen, SpringBoard is in fork1.spawn, same caller, same syscall, different spawnattr.** **That is the mechanism behind the correlation addendum BA called "a correlation, exactly as the state document has said since the discriminator was first written": POSIXSpawnType=App jobs are spawned WITHOUT POSIX_SPAWN_SETEXEC, so they take do_fork1 and leave no spawn.seen record. It was a correlation and a mechanism at the same time, and the emitter that could tell them apart did not exist until this interval.** **It also explains the 69 xpcproxy rows and the eight duplicated pids from addenda BG/BH: that population is spawned by the same route, rapidly, 69 of them, which is what makes a walk in flight see some freed mid-traversal -- so the duplicated pids are now a RACE IN THE WALK rather than a layout error.** **THE EMITTER PROVED ITSELF ON THE WAY: `vname` and `comm` disagree exactly as the struct says they should -- vname="mobile_obliterator" against comm="mobile_obliterat", because p_comm is char[MAXCOMLEN+1] with MAXCOMLEN 16 while imgp->ip_vp->v_name is not truncated. A wrong field would not produce that pair.** **And the pre-flight that saved this build is recorded: the hunk's first transcription dropped its opening #if line and **git apply --check ACCEPTED the broken patch**, because git apply verifies context bytes and not C -- it would have applied and failed the kernel link 40 minutes in. Only the compile check caught it, and the added block compiles clean with -Wall -Werror under both aarch64 targets.** **SO THE SPAWN QUESTION IS SETTLED AND THE NEXT ONE IS NOT: SpringBoard is spawned AND alive (pid 27, with 116-125 processes on the guest), and the screen is still the UniXNU boot menu. The blocker is no longer the spawn -- it is whatever SpringBoard does after it, and the instruments that bear on that are the ones this interval just proved work: name the binary at the point of interest, and read the guest's own state rather than inferring it from a silence.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is now proven spawned AND proven alive.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-fourth, addendum BJ). THE HEADLINE is **THE RACE TEST FIRED, THE CONTROL PASSED, AND THE ANOMALOUS SET IS TWO**. Three open questions closed in one run. **THE DUPLICATED PIDS ARE A RACE, AND THE SCRIPT'S OWN TEST SAYS SO: `DUPLICATED PIDS: 30 distinct set(s) across 142 samples` and "the set MOVES between samples: a proc is being freed while the walk is in flight". Thirty DIFFERENT duplicate sets -- a layout error would be identical every time -- so the offsets were right all along and the eight duplicated pids of addendum BG were never a defect in `GuestObserver.processes()`. They were a seconds-long walk over a guest that forks continuously, reading some procs after they were freed; a freed proc keeps its old p_pid until its slot is reused, so two rows can collide on a pid only one of them ever owned. And fork1.spawn explains the volume: 69 of the 124 spawns on that boot are xpcproxy, all on the do_fork1 route, one per XPC domain, spawned in a burst.** **THE CONTROL PASSED: launchd, configd and backboardd all recovered across the run. It had failed twice before -- once on a stale page cache (BD) and once on a single-frame union (BE) -- and both times it was the control that was wrong, not the walk.** **THE BOOT IS THE DEEPEST ON RECORD: 135 processes at the peak, 95 distinct names, against 99/74 and 112/80 earlier.** **AND ADDENDUM BA'S ANOMALOUS SET IS DOWN TO TWO: on this boot's union SpringBoard is PRESENT (pid 27, and springboard.fork1 names it), OTACrashCopier is PRESENT and axassetsd is PRESENT, leaving only checkerboard and ClarityBoard absent -- and BOTH ARE EmbeddedHomeScreen JOBS.** So EmbeddedHomeScreen is not a sufficient condition for not-spawning either, which leaves the home-screen claim at 0x100007b64 as the one mechanism that still fits, and it now has a SHARP PREDICTION: **the first of the three to claim wins and the other two are refused** -- testable from the claim function's own owner slot at [x1+0x48], and the next thing to measure rather than theorise about. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is proven spawned, proven alive, and proven to take the do_fork1 route.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14414,3 +14414,75 @@ Onsite: N/A.
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
 reached -- the screen is still the UniXNU boot menu even though SpringBoard is now
 proven spawned AND proven alive.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-fourth, addendum BJ): the race test fired, the control passed, and the anomalous set is two
+
+## Three questions closed in one run
+
+**The duplicated pids are a race, and the script's own test says so.**  Addendum
+BH named the test and could not run it; the run on the `fork1.spawn` kernel ran
+it, 142 samples, and the verdict is unambiguous:
+
+    DUPLICATED PIDS: 30 distinct set(s) across 142 samples
+      --> the set MOVES between samples: a proc is being freed while the walk is
+          in flight, so the rows are a race and not a layout error
+
+Thirty *different* duplicate sets across 142 samples.  A layout error would be
+identical every time.  **So the offsets were right all along and the eight
+duplicated pids of addendum BG were never a defect in `GuestObserver.processes()`**
+-- they were a walk in flight over a guest that forks continuously, reading some
+procs after they were freed.  A freed proc keeps its old `p_pid` until its slot is
+reused, so two rows can collide on a pid that only one of them ever owned.
+
+And `fork1.spawn` explains the volume: **69 of the 124 spawns on that boot are
+`xpcproxy`**, all on the `do_fork1` route, one per XPC domain, spawned in a burst.
+That is exactly the population a seconds-long walk would catch mid-flight.
+
+**The control passed.**  launchd, configd and backboardd were all recovered across
+the run, so the walk works and the names below it mean something.  The control had
+failed twice before -- once on a stale page cache (addendum BD) and once on a
+single-frame union (addendum BE) -- and both times it was the control that was
+wrong, not the walk.
+
+**The boot is the deepest on record**: 135 processes at the peak, 95 distinct
+names across the run, against 99/74 and 112/80 on the two earlier walks.
+
+## And addendum BA's anomalous set is down to two
+
+Addendum BA narrowed the set of `RunAtLoad=true` jobs that never spawned from 13
+to 8, then to 5: SpringBoard, checkerboard, ClarityBoard, OTACrashCopier,
+axassetsd.  On this boot's union:
+
+    SpringBoard       PRESENT    (pid 27, and springboard.fork1 names it)
+    OTACrashCopier    PRESENT
+    axassetsd         PRESENT
+    checkerboard      absent
+    ClarityBoard      absent
+
+**The set is two, and both are `EmbeddedHomeScreen` jobs.**  Addendum BA's
+observation that the three `EmbeddedHomeScreen` jobs were the common factor has
+become *more* pointed, not less: SpringBoard carries the key and spawns, the
+other two carry it and do not.  So `EmbeddedHomeScreen` is not a sufficient
+condition for not-spawning either -- which leaves the home-screen claim at
+`0x100007b64` as the one mechanism that still fits, and it now has a sharp
+prediction: **the first of the three to claim wins, and the other two are
+refused.**  That is testable from the claim function's own owner slot, and it is
+the next thing to measure rather than the next thing to theorise about.
+
+## Status
+
+Windows/real-guest: **a real guest on a kernel built this interval (`d2c5a914`,
+run 41980452867), walked 142 times over 900 seconds, with the emitter's own
+records naming SpringBoard on the `do_fork1` route.**  135 processes at the peak,
+95 distinct names, control passed.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, completed successfully.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is
+proven spawned, proven alive, and proven to take the `do_fork1` route.**
+THE HEADLINE is unchanged from AH
