@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred second, addendum BR). THE HEADLINE is **THE WHOLE DISPLAY FAILURE, GATE BY GATE, IN SOURCE**. The swap path in NativeLegacyDisplay.cpp is: `newUserClient` (:398, which calls client_enter at :399) -> `validateSwap` (:314, an override, which calls swap_validation_observed at :365) -> `kickSwapQueue` (:137, an override) -> `kickOnce` (:147, which calls transfer_observed at :181). **EVERY LINK HAS A MEASURED COUNTER AND THEY ALL AGREE: client_calls=3, client_pid=95, client_status=0 -- the client reaches the display and is answered. swap_validation_calls=0 -- validateSwap NEVER RAN, because the :365 call sits outside the boot-arg's `if` so a zero means the function was never entered. transfer_calls=0, transfer_status=-1, transfer_bytes=0 -- kickOnce never got past GATE 2. retirement_calls=0, retired_frames=0 -- no frame was retired. And stage=10, init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4, pm_status=0, gop_width=800, gop_height=600 -- the driver itself is fully up.** **AND GATE 1 IS NOT THE BLOCKER: the measured boot's own kernel_args carries offline-legacy-transfer=1 and offline-legacy-validate=1, and stage=10 with pm_stage=4 means logicalPM, bootMapping and primary were all established during init, so kickOnce passes its first gate. GATE 2 IS THE BLOCKER AND IT IS BLOCKED BY STEP 2: `isValidated(request)` is true only for a request validateSwap accepted and addValidated-ed, and swap_validation_calls=0 means that never happened, so kickOnce returns at :151 on every invocation forever.** **SO THE FAILURE IS ONE SENTENCE AND IT IS NOT ABOUT THE HOOK: the client creates a user client three times and NEVER SUBMITS A SWAP. With no swap submitted, validateSwap never runs, nothing is ever validated, and kickOnce returns at its second gate on every call. Nothing downstream can run, which is why the framebuffer never changes. This is BL's "the swap is never submitted" with the mechanism filled in, and BM's "the hooks are dead code" refuted twice over.** **THE INSTRUMENTATION GAP: there is NO counter on kickSwapQueue or on kickOnce's two gates, so the guest cannot distinguish (a) the family never calls kickSwapQueue, from (b) it calls it and kickOnce returns at GATE 1, from (c) it calls it and kickOnce returns at GATE 2. The existing counters start counting at transfer_observed, which is AFTER both gates, so transfer_calls=0 is consistent with all three and the derivation picks (c) BY ELIMINATION rather than by measurement. An emitter on the kick path would settle it directly and is the one measurement that would say whether the family is kicking at all.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display failure is now derived end to end in source and is one sentence long: the client never submits a swap. What is not yet measured is whether the family ever kicks the queue at all, because no counter watches the kick path.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred third, addendum BS). THE HEADLINE is **THE CALLER WAS ALREADY ASKED, AND THE ANSWER IS IN THE TREE**. BR derived the display failure to "the client never submits a swap" and called that a question about the caller. The caller was already asked: `display-clients.py` reads the framebuffer's USER CLIENT table out of a live guest, and its saved output records **5 clients (pids 86, 58, 95, 95, 74), the busiest being pid 58 with 15 calls and 11 failures across 14 distinct selectors -- ELEVEN of them refused with kIOReturnUnsupported (selectors 12, 22, 27, 29, 33, 50, 57, 79 x2, 84), with only 6, 74 and 88 succeeding. Selector 6, the swap/wait selector, was called ONCE and answered SUCCESS, so it is not the swap submission.** **THAT IS THE MEASURED SHAPE OF BR's ONE SENTENCE: the client does not decline to submit a swap, it is REFUSED ELEVEN OF THE FOURTEEN THINGS IT ASKS FOR.** **BUT IT IS A DIFFERENT BUILD: client-table.txt is kernel 2ebda0ec (run 41880912125) while addendum BL measured d2c5a914 (run 41980452867), so the selector table is evidence about the older one and is recorded with its kernel named.** **THE CURRENT KERNEL CAN MEASURE IT AGAIN WITH NO BUILD: client_calls, client_pid, client_status, client_object, client_class, slot_armed_count, prepare_calls and swap_validation_calls are ALL present, and interpose() is armed because client_observed (:625) is called from newUserClient (:401) and client_calls=3 with client_status=0 proves it ran. So re-running display-clients.py needs no build and no patch -- it needs a guest, and the guest is BLOCKED: the host is at 1.0 GB free because msedgewebview2 holds 6 GB and the user's own applications hold the rest, with no leaked process of ours. That is an environment limit, recorded as one rather than worked around by killing the user's applications.** **AND THE KICK-PATH GAP IS CONFIRMED BY ABSENCE: native_legacy_kick_calls is ABSENT from this kernel, which is task #36's premise proved from the image rather than asserted. The existing counters begin at transfer_observed, after both of kickOnce's gates, so the guest cannot say where kickOnce stops without a build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display blocker is now characterised from both ends: in source it is one gate (isValidated is never true), and on a guest it is a client refused eleven of fourteen selectors. Both are waiting on the same thing, which is a boot on a host with memory for one.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15266,3 +15266,107 @@ reached.  The display failure is now derived end to end in source and is one
 sentence long: the client never submits a swap.  What is not yet measured is
 whether the family ever kicks the queue at all, because no counter watches the
 kick path.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred third, addendum BS): the caller was already asked, and the answer is in the tree
+
+## What BR left open, and what was already there
+
+BR derived the display failure to "the client never submits a swap" and called
+that a question about the caller.  The caller was already asked.
+`local-private/tmp/display-clients.py` reads the framebuffer's USER CLIENT table
+out of a live guest -- `LegacyDisplayProbe.cpp:381`'s `static ClientStat
+seenClients[8]`, one entry per user client, recording its pid, its per-selector
+call and failure counts, the notification ports it registered, and the arguments
+of selector 6, the swap/wait selector.
+
+Its saved output, `local-private/boot53/display-refusal-run/client-table.txt`, is
+a complete answer:
+
+    5 clients opened the framebuffer:  pid 86, pid 58, pid 95, pid 95, pid 74
+
+    the busiest, pid 58: 15 calls, 11 failures, across 14 distinct selectors
+
+        selector   6: calls=1 fails=0 status=SUCCESS      <- the swap/wait selector
+        selector  74: calls=1 fails=0 status=SUCCESS      <- supportedFrameInfo
+        selector  88: calls=1 fails=0 status=SUCCESS
+        selector  12: calls=1 fails=1 status=Unsupported
+        selector  15: calls=1 fails=1 status=Error
+        selector  22: calls=1 fails=1 status=Unsupported
+        selector  27: calls=1 fails=1 status=Unsupported
+        selector  29: calls=1 fails=1 status=Unsupported
+        selector  33: calls=1 fails=1 status=Unsupported
+        selector  50: calls=1 fails=1 status=Unsupported
+        selector  57: calls=1 fails=1 status=Unsupported
+        selector  79: calls=2 fails=2 status=Unsupported
+        selector  84: calls=1 fails=1 status=Unsupported
+
+**A client opened the framebuffer five times, called fourteen distinct selectors,
+and was refused eleven of them with `kIOReturnUnsupported`.**  The swap/wait
+selector was called once and answered SUCCESS -- so it is not the swap
+submission, and the submission is among the refused selectors or never reached.
+
+That is the measured shape of BR's one sentence: the client does not decline to
+submit a swap, it is **refused eleven of the fourteen things it asks for** and
+gets as far as one successful swap/wait call.
+
+## Which kernel that came from, and it is not the one BL measured
+
+    client-table.txt   kernel sha256 2ebda0ec...  (run 41880912125)
+    addendum BL        kernel sha256 d2c5a914...  (run 41980452867)
+
+**These are different builds.**  The selector table is evidence about the older
+one.  It is recorded here with its kernel named so it is not read as a property
+of the current tree -- the same discipline as the recorded fact about a green
+run's manifest naming the commits it actually built.
+
+## The current kernel can measure it again, with no build
+
+Every symbol the client-table reading needs is present in the kernel addendum BL
+measured:
+
+    native_legacy_client_calls        present
+    native_legacy_client_pid          present
+    native_legacy_client_status       present
+    native_legacy_client_object       present
+    native_legacy_client_class        present
+    native_legacy_slot_armed_count    present
+    native_legacy_prepare_calls       present
+    native_legacy_swap_validation_calls present
+
+`interpose()` is armed too: `native_legacy_client_observed` (:625) is called from
+`newUserClient` (:401) on every successful open, and `client_calls=3` with
+`client_status=0` on the measured boot proves it ran.
+
+**So re-running `display-clients.py` against the current kernel needs no build
+and no patch.**  It needs a guest, and the guest is blocked: the host is at 1.0 GB
+free because `msedgewebview2` holds 6 GB and the user's own applications hold the
+rest, with no leaked process of ours.  That is an environment limit and is
+recorded as one rather than worked around by killing the user's applications.
+
+## And the kick-path gap is confirmed by absence
+
+    native_legacy_kick_calls          ABSENT
+
+There is no kick-path counter in this kernel, which is task #36's premise proved
+from the image rather than asserted.  The existing counters begin at
+`transfer_observed`, after both of `kickOnce`'s gates, so the guest cannot say
+where `kickOnce` stops without a build.
+
+## Status
+
+Windows/real-guest: **none this interval.**  The client-table numbers are from
+run 41880912125 on kernel `2ebda0ec`, read earlier; this interval only
+established which kernel they belong to and that the current kernel carries the
+same instrumentation.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The display blocker is now characterised from both ends: in source it is
+one gate (`isValidated` is never true), and on a guest it is a client refused
+eleven of fourteen selectors.  Both are waiting on the same thing, which is a boot
+on a host with memory for one.**  THE HEADLINE is unchanged from AH
