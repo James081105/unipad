@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty seventh, addendum DA). THE HEADLINE is **THE LEAF RECORD FORMAT IS MEASURED IN FULL AND REMAINS UNIDENTIFIED -- AND 781228 IS NOT A CATALOG LEAF**. CZ proposed apfs_file_extent_key for the 16-byte leaf keys; raw.h:580-583 defines it as {apfs_key_header hdr; __le64 logical_addr} = 16 bytes, the right length, but the measured second qword does not decode as a plain logical address. **THE RECORDS MEASURED IN FULL: leaf 781228 has 67 records, each a 16-byte key of a CONSTANT first qword 0xd000000000000061 plus a second qword stepping by exactly 0x4000 = 16384 bytes (range 0x0100000001218000..0x0100000001320000), and a 35-byte value of a CONSTANT 3-byte prefix 04 00 20 plus 32 bytes that are distinct in all 67 of 67 records.** **WHAT THAT RULES IN AND OUT: it RULES OUT A FILE CATALOG -- a catalog leaf's keys must include names, as the root's own keys did decoding private-dir, and these carry no name and a constant first qword, so 781228 is not a catalog leaf. It RULES OUT apfs_file_extent_key as literally defined -- the second qword's low 32 bits do step by 16384, which is extent-like, but its high 32 bits are a constant 0x01000000 which a logical_addr should not carry. And it is CONSISTENT WITH A HASHED INDEX -- the node carries APFS_BTNODE_HASHED, each value holds 32 distinct bytes with a constant 3-byte prefix, the shape of a per-record hash, and combined with a constant key prefix and a stepping second field this looks like an allocated sequentially-addressed structure with a hash per record, not a name-keyed one.** **SO THE ANSWER TO THE QUESTION CX, CY AND CZ HAVE BEEN CIRCLING IS: 781228 IS NOT A CATALOG LEAF, AND THE CATALOG'S OWN LEAVES HAVE NOT BEEN FOUND. That is a negative result with a sound instrument and worth more than the three previous intervals' guesses -- the geometry is exact (67 x 16 = key area, 67 x 35 = value area, no remainder), the reader is validated, and the record shape simply is not a catalog's.** **THE NEXT ACTION CHANGES DIRECTION: stop trying to identify these leaves. The catalog root is known and its key area works, so enumerate its children properly rather than guessing their oids from a 40-byte value whose format is unconfirmed. Concretely, scan the omap for blocks whose btn_flags is 0x0019 (ROOT|HASHED|NOHEADER, non-leaf) -- there is exactly one in the volume, the catalog root at 770808 -- and for blocks whose flags are 0x0018 (non-leaf, level 1), of which there are five at oids 1278, 1279, 3635, 3697 and 4565. READ THOSE FIVE LEVEL-1 NODES' KEYS AND SEE WHETHER ANY DECODES AS A DIR_REC WITH A NAME. If one does, that node is in the catalog and its children are the catalog's leaves. That is a bounded five-block search with a decisive test and does not depend on the child-reference format at all.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty eighth, addendum DB). THE HEADLINE is **THE CATALOG'S KEY FORMAT IS apfs_drec_hashed_key, IT DECODES PERFECTLY, AND 770872 IS A CATALOG NODE**. DA's next action was to read the five level-1 nodes' keys looking for a DIR_REC with a name. **LEVEL-1 NODE OID 1279, BLOCK 770872, ENTRY 0 is 01 00 00 00 00 00 00 90 | 0c 8c a6 ac | "private-dir" -- the SAME key as the catalog root's own first key, byte for byte. In a B-tree a child's first key is its parent's separator, so 770872 IS the catalog root's first child. The catalog's own nodes are at oids 1278 and 1279, and DA's conclusion that 781228 is not a catalog leaf is confirmed from the other direction.** **THE KEY FORMAT: the nodes carry APFS_BTNODE_HASHED so their directory keys are not apfs_drec_key but apfs_drec_hashed_key (raw.h:634-638) = {apfs_key_header hdr; __le32 name_len_and_hash; u8 name[0]}, with masks at raw.h:600-602 (APFS_DREC_LEN_MASK 0x3ff, APFS_DREC_HASH_MASK 0xfffffc00, shift 10). Decoding the root's key: hdr = 0x9000000000000001 gives type 9 (APFS_TYPE_DIR_REC) and obj_id 1 (the volume root directory); name_len_and_hash = 0xaca68c0c gives name_len = 12 and name_hash = 0x2b29a3; name = "private-dir" (12 bytes including the NUL); total = 8 + 4 + 12 = 24 bytes, EXACTLY the measured key length. EVERY FIELD DECODES AND THE LENGTH IS EXACT.** **WHY THE LEAF PARSE FAILED, AND IT WAS ONE FIELD: every leaf-record parse since CU read name_len as a __le16 at offset 8. In a hashed node that offset is the LOW HALF of name_len_and_hash and the high half belongs to the name hash. That single wrong field is what made 67 records look like "type 13, obj_id 97, no name" -- the bytes called a type and an object id were partly a hash.** **STILL NOT KNOWN: the type-13 keys (level-1 nodes 770871, 781144, 781206 and 782082 carry 16-byte keys whose first qword is type 13 with obj_id 50/95/105; under apfs_drec_hashed_key a 16-byte key is 8 + 4 + a 4-byte name with name_len = 0, which does not fit, so type 13 uses a different key struct still unidentified -- but that no longer blocks the catalog because 770872 demonstrably holds DIR_RECs), and the child-reference format (the catalog root's two 40-byte values still have an unconfirmed format, though the key match above identifies the catalog's children without it: they are the level-1 nodes at oids 1278 and 1279).** **THE NEXT ACTION: read level-1 node 770872 (oid 1279) as a catalog node -- take its 40-byte values as child references, resolve them through the omap, and check that each child is a leaf whose keys decode as apfs_drec_hashed_key with real names. THE CONTROL is the one that has worked every time: a child's first key must equal its parent's separator key. If the names come out, the catalog is readable end to end and IOMobileFramebuffer.framework becomes a name search rather than a format problem.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18445,6 +18445,97 @@ catalog and its children are the catalog's leaves.
 
 That is a bounded, five-block search with a decisive test, and it does not depend on the
 child-reference format at all.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty eighth, addendum DB): the catalog's key format is `apfs_drec_hashed_key`, it decodes perfectly, and 770872 IS a catalog node
+
+## The five level-1 nodes, read -- and one of them is in the catalog
+
+DA's next action was to read the five level-1 nodes' keys and look for a DIR_REC with a
+name.  **Level-1 node oid 1279, block 770872, entry 0:**
+
+    key (24 bytes)  01 00 00 00 00 00 00 90 | 0c 8c a6 ac | 70 72 69 76 61 74 65 2d 64 69 72 00
+                    ^ hdr                    ^ len+hash   ^ "private-dir\0"
+
+That is **the same key as the catalog root's own first key**, byte for byte.  In a B-tree a
+child's first key is its parent's separator, so **770872 is the catalog root's first
+child.**  The catalog's own nodes are at oids 1278 and 1279, and DA's conclusion that
+781228 is not a catalog leaf is confirmed from the other direction.
+
+## The key format, and it decodes exactly
+
+The nodes carry `APFS_BTNODE_HASHED`, so their directory keys are not `apfs_drec_key` but
+**`apfs_drec_hashed_key`** (raw.h:634-638):
+
+    struct apfs_drec_hashed_key {
+        struct apfs_key_header hdr;   /* 8 bytes: obj_id_and_type */
+        __le32 name_len_and_hash;     /* 4 bytes */
+        u8 name[0];
+    } __packed;
+
+with the masks at raw.h:600-602:
+
+    APFS_DREC_LEN_MASK   0x000003ff
+    APFS_DREC_HASH_MASK  0xfffffc00
+    APFS_DREC_HASH_SHIFT 10
+
+Decoding the root's key:
+
+    hdr              = 0x9000000000000001
+                      type = 9 (APFS_TYPE_DIR_REC), obj_id = 1 (the volume root directory)
+    name_len_and_hash = 0xaca68c0c
+                      name_len = 0xaca68c0c & 0x3ff  = 12
+                      name_hash = 0xaca68c0c >> 10    = 0x2b29a3
+    name             = "private-dir"                  (12 bytes, including the NUL)
+    total            = 8 + 4 + 12 = 24 bytes          <- exactly the measured key length
+
+**Every field decodes and the length is exact.**  So the catalog's key format is settled,
+and it was wrong in every addendum from CU to DA, all of which assumed `apfs_drec_key`
+(8 + 2 + name).
+
+## Why the leaf parse failed, and it was one field
+
+Every leaf-record parse since CU read `name_len` as a `__le16` at offset 8.  In a hashed
+node that offset is the **low half of `name_len_and_hash`**, and the high half belongs to
+the name hash.  That single wrong field is what made 67 records look like "type 13,
+obj_id 97, no name" -- the bytes I was calling a type and an object id were partly a hash.
+
+## What is still not known
+
+**The type-13 keys.**  Level-1 nodes 770871, 781144, 781206 and 782082 carry 16-byte keys
+whose first qword is `type 13, obj_id 50/95/105`.  Under `apfs_drec_hashed_key` a 16-byte
+key is 8 + 4 + a 4-byte name with `name_len = 0`, which does not fit.  So type 13 uses a
+different key struct and it is still unidentified -- but that no longer blocks the
+catalog, because 770872 demonstrably holds DIR_RECs.
+
+**The child-reference format.**  The catalog root's two 40-byte values still have an
+unconfirmed format.  But the key match above identifies the catalog's children without
+it: they are the level-1 nodes at oids 1278 and 1279.
+
+## The next action, concretely
+
+Read level-1 node **770872** (oid 1279) as a catalog node: take its 40-byte values as
+child references, resolve them through the omap, and check that each child is a leaf whose
+keys decode as `apfs_drec_hashed_key` with real names.  **The control is the one that has
+worked every time: a child's first key must equal its parent's separator key.**  If the
+names come out, the catalog is readable end to end and `IOMobileFramebuffer.framework`
+becomes a name search rather than a format problem.
 
 ## Status
 
