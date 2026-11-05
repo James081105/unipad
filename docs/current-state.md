@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty fourth, addendum DH). THE HEADLINE is **THE OS ROOT VOLUME'S GEOMETRY IS SOLVED (BASE = 17408), ITS CATALOG USES THE SAME KEY FORMAT, AND THE OMAP TREE IS THREE LEVELS DEEP**. The OS root volume 044-76040-038.raw is not a container at byte 0: its APFS container superblock is at BYTE 17408, with nx_block_size 4096, nx_block_count 1,483,776, nx_omap_oid 15897 and nx_fs_oid[0] 1026. **AND BLOCK 15897 IS AN OBJECT OF TYPE 0x0B OMAP -- the exact block an earlier teammate's walker refused with "block 15897 is not the container omap". That refusal was a BASE ERROR, not a property of the volume: with BASE = 0 the reader looked at byte 15897, mid-block; with BASE = 17408 it is the container omap.** **THE FULL CHAIN RESOLVES: container superblock (NXSB at BASE 17408) -> nx_omap_oid 15897 (OMAP, tree root 15898) -> volume oid 1026 -> block 15896 (APSB) -> apfs_omap_oid 67545 (OMAP, tree root 67578) -> catalog root oid 1028 -> block 65684 (flags 0x0001, level 3, 6 keys).** **AND THE OS VOLUME'S CATALOG USES THE SAME KEY FORMAT AS THE CRYPTEX: the catalog root 65684's keys decode as apfs_drec_hashed_key, confirmed the same way -- type=9 obj=1 name_len=12 name='private-dir' (identical to the cryptex), plus dalDerogatoryRaceOpinion.cat and 20433_GID1-... So the decoder validated on the cryptex transfers directly.** **WHY THE FIRST WALK FOUND ZERO LEAVES, AND IT IS A REAL BUG: the volume omap root 67578 is at LEVEL 2 with 4 children, and those children are LEVEL-1 nodes (flags 0x0004, 140 keys each) whose children are the leaves. The leaf collector walked exactly one level and assumed the children were leaves, as they were in the cryptex -- but the cryptex's volume omap root was level 1 and this one is level 2. So zero leaves were collected and zero records decoded: a WALKER DEFECT, not a property of the volume.** **THE FIX: make the leaf collection recursive, exactly as the omap_lookup helper already is -- descend while btn_level > 0 and BTNODE_LEAF is clear, collect only when both hold. The child-pointer read must also take 8 BYTES for a non-leaf value, not 16, the same `len = node_is_leaf(node) ? 16 : 8` rule apfsprogs states for omap values. Then re-run; the controls carry forward unchanged (C1 container magic at BASE, C2 the volume superblock's APSB and its omap being an OMAP, C3 every DIR_REC name clean ASCII after one NUL, C4 a non-zero catalog root).** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty fifth, addendum DI). THE HEADLINE is **THE OS ROOT VOLUME'S WHOLE CATALOG IS READABLE -- 349,284 DIR_RECs, CONTROL 349,284 OF 349,284 -- AND IOMobileFramebuffer.framework IS PRESENT**. DH's bug was that the leaf collector walked one level. Made recursive -- descend while btn_level > 0 and BTNODE_LEAF is clear, and read 8 BYTES for a non-leaf child pointer rather than 16 -- the OS root volume's catalog opened: 447 volume omap leaves, 39,497 catalog leaves, type histogram {XATTR 178,175, SIBLING_LINK 50,847, FILE_EXTENT 39,421, DIR_REC 349,284}, and **C3: 349,284 DIR_RECs decoded, clean ASCII after one NUL: 349,284 OF 349,284 -- OK**. 43,028 distinct parent obj_ids and 49,199 distinct names. **THAT IS THE WHOLE ROOT FILESYSTEM'S DIRECTORY CATALOG, READ END TO END: container -> omap -> volume -> catalog root (level 3) -> leaves -> apfs_drec_hashed_key -> name.** **AND THE TARGET IS THERE: searching all 49,199 distinct names gives IOMobileFramebuffer.framework (1 distinct -- THE TASK #38 TARGET), AGX (19: AGX.plist, AGXCompilerConnection-S2A8.framework, AGXCompilerCore-S2A8.framework, AGXCompilerCore.framework, AGXCompilerCrashLogs-S2A8(.appex)...), IOAccelerator.framework, IOGPU.framework, SpringBoard (58: SpringBoard, AXSpringBoardServerInstance.framework, SpringBoard-D83.loctable...), kext (38: ASIOKit.kext, AppleBiometricSensor.kext, AppleGameControllerPersonality.kext...) and Metal (143: AGXMetalA10.bundle, AGXMetalPerfCountersExternal.plist...). So IOMobileFramebuffer.framework IS PRESENT IN THE OS ROOT VOLUME. DG's "not in this volume" applied only to the SystemOS cryptex and was correct for it; the framework lives on the OS root volume, exactly where the earlier plist finding said it was (com.apple.IOMobileFramebuffer, v343.0.0).** **WHAT THIS UNBLOCKS: task #38 needs the framework's BINARY, not its plist. The catalog now gives the DIR_REC for IOMobileFramebuffer.framework with its parent obj_id and file_id, so the directory's contents are enumerable the same way PrivateFrameworks was on the cryptex. The binary itself is an INODE plus FILE_EXTENT records -- and the histogram shows 39,421 FILE_EXTENT records already decoded, so the extent mechanism is present and measured. THE NEXT ACTION IS CONCRETE: locate the IOMobileFramebuffer.framework DIR_REC, list its children, find the Mach-O binary's inode and extents, and read the kext's symbol table for the 181 vtable slot names.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -19015,6 +19015,82 @@ child-pointer read must also take **8 bytes** for a non-leaf value, not 16 -- th
 Then re-run the walk.  The controls already in the script carry forward unchanged: C1 the
 container magic at BASE, C2 the volume superblock's `APSB` and its omap being an OMAP, C3
 every DIR_REC name clean ASCII after one NUL, C4 a non-zero catalog root.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the OS
+volume file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty fifth, addendum DI): the OS root volume's whole catalog is readable -- 349,284 DIR_RECs, control 349,284 of 349,284 -- and `IOMobileFramebuffer.framework` IS present
+
+## The fix, and it worked
+
+DH's bug was that the leaf collector walked one level.  Made recursive -- descend while
+`btn_level > 0` and `BTNODE_LEAF` is clear, and read **8 bytes** for a non-leaf child
+pointer rather than 16 -- the OS root volume's catalog opened:
+
+    volume omap leaves (recursive): 447
+    catalog leaves found:           39,497
+    record type histogram: {XATTR: 178,175, SIBLING_LINK: 50,847,
+                            FILE_EXTENT: 39,421, DIR_REC: 349,284}
+    C3 DIR_RECs decoded: 349,284, clean ASCII after one NUL: 349,284 of 349,284   OK
+    distinct parent obj_ids: 43,028          distinct names: 49,199
+
+**349,284 of 349,284 pass the control.**  That is the whole root filesystem's directory
+catalog, read end to end: container -> omap -> volume -> catalog root (level 3) -> leaves ->
+`apfs_drec_hashed_key` -> name.  The 43,028 distinct parent obj_ids are the directories.
+
+## And the target is there
+
+Searching all 49,199 distinct names:
+
+    IOMobileFramebuffer.framework          1 distinct   <- THE TASK #38 TARGET
+    AGX                                   19 distinct   AGX.plist,
+                                                    AGXCompilerConnection-S2A8.framework,
+                                                    AGXCompilerCore-S2A8.framework,
+                                                    AGXCompilerCore.framework,
+                                                    AGXCompilerCrashLogs-S2A8(.appex)...
+    IOAccelerator.framework                1
+    IOGPU.framework                        1
+    SpringBoard                           58            SpringBoard,
+                                                    AXSpringBoardServerInstance.framework,
+                                                    SpringBoard-D83.loctable...
+    kext                                  38            ASIOKit.kext,
+                                                    AppleBiometricSensor.kext,
+                                                    AppleGameControllerPersonality.kext...
+    Metal                                143            AGXMetalA10.bundle,
+                                                    AGXMetalPerfCountersExternal.plist...
+
+**`IOMobileFramebuffer.framework` is present in the OS root volume.**  Addendum DG's
+"not in this volume" applied only to the SystemOS cryptex and was correct for it; the
+framework lives on the OS root volume, which is where the earlier plist finding
+(`/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Info.plist`,
+`com.apple.IOMobileFramebuffer`, v343.0.0) said it was.
+
+## What this unblocks
+
+Task #38 needs the framework's **binary**, not its plist.  The catalog now gives the
+DIR_REC for `IOMobileFramebuffer.framework` with its parent obj_id and file_id, so the
+directory's contents are enumerable the same way `PrivateFrameworks` was on the cryptex.
+The binary itself is an `INODE` plus `FILE_EXTENT` records -- and the histogram shows
+39,421 `FILE_EXTENT` records already decoded, so the extent mechanism is present and
+measured.
+
+**The next action is therefore concrete:** locate the `IOMobileFramebuffer.framework`
+DIR_REC, list its children, find the Mach-O binary's inode and extents, and read the
+kext's symbol table for the 181 vtable slot names.
 
 ## Status
 
