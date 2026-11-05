@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred nineteenth, addendum CI). THE HEADLINE is **CF's INFERENCE FAILS TWICE, AND CH ONLY FIXED THE FIRST FAILURE**. CH withdrew CF's pid step because fact 202 puts the owners reading and `client_pid=74` in different boots. A teammate then found a second defect that survives even if the boot attribution is granted. **The two symbols are written by DIFFERENT USER CLIENTS ON DIFFERENT SERVICES: `native_qemu_metal_owners` at QemuMetalAccelerator.cpp:164, inside `AGXDeviceUserClient::start(IOService*)` (:151) -- the AGX / GPU Metal user client; `native_legacy_client_pid` at LegacyDisplayProbe.cpp:368, inside `native_legacy_client_enter(task_t,uint32_t)` -- the display's user-client interpose path. So "backboardd holds the Metal window" and "pid 74 is the framebuffer user client" are claims about different objects and neither implies the other. A process can hold the Metal slot and never open the framebuffer -- which run7 shows: pid 86 held a framebuffer client with ZERO calls while the Metal window was held elsewhere.** **SO CF's INFERENCE FAILS TWICE: different boots AND different client relationships. CH fixed the first and missed the second, and the second would have been enough alone. Same shape as the recorded ci-input-vs-lock-mismatch-was-silent -- a green comparison of two things that were never the same thing.** **AND THE POSITIVE CLAIM GOT STRONGER: the teammate's background grep found backlightd in ZERO process lists anywhere under local-private, so the one name sharing the `back` prefix is not merely ruled out by the slot-0 invariant -- it is not running in any captured boot.** **NET, AND IT IS A NARROW WITHDRAWAL: withdrawn is the single step "fact 202's client_pid=74 was backboardd" -- that pid comes from a boot whose process list was never captured, and even within a boot it could not have been matched to a Metal-owner reading. It stays UNKNOWN. STANDS and is directly measured: backboardd is the framebuffer client (run8's C0, pid 58, 9 calls / 3 failures, refused on 15/29/57, no notification port, never selector 6). STANDS: pids are not stable across boots (13 disagreements of 72 shared pids, identical kernel). STANDS, better grounded: backboardd holds the Metal window, via the slot-0 invariant and with backlightd absent from every captured process list.** **THE LESSON, which cost two addenda: I read a fact's summary, saw two numbers that looked like they belonged together, and built a bridge. The fact's own text separated them by a semicolon and a boot label, and the symbols turned out to be written by different drivers for different services. Two numbers in one document are not two numbers in one measurement -- and the check is to read the write sites, not the summary.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CF is now withdrawn correctly rather than partially.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twentieth, addendum CJ). THE HEADLINE is **THE ROUTE TO NAMING THE 181 FAMILY SLOTS IS BLOCKED TWICE OVER**. The plist exists at /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Info.plist (com.apple.IOMobileFramebuffer, v343.0.0) -- **a PrivateFramework, not a kext; there is no IOMobileFramebuffer.kext anywhere in the 43,028-directory catalog.** **And the executable is not there: every bundle on the volume is a shell (the framework's only children are Info.plist and _CodeSignature; every .kext under /System/Library/Extensions has only a PlugIns entry). No Contents/, no Contents/MacOS/<exe>. The binaries live in the kernelcache, and /System/Library/Caches/com.apple.kernelcaches is EMPTY.** **THE CONTROL IS SOUND: /System/Library/Extensions holds 21 bundles (17 .kext) and IOHIDFamily, IOUSBHostFamily and IOStreamFamily are all found, so the walker distinguishes absent from unreadable and IOGraphicsFamily's absence is real.** **And the reader is not the limit: it recovers extent-resident binaries (proved on /usr/sbin/fairplayd.A2, 5 extents, 17,485,824 bytes, valid Mach-O arm64 with 27 load commands), but every multi-megabyte binary is a MULTI-CHUNK type-4 resource fork and the decoder handles only single-chunk. So the route is blocked twice: the binary is not in this catalog, and even if it were it could not be pulled out of a multi-chunk fork.** **TWO BUGS THAT PRODUCED PLAUSIBLE-LOOKING WRONG ANSWERS, recorded before anyone reuses those scripts: (1) `j_file_extent_key.logical_addr` is a BYTE offset, not a block number -- multiplying by 4096 silently read only the first extent of fairplayd.A2 (4,345,856 of 17,485,824 bytes) while STILL yielding a valid Mach-O magic and 27 load commands, so a header check alone would have passed it; (2) an extent spans many blocks, so reading only the block at phys_block_num truncates the same way; (3) `apfs_inode_val.uncompressed_size` (+0x54) reads 0, so a file's real length must come from the sum of its extent lengths. And a negative that must not be over-read: the framework's _CodeSignature/CodeResources is 2467 bytes listing 0 files, and the IDENTICAL 2467 bytes are IOHIDFamily.kext's CodeResources -- a stub, not a manifest, so its emptiness is not evidence about the missing executable.** **MY OWN CHECK CLOSES THE ALTERNATIVE: the 181 slots cluster at 0xfffffff005786e20..0xfffffff0057a02d4, and that range holds ZERO symbols, with no symbol anywhere below it and the nearest above being the kernel's own __mh_execute_header at 0xfffffff007004000 some 14 MB away. So there is no alternative spelling to find -- the prelinked kext region is symbol-free in this kernel's table.** **SO TASK #38 HAS NO INSTRUMENT AND NOW NO ROUTE ON THIS ARTIFACT. The next probe, unverified and recorded as such: the kext binaries are almost certainly in the IPSW's kernelcache.im4p, which is a DIFFERENT artifact from the one this route used.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16837,3 +16837,99 @@ Onsite: N/A.
 reached.  CF is now withdrawn correctly rather than partially: the pid step fails on
 two independent grounds, and everything else in it stands.**  THE HEADLINE is
 unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twentieth, addendum CJ): the route to naming the 181 family slots is blocked twice over
+
+## The blocker, from a teammate who walked the volume
+
+The plist exists:
+
+    /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Info.plist
+    819 bytes, decmpfs type 9 inline, sha256 c1c63fbb...
+    CFBundleIdentifier = com.apple.IOMobileFramebuffer
+    CFBundleVersion = 343.0.0, CFBundlePackageType = FMWK
+
+**It is a PrivateFramework, not a kext.**  There is no `IOMobileFramebuffer.kext`
+anywhere in the 43,028-directory catalog.
+
+**And the executable is not there to recover.**  Every bundle on this volume is a
+shell -- the framework's only children are `Info.plist` and `_CodeSignature`, and
+every `.kext` under `/System/Library/Extensions` has only a `PlugIns` entry.  No
+`Contents/`, no `Contents/MacOS/<exe>`.  The binaries live in the kernelcache, and
+`/System/Library/Caches/com.apple.kernelcaches` exists but is **empty**.
+
+**The control is sound, which is what makes the zero believable.**
+`/System/Library/Extensions` holds 21 bundles, 17 of them `.kext`, and
+`IOHIDFamily`, `IOUSBHostFamily` and `IOStreamFamily` are all found as directory
+entries.  So the walker distinguishes "absent" from "unreadable", and
+`IOGraphicsFamily` being absent is a real absence on this volume, not a broken
+reader.
+
+**And the reader is not the limit it might look like.**  It does reach
+extent-resident binaries -- proved by recovering `/usr/sbin/fairplayd.A2`, 5 extents,
+17,485,824 bytes, a valid Mach-O arm64 with 27 load commands.  The blocker is that
+every multi-megabyte binary on this volume is a **multi-chunk type-4 resource fork**,
+and the decoder handles only the single-chunk layout.  So the route is blocked twice:
+the binary is not in this catalog, and even if it were, it could not be pulled out of
+a multi-chunk fork.
+
+## Two bugs that produced plausible-looking wrong answers
+
+Both are worth knowing before anyone reuses the earlier scripts, because both
+yielded something that looked like a successful read:
+
+1. **`j_file_extent_key.logical_addr` is a BYTE offset, not a block number.**  The
+   script had been multiplying by 4096.  On `fairplayd.A2` that silently read only the
+   first extent -- 4,345,856 of 17,485,824 bytes -- while still yielding a valid
+   Mach-O magic and 27 load commands.  **A header check alone would have passed it.**
+2. **An extent spans many blocks**, so reading only the block at `phys_block_num`
+   truncates the same way.
+3. Related: `apfs_inode_val.uncompressed_size` (+0x54) reads **0** for that file, so
+   a file's real length must come from the sum of its extent lengths.
+
+And a negative that must not be over-read: the framework's
+`_CodeSignature/CodeResources` is 2467 bytes listing **0 files** with 8 generic
+`^Resources/...` rules -- and the identical 2467 bytes are the CodeResources of
+`IOHIDFamily.kext/PlugIns/IOHIDLib.plugin`.  It is a stub, not a manifest, so its
+emptiness is **not** evidence about the missing executable.
+
+## My own check, and it closes the alternative
+
+The 181 unnamed slots cluster at `0xfffffff005786e20..0xfffffff0057a02d4`.  I asked
+whether that range holds symbols under some spelling other than
+`IOMobileFramebuffer*`:
+
+    symbols in [0xfffffff005786e20, 0xfffffff0057a02d4] : 0
+    nearest symbol anywhere below the range            : none
+    nearest symbol above the range                     : 0xfffffff007004000
+                                                        __mh_execute_header
+
+**Zero, and the nearest symbol above is the kernel's own Mach-O header some 14 MB
+away.**  So there is no alternative spelling to find: the prelinked kext region is
+symbol-free in this kernel's table, which generalises the teammate's
+`IOMobileFramebuffer`-has-zero-symbols finding to the whole region the 181 slots
+point into.
+
+## So task #38's route is blocked, and the next artifact is a different one
+
+Naming the 181 needs an external symbol source.  The teammate's suggestion, which I
+have not checked and am not claiming: the kext binaries are almost certainly in the
+IPSW's `kernelcache.im4p` rather than on any mounted volume.  **That is a different
+artifact from the one this route used**, and it is recorded as the next probe rather
+than as a plan.
+
+## Status
+
+Windows/real-guest: **none this interval -- the blocked verdict is a host-side
+catalog walk, plus a symbol-range check against the kernel file.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  Task #38 has no instrument and now no route on this artifact: the family's
+binary is not on the volume, and the kernel's own symbol table has nothing in the
+region the 181 slots point into.**  THE HEADLINE is unchanged from AH
