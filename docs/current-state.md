@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-first, addendum BG). THE HEADLINE is **THE `do_fork1` POPULATION IS MEASURED, AND THE PROCESS TABLE HAS A DEFECT**. Addendum BE inferred the do_fork1 route from one instrument's silence; the same boot now supplies a second and the two disagree by a number. **`spawn.seen`'s own counter says 59 spawn events across 53 distinct comms, `exit.seen` says 28 exits, and the process list at the peak holds 99 rows / 91 DISTINCT pids. With kernel_task and launchd aside, 59 spawn events cannot account for 91 live processes, so at least 32 were created by something spawn.seen does not record.** The emitter's counter is a per-boot monotonic count, so 59 is not an estimate, and the process list is read independently of it -- which makes this a measurement rather than an inference. **SpringBoard is one of the 32: pid 27, with 0 of the 53 spawn.seen comms naming it, and runningboardd at pid 26 immediately before it.** So the reading addendum BC qualified and BE inferred is now supported by two instruments that share no code path. **THE DEFECT: the 99 rows carry only 91 distinct pids, with eight duplicated -- 43, 68, 71, 104, 105, 108, 113, 116 -- and in every one the second row is `xpcproxy` paired with a row that is not (pid=43 biomed + xpcproxy; pid=116 fairplayd.A2 + xpcproxy). A pid is unique while its proc is allocated, so two rows cannot share one.** The shape points at the name field: PROC_P_COMM=1468 and PROC_SPAN=1485, and if `struct proc` is in fact smaller than 1485 in this kernel then `blob[1468:1485]` reads past one proc into the next zone allocation -- which would yield another process's name, and xpcproxy is by far the most numerous process here (38 of 99 rows). **That is a hypothesis, not a finding, and it does not explain a duplicated pid, because the pid sits at offset 96, 1372 bytes inside the same span, and would be unaffected -- so there are two defects here and only the second is explained.** **CONSEQUENCE, PLAINLY: the 99 and the 91 are both unsafe to quote until this is settled. What survives it is the SpringBoard finding -- SpringBoard appears exactly once, at pid 27, and no spawn.seen record names it -- because that does not depend on the count.** **HOW TO SETTLE IT, CHEAPLY: the walk already has the answer and discards it. `GuestObserver.processes()` returns a `Process` carrying `address`, and the script prints only pid, state and name. Printing the address settles it in one run: two rows with DIFFERENT addresses mean the walk is reading the wrong struct; the SAME address means it visited one proc twice and `processes()`' loop guard did not fire. Those are different bugs with different fixes, and neither can be chosen from the current output.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is confirmed running at pid 27.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-second, addendum BH). THE HEADLINE is **THE DUPLICATED PIDS ARE TWO DIFFERENT STRUCTS, NOT ONE PROC TWICE**. Addendum BG could not choose between "the walk read the wrong struct" and "the walk visited one proc twice", because the script discarded the one field that separates them -- `GuestObserver.processes()` returns a `Process` carrying `address`. It now prints it, and pid 68 appears at **0xfffffff348a67cc0 (dasd) and 0xfffffff348983880 (xpcproxy): two different addresses.** So the walk read two different `struct proc`s and `processes()`' loop guard did not fail: **the "visited one proc twice" branch is CLOSED.** What is left is that two distinct structs in the allproc chain both carry 68 at offset 96, and since a pid is unique while its proc is allocated, at most one of them is a live proc read correctly. **THE ADDRESSES NARROW IT FURTHER: every duplicated pair has one member in each of two clusters -- 0xfffffff34894xxxx-3498xxxx (biomed, audiomxd, and the xpcproxy rows) and 0xfffffff348a6xxxx-34a8xxxx (dasd, securityd, mobileactivation, runningboardd at 0xfffffff348a77880, SpringBoard at 0xfffffff348a84cc0). xpcproxy is 38 of the 112 rows and concentrates in the first cluster, which is consistent with the PROC_P_COMM=1468 / PROC_SPAN=1485 overrun hypothesis -- but it still does not explain a duplicated pid, because p_pid sits at offset 96, 1372 bytes inside the same span, and would be unaffected by an overrun at the far end. So there are two defects and the second is still unexplained.** **The third possibility the addresses make plausible: the chain contains a proc FREED while the walk was in flight. The walk takes seconds over 112 structs, the guest forks continuously, and a freed proc keeps its old p_pid until its slot is reused -- so a row read from a freed proc carries a stale pid and a stale name, and two such rows could collide. TESTABLE CHEAPLY: walk twice back to back and compare. If the duplicated pids MOVE between the two walks it is a race in the walk; if they are IDENTICAL both times it is a layout error and the offsets are wrong.** **WHAT SURVIVES ALL OF IT: the SpringBoard finding does not depend on any of this. SpringBoard appears exactly once, at 0xfffffff348a84cc0, pid 27, and 0 of the 53 spawn.seen comms names it -- a duplicated pid elsewhere cannot make that row wrong.** **And the two instruments still disagree widely: spawn.seen's counter says 70 events across 53 distinct comms while the process list holds 112 rows and 80 distinct names, so the do_fork1 population is at least 42 and SpringBoard is in it.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is confirmed running at pid 27.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14230,6 +14230,92 @@ own counters from the virtio channel, and the live process list over QMP.  Both
 are guest data.
 
 Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, still in progress.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is
+confirmed running at pid 27.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-second, addendum BH): the duplicated pids are two different structs, not one proc twice
+
+## What the addresses settle
+
+Addendum BG ended unable to choose between two explanations for the eight
+duplicated pids, and named the field that would separate them:
+`GuestObserver.processes()` returns a `Process` carrying `address`, and the
+script was throwing it away.  It now prints it.
+
+pid 68, from the run at t=708.5s:
+
+    pid=68   addr=0xfffffff348a67cc0   dasd
+    pid=68   addr=0xfffffff348983880   xpcproxy
+
+**Two different addresses.**  So the walk read two different `struct proc`s, and
+`processes()`' loop guard -- which raises if a `current` repeats -- did not fail.
+**The "visited one proc twice" branch is closed.**  What is left is that two
+distinct structs in the `allproc` chain both carry 68 at offset 96, and since a
+pid is unique while its proc is allocated, at most one of them is a live proc
+read correctly.
+
+## What the addresses also show, and it narrows it further
+
+Every duplicated pair has one member in each of two address clusters:
+
+    0xfffffff34894xxxx - 0xfffffff34898xxxx    biomed(43), audiomxd(108),
+                                               xpcproxy(71), xpcproxy(104),
+                                               xpcproxy(68)
+    0xfffffff348a6xxxx - 0xfffffff348a8xxxx    dasd(68), securityd(113),
+                                               mobileactivation(116),
+                                               runningboardd(26),
+                                               SpringBoard(27)
+
+SpringBoard sits at `0xfffffff348a84cc0` and runningboardd at
+`0xfffffff348a77880`, both in the second cluster.  The first cluster is where the
+`xpcproxy` rows concentrate, and `xpcproxy` is 38 of the 112 rows.
+
+That is consistent with the hypothesis addendum BG raised -- `PROC_P_COMM=1468`
+and `PROC_SPAN=1485` reading past the end of a smaller `struct proc` into the
+next zone allocation -- but it is still a hypothesis.  **It does not explain a
+duplicated pid**, because `p_pid` sits at offset 96, 1372 bytes inside the same
+span, and would be unaffected by an overrun at the far end.  So there are two
+defects and the second is still unexplained.
+
+The third possibility, which the addresses make plausible and the current output
+cannot exclude: **the chain contains a proc that was freed while the walk was in
+flight.**  The walk takes seconds to traverse 112 structs, the guest is forking
+continuously, and a freed proc keeps its old `p_pid` until the slot is reused.  A
+row read from a freed proc would carry a stale pid and a stale name, and two such
+rows could collide.
+
+That is testable and cheaply: walk twice, back to back, and compare.  **If the
+duplicated pids move between the two walks, it is a race in the walk.  If they
+are identical both times, it is a layout error and the offsets are wrong.**
+
+## What survives all of it
+
+**The SpringBoard finding does not depend on any of this.**  SpringBoard appears
+exactly once, at `0xfffffff348a84cc0`, pid 27, and 0 of the 53 `spawn.seen` comms
+names it.  A duplicated pid elsewhere in the table cannot make that row wrong.
+
+And the two instruments still disagree by a wide margin:
+
+    spawn.seen counter, this boot:   70 events, 53 distinct comms
+    the process list at the peak:    112 rows, 80 distinct names
+
+**70 spawn events cannot account for 112 processes.**  The `do_fork1` population
+is at least 42, and SpringBoard is in it.
+
+## Status
+
+Windows/real-guest: **a second real boot, read the same way, with the proc
+addresses printed** -- 112 processes at the peak, 80 distinct names across the
+run, SpringBoard at pid 27 and runningboardd at pid 26.  Guest data.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, **completed successfully**.
+Its `boot-inputs` artifact (310,411,144 bytes) is being fetched.
 
 Onsite: N/A.
 
