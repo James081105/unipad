@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred seventh, addendum BW). THE HEADLINE is **TWO RAMPED BOOTS AGREE, AND THE LIFT IS ACTIVE WITH 60 SLOTS REPLACED**. The second ramped boot of run 41980452867 (kernel sha256 d2c5a914 verified, control passed, 900 s window) ramps to 93 processes at 502 s and a client opens the framebuffer at 604.3 s with seenClientCount=1: **C0 pid 86, 0 calls, 0 fails -- it opened the framebuffer and called NOTHING**, with client_class 'IOMobileFramebufferUserClient', stage=10, slot_armed_count=358 and **slot_lifted_count=60**, while swap_validation_calls, prepare_calls and transfer_calls are all STILL AT THEIR INITIALS. **WHAT THE TWO BOOTS AGREE ON: 3 clients and 11 selector calls on boot 1 versus 1 client and 0 calls on boot 2 -- the client population is wildly non-deterministic -- but swap_validation_calls=0, prepare_calls=0 and transfer_calls=0 on BOTH, and selector 6 is called on NEITHER. That is the first result in this investigation that survives a second boot: whatever the client does, it never submits a swap and never waits for one.** **THE LIFT IS ACTIVE: 60 of the display's 358 slots had a refusing stub as their original function and were replaced with native_legacy_slot_success, so 60 slots were refusing before the lift. That reframes boot 1's four refusals -- they are not among the 60 lifted slots, or they come from the client's own vtable -- and either way the refusals are not what stops the swap, because the swap was never attempted on either boot.** **SETTLED across two ramped boots of a verified kernel: the display is fully up (stage=10) and fully traced (358 armed, 60 lifted), a client opens the framebuffer, and no swap is ever submitted, validated, prepared or transferred. NOT SETTLED, and now the only open question on this path: WHY does the compositor open the framebuffer and then not present? The driver's own comment at NativeLegacyDisplay.cpp:87 names the candidate -- the user client's wait (selector 6) answers kIOReturnBusy forever if the powered word is not announced, "and the compositor never presents" -- and announcePoweredByFirmware() runs during start() when primary && bootMapping with start_result=1, so it ran, but whether the state setter at vtable slot 354 actually took is not measured by any counter that exists.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But for the first time a display conclusion survives a second boot: the compositor opens the framebuffer and never presents, and nothing in this build observes why.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred eighth, addendum BX). THE HEADLINE is **THE POWERED WORD IS SET, SO THE NAMED CANDIDATE IS ELIMINATED**. BW's only open question had one named candidate: the driver's comment at NativeLegacyDisplay.cpp:87 says that without the powered word the user client's wait (selector 6) answers kIOReturnBusy forever "and the compositor never presents", and that no counter measures whether the state setter took. **It is now measured, by reading the word out of the display object: on run 41980452867 with kernel sha256 d2c5a914 verified and the control passed, ramped to 124 processes and the client opening the framebuffer at t=604.8s, +5836 (the REQUESTED half) is 0x1 and +5840 (the POWERED word) is 0x1. So the state setter took, and the failure mode the comment describes is NOT in effect.** **THE CANDIDATE IS ELIMINATED, and that is the result: nothing in the display driver's power path explains the frozen screen. The zero words at +5820 and +5824 are consistent with everything already measured (no swap completed, nothing presented); the non-zero words at +5808 (0x320) and +5812 (0x258) are state the driver did not set and this measurement does not interpret.** **AND IT EXPOSED A DEFECT IN MY OWN INSTRUMENT: the notification-port print sat AFTER the `continue` for clients with no selector calls, so the one client that matters -- the one that opened the framebuffer and made no external-method call at all -- was exactly the one whose port registration was never shown. registerNotificationPort is the other slot interpose() wraps and is recorded in reg[] rather than in calls, so a client can register a port with zero external-method calls, and the compositor's swap-completion wait hangs off that port. Fixed: the port registration is printed first, before any continue.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The one hypothesis the source offered is measured and refuted, and the next run asks the question this one was supposed to: did the compositor register a notification port before it went quiet.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15724,3 +15724,82 @@ Onsite: N/A.
 reached.  But for the first time a display conclusion survives a second boot: the
 compositor opens the framebuffer and never presents, and nothing in this build
 observes why.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred eighth, addendum BX): the powered word IS set, so the named candidate is eliminated
+
+## The measurement
+
+The state setter that `announcePoweredByFirmware()` drives through vtable slot 354
+writes the power-state word at `display+5840`, the "powered" half of the pair next
+to `+5836`.  `native_legacy_object` gives the display object, so the word is read
+straight out of guest memory -- no build, no patch, and no counter that did not
+exist.
+
+Run 41980452867, kernel sha256 `d2c5a914` verified against `payload.json`, control
+passed, ramped to 124 processes, client opened the framebuffer at t=604.8 s:
+
+    the display object's state words (object=0xfffffff33a5ed000):
+      +5808: 0x00000320
+      +5812: 0x00000258
+      +5816: 0x00000000
+      +5820: 0x00000000     <- the "done" word wrappedExternal reads
+      +5824: 0x00000000     <- the "presented" word
+      +5828: 0x00000000
+      +5832: 0x00000000
+      +5836: 0x00000001     <== the REQUESTED half of the pair
+      +5840: 0x00000001     <== the POWERED word
+      +5844: 0x00000000
+      ... (all the rest zero)
+
+**The powered word is 1.  The requested half is 1.**  So the state setter took and
+the powered word is announced, exactly as `start()` intended -- and the failure
+mode the driver's comment describes, "the wait answers kIOReturnBusy forever and
+the compositor never presents", is not in effect.
+
+## So the candidate is eliminated, and that is the result
+
+BW's only open question had one named candidate.  It is refuted: the condition the
+comment says would cause the compositor never to present does not hold.  The
+display is powered, the requested word is set, `stage=10`, 358 slots armed and 60
+lifted, and the compositor still never presents.
+
+That is worth recording as a refutation rather than as a gap, because it removes
+the one hypothesis the source offered and leaves the search honest: **nothing in
+the display driver's power path explains the frozen screen.**
+
+The zero words at `+5820` and `+5824` are consistent with everything already
+measured -- no swap completed, nothing presented -- and the non-zero words at
+`+5808` (0x320) and `+5812` (0x258) are state the driver did not set and this
+measurement does not interpret.
+
+## The defect this exposed in my own instrument
+
+The notification-port print sat *after* the `continue` for clients with no
+selector calls.  So the one client that matters -- the one that opened the
+framebuffer and made no external-method call at all -- was exactly the one whose
+port registration was never shown.
+
+`registerNotificationPort` is the other slot `interpose()` wraps, and it is
+recorded in `reg[]` rather than in `calls`, so a client can register a port with
+zero external-method calls.  **The compositor's swap-completion wait hangs off
+that port, so whether it registered one is the question this run could not answer
+and should have.**  Fixed: the port registration is now printed first, before any
+`continue`.
+
+## Status
+
+Windows/real-guest: **a live guest on run 41980452867, kernel sha256 verified
+against payload.json, control passed, ramped to 124 processes, the display
+object's state words read out of guest memory.**  The powered word is 1.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The one hypothesis the source offered is now measured and refuted, and
+the next run asks the question this one was supposed to: did the compositor
+register a notification port before it went quiet.**  THE HEADLINE is unchanged
+from AH
