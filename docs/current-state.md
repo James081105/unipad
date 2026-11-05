@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty first, addendum CK). THE HEADLINE is **THE SELECTOR DECODER IS VALIDATED -- SLOT 182 REPRODUCED -- AND A TEMPTING 181-THUNK TABLE WAS CORRECTLY REFUSED**. A teammate retracted their earlier claim that the decoder fails validation (their test was on the wrong function set); I had accepted that claim into the record and am correcting it with them. **I verified the bytes independently: at 0xfffffff00bef6378 + 548 the word is 0xf942d94a -- `LDR x10,[x10,#0x5b0]`, imm12 = 182, byte offset 1456 = 182*8. The slot-182 load is exactly where they said, in the documented position, so the decoder passes the gate I set.** **BUT THE SYMBOL ATTRIBUTION IS NOT VERIFIED: there is no `IOUserClient::externalMethod` symbol in this kernel's table; the 22 code-address symbols containing `externalMethod` are all subclasses (IOUserUserClient, AppleKeyStoreUserClient, IOUserServer...). The address may be the right function, but nothing in the file names it. The VALIDATION rests on the load's position, which is confirmed; the INTERPRETATION rests on addendum U and the teammate's reading, not on the symbol table. Those are different strengths of evidence and must not be merged.** **AND A TEMPTING STRUCTURE WAS CORRECTLY REFUSED: at 0xfffffff0057a26f8 there are 181 twelve-byte thunks (ADRP/LDR/BR) spanning to 0xfffffff0057a2f68, and the count matches the 181 original-family vtable entries exactly -- which is what made it tempting. Applying the guardrail it fails: only 80 of its immediates are real vtable slots, 101 point past the vtable entirely (range 359..485), 6 are the fork's own, and 107 original-family slots are absent including all of 168-182. The matching 181 is a coincidence, and it was reported as a refusal rather than a bridge.** **AND THE FORK NEVER LEARNED THE NAMES EITHER: build-native-legacy-display.py:87-98 generates the entire 358-slot base-class declaration, naming exactly nine slots (184 isMainDisplay, 188 getDotPitch, 213 supportedFrameInfo, 249 getDisplayDimensions, 288 startHardware, 290 kickSwapQueue, 295 completeCurrentSwap, 296 validateSwap, 337 collectCompletionReports) and emitting every other slot as `opaque{i}()` pure-virtual or deprecated with "Unclassified ABI: never call from source". So the ABI was reconstructed slot-for-slot but the names were never learned, and the 181 must come from the kext and nowhere else.** **THE KEXT IS NOT ON THE OS VOLUME, AND THE EARLIER EVIDENCE FOR THAT WAS ALSO WRONG: a teammate had reported "System/Library/Extensions has 0 inodes", which was a bug in their script -- catalog paths come back prefixed with `root/`, so their startswith never matched. The conclusion is right and the measurement was not. It is corroborated independently by apfs-reader, which found 21 bundles including IOHIDFamily, IOUSBHostFamily and IOStreamFamily and no IOMobileFramebuffer.kext in the 43,028-directory catalog. The next artifact is the SystemOS cryptex (044-76034-038.dmg), a raw APFS container (NXSB at offset 32) that refused BASE=0 with "block 15897 is not the container omap" -- its geometry differs and needs its own work.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What changed is that task #38 has a validated instrument again: the missing piece is a decoded selector and the 181 names, not a working tool.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty second, addendum CL). THE HEADLINE is **THE SYSTEMOS CRYPTEX'S CONTAINER GEOMETRY IS SOLVED, AND THE WALKER WAS READING THE WRONG BLOCK**. A teammate reported the cryptex refused their walker with BASE=0: "block 15897 is not the container omap", which read as a geometry problem. **It is not. Read directly from the superblock: magic NXSB at 32, nx_block_size 4096, nx_block_count 806,400 (3,303,014,400 / 4096 = 806,400 exactly), nx_omap_oid 782662. BASE=0 and block_size=4096 are correct -- the block count matches the file size to the byte, so there is no hidden offset and no UDIF wrapper. And the omap object at block 782662 verifies on both fields: oid=782662, type=0xe (OBJECT_TYPE_OMAP).** **SO THE WALKER WAS READING BLOCK 15897, WHICH IS NOT THE OMAP BLOCK AT ALL. The geometry was never the problem; the block was.** **VERIFIED: the superblock, the block size, the block count against the file size, and the omap object's oid and type at 782662. NOT VERIFIED: the btree chain below it -- om_tree_oid reads as 782663 (omap_oid + 1, suspiciously adjacent and possibly a coincidence), and the object there has type 0xe but the four bytes at +32 read 07 00 00 00 rather than the BTRE magic a btree root should carry. So the omap is confirmed and the tree below it is not.** **WHAT THIS BUYS: the recorded next step for task #38 is done for the container level, with the exact values BASE=0, block_size=4096, omap_oid=782662 (verified on oid and type). A walker pointed at 782662 instead of 15897 should get past the refusal.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The cryptex's container level is no longer a blocker; the btree below the omap is unverified, and the kext binary is still not in reach.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17036,3 +17036,69 @@ Onsite: N/A.
 reached.  What changed is that task #38 has a validated instrument again: the decoder
 reproduces slot 182 in the documented position, so the missing piece is a decoded
 selector and the 181 names, not a working tool.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty second, addendum CL): the SystemOS cryptex's container geometry is solved, and the walker was reading the wrong block
+
+## The blocker, and what it actually was
+
+A teammate reported that the SystemOS cryptex (`044-76034-038.dmg`, 3,303,014,400
+bytes) refused their walker with `BASE = 0`: `block 15897 is not the container omap`.
+That read as "the container geometry differs and needs its own BASE/block-size work".
+
+**It does not.**  The superblock says otherwise, read directly:
+
+    magic @32            NXSB
+    nx_block_size        4096
+    nx_block_count       806,400        (3,303,014,400 / 4096 = 806,400 exactly)
+    nx_omap_oid          782662
+
+`BASE = 0` and `block_size = 4096` are correct -- the block count matches the file size
+to the byte, so there is no hidden offset and no UDIF wrapper.  And the omap object at
+block 782662 verifies on both fields:
+
+    omap obj: oid=782662  type=0xe
+
+`0xe` is `OBJECT_TYPE_OMAP`, and the oid matches the superblock's `nx_omap_oid`.  So
+the container omap is exactly where the superblock says it is.
+
+**The walker was reading block 15897, which is not the omap block at all.**  The
+geometry was never the problem; the block was.
+
+## What is verified and what is not
+
+**Verified:** the container superblock, the block size, the block count against the
+file size, and the omap object's oid and type at block 782662.
+
+**NOT verified:** the btree chain below the omap.  `om_tree_oid` reads as 782663
+(omap_oid + 1, which is suspiciously adjacent and may be a coincidence), and the
+object there has type `0xe` but the four bytes at +32 read `07 00 00 00` rather than
+the `BTRE` magic a btree node root should carry.  So the omap is confirmed and the
+tree below it is not.  Recorded as unverified rather than assumed.
+
+## What this buys
+
+The recorded next step for task #38 -- "the cryptex needs its own container-geometry
+work" -- is now done for the container level, with the exact values:
+
+    BASE        = 0
+    block_size  = 4096
+    omap_oid    = 782662     (verified: oid and type both match)
+
+A walker pointed at block 782662 instead of 15897 should get past the refusal.  What
+it does after that is the part still unverified.
+
+## Status
+
+Windows/real-guest: **none this interval -- the geometry is read from the cryptex
+file's own superblock.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The cryptex's container level is no longer a blocker; the btree below the
+omap is unverified, and the kext binary is still not in reach.**  THE HEADLINE is
+unchanged from AH
