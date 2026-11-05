@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred sixth, addendum BV). THE HEADLINE is **THE SWAP/WAIT SELECTOR IS NEVER CALLED, AND THAT IS THE FROZEN SCREEN**. BU's hypothesis -- the guest ramps but slowly and 420 s is not enough -- is CONFIRMED: on run 41980452867 with kernel sha256 d2c5a914 verified against payload.json and the control passed, procs goes 1 -> 2 stalled, then 40 at 471.5s, 57, 71, and 134 at 501.9s, and a client opens the framebuffer at t=624.9s. **Every earlier client_calls=0 reading was a window that closed before the guest got there.** **WHAT THE CLIENT DID, MEASURED: client_calls=3, client_pid=86, client_status=0, client_class='IOMobileFramebufferUserClient', stage=10 (the success terminal state), slot_armed_count=358 (the display's vtable is FULLY lifted), while swap_validation_calls=0, prepare_calls=0 and transfer_calls=0 are all STILL AT THEIR INITIALS.** **Three clients read out of static ClientStat seenClients[8] at 0xfffffff00c146888 (stride 2312): C0 pid 58 with 9 calls and 3 fails across selectors 8, 15, 22, 29, 33, 57, 74, 79, 88; C1 pid 95 with 2 calls across selectors 8 and 28; C2 pid 86 with ZERO calls -- it opened the framebuffer and called NOTHING. Eleven selector calls in total, four refused, and SELECTOR 6, THE SWAP/WAIT SELECTOR, IS NOT AMONG THEM. No client ever calls it.** **So BR's chain is closed at both ends by measurement rather than by elimination: the swap/wait selector is never invoked, so validateSwap is never entered, so nothing is ever validated, so GATE 2 never opens. And slot_armed_count=358 means this is NOT an instrumentation gap -- the display's own vtable is fully traced, the client reaches it, calls it eleven times, and never asks it to swap.** **AND THE TWO KERNELS DIFFER, which BS could not see: the saved table from kernel 2ebda0ec had selector 6 called once successfully; on d2c5a914 it is never called at all. BS was right to refuse to read the older table as a property of this one.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now measured rather than derived is the specific thing the guest never does: no client ever calls the swap/wait selector, on a boot that ramped, on the current kernel, with the display fully up and its vtable fully traced.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred seventh, addendum BW). THE HEADLINE is **TWO RAMPED BOOTS AGREE, AND THE LIFT IS ACTIVE WITH 60 SLOTS REPLACED**. The second ramped boot of run 41980452867 (kernel sha256 d2c5a914 verified, control passed, 900 s window) ramps to 93 processes at 502 s and a client opens the framebuffer at 604.3 s with seenClientCount=1: **C0 pid 86, 0 calls, 0 fails -- it opened the framebuffer and called NOTHING**, with client_class 'IOMobileFramebufferUserClient', stage=10, slot_armed_count=358 and **slot_lifted_count=60**, while swap_validation_calls, prepare_calls and transfer_calls are all STILL AT THEIR INITIALS. **WHAT THE TWO BOOTS AGREE ON: 3 clients and 11 selector calls on boot 1 versus 1 client and 0 calls on boot 2 -- the client population is wildly non-deterministic -- but swap_validation_calls=0, prepare_calls=0 and transfer_calls=0 on BOTH, and selector 6 is called on NEITHER. That is the first result in this investigation that survives a second boot: whatever the client does, it never submits a swap and never waits for one.** **THE LIFT IS ACTIVE: 60 of the display's 358 slots had a refusing stub as their original function and were replaced with native_legacy_slot_success, so 60 slots were refusing before the lift. That reframes boot 1's four refusals -- they are not among the 60 lifted slots, or they come from the client's own vtable -- and either way the refusals are not what stops the swap, because the swap was never attempted on either boot.** **SETTLED across two ramped boots of a verified kernel: the display is fully up (stage=10) and fully traced (358 armed, 60 lifted), a client opens the framebuffer, and no swap is ever submitted, validated, prepared or transferred. NOT SETTLED, and now the only open question on this path: WHY does the compositor open the framebuffer and then not present? The driver's own comment at NativeLegacyDisplay.cpp:87 names the candidate -- the user client's wait (selector 6) answers kIOReturnBusy forever if the powered word is not announced, "and the compositor never presents" -- and announcePoweredByFirmware() runs during start() when primary && bootMapping with start_result=1, so it ran, but whether the state setter at vtable slot 354 actually took is not measured by any counter that exists.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But for the first time a display conclusion survives a second boot: the compositor opens the framebuffer and never presents, and nothing in this build observes why.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15626,3 +15626,101 @@ reached.  What is now measured rather than derived is the specific thing the gue
 never does: no client ever calls the swap/wait selector, on a boot that ramped, on
 the current kernel, with the display fully up and its vtable fully traced.**  THE
 HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred seventh, addendum BW): two ramped boots agree, and the lift is active with 60 slots replaced
+
+## The second ramped boot
+
+Same script, same kernel (`d2c5a914` on run 41980452867, sha256 verified against
+`payload.json`), control passed, 900 s window:
+
+    481.8s  procs=56
+    491.9s  procs=78
+    502.1s  procs=93
+    604.3s  a client opened the framebuffer; seenClientCount=1
+
+    native_legacy_client_calls      1
+    native_legacy_client_pid        86
+    native_legacy_client_status     0
+    native_legacy_client_class      b'IOMobileFramebufferUserClient'
+    native_legacy_stage             10
+    native_legacy_slot_armed_count  358
+    native_legacy_slot_lifted_count 60      <- THE LIFT IS ACTIVE
+
+    native_legacy_swap_validation_calls  0   <- STILL AT ITS INITIAL
+    native_legacy_prepare_calls          0   <- STILL AT ITS INITIAL
+    native_legacy_transfer_calls         0   <- STILL AT ITS INITIAL
+
+    C0  pid=86   object=0xfffffff43ceb8f00   calls=0   fails=0
+        opened the framebuffer and called NOTHING
+
+## What the two boots agree on, and what they do not
+
+                    ramped boot 1 (BV)     ramped boot 2 (this)
+    clients         3                      1
+    selector calls  11                     0
+    refusals        4                      0
+    selector 6      never called           never called
+    swap_validation 0                      0
+    prepare         0                      0
+    transfer        0                      0
+    stage           10                     10
+    slots armed     358                    358
+    slots lifted    not read               60
+
+**The client population is wildly non-deterministic and the display outcome is
+not.**  Three clients and eleven selector calls on one boot, one client and none on
+the next -- but `swap_validation_calls`, `prepare_calls` and `transfer_calls` are
+zero on both, and selector 6 is called on neither.
+
+That is the first result in this investigation that survives a second boot, and it
+is the one that matters: **whatever the client does, it never submits a swap and
+never waits for one.**
+
+## The lift is active, so the refusals are not the whole story
+
+`native_legacy_slot_lifted_count = 60`: the display's vtable copy had **60 slots
+whose original function was a refusing stub**, and each was replaced with
+`native_legacy_slot_success`, a stub that returns 0.  So 60 of the display's 358
+slots were refusing before the lift and answer success after it.
+
+That reframes boot 1's four refusals: they are NOT among the 60 lifted slots, or
+they come from the client's own vtable rather than the display's.  Either way the
+refusals are not what stops the swap, because the swap was never attempted on
+either boot.
+
+## What this settles, and what it does not
+
+Settled, across two ramped boots of a verified kernel:
+
+    the display is fully up (stage=10) and fully traced (358 slots armed, 60 lifted)
+    a client opens the framebuffer
+    and no swap is ever submitted, validated, prepared or transferred
+
+Not settled, and now the only open question on this path:
+
+    WHY does the compositor open the framebuffer and then not present?
+
+The driver's own comment at `NativeLegacyDisplay.cpp:87` names the candidate: the
+user client's wait (selector 6) answers `kIOReturnBusy` forever if the powered
+word is not announced, "and the compositor never presents".  `announcePoweredByFirmware()`
+runs during `start()` when `primary && bootMapping`, and `start_result=1`, so it
+ran -- but whether the state setter at vtable slot 354 actually took is not
+measured by any counter that exists.
+
+## Status
+
+Windows/real-guest: **two live boots on run 41980452867, kernel sha256 verified
+against payload.json, control passed both times, 900 s windows, both observed
+ramping past 50 processes, the client table read out of kernel memory on both.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  But for the first time a display conclusion survives a second boot: the
+compositor opens the framebuffer and never presents, and nothing in this build
+observes why.**  THE HEADLINE is unchanged from AH
