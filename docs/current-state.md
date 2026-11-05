@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirtieth, addendum CT). THE HEADLINE is **THE OMAP LOOKUP WORKS AND REACHES THE CATALOG ROOT, BUT THE DESCENT INTO THE CATALOG FAILS**. Using the rules validated in CS, volume superblock 782661's apfs_root_tree_oid=1216 resolves through the volume omap: node 782657 (level 1, 36 keys) entry[0] oid=1214 -> child 782659 (level 0 leaf, 70 keys) entry[1] oid=1216 -> value flags=0x8 size=4096 paddr=770808. **The descent is clean and controlled: it terminates at a leaf, finds the entry whose oid is exactly the target, and returns a one-block object. flags=0x8 is APFS_OMAP_VAL_NOHEADER, which is why the block's first 32 bytes are zero.** **AND THE CATALOG ROOT IS FOUND WITH ITS REAL FLAGS: block 770808 has btn_flags 0x0019 = ROOT | HASHED | NOHEADER, btn_level 3, btn_nkeys 2, btn_table_space {0, 64}, btn_free_space {40, 3816}, and both free lists APFS_BTOFF_INVALID. 0x0019 has NO APFS_BTNODE_FIXED_KV_SIZE, so the catalog is a VARIABLE-LENGTH KV tree whose TOC entries are apfs_kvloc (8 bytes: k.off, k.len, v.off, v.len), not the 4-byte apfs_kvoff the omap uses. APFS_BTNODE_MASK is 0x001f so every set bit is valid, and a level-3 root with 2 keys is a plausible shape for a real catalog.** **BUT THE DESCENT INTO THE CATALOG FAILS: reading the root as a variable-KV node gives toc=0x38 key=0x78 free=0xa0 data=0xf88 area_len=80, and entries [0] k@0x78 len=24 v@0xfb0 len=40 -> child 3720 and [1] k@0x90 len=16 v@0xf88 len=40 -> child 3719. BOTH CHILDREN ARE ENTIRELY ZERO BLOCKS -- 48 zero bytes at both +0x00 and +0x20 -- so they are not btree nodes and the child oids are wrong. The tell is the value length: 40 bytes, where a non-leaf value should be an 8-byte child oid. apfsprogs does not special-case the catalog the way it does the omap (the `len = node_is_leaf(node) ? 16 : 8` rule is omap-only, btree.c:486); it takes entry->v.len verbatim. So either the kvloc parse is misaligned, or the key/value area boundaries are wrong for this node, or both. THE ROUTE THEREFORE STOPS AT THE CATALOG ROOT -- it does not reach a catalog leaf and it does not reach IOMobileFramebuffer.framework.** **VERIFIED: container geometry, container omap, its tree root, the volume superblock by magic, the volume omap, its tree root and leaves, the omap lookup itself, and the catalog tree root's own header. NOT VERIFIED: anything below the catalog root -- the two child oids it produced are zero blocks, so that read is wrong and nothing downstream of it exists.** **THE NEXT ACTION: fix the variable-KV node reader before descending again. The control is the one that settled the omap -- every child a level-N root names must itself be a well-formed level-(N-1) node with valid flags, nkeys > 0 and areas in order. Both children here fail that, so the reader is wrong, not the tree. Concretely, re-read the apfs_kvloc handling in apfsprogs/src/apfsck/btree.c around node_locate_key / node_locate_data (the else branches, lines 439-447 and 507-514) and check the area_len computation for a root with a 40-byte footer, then re-run the descent. The omap lookup in local-private/tmp/walk-to-catalog.py is correct and should be reused unchanged.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty first, addendum CU). THE HEADLINE is **THE CATALOG'S CHILDREN ARE VIRTUAL OIDS AND DO RESOLVE TO WELL-FORMED LEAVES, BUT THE RECORD PARSE IS WRONG**. CT ended with the catalog root's children reading as entirely zero blocks and blamed the reader. The falsifiable hypothesis: the catalog tree is a VIRTUAL object (apfs_root_tree_type is 0x2, not 0x40000002), so the oids in its hashed child references are virtual oids needing one more omap hop, exactly as apfs_root_tree_oid itself did. **CONFIRMED: virtual oid 3719 resolves through the volume omap (782657 -> 781118) to block 781228, and 3720 to 781229; both are flags 0x001a (LEAF|HASHED|NOHEADER), level 0, nkeys 67, table_space {0,576} -- well-formed leaves, and adjacent blocks matching adjacent oids. So CT's "the reader is wrong" was itself wrong: the reader was right and the oids needed one more hop. A ZERO BLOCK IS NOT EVIDENCE OF A BAD READER; IT IS EVIDENCE OF AN UNRESOLVED VIRTUAL OID.** **AND THE CATALOG ROOT REALLY IS A CATALOG NODE: its key area holds the ASCII string "private-dir" at 0x78, a real APFS directory entry name, so the node at 770808 is genuinely a catalog node and the key-area parse is correct. Its 40-byte values are {oid, 32-byte hash}, the HASHED child-reference format the root's APFS_BTNODE_HASHED flag implies.** **BUT TWO THINGS ARE INCONSISTENT AND UNRESOLVED: (1) THE LEVELS DO NOT CHAIN -- the root reads btn_level=3 but its children read btn_level=0, and a level-3 root's children must be level 2, so either the level read is wrong or the omap resolution landed on the wrong blocks despite their plausible shape; (2) THE LEAF RECORDS DO NOT PARSE AS FILE RECORDS -- leaf 781228 has 67 keys of 16 bytes each in a 1072-byte key area, and every one parses as type 1 with an IDENTICAL obj_id and an empty name, which is not a catalog of files, so the leaf's key layout is not the j_key+name shape assumed even though the root's key area clearly contains a name.** **SO THE ROUTE REACHES CATALOG LEAVES BUT READS NO FILE RECORD AND DOES NOT REACH IOMobileFramebuffer.framework. VERIFIED: container geometry, container omap and its tree, the volume superblock by magic, the volume omap, the omap lookup (now used three times successfully), the catalog root's header, its key area containing a real directory name, and the resolution of its two children to well-formed leaves. NOT VERIFIED: the level chain, the leaf record layout, and therefore any file name or path.** **THE NEXT ACTION: the root's key area is the instrument that works -- it produced "private-dir" -- so use it to fix the leaf parse rather than assuming j_key. Read apfs_j_key and the APFS_TYPE_* constants from raw.h (the authority, as with every other correction this interval) and check the leaf's 16-byte keys against them, then re-read the 67 records looking for IOMobileFramebuffer. THE CONTROL: whatever key shape explains the root's 24-byte and 16-byte keys must also explain the leaf's 16-byte keys.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17790,6 +17790,105 @@ Concretely, re-read `apfs_kvloc` handling in `apfsprogs/src/apfsck/btree.c` arou
 and check the `area_len` computation for a root with a 40-byte footer.  Then re-run the
 descent.  The omap lookup in
 `local-private/tmp/walk-to-catalog.py` is correct and should be reused unchanged.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header and reader.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty first, addendum CU): the catalog's children ARE virtual oids and DO resolve to well-formed leaves, but the record parse is wrong
+
+## The hypothesis, and it is confirmed
+
+Addendum CT ended with the children reading as entirely zero blocks and the reader
+blamed.  The falsifiable hypothesis: **the catalog tree is a virtual object**
+(`apfs_root_tree_type` is `0x2`, not `0x40000002`), so the oids in its hashed child
+references are **virtual oids** that must be resolved through the volume omap, exactly as
+`apfs_root_tree_oid` itself was.
+
+Tested by resolving 3719 and 3720 through the volume omap (root 782657):
+
+    virtual oid 3719 : as a raw block, ENTIRELY ZERO
+                       through omap -> block 781228 via 782657 -> 781118
+                       flags 0x001a level 0 nkeys 67 table_space {0, 576}
+                       LEAF=1 HASHED=1 NOHDR=1
+    virtual oid 3720 : as a raw block, ENTIRELY ZERO
+                       through omap -> block 781229 via 782657 -> 781118
+                       flags 0x001a level 0 nkeys 67 table_space {0, 576}
+                       LEAF=1 HASHED=1 NOHDR=1
+
+**Both resolve to well-formed leaf nodes with 67 keys each, and to adjacent blocks
+781228/781229 matching the adjacent oids 3719/3720.**  So the hypothesis holds, and
+CT's "the reader is wrong" was itself wrong -- the reader was right, and the child oids
+simply needed one more omap hop.  **A zero block is not evidence of a bad reader; it is
+evidence of an unresolved virtual oid.**
+
+## And the catalog root really is a catalog node
+
+The root's key area holds, verbatim:
+
+    0x0078  01 00 00 00 00 00 00 90  0c 8c a6 ac  70 72 69 76
+    0x0088  61 74 65 2d 64 69 72 00
+
+The trailing bytes are the ASCII string **`private-dir`** -- a real APFS directory entry
+name.  So the node at 770808 is genuinely a catalog node and the key-area parse is
+correct.  The 40-byte values are `{oid, 32-byte hash}`, the HASHED child-reference
+format the root's `APFS_BTNODE_HASHED` flag implies.
+
+## But two things are inconsistent, and they are not resolved
+
+**1. The levels do not chain.**  The root reads `btn_level = 3`, but its children read
+`btn_level = 0`.  A level-3 root's children must be level 2.  So either the level read is
+wrong, or the omap resolution of 3719/3720 landed on the wrong blocks despite their
+plausible shape.
+
+**2. The leaf records do not parse as file records.**  Leaf 781228 has 67 keys in a
+1072-byte key area (16 bytes each).  Every one of the 67 parses as `obj_id_and_type`
+with type **1** and an **identical** `obj_id`, with an empty name:
+
+    record types: {1: 67}
+    obj_id=936748722493063174 type=1 name=''      (x67, all identical)
+
+Sixty-seven identical keys with no names is not a catalog of files.  So the leaf's key
+layout is not the `j_key` + name shape I assumed, even though the root's key area clearly
+contains a name.
+
+**The route therefore reaches catalog leaves but does not read a single file record, and
+it does not reach `IOMobileFramebuffer.framework`.**
+
+## What is verified and what is not
+
+**Verified:** container geometry, container omap and its tree, the volume superblock by
+magic, the volume omap, the omap lookup (now used three times successfully), the catalog
+root's own header, the catalog root's key area containing a real directory name, and the
+resolution of its two children to well-formed leaf blocks.
+
+**Not verified:** the level chain, the leaf record layout, and therefore any file name or
+path.  Nothing below the catalog leaves is established.
+
+## The next action, concretely
+
+The root's key area is the instrument that works -- it produced `private-dir`.  Use it to
+fix the leaf parse rather than assuming `j_key`.  Read `apfs_j_key` and the
+`APFS_TYPE_*` constants from `raw.h` (they are the authority, as with every other
+correction this interval), and check the leaf's 16-byte keys against them.  Then re-read
+the 67 records and look for `IOMobileFramebuffer` among them.
+
+The control: the root's key area decoded a real name, so whatever key shape explains the
+root's 24-byte and 16-byte keys must also explain the leaf's 16-byte keys.  Find the
+shape that does both.
 
 ## Status
 
