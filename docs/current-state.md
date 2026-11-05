@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty first, addendum DE). THE HEADLINE is **apfs_file_info_key IS {hdr, info_and_lba}, ALL 56 TYPE-13 RECORDS DECODE, AND THEY CARRY NO NAMES**. DD left one open question: the 56 type-13 records' 16-byte keys fit no struct. The struct is apfs_file_info_key (raw.h:1465-1468) = {apfs_key_header hdr; __le64 info_and_lba}, which is 8 + 8 = 16 bytes, EXACTLY the measured key length, with masks at raw.h:1470-1472 (LBA_MASK 0x00ffffffffffffff, TYPE_MASK 0xff00000000000000, shift 56). **AND ALL 56 RECORDS DECODE: hdr_type 13, obj_id 22, info_type 1 for every one, LBA range 491,520..44,400,640. So DD's unidentified struct is identified, and it is the same class of error as the five before it -- the definition was in raw.h and the layout was derived instead of read.** **WHAT THESE RECORDS ARE: apfs_file_info_key carries NO NAME -- it is a location/data-stream record keyed by object id and logical block address. So the 56 records in this leaf are not directory entries and the catalog's DIR_RECs must live in other leaves. That reframes the goal rather than blocking it: the catalog is now fully decodable record by record, with DIR_REC -> apfs_drec_hashed_key {hdr, u32 name_len_and_hash, name[]}, FILE_INFO -> apfs_file_info_key {hdr, u64 info_and_lba}, and value -> apfs_drec_val {u64 file_id, u64 date_added, u16 flags, xfields[]}. Both key formats are confirmed on live records and one real name (private-dir, file_id 2) has been read. What remains is to point both decoders at the catalog's other leaves and collect the names.** **ONE NUMBER THAT DOES NOT FIT, RECORDED RATHER THAN EXPLAINED: the LBA range 491,520..44,400,640 at 512 bytes per sector is 251 MB to 22.7 GB, while the whole container is 3,303,014,400 bytes. So these LBAs do not point into this container under a 512-byte unit and the unit is not established. It does not block the name search, only the FILE_INFO targets, but it is recorded as an open question rather than assumed away.** **THE NEXT ACTION: apply both decoders to the catalog's other leaves and collect every DIR_REC name. The catalog's leaves are named by the omap: oids 1217..1284 map to blocks 770809..770877, each a flags 0x001a level-0 node. Decode each with apfs_drec_hashed_key for type-9 keys and apfs_file_info_key for type-13 keys, print every name with its parent obj_id and file_id, and search for IOMobileFramebuffer. THE CONTROL is the one that has held all interval: a name that decodes as clean ASCII with a name_len matching the key length minus 12. private-dir already passes it.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty second, addendum DF). THE HEADLINE is **87 REAL FILESYSTEM NAMES ARE READ FROM THE CRYPTEX CATALOG, AND THE CONTROL PASSES 87 OF 87**. Blocks 770809..770877 (omap oids 1217..1284) were decoded with both confirmed key formats. DIR_RECs appear in four of the 69 leaves: 770810 (11), 770824 (16), 770825 (5) and 770826 (55), 87 in total, and every one decodes -- dyld_shared_cache_arm64, .01 through .52, .symbols, .dylddata and .dyldlinkedit variants, all under parent obj_id 48. **THE CONTROL PASSES: the first run reported 0 of 87 clean ASCII because name_len INCLUDES THE TRAILING NUL (dyld_shared_cache_arm64.45\0 is 27 bytes for a 26-character name); stripping exactly one NUL and re-testing gives 87 of 87 clean ASCII. This is the first time a control has passed on catalog records in this project, and it means the whole route is sound: container -> omap -> volume -> catalog -> leaf -> apfs_drec_hashed_key -> name.** **ESTABLISHED: the SystemOS cryptex's catalog is readable and 87 real filesystem names have been read from it. NOT ESTABLISHED: IOMobileFramebuffer is not among them -- 0 records match -- but these 87 come from only 4 of 69 leaves and the volume omap names oids well beyond 1284 (its root covers 1214 through 5065), so the catalog's remaining leaves have not been read and this is a COVERAGE GAP, NOT A NEGATIVE RESULT about the framework.** **THE NEXT ACTION: enumerate the rest of the catalog's leaves. The volume omap root 782657 has 36 entries covering oids 1214..5065, so the catalog's node oids extend far past 1284. Walk every omap leaf, collect every mapped block whose btn_flags is 0x001a (a leaf), decode each with the same two key formats, and accumulate every DIR_REC name, then search the full set for IOMobileFramebuffer. THE CONTROL CARRIES FORWARD UNCHANGED: a name that is clean ASCII after stripping one NUL, with name_len equal to the key length minus 12.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18780,6 +18780,78 @@ file_id, and search for `IOMobileFramebuffer`.
 
 **The control is the one that has held all interval: a name that decodes as clean ASCII
 with a `name_len` that matches the key length minus 12.**  `private-dir` already passes it.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty second, addendum DF): 87 real filesystem names are read from the cryptex catalog, and the control passes 87 of 87
+
+## The decode, across all 69 of the catalog's leaves
+
+Blocks 770809..770877 (omap oids 1217..1284) were decoded with both confirmed key formats.
+DIR_RECs appear in four of the 69 leaves:
+
+    block 770810: 59 keys, 11 DIR_RECs
+    block 770824: 59 keys, 16 DIR_RECs
+    block 770825: 61 keys,  5 DIR_RECs
+    block 770826: 57 keys, 55 DIR_RECs
+    (the other 65 leaves: 0 DIR_RECs)
+
+**87 DIR_RECs in total**, and every one decodes:
+
+    770826  parent=48  file_id=49   klen_namelen=24  name='dyld_shared_cache_arm64'
+    770826  parent=48  file_id=50   klen_namelen=27  name='dyld_shared_cache_arm64.01'
+    770826  parent=48  file_id=101  klen_namelen=36  name='dyld_shared_cache_arm64.51.dylddata'
+    770826  parent=48  file_id=104  klen_namelen=32  name='dyld_shared_cache_arm64.symbols'
+    ... through .52, plus .dylddata and .dyldlinkedit variants
+
+## The control, and it passes
+
+The first run reported "0 of 87 clean ASCII" because **`name_len` includes the trailing
+NUL** -- `dyld_shared_cache_arm64.45\0` is 27 bytes for a 26-character name.  Stripping
+exactly one NUL and re-testing:
+
+    CONTROL: DIR_RECs whose name is clean ASCII after stripping the NUL: 87 of 87
+
+**87 of 87.**  This is the first time a control has passed on catalog records in this
+project, and it means the whole route is sound: container -> omap -> volume -> catalog ->
+leaf -> `apfs_drec_hashed_key` -> name.
+
+## What is established and what is not
+
+**Established:** the SystemOS cryptex's catalog is readable, and 87 real filesystem names
+have been read from it.  All 87 sit under parent obj_id 48 and all are
+`dyld_shared_cache_arm64.*` entries.
+
+**Not established:** `IOMobileFramebuffer` is **not** among them -- 0 records match.  But
+these 87 come from only 4 of 69 leaves, and the volume omap names oids well beyond 1284
+(its root covers 1214 through 5065).  The catalog's remaining leaves have not been read,
+so this is a coverage gap, not a negative result about the framework.
+
+## The next action, concretely
+
+Enumerate the rest of the catalog's leaves.  The volume omap root 782657 has 36 entries
+covering oids 1214..5065, so the catalog's node oids extend far past 1284.  **Walk every
+omap leaf, collect every mapped block whose `btn_flags` is `0x001a` (a leaf), decode each
+with the same two key formats, and accumulate every DIR_REC name.**  Then search the full
+set for `IOMobileFramebuffer`.
+
+The control carries forward unchanged: a name that is clean ASCII after stripping one NUL,
+with `name_len` equal to the key length minus 12.
 
 ## Status
 
