@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirteenth, addendum CC). THE HEADLINE is **BACKBOARDD IS PRESENT IN 12 OF 14 BOOTS, AND THE SCREEN IS FROZEN ANYWAY**. 29 guest channel logs exist under local-private/boot53; counting each distinct boot once, and matching a comm OR a vname (the springboard.fork1 record spells the name `vname`, which is why the first pass of this survey reported SpringBoard=0 everywhere and would have been believed): **backboardd present in 12 of 14, SpringBoard in 4 of 14, BOTH in 2 of 14 (procwalk-scratch, screen-scratch).** **AND THE BOOT THAT SETTLES IT IS screen-scratch: backboardd AND SpringBoard both present, diag.legacy_display_status stage=10 surface_status=0 surface_found=1 dt=1, and it is the run that took 148 screendumps over 1500 s and found ONE DISTINCT FRAME -- the boot menu. Both processes present, display at its success terminal state, and still one frame. So the missing compositor is not the general blocker.** `display-refusal-run` says the same from the other side: backboardd present, five clients, the busiest with 15 calls and 11 failures across 14 selectors, display at stage 10 -- and still no frame. **WHAT THIS DOES TO THE LAST FOUR ADDENDA: BZ's "launchd never spawns backboardd" is FALSE (12 of 14); CA's three eliminations were measured on boots where backboardd was the absent one, so they explain those boots and not the screen; BY's "the only client is IOMFB_FDR_Loader" is true of MY boots but on display-refusal-run five clients called 14 selectors; and BV's "the swap/wait selector is never called" SURVIVES -- it was never called on the boot where a client called 14 other selectors either.** **WHAT SURVIVES IS THE CLIENT-SIDE EVIDENCE, and it is now the only lead: on the one boot where clients were busy they called 14 distinct selectors, were refused 11 of them, and never called selector 6 -- true whether or not backboardd is present. The screen is frozen on boots with and without backboardd, with and without SpringBoard, with one client and with five; what is constant is that no swap is ever submitted and no frame is ever presented.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. BZ's headline is withdrawn and CB's is withdrawn with it.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred fourteenth, addendum CD). THE HEADLINE is **BACKBOARDD IS THE CLIENT, IT IS REFUSED THREE SELECTORS, AND IT NEVER SUBMITS A SWAP**. A teammate found that `read-client-table.py` broke out of its sampling loop the instant a client opened the framebuffer and then killed QEMU, so the console channel stopped at the moment of measurement: 207 lines and 2 `job.open` records against 742 and 352 on the kernel that did reach bulk job discovery. **BZ read "backboardd was never attempted" off that truncated channel, and the absence was a window artifact produced by my own sampler. The truncated channel is preserved at local-private/boot53/truncated-channel-d2c5a914.log.** **Running the same script with the break removed, to a 1800 s deadline: backboardd is ALIVE at pid 58 and IS a framebuffer client; the channel carries `{"event":"spawn.seen","n":55,"comm":"backboardd"}`; C0 (pid 58) made 9 calls with 3 failures across selectors 8, 15, 22, 29, 33, 57, 74, 79 and 88 -- REFUSED on 15 (0xe00002bc), 29 (0xe00002c7) and 57 (0xe00002c7) -- registered NO notification port, and never called selector 6; C1 (pid 95) called selectors 8 and 28. stage=10, armed=358, lifted=60, swap_validation_calls=0, prepare_calls=0, transfer_calls=0.** **SO BY AND BZ ARE BOTH WITHDRAWN: BY's "the only client is IOMFB_FDR_Loader" is false (its process list was captured at t=605 s, before backboardd had spawned), and BZ's "launchd never spawns backboardd" is false. And the saved table from kernel 2ebda0ec, which the record called "the busiest client: pid=58", WAS BACKBOARDD ALL ALONG -- 15 calls and 11 failures there, 9 and 3 here, same pid, same process.** **THE BLOCKER, STATED FROM THE MEASUREMENT: backboardd opens the framebuffer, calls nine selectors, is refused three of them, registers no notification port, and never calls selector 6. With no swap submitted, validateSwap never runs, nothing is validated, kickOnce returns at GATE 2, and no transfer ever happens.** **STILL NOT KNOWN: which of selectors 15, 29 and 57 is the swap submission, and whether the absence of selector 6 follows from one of those refusals or is independent. The family that owns the dispatch table is a prebuilt Apple kext with no source in the tree. Note that 0xe00002c7 and 0xe00002bc are DIFFERENT refusals, so "the refusals" is not one thing.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the display blocker is now named rather than inferred: backboardd is alive and driving the framebuffer, it is refused three selectors, and it never submits a swap.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16276,3 +16276,110 @@ reached.  BZ's headline is withdrawn and CB's is withdrawn with it: backboardd i
 present in 12 of 14 boots, and on the boot where both it and SpringBoard were
 present the display was still frozen at one frame.**  THE HEADLINE is unchanged
 from AH
+
+---
+
+# Interval 2026-11-05 (one hundred fourteenth, addendum CD): backboardd is the client, it is refused three selectors, and it never submits a swap
+
+## The defect, found by a teammate and confirmed
+
+`read-client-table.py` broke out of its sampling loop the instant `client_calls`
+was non-zero and then killed QEMU in its `finally`.  So the console channel stopped
+at the moment of measurement:
+
+    truncated channel (d2c5a914)   207 lines,  2 job.open, spawn.seen n=1..63
+    full channel (2ebda0ec)        742 lines, 352 job.open, 230 spawn.seen
+
+and the patch that emits `job.open` documents the trap in its own REVISION 3
+comment: "the boot had not reached bulk job discovery yet... The general record
+was measuring opens correctly all along."
+
+BZ read "no spawn.failed record either, so backboardd was never ATTEMPTED" off the
+truncated channel.  **The absence was a window artifact produced by my own
+sampler.**  The truncated channel is preserved at
+`local-private/boot53/truncated-channel-d2c5a914.log` so the defect stays
+inspectable.
+
+## The full-window boot, and it answers the question
+
+Same script, same kernel (`d2c5a914` on run 41980452867, sha256 verified against
+`payload.json`), same 900 s ramp, but the sampler now runs to a 1800 s deadline
+instead of breaking.  686 channel lines, 143 processes at the end.
+
+    pid 27     SpringBoard
+    pid 58     backboardd   <== a framebuffer client
+
+    C0  pid=58   object=0xfffffff7a6007180   calls=9   fails=3
+    C1  pid=95   object=0xfffffff7a6007800   calls=2   fails=1
+
+    C0 (backboardd): registered NO notification port
+        selector   8: SUCCESS
+        selector  15: 0xe00002bc     <- REFUSED
+        selector  22: SUCCESS
+        selector  29: 0xe00002c7     <- REFUSED
+        selector  33: SUCCESS   collectCompletionReports (slot 337)
+        selector  57: 0xe00002c7     <- REFUSED
+        selector  74: SUCCESS   supportedFrameInfo (slot 213)
+        selector  79: SUCCESS
+        selector  88: SUCCESS
+    C1 (pid 95): registered NO notification port
+        selector   8: SUCCESS
+        selector  28: 0xe00002f0     <- REFUSED
+
+    swap_validation_calls 0   prepare_calls 0   transfer_calls 0
+    stage 10   slot_armed_count 358   slot_lifted_count 60
+
+And the channel carries
+`{"event":"spawn.seen","n":55,"comm":"backboardd","source":"XNU.posix_spawn"}`.
+
+## So BY and BZ are both withdrawn, and the real blocker is named
+
+**BY**: "the framebuffer's only client is IOMFB_FDR_Loader" -- false.  backboardd
+is a client and the busy one.  BY's process list was captured at t=605 s, before
+backboardd had spawned.
+
+**BZ**: "launchd never spawns backboardd" -- false.  It spawns, as `spawn.seen`
+n=55, and is alive at pid 58.
+
+And the saved table from kernel `2ebda0ec`, which the record described as "the
+busiest client: pid=58", **was backboardd all along** -- 15 calls and 11 failures
+there, 9 calls and 3 failures here, same pid, same process, different extent.
+
+## The blocker, stated from the measurement
+
+backboardd opens the framebuffer, calls nine selectors, is **refused three of
+them** (15, 29 and 57, with `0xe00002bc` and `0xe00002c7`), registers **no
+notification port**, and **never calls selector 6**.  With no swap submitted,
+`validateSwap` never runs, nothing is validated, `kickOnce` returns at GATE 2, and
+no transfer ever happens.
+
+That is the same conclusion BV and BW reached from the other end, now with the
+client named and its refusals counted on the current kernel.
+
+## What is still not known
+
+Which of selectors 15, 29 and 57 is the swap submission, and whether the absence
+of selector 6 is a consequence of one of those refusals or independent of them.
+The family that owns the dispatch table (`IOMobileFramebufferLegacy`) is a
+prebuilt Apple kext with no source in the tree, so the selector-to-method mapping
+is not directly readable.
+
+Note that `0xe00002c7` is the code the older kernel's output labelled
+`Unsupported`, and `0xe00002bc` is a different refusal -- the two are not the same
+failure, which is worth knowing before treating "the refusals" as one thing.
+
+## Status
+
+Windows/real-guest: **a live guest on run 41980452867, kernel sha256 verified
+against payload.json, control passed, 1800 s window, 143 processes named, the
+client table read with backboardd identified as C0, and a 686-line console
+channel.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  But the display blocker is now named rather than inferred: backboardd is
+alive and driving the framebuffer, it is refused three selectors, and it never
+submits a swap.**  THE HEADLINE is unchanged from AH
