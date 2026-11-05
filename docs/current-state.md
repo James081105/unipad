@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred tenth, addendum BZ). THE HEADLINE is **LAUNCHD NEVER SPAWNS BACKBOARDD, AND THAT IS THE FROZEN SCREEN**. The console channel from run 41980452867 (kernel sha256 d2c5a914 verified, control passed) carries 93 `fork1.spawn` records, 50 `spawn.seen` records, 24 `exit.seen`, and ONE `springboard.fork1` naming SpringBoard. The 93 do_fork1 children are 72 xpcproxy, 2 mount, xpcroleaccountd, usermanagerd, tzinit, sysstatuscheck, seputil, prng_seedctl, mobile_obliterator, launchd_cache_loader, keybagd, init_featureflags, init_exclavekit, fsck, finish_demo_restore, dirs_cleaner, cc_fips_test, auearlyboot, SpringBoard, MSUarlyBootTask and FinishRestoreFromBackup; the 50 exec-path children include runningboardd, notifyd, configd, wifid, mediaserverd, tccd, watchdogd, containermanager and cfprefsd. **`backboardd` appears in NO comm field anywhere in the channel -- not in the 93 do_fork1 children, not in the 50 exec-path children, and there is no spawn.failed record either, so it was never ATTEMPTED, which puts the cause in launchd's job handling rather than in exec.** **SO THE CHAIN IS CLOSED: launchd never spawns backboardd -> no compositor exists (73 processes named, BY) -> the framebuffer's only client is IOMFB_FDR_Loader, which does nothing -> no swap is ever submitted (three ramped boots) -> validateSwap never runs -> nothing is validated -> kickOnce returns at GATE 2 -> no transfer, no frame. Every link is a measurement on this kernel and none is an inference. The frozen screen is not a display-driver defect; it is a missing process.** **AND SPRINGBOARD IS RUNNING, which makes it sharper: launchd DID spawn SpringBoard (the springboard.fork1 record names it, alive at pid 27), so launchd is spawning App jobs -- it spawns SpringBoard and not backboardd from the same machinery. That is the shape addenda BA-BJ were built to answer.** **THE NEXT MEASUREMENT NEEDS NO BUILD: is backboardd's job in launchd's job table, and what are its flags? The promotion gate reads bit 29 of job+0x538 and the home-screen claim reads EmbeddedHomeScreen at job+0x53b bit 5, so reading the job's flags distinguishes "the job is not loaded at all" (a plist or volume problem) from "the job is loaded but not promoted" (the gate BA-BJ characterised). The project already has the launchd job-table reader from BA-BJ, so this is one guest run.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the critical path now has a measured root cause instead of a symptom: launchd never spawns backboardd, so nothing drives the framebuffer, so nothing is ever drawn.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred eleventh, addendum CA). THE HEADLINE is **THE JOB IS LOADED, AND THREE CANDIDATE CAUSES ARE ELIMINATED**. `enumerate-launchd-jobs.py` walks the OS root volume and recovers every launchd job plist by Label -- 373 of them -- and `com.apple.backboardd` is one: UserName=mobile, ProgramArguments=['/usr/libexec/backboardd'], 18 MachServices including com.apple.iohideventsystem, PurpleWorkspacePort, PurpleSystemEventPort and com.apple.CARenderServer, RunAtLoad=True, KeepAlive=True, POSIXSpawnType=Interactive. **So launchd HAS the job, it is RunAtLoad and KeepAlive, and it still never spawns it -- the cause is in launchd's handling of this job, not a missing plist.** (`com.apple.SpringBoard` is ABSENT from this volume, which is expected: it is an app, not a daemon, and its job is not in /System/Library/LaunchDaemons. It runs at pid 27 regardless.) **CANDIDATE 1 REFUTED: only 3 of 373 plists carry a POSIXSpawnType -- backboardd Interactive (never spawned), runningboardd Adaptive (SPAWNED, pid 26), configd Interactive (SPAWNED, pid 37). configd is Interactive exactly like backboardd and spawned, so this port's launchd handles Interactive jobs fine.** **CANDIDATE 2 REFUTED: 240 of 373 plists carry UserName=mobile, and three SPAWNED jobs run as mobile -- sleepd, routined and peopled, all RunAtLoad=True and all in the spawn.seen records. So launchd spawns non-root jobs.** **CANDIDATE 3 IS UNANSWERED BECAUSE THE TEST IS INVALID: grepping the raw image returns 2 hits for /usr/libexec/backboardd and 2 for /usr/libexec/configd, but ZERO for /usr/libexec/sleepd -- and sleepd provably ran. A test whose control fails is not a negative.** **WHAT IS LEFT, AND IT IS THE NEXT HYPOTHESIS: the keys that distinguish backboardd from every spawned control are its MachServices -- 18 entries against configd's 10 and runningboardd's 3 -- and specifically com.apple.iohideventsystem, PurpleWorkspacePort, PurpleSystemEventPort and com.apple.CARenderServer. Hypothesis: launchd refuses the job because it cannot claim one of these services, most likely com.apple.iohideventsystem, which on this port is served by the native offline-hid-input driver rather than by an IOHIDEventSystem. Falsifiable by reading backboardd's job flags out of launchd's memory: the job should show loaded and un-promoted, and the refusal reason should name the service. One guest run, no build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is narrower is the cause of the frozen screen: the job is loaded, RunAtLoad, and never attempted, and it is not the spawn type and not the user.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15998,3 +15998,101 @@ Onsite: N/A.
 reached.  But the critical path now has a measured root cause instead of a
 symptom: launchd never spawns backboardd, so nothing drives the framebuffer, so
 nothing is ever drawn.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred eleventh, addendum CA): the job is loaded, and three candidate causes are eliminated
+
+## The job IS loaded, which was the first question
+
+`local-private/tmp/enumerate-launchd-jobs.py` walks the OS root volume
+(`raw/044-76040-038.raw`) and recovers every launchd job plist by its `Label`,
+reading the bytes APFS keeps inline in the catalog node.  373 labelled plists.
+`com.apple.backboardd` is one of them:
+
+    UserName        = mobile
+    ProgramArguments= ['/usr/libexec/backboardd']
+    MachServices    = 18 entries, including com.apple.iohideventsystem,
+                      PurpleWorkspacePort, PurpleSystemEventPort,
+                      com.apple.CARenderServer, com.apple.backlightd
+    RunAtLoad       = True
+    KeepAlive       = True
+    POSIXSpawnType  = Interactive
+
+So launchd has the job, it is `RunAtLoad`, it is `KeepAlive`, and it still never
+spawns it.  The cause is in launchd's handling of this job, not in a missing
+plist.
+
+(`com.apple.SpringBoard` is ABSENT from this volume, which is expected rather than
+anomalous: SpringBoard is an app, not a daemon, and its job is not in
+`/System/Library/LaunchDaemons`.  It is running at pid 27 regardless.)
+
+## Candidate 1: POSIXSpawnType=Interactive -- REFUTED
+
+Only three of the 373 labelled plists carry a `POSIXSpawnType` at all:
+
+    com.apple.backboardd      Interactive    <- never spawned
+    com.apple.runningboardd   Adaptive       <- SPAWNED (pid 26)
+    com.apple.configd         Interactive    <- SPAWNED (pid 37)
+
+`configd` is `Interactive`, exactly like backboardd, and it spawned and is in the
+`spawn.seen` records.  So this port's launchd handles `Interactive` jobs fine.
+
+## Candidate 2: UserName=mobile -- REFUTED
+
+240 of the 373 plists carry `UserName=mobile`, so it cannot be a gate on its own.
+More decisively, three spawned jobs run as `mobile`:
+
+    com.apple.sleepd      UserName=mobile  RunAtLoad=True   SPAWNED
+    com.apple.routined    UserName=mobile  RunAtLoad=True   SPAWNED
+    com.apple.peopled     UserName=mobile  RunAtLoad=True   SPAWNED
+
+All three appear in the `spawn.seen` records.  So launchd spawns non-root jobs.
+
+## Candidate 3: the binary is missing -- THE TEST IS INVALID, so no conclusion
+
+The obvious next check was whether `/usr/libexec/backboardd` exists on the volume.
+A grep of the raw image returns **2** occurrences of that path, and **2** for
+`/usr/libexec/configd` -- but **0** for `/usr/libexec/sleepd`, and `sleepd`
+provably ran.
+
+So the instrument returns zero for a binary that executed.  Whatever those two
+`backboardd` hits are, they do not establish that the binary is present, and the
+question is unanswered rather than answered.  **A test whose control fails is not
+a negative.**
+
+## What is left, and it is the next hypothesis
+
+The two keys that distinguish backboardd from every spawned control are its
+`MachServices` list -- 18 entries against configd's 10 and runningboardd's 3 --
+and specifically the ones that need subsystems this port may not provide:
+
+    com.apple.iohideventsystem      <- the HID event stack
+    PurpleWorkspacePort             <- the workspace port
+    PurpleSystemEventPort
+    com.apple.CARenderServer        <- the render server
+
+**Hypothesis: launchd refuses the job because it cannot claim one of these
+services, most likely `com.apple.iohideventsystem`, which on this port is served
+by the native `offline-hid-input` driver rather than by an `IOHIDEventSystem`.**
+The prediction is falsifiable: reading backboardd's job flags out of launchd's
+memory should show the job loaded and un-promoted, and the refusal reason should
+name the service.
+
+That needs one guest run with the launchd job-table reader the project already
+has from addenda BA-BJ.  It needs no build.
+
+## Status
+
+Windows/real-guest: **none this interval -- the job plists come from a host-side
+APFS scan of the OS root volume, and the spawn records come from a guest run made
+earlier in this interval.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is narrower is the cause of the frozen screen: the job is loaded,
+`RunAtLoad`, and never attempted, and it is not the spawn type and not the user.**  THE
+HEADLINE is unchanged from AH
