@@ -1,8 +1,8 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "995bfa707c07f1708f4d71f3f5940b556376fb9c",
-    "commit_note": "Moved 2026-11-05 from 9782ddf6. Task #36's probe half: the kick-path counters and their two observers, in package/LegacyDisplayProbe.cpp.",
+    "commit": "84b93262c2c6893e620bfb357ab8e62bd28d9197",
+    "commit_note": "Moved 2026-11-06 from 995bfa7. Task #41: the probe records every selector's FIRST argument set, not selector 6's alone.  Addendum EI withdrew the identification of selector 6 as the swap -- it is the WAIT (NativeLegacyDisplay.cpp:91-93) -- so the submission must be recognised by its argument shape, and a swap is a SwapSetLayer / SwapSetBackgroundColor request (NativeLegacyRequest.h:4-5).  ClientStat grows from 2312 to 4720 bytes and display-clients.py's ctypes mirror is updated to match.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
     "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
