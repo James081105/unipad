@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-fourth, addendum BJ). THE HEADLINE is **THE RACE TEST FIRED, THE CONTROL PASSED, AND THE ANOMALOUS SET IS TWO**. Three open questions closed in one run. **THE DUPLICATED PIDS ARE A RACE, AND THE SCRIPT'S OWN TEST SAYS SO: `DUPLICATED PIDS: 30 distinct set(s) across 142 samples` and "the set MOVES between samples: a proc is being freed while the walk is in flight". Thirty DIFFERENT duplicate sets -- a layout error would be identical every time -- so the offsets were right all along and the eight duplicated pids of addendum BG were never a defect in `GuestObserver.processes()`. They were a seconds-long walk over a guest that forks continuously, reading some procs after they were freed; a freed proc keeps its old p_pid until its slot is reused, so two rows can collide on a pid only one of them ever owned. And fork1.spawn explains the volume: 69 of the 124 spawns on that boot are xpcproxy, all on the do_fork1 route, one per XPC domain, spawned in a burst.** **THE CONTROL PASSED: launchd, configd and backboardd all recovered across the run. It had failed twice before -- once on a stale page cache (BD) and once on a single-frame union (BE) -- and both times it was the control that was wrong, not the walk.** **THE BOOT IS THE DEEPEST ON RECORD: 135 processes at the peak, 95 distinct names, against 99/74 and 112/80 earlier.** **AND ADDENDUM BA'S ANOMALOUS SET IS DOWN TO TWO: on this boot's union SpringBoard is PRESENT (pid 27, and springboard.fork1 names it), OTACrashCopier is PRESENT and axassetsd is PRESENT, leaving only checkerboard and ClarityBoard absent -- and BOTH ARE EmbeddedHomeScreen JOBS.** So EmbeddedHomeScreen is not a sufficient condition for not-spawning either, which leaves the home-screen claim at 0x100007b64 as the one mechanism that still fits, and it now has a SHARP PREDICTION: **the first of the three to claim wins and the other two are refused** -- testable from the claim function's own owner slot at [x1+0x48], and the next thing to measure rather than theorise about. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is proven spawned, proven alive, and proven to take the do_fork1 route.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-fifth, addendum BK). THE HEADLINE is **THE SCREEN WAS MEASURED AND LOOKED AT, AND THE DISPLAY STOPS AT STAGE 10**. `screen-vs-springboard.py` boots the guest, walks allproc and screendumps every 10 s: **65 screendumps over 650 s, ONE distinct frame, and SpringBoard appeared at t=411.6s with the framebuffer unchanged 240 s later.** **And the frame was LOOKED AT, not just hashed** -- the recorded fact is that 39 minutes of sha256 once said "the display froze" while one PNG said it was the boot menu. The PNG is the UniXNU boot menu: green/magenta/blue banner, "Booting QEMU virt: source 4K XNU in 1s", "drivers 1 loaded / 0 failed". **So the sentence repeated for fifteen addenda is now measured AND seen.** **THE SCREENDUMP IS READING THE RIGHT BUFFER: the guest's own serial log says `video base=0x1BC7A0000 display=1 row=3200 width=800 height=600 depth=32`, the same geometry as the screendump -- so the guest's display path is simply not writing it. But the 800x600 is itself the finding: `QemuRamfb.efi` sizes the ramfb via `-fw_cfg name=opt/org.unixnu/ramfb-size`, and `unixnu.toml` names exactly ONE driver, `Payloads/DarwinBoot.efi`. `_check_ramfb_pair` refuses a boot that stages it anyway, because a 24-minute run already measured that a staged driver with no `[[driver]]` entry is a file nothing opens (29 screendumps, all 800x600, one sha256). **So the geometry cannot be fixed from the host -- it needs a payload build whose unixnu.toml names the driver. The guest is running at 800x600 on a 1376x1024 panel, and that is a build change, not a measurement problem.** **WHERE THE DISPLAY PATH ACTUALLY STOPS: `{"event":"diag.legacy_display_status","stage":10,"surface_status":0,"surface_found":1,"dt":1}` -- the surface WAS found and the device tree DID attach, and the probe stopped at stage 10. That is the first point in this chain where the display path has a NUMBERED place it stopped rather than a silence to interpret, and what stage 10 needs is in LegacyDisplayProbe.cpp.** **TWO DEFECTS IN MY OWN SCRIPT, both of which would have lied: the first screendump attempt opened a SECOND QMP connection while the first was held, so every dump failed with "no qmp greeting within 60s" -- which reads exactly like a guest with no framebuffer; and that broken run STILL PRINTED A VERDICT, "THE SCREEN DID NOT CHANGE", derived from 34 failed reads and zero frames. A confident negative from an instrument that never produced a frame is worse than no verdict.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The screen is the UniXNU boot menu, now measured and seen rather than inferred from a hash, and the display path has a numbered place it stopped: stage 10, surface found, device tree attached.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14486,3 +14486,95 @@ Onsite: N/A.
 reached -- the screen is still the UniXNU boot menu even though SpringBoard is
 proven spawned, proven alive, and proven to take the `do_fork1` route.**
 THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-fifth, addendum BK): the screen measured AND looked at, and the display stops at stage 10
+
+## The measurement, and the picture that goes with it
+
+`local-private/tmp/screen-vs-springboard.py` boots the guest, walks `allproc`, and
+screendumps the framebuffer every 10 s, keeping every distinct frame.  On the
+`fork1.spawn` kernel (`d2c5a914`, run 41980452867):
+
+    411.6s  nprocs=14    SPRINGBOARD APPEARED, frame=f54dadc07fb07106
+    65 screendumps over 650 s, ONE distinct frame, f54dadc07fb07106
+
+**And the frame was looked at, not just hashed** -- the recorded fact is that 39
+minutes of sha256 comparison once said "the display froze" while one PNG said the
+framebuffer was still the UniXNU boot menu.  The PNG is the UniXNU boot menu:
+green/magenta/blue banner across the top, `Booting QEMU virt: source 4K XNU in
+1s`, `Up/Down: select  Enter: boot`, `drivers 1 loaded / 0 failed`.
+
+So the statement that has been repeated for fifteen addenda is now **measured and
+seen**, and it survives: SpringBoard is alive at pid 27 and the framebuffer holds
+the bootloader's banner, unchanged for 240 s after SpringBoard appeared.
+
+## Whether the screendump is even reading the right buffer
+
+It was worth checking, because `unixnu_boot.SCREEN` is `1376x1024` and the
+screendump is 800x600.  The guest's own serial log settles it:
+
+    DARWINBOOT: video base=0x1BC7A0000 display=1 row=3200 width=800 height=600 depth=32
+
+**The GOP framebuffer the guest is handed IS 800x600, row 3200, 32 bpp** -- the
+same geometry as the screendump.  So the screendump is not reading some unrelated
+QEMU surface; it is reading the buffer the bootloader drew into, and the guest's
+display path is not writing it.
+
+But the 800x600 is itself the finding.  `QemuRamfb.efi` exists to size the ramfb
+via `-fw_cfg name=opt/org.unixnu/ramfb-size`, and `unixnu.toml` names exactly one
+driver:
+
+    [[driver]]
+    path = "Payloads/DarwinBoot.efi"
+
+`QemuRamfb.efi` is not among them, and `_check_ramfb_pair` refuses a boot that
+stages it anyway -- because a 24-minute run already measured that a staged driver
+with no `[[driver]]` entry is a file nothing opens (29 screendumps, all 800x600,
+all one sha256).  **So the framebuffer geometry cannot be fixed from the host; it
+needs a payload build whose `unixnu.toml` names the driver.**  The guest is
+running at 800x600 on a 1376x1024 panel, and that is a build change, not a
+measurement problem.
+
+## Where the display path actually stops
+
+The channel carries the display probe's own stage counter, and it is the most
+specific datum in this interval:
+
+    {"event":"diag.legacy_display_status","stage":10,"surface_status":0,
+     "surface_found":1,"dt":1,"source":"XNU.LegacyDisplayProbe"}
+
+**The surface was found and the device tree attached, and the probe stopped at
+stage 10 with `surface_status` 0.**  `surface_found: 1` and `dt: 1` mean the two
+things that could have failed early did not.  What stage 10 is, and what the next
+stage needs, is in `LegacyDisplayProbe.cpp` and is the next thing to read -- it is
+the first point in this chain where the display path has a numbered place to have
+stopped rather than a silence to interpret.
+
+## The instrument defects in my own script, recorded because both would have lied
+
+* **The first screendump attempt opened a second QMP connection while the first
+  was held.**  QMP serves one client, so every dump failed with "no qmp greeting
+  within 60s" -- which reads exactly like a guest with no framebuffer.  It is not.
+  The dumps now use the one connection the run holds.
+* **That broken run still printed a verdict.**  "THE SCREEN DID NOT CHANGE once
+  SpringBoard was alive" was derived from 34 failed reads and zero frames.  A
+  confident negative from an instrument that never produced a frame is worse than
+  no verdict, and it is the recorded fact 13 shape again.  The run reported here
+  has 65 real frames behind its verdict.
+
+## Status
+
+Windows/real-guest: **a real guest, 65 screendumps over 650 s, one distinct frame,
+and that frame looked at and identified as the UniXNU boot menu.**  SpringBoard
+appeared at t=411.6 s with the framebuffer unchanged.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, completed successfully.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The screen is the UniXNU boot menu, now measured and seen rather than
+inferred from a hash, and the display path has a numbered place it stopped:
+stage 10, surface found, device tree attached.**  THE HEADLINE is unchanged from AH
