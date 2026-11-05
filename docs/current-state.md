@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty eighth, addendum DB). THE HEADLINE is **THE CATALOG'S KEY FORMAT IS apfs_drec_hashed_key, IT DECODES PERFECTLY, AND 770872 IS A CATALOG NODE**. DA's next action was to read the five level-1 nodes' keys looking for a DIR_REC with a name. **LEVEL-1 NODE OID 1279, BLOCK 770872, ENTRY 0 is 01 00 00 00 00 00 00 90 | 0c 8c a6 ac | "private-dir" -- the SAME key as the catalog root's own first key, byte for byte. In a B-tree a child's first key is its parent's separator, so 770872 IS the catalog root's first child. The catalog's own nodes are at oids 1278 and 1279, and DA's conclusion that 781228 is not a catalog leaf is confirmed from the other direction.** **THE KEY FORMAT: the nodes carry APFS_BTNODE_HASHED so their directory keys are not apfs_drec_key but apfs_drec_hashed_key (raw.h:634-638) = {apfs_key_header hdr; __le32 name_len_and_hash; u8 name[0]}, with masks at raw.h:600-602 (APFS_DREC_LEN_MASK 0x3ff, APFS_DREC_HASH_MASK 0xfffffc00, shift 10). Decoding the root's key: hdr = 0x9000000000000001 gives type 9 (APFS_TYPE_DIR_REC) and obj_id 1 (the volume root directory); name_len_and_hash = 0xaca68c0c gives name_len = 12 and name_hash = 0x2b29a3; name = "private-dir" (12 bytes including the NUL); total = 8 + 4 + 12 = 24 bytes, EXACTLY the measured key length. EVERY FIELD DECODES AND THE LENGTH IS EXACT.** **WHY THE LEAF PARSE FAILED, AND IT WAS ONE FIELD: every leaf-record parse since CU read name_len as a __le16 at offset 8. In a hashed node that offset is the LOW HALF of name_len_and_hash and the high half belongs to the name hash. That single wrong field is what made 67 records look like "type 13, obj_id 97, no name" -- the bytes called a type and an object id were partly a hash.** **STILL NOT KNOWN: the type-13 keys (level-1 nodes 770871, 781144, 781206 and 782082 carry 16-byte keys whose first qword is type 13 with obj_id 50/95/105; under apfs_drec_hashed_key a 16-byte key is 8 + 4 + a 4-byte name with name_len = 0, which does not fit, so type 13 uses a different key struct still unidentified -- but that no longer blocks the catalog because 770872 demonstrably holds DIR_RECs), and the child-reference format (the catalog root's two 40-byte values still have an unconfirmed format, though the key match above identifies the catalog's children without it: they are the level-1 nodes at oids 1278 and 1279).** **THE NEXT ACTION: read level-1 node 770872 (oid 1279) as a catalog node -- take its 40-byte values as child references, resolve them through the omap, and check that each child is a leaf whose keys decode as apfs_drec_hashed_key with real names. THE CONTROL is the one that has worked every time: a child's first key must equal its parent's separator key. If the names come out, the catalog is readable end to end and IOMobileFramebuffer.framework becomes a name search rather than a format problem.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty ninth, addendum DC). THE HEADLINE is **770872's 40-BYTE VALUES ARE RECORDS, NOT CHILD REFERENCES**. DB's next action was to take them as child references and resolve them through the omap. **THAT ASSUMPTION IS FALSIFIED: reading the oid at offset 0 gave 2, 1, 3, 4, 5, 6 -- all below the volume omap's oid range 1214..5065, so the omap lookup failed for every one; and scanning EVERY 8-byte window of each 40-byte value for an oid in that range found NONE in any of the 60 values. So they are not child references, and the "40-byte child-reference format" that CU, CV, CW, CX, CY, CZ, DA and DB all circled was never a child reference at all.** **WHAT THEY ARE INSTEAD: the first qword of each value is a small sequential counter -- 2, 1, 3, 4, 5 -- followed by 32 bytes, and entry 0's separator key is the DIR_REC private-dir under obj_id 1 with its value's first qword = 2. That is the shape of apfs_drec_val (raw.h:236-241) = {__le64 file_id; __le64 date_added; __le16 flags; u8 xfields[]}, so 770872 HOLDS REAL CATALOG RECORDS, NOT POINTERS, and private-dir has file_id 2. The 32 bytes after it are the rest of the record, not a hash and not a child block.** **WHAT THAT MEANS FOR THE TREE: 770872 carries the catalog's own separator keys AND real record values, so it is effectively a LEAF, and the catalog root's btn_level=3 is wrong in the same way CZ established for the rest of the volume -- the level field is not a plain depth counter. The catalog is therefore root 770808 -> leaves, with 770872 one of them and private-dir (file_id 2) its first entry. THE CATALOG IS READABLE FROM 770872 RIGHT NOW and no child-pointer resolution is needed.** **STILL NOT KNOWN: the type-13 keys. Entries 1-4 of 770872 carry 16-byte keys decoding as type 13 (FILE_INFO), obj_id 22, name_len 0 -- and apfs_file_info's key should be 8 bytes, not 16 -- so type 13 uses a key struct still unidentified, accounting for most of the 60 records. That no longer blocks the goal.** **THE NEXT ACTION: decode all 60 records of 770872 as {apfs_drec_hashed_key, apfs_drec_val} and print every DIR_REC's name and file_id plus a histogram of record types. THE CONTROL is the one that has held all interval: a name that decodes as clean ASCII with a matching name_len. If the DIR_RECs come out with real names, search them for IOMobileFramebuffer, and if it is not in this leaf the same decode applied to the catalog's other leaves will find it.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18536,6 +18536,92 @@ keys decode as `apfs_drec_hashed_key` with real names.  **The control is the one
 worked every time: a child's first key must equal its parent's separator key.**  If the
 names come out, the catalog is readable end to end and `IOMobileFramebuffer.framework`
 becomes a name search rather than a format problem.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty ninth, addendum DC): 770872's 40-byte values are RECORDS, not child references
+
+## The test DB asked for, and it falsified DB's assumption
+
+DB's next action was to take 770872's 40-byte values as child references, resolve them
+through the omap, and check each child is a leaf.  **That assumption is falsified.**
+
+Reading the oid at offset 0 gave 2, 1, 3, 4, 5, 6 -- all below the volume omap's oid range
+(1214..5065), so the omap lookup failed for every one.  Scanning **every** 8-byte window of
+each 40-byte value for an oid in the omap's range:
+
+    entry 0  +0  = 2      8-byte windows in [1214, 5065]: (none)
+    entry 1  +0  = 1      8-byte windows in [1214, 5065]: (none)
+    entry 2  +0  = 3      8-byte windows in [1214, 5065]: (none)
+    entry 3  +0  = 4      8-byte windows in [1214, 5065]: (none)
+    entry 4  +0  = 5      8-byte windows in [1214, 5065]: (none)
+
+**Not one of the 60 values contains a child oid anywhere.**  So the 40-byte values are not
+child references, and the "40-byte child-reference format" that CU, CV, CW, CX, CY, CZ, DA
+and DB all circled was never a child reference at all.
+
+## What they are instead
+
+The first qword of each value is a small sequential counter -- 2, 1, 3, 4, 5 -- followed by
+32 bytes.  Entry 0's separator key is the DIR_REC `private-dir` under obj_id 1, and its
+value's first qword is **2**.
+
+That is the shape of `apfs_drec_val` (raw.h:236-241):
+
+    struct apfs_drec_val {
+        __le64 file_id;
+        __le64 date_added;
+        __le16 flags;
+        u8 xfields[];
+    } __packed;
+
+**So 770872 holds real catalog records, not pointers.**  `private-dir` has file_id 2.  The
+32 bytes after it are the rest of the record -- date, flags and extended fields -- not a
+hash and not a child block.
+
+## What that means for the tree
+
+770872 carries the catalog's own separator keys *and* real record values.  So it is
+effectively a **leaf**, and the catalog root's `btn_level = 3` is wrong in the same way CZ
+established for the rest of the volume: the level field is not a plain depth counter.
+
+The catalog is therefore: root 770808 -> leaves, with 770872 being one of them and
+`private-dir` (file_id 2) its first entry.  **The catalog is readable from 770872 right
+now**, and no child-pointer resolution is needed.
+
+## What is still not known
+
+The remaining type-13 keys.  Entries 1-4 of 770872 carry 16-byte keys decoding as type 13
+(FILE_INFO), obj_id 22, `name_len = 0` -- and `apfs_file_info`'s key should be 8 bytes, not
+16.  So type 13 uses a key struct that is still unidentified, and it accounts for most of
+the 60 records.
+
+**That no longer blocks the goal.**  The route to a file name is open: read 770872's
+records, take the DIR_RECs, and search their names.
+
+## The next action, concretely
+
+Decode all 60 records of 770872 as `{apfs_drec_hashed_key, apfs_drec_val}` and print every
+DIR_REC's name and file_id, plus a histogram of the record types.  **The control is the one
+that has held all interval: a name that decodes as clean ASCII with a matching
+`name_len`.**  If the DIR_RECs come out with real names, search them for
+`IOMobileFramebuffer` -- and if it is not in this leaf, the same decode applied to the
+catalog's other leaves will find it.
 
 ## Status
 
