@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval seventy-seventh, addendum AS). THE HEADLINE is **BIT 12 IS WRITTEN AND NEVER EXTRACTED**. Addendum AR named the fork: `App` is the only spawn type that sets bit 12 of `job+0x538`. This interval hunted its consumer with a purpose-built walker that follows each of the 345 readers of that field forward and reports every conditional that depends on it -- 203 do something testable -- and the answer is a negative that redirects the search. launchd keeps one `lsr` accessor per flag bit at 0x100004b30, and the positions present are 1, 2, 3, 5, 6, 8, 9, 10, 16, 23, 24, 30, 33, 34, 52, 54 -- **11 and 12 are absent**. The translator at 0x1000034a8 consumes bits 25, 26, 33, 34, 52 and 54. The only reader that discriminates on `App`, 0x100006da4, compares the CODE at +0x358 against 0x100 and sets attributes without refusing anything. **So bit 12 is a write-only marker as far as launchd's own `__text` goes -- which is not 'bit 12 does nothing' but 'its consumer is not a branch here'**, and the stronger candidate is that it leaves the process in a marshalled spawnattr: launchd carries the string "failed to marshall spawnattrs: offset = %u, left = %lu, expected = %lu", a serialisation failure path. Task #33's next step is therefore no longer 'find the branch that tests bit 12' but 'find what the flag is marshalled into and who reads it'. **The caveat travels with the negative: this is a static scan of one binary and establishes only that no instruction in launchd extracts bit 12.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval seventy-eighth, addendum AT). THE HEADLINE is **TWO RED TESTS, TWO DIFFERENT ATTRIBUTIONS**, and PRD requirement 6 is the reason the distinction matters. The full suite came back red on two tests. **(1) was mine and the gate was right to catch it**: committing the wide-mode lifter to `unipad/qemu-metal-bridge-stubs` moved `vendor/UniXNU-qemu` to 9a784bf off the lock's pin 9782ddf, and the lock names the last commit a build was VERIFIED against. Resolved without weakening anything: the work now lives on `unipad/qemu-metal-bridge-stubs-wide` at 9a784bf and the pinned branch is back at 9782ddf with a clean tree. **Worth noting: this is a different test reading a different checkout than the one AR recorded -- test_p0p1_gate_main reads local-private/upstream/UniXNU-qemu and labels it vendor/UniXNU-qemu, while this one really reads vendor/UniXNU-qemu. Two tests, two checkouts, one label, which is why fixing the mirror did not fix this one.** **(2) is an environment problem, now measured rather than argued**: QMP `pmemsave` returns ENOENT for a file whose parent directory exists, because the pinned QEMU cannot open a path containing the non-ASCII characters in this host's account name -- the same test passes unchanged under `--basetemp=.scratch/pt-ascii`. Fixed in the test with `_qemu_facing_dir()`, which uses pytest's `tmp_path` when it is ASCII and otherwise the repository's untracked `.scratch/`; nothing about the measurement changes, only the spelling of the path. **The pre-flight and its mutation suite now say SKIPPED rather than PASSED when the file under test has no wide mode** -- with the checkout back on the narrow-only pin, the wide cases were a green check on a mode the binary does not have, which is the same defect as a green check on a broken binary. Six of seven mutations caught, the seventh inapplicable and saying so. **Also: F: was at 6.2 GB and C: at 5.9 GB; reclaimed 3.0 GB of stale `*-input/unixnu-out` build output and 3.3 GB of stale pytest temp, by name, keeping every log and manifest.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is task #33.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -12822,3 +12822,103 @@ Onsite: N/A.
 
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven.**  THE HEADLINE is
 unchanged from AH
+
+---
+
+# Interval 2026-11-05 (seventy-eighth, addendum AT): two red tests, two different attributions
+
+## The two failures, and they are not the same kind of thing
+
+The full suite came back red on two tests:
+
+    1. tests/integration/test_upstream_flag_table.py::
+       test_the_pinned_device_repository_is_the_one_the_lock_names
+    2. tests/integration/test_window_is_host_readable.py::
+       test_the_host_can_read_the_window_and_the_framebuffer_over_qmp
+
+### (1) was mine, and the gate was right to catch it
+
+    vendor/UniXNU-qemu is at 9a784bfd... but config/sources.lock.json
+    pins 9782ddf6f...: the integration stage would be testing a different tool
+
+This interval committed the wide-mode lifter to
+`unipad/qemu-metal-bridge-stubs`, which moved the checkout off the lock's pin.
+**The gate is correct and it caught a real inconsistency.**  What it caught is
+that the lock names the last commit a build was VERIFIED against, and a commit
+on top of it has not been built.
+
+Resolved without weakening anything: the work now lives on
+**`unipad/qemu-metal-bridge-stubs-wide` at `9a784bf`**, and the pinned branch is
+back at `9782ddf` with a clean tree.  The lock still names the verified build,
+the integration stage still tests the tool the lock names, and the capability is
+preserved rather than discarded.
+
+Note that this is a DIFFERENT test reading a DIFFERENT checkout than the one
+addendum AR recorded: `test_p0p1_gate_main` reads
+`local-private/upstream/UniXNU-qemu` and labels it `vendor/UniXNU-qemu`, while
+this one really does read `vendor/UniXNU-qemu`.  **Two tests, two checkouts, one
+label** -- which is why fixing the mirror did not fix this one, and why fixing
+this one would not have fixed that one.
+
+### (2) is an environment problem, and it is now measured rather than argued
+
+    Could not open 'C:\...\pytest-of-<non-ascii user>\pytest-1404\
+    test_the_host_can_read_the_win0\known.bin': No such file or directory
+
+from QMP `pmemsave`.  **ENOENT for a file whose parent directory exists is a
+path QEMU could not resolve, not a missing directory.**  `pmemsave` takes a
+filename and QEMU opens it on the host, and the pinned QEMU cannot open a path
+containing the non-ASCII characters in this host's account name.  Measured, not
+inferred: the same test passes unchanged under
+`--basetemp=.scratch/pt-ascii`.
+
+Fixed in the test, not worked around in the invocation:
+`_qemu_facing_dir()` returns pytest's `tmp_path` when it is ASCII and otherwise
+a directory under the repository's untracked `.scratch/` -- a normal test
+location, and not under `local-private/` (PRD 12).  **Nothing about the
+measurement changes; only the spelling of the path the bytes are written to.**
+The instrument's own known-present read still runs first, so a path problem now
+fails as a broken instrument rather than as an answer.
+
+This is the seventh instrument defect this interval's controls caught, and the
+second one where the fix was to the harness rather than to the claim.
+
+## The pre-flight and its mutation suite now say SKIPPED, not PASSED
+
+With the device checkout back on the narrow-only pin, the pre-flight's wide-mode
+cases were exercising a mode that is not in the binary -- a green check on
+nothing.  Both tools now guard on the file actually carrying the mode:
+
+* the pre-flight prints `wide mode: NOT PRESENT in this file -- the wide cases
+  below are SKIPPED, not passed`, and its summary names the modes it exercised;
+* the mutation suite reports `SKIPPED -- the device file on this checkout has no
+  wide mode to mutate` and its verdict becomes
+  `ALL APPLICABLE MUTATIONS CAUGHT`.
+
+Six of the seven mutations are caught; the seventh is inapplicable to this
+checkout and says so.  **A check that goes green on a mode the binary does not
+have is the same defect as a check that goes green on a broken binary.**
+
+## Disk, reclaimed by name
+
+F: was at 6.2 GB free and C: at 5.9 GB.  Reclaimed, by name, keeping every log
+and manifest:
+
+* eight stale `local-private/boot53/*-input/unixnu-out` trees -- 3.0 GB on F:,
+  build output, re-derivable from the artifact store;
+* five stale `pytest-of-*/pytest-<n>` dirs older than the live run -- 3.3 GB on
+  C:.
+
+F: is at 9.2 GB and C: at 9.0 GB.  Nothing under `shell/`, nothing holding a
+live run, and no `guest-input.log` or `artifact-manifest.json` was touched.
+
+## Status
+
+Windows/real-guest: **PASS for both fixes**, each re-run in isolation and green.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is
+task #33.**  THE HEADLINE is unchanged from AH
