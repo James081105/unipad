@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty ninth, addendum DC). THE HEADLINE is **770872's 40-BYTE VALUES ARE RECORDS, NOT CHILD REFERENCES**. DB's next action was to take them as child references and resolve them through the omap. **THAT ASSUMPTION IS FALSIFIED: reading the oid at offset 0 gave 2, 1, 3, 4, 5, 6 -- all below the volume omap's oid range 1214..5065, so the omap lookup failed for every one; and scanning EVERY 8-byte window of each 40-byte value for an oid in that range found NONE in any of the 60 values. So they are not child references, and the "40-byte child-reference format" that CU, CV, CW, CX, CY, CZ, DA and DB all circled was never a child reference at all.** **WHAT THEY ARE INSTEAD: the first qword of each value is a small sequential counter -- 2, 1, 3, 4, 5 -- followed by 32 bytes, and entry 0's separator key is the DIR_REC private-dir under obj_id 1 with its value's first qword = 2. That is the shape of apfs_drec_val (raw.h:236-241) = {__le64 file_id; __le64 date_added; __le16 flags; u8 xfields[]}, so 770872 HOLDS REAL CATALOG RECORDS, NOT POINTERS, and private-dir has file_id 2. The 32 bytes after it are the rest of the record, not a hash and not a child block.** **WHAT THAT MEANS FOR THE TREE: 770872 carries the catalog's own separator keys AND real record values, so it is effectively a LEAF, and the catalog root's btn_level=3 is wrong in the same way CZ established for the rest of the volume -- the level field is not a plain depth counter. The catalog is therefore root 770808 -> leaves, with 770872 one of them and private-dir (file_id 2) its first entry. THE CATALOG IS READABLE FROM 770872 RIGHT NOW and no child-pointer resolution is needed.** **STILL NOT KNOWN: the type-13 keys. Entries 1-4 of 770872 carry 16-byte keys decoding as type 13 (FILE_INFO), obj_id 22, name_len 0 -- and apfs_file_info's key should be 8 bytes, not 16 -- so type 13 uses a key struct still unidentified, accounting for most of the 60 records. That no longer blocks the goal.** **THE NEXT ACTION: decode all 60 records of 770872 as {apfs_drec_hashed_key, apfs_drec_val} and print every DIR_REC's name and file_id plus a histogram of record types. THE CONTROL is the one that has held all interval: a name that decodes as clean ASCII with a matching name_len. If the DIR_RECs come out with real names, search them for IOMobileFramebuffer, and if it is not in this leaf the same decode applied to the catalog's other leaves will find it.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred fortieth, addendum DD). THE HEADLINE is **THE FIRST CATALOG FILE NAME IS READ -- "private-dir", file_id 2 -- AND 56 OF 57 RECORDS ARE STILL NAMELESS**. All 60 entries of node 770872 were decoded as {apfs_drec_hashed_key, apfs_drec_val}: 57 records, type histogram {DIR_REC: 1, FILE_INFO: 56}. **THE ONE DIR_REC IS parent=1, name="private-dir", file_id=2, date=14894263258653165926, vflags=0xada2, klen=24, vlen=40 -- THE FIRST REAL FILESYSTEM NAME READ OUT OF THE SYSTEMOS CRYPTEX. It sits under obj_id 1 (the volume root directory) with file_id 2, and its 24-byte key decodes exactly as apfs_drec_hashed_key. That closes the loop DB and DC opened: the catalog's key format and record value are both confirmed on a live record.** **AND THE OTHER 56 RECORDS ARE NOT NAMELESS DIR_RECS: they all decode as type 13 (APFS_TYPE_FILE_INFO), obj_id 22 constant, name_len 0, no name, and SEQUENTIAL file_ids 1, 3, 4, 5, 6, 7... Only 1 of 57 names is clean ASCII, and 0 records match IOMobileFramebuffer or Framebuffer.** **SO ONE REAL NAME HAS BEEN READ AND IT IS NOT THE ONE TASK #38 NEEDS. The route now works end to end for DIR_REC records: container -> omap -> volume -> catalog -> node -> key -> name. What is missing is the other 56 records, which dominate every leaf examined and carry no name under the apfs_drec_hashed_key reading. The type-13 key is 16 bytes and decodes as {hdr, name_len_and_hash = 0x00098000, 4 bytes}; name_len reads 0 so those trailing 4 bytes are unexplained, and apfs_file_info's key should be 8 bytes. So type 13 uses a key struct still unidentified, and it is 56 of every 57 records in this leaf.** **THE NEXT ACTION: read apfs_file_info and its key from raw.h -- do not derive them. The struct is almost certainly {apfs_key_header hdr; ...} with a fixed size, and the 16-byte measurement says there are 8 bytes after the header. If those 8 bytes are a file id or a hash, the 56 records become identifiable and the leaf's real contents become visible. If type 13 carries no names at all, the catalog's directory entries live in other leaves, and the same decode applied to the catalog's remaining leaves (the omap names oids 1217..1284 as blocks 770809..770877) will surface them.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18622,6 +18622,78 @@ that has held all interval: a name that decodes as clean ASCII with a matching
 `name_len`.**  If the DIR_RECs come out with real names, search them for
 `IOMobileFramebuffer` -- and if it is not in this leaf, the same decode applied to the
 catalog's other leaves will find it.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred fortieth, addendum DD): the first catalog file name is read -- "private-dir", file_id 2 -- and 56 of 57 records are still nameless
+
+## The decode, and the first real name
+
+All 60 entries of node 770872 were decoded as `{apfs_drec_hashed_key, apfs_drec_val}`:
+
+    decoded 57 records
+    type histogram: {'DIR_REC': 1, 'FILE_INFO': 56}
+
+    DIR_REC  parent=1  name='private-dir\0'  file_id=2  date=14894263258653165926
+             vflags=0xada2  klen=24  vlen=40
+
+**`private-dir` is the first real filesystem name read out of the SystemOS cryptex.**  It
+sits under obj_id 1 (the volume root directory) with file_id 2, and its 24-byte key decodes
+exactly as `apfs_drec_hashed_key`: header, `name_len_and_hash` giving `name_len = 12`, then
+the name.  That closes the loop DB and DC opened -- the catalog's key format and record
+value are both confirmed on a live record.
+
+## And the other 56 records are not nameless DIR_RECs
+
+The remaining 56 records all decode as **type 13 (`APFS_TYPE_FILE_INFO`)**, obj_id 22
+constant, `name_len = 0`, no name, and **sequential file_ids 1, 3, 4, 5, 6, 7, ...**:
+
+    type=FILE_INFO obj=22 nlen=0 name=b'' file_id=1  klen=16 vlen=40
+    type=FILE_INFO obj=22 nlen=0 name=b'' file_id=3  klen=16 vlen=40
+    type=FILE_INFO obj=22 nlen=0 name=b'' file_id=4  klen=16 vlen=40
+    ...
+
+Only **1 of 57** names is clean ASCII.  And **0 records match `IOMobileFramebuffer` or
+`Framebuffer`.**
+
+## What this means, stated plainly
+
+**One real name has been read, and it is not the one task #38 needs.**  The route now works
+end to end for DIR_REC records: container -> omap -> volume -> catalog -> node -> key ->
+name.  What is missing is the *other* 56 records, which dominate every leaf examined, and
+which carry no name under the `apfs_drec_hashed_key` reading.
+
+The type-13 key is 16 bytes and decodes as `{hdr, name_len_and_hash = 0x00098000, 4 bytes}`.
+`name_len` reads 0, so those trailing 4 bytes are unexplained, and `apfs_file_info`'s key
+should be 8 bytes.  **So type 13 uses a key struct that is still unidentified, and it is
+56 of every 57 records in this leaf.**
+
+## The next action, concretely
+
+Read `apfs_file_info` and its key from raw.h -- do not derive them.  The struct is almost
+certainly `{apfs_key_header hdr; ...}` with a fixed size, and the 16-byte measurement says
+there are 8 bytes after the header.  If those 8 bytes are a **file id or a hash**, the 56
+records become identifiable and the leaf's real contents -- including any
+`IOMobileFramebuffer` entry -- become visible.
+
+If type 13 turns out to carry no names at all, then the catalog's directory entries live in
+other leaves, and the same decode applied to the catalog's remaining leaves (the omap names
+oids 1217..1284 as blocks 770809..770877) will surface them.
 
 ## Status
 
