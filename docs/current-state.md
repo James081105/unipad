@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twentieth, addendum CJ). THE HEADLINE is **THE ROUTE TO NAMING THE 181 FAMILY SLOTS IS BLOCKED TWICE OVER**. The plist exists at /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Info.plist (com.apple.IOMobileFramebuffer, v343.0.0) -- **a PrivateFramework, not a kext; there is no IOMobileFramebuffer.kext anywhere in the 43,028-directory catalog.** **And the executable is not there: every bundle on the volume is a shell (the framework's only children are Info.plist and _CodeSignature; every .kext under /System/Library/Extensions has only a PlugIns entry). No Contents/, no Contents/MacOS/<exe>. The binaries live in the kernelcache, and /System/Library/Caches/com.apple.kernelcaches is EMPTY.** **THE CONTROL IS SOUND: /System/Library/Extensions holds 21 bundles (17 .kext) and IOHIDFamily, IOUSBHostFamily and IOStreamFamily are all found, so the walker distinguishes absent from unreadable and IOGraphicsFamily's absence is real.** **And the reader is not the limit: it recovers extent-resident binaries (proved on /usr/sbin/fairplayd.A2, 5 extents, 17,485,824 bytes, valid Mach-O arm64 with 27 load commands), but every multi-megabyte binary is a MULTI-CHUNK type-4 resource fork and the decoder handles only single-chunk. So the route is blocked twice: the binary is not in this catalog, and even if it were it could not be pulled out of a multi-chunk fork.** **TWO BUGS THAT PRODUCED PLAUSIBLE-LOOKING WRONG ANSWERS, recorded before anyone reuses those scripts: (1) `j_file_extent_key.logical_addr` is a BYTE offset, not a block number -- multiplying by 4096 silently read only the first extent of fairplayd.A2 (4,345,856 of 17,485,824 bytes) while STILL yielding a valid Mach-O magic and 27 load commands, so a header check alone would have passed it; (2) an extent spans many blocks, so reading only the block at phys_block_num truncates the same way; (3) `apfs_inode_val.uncompressed_size` (+0x54) reads 0, so a file's real length must come from the sum of its extent lengths. And a negative that must not be over-read: the framework's _CodeSignature/CodeResources is 2467 bytes listing 0 files, and the IDENTICAL 2467 bytes are IOHIDFamily.kext's CodeResources -- a stub, not a manifest, so its emptiness is not evidence about the missing executable.** **MY OWN CHECK CLOSES THE ALTERNATIVE: the 181 slots cluster at 0xfffffff005786e20..0xfffffff0057a02d4, and that range holds ZERO symbols, with no symbol anywhere below it and the nearest above being the kernel's own __mh_execute_header at 0xfffffff007004000 some 14 MB away. So there is no alternative spelling to find -- the prelinked kext region is symbol-free in this kernel's table.** **SO TASK #38 HAS NO INSTRUMENT AND NOW NO ROUTE ON THIS ARTIFACT. The next probe, unverified and recorded as such: the kext binaries are almost certainly in the IPSW's kernelcache.im4p, which is a DIFFERENT artifact from the one this route used.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty first, addendum CK). THE HEADLINE is **THE SELECTOR DECODER IS VALIDATED -- SLOT 182 REPRODUCED -- AND A TEMPTING 181-THUNK TABLE WAS CORRECTLY REFUSED**. A teammate retracted their earlier claim that the decoder fails validation (their test was on the wrong function set); I had accepted that claim into the record and am correcting it with them. **I verified the bytes independently: at 0xfffffff00bef6378 + 548 the word is 0xf942d94a -- `LDR x10,[x10,#0x5b0]`, imm12 = 182, byte offset 1456 = 182*8. The slot-182 load is exactly where they said, in the documented position, so the decoder passes the gate I set.** **BUT THE SYMBOL ATTRIBUTION IS NOT VERIFIED: there is no `IOUserClient::externalMethod` symbol in this kernel's table; the 22 code-address symbols containing `externalMethod` are all subclasses (IOUserUserClient, AppleKeyStoreUserClient, IOUserServer...). The address may be the right function, but nothing in the file names it. The VALIDATION rests on the load's position, which is confirmed; the INTERPRETATION rests on addendum U and the teammate's reading, not on the symbol table. Those are different strengths of evidence and must not be merged.** **AND A TEMPTING STRUCTURE WAS CORRECTLY REFUSED: at 0xfffffff0057a26f8 there are 181 twelve-byte thunks (ADRP/LDR/BR) spanning to 0xfffffff0057a2f68, and the count matches the 181 original-family vtable entries exactly -- which is what made it tempting. Applying the guardrail it fails: only 80 of its immediates are real vtable slots, 101 point past the vtable entirely (range 359..485), 6 are the fork's own, and 107 original-family slots are absent including all of 168-182. The matching 181 is a coincidence, and it was reported as a refusal rather than a bridge.** **AND THE FORK NEVER LEARNED THE NAMES EITHER: build-native-legacy-display.py:87-98 generates the entire 358-slot base-class declaration, naming exactly nine slots (184 isMainDisplay, 188 getDotPitch, 213 supportedFrameInfo, 249 getDisplayDimensions, 288 startHardware, 290 kickSwapQueue, 295 completeCurrentSwap, 296 validateSwap, 337 collectCompletionReports) and emitting every other slot as `opaque{i}()` pure-virtual or deprecated with "Unclassified ABI: never call from source". So the ABI was reconstructed slot-for-slot but the names were never learned, and the 181 must come from the kext and nowhere else.** **THE KEXT IS NOT ON THE OS VOLUME, AND THE EARLIER EVIDENCE FOR THAT WAS ALSO WRONG: a teammate had reported "System/Library/Extensions has 0 inodes", which was a bug in their script -- catalog paths come back prefixed with `root/`, so their startswith never matched. The conclusion is right and the measurement was not. It is corroborated independently by apfs-reader, which found 21 bundles including IOHIDFamily, IOUSBHostFamily and IOStreamFamily and no IOMobileFramebuffer.kext in the 43,028-directory catalog. The next artifact is the SystemOS cryptex (044-76034-038.dmg), a raw APFS container (NXSB at offset 32) that refused BASE=0 with "block 15897 is not the container omap" -- its geometry differs and needs its own work.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What changed is that task #38 has a validated instrument again: the missing piece is a decoded selector and the 181 names, not a working tool.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16933,3 +16933,106 @@ Onsite: N/A.
 reached.  Task #38 has no instrument and now no route on this artifact: the family's
 binary is not on the volume, and the kernel's own symbol table has nothing in the
 region the 181 slots point into.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty first, addendum CK): the selector decoder IS validated -- slot 182 reproduced -- and a tempting 181-thunk table was correctly refused
+
+## The retraction, verified
+
+A teammate reported that the selector decoder "fails its own validation" -- slot 182
+found in 0 of 81 selectors -- and I accepted that into the record.  They have now
+retracted it: **their test was on the wrong function set.**  Addendum U says slot 182
+is loaded by `externalMethod` itself, not by the per-selector dispatch functions.
+
+I verified the bytes independently rather than take the retraction on trust:
+
+    at 0xfffffff00bef6378 + 548 :  0xf942d94a
+    LDR x10,[x10,#0x5b0]   imm12 = 182, byte offset 1456 = 182*8
+
+**The slot-182 load is exactly where they said, in the documented position.**  So the
+decoder is validated, and the gate I set -- reproduce the documented shape before
+believing a number -- is passed.  My acceptance of the earlier "fails validation"
+claim was an error I am correcting with them.
+
+## The part that does not check out, and it matters for interpretation
+
+**The symbol attribution is not verified.**  There is no `IOUserClient::externalMethod`
+symbol in this kernel's table.  There are 22 code-address symbols containing
+`externalMethod`, and every one of them is a subclass -- `IOUserUserClient`,
+`AppleKeyStoreUserClient`, `IOUserServer`, and so on.  So the address
+`0xfffffff00bef6378` may well be the right function, but nothing in the file names it,
+and I am not claiming it does.
+
+That distinction matters: the *validation* rests on the load being in the documented
+position, which is confirmed.  The *interpretation* -- that the function doing the
+loading is `externalMethod` -- rests on addendum U and on the teammate's reading, not
+on the symbol table.  Those are different strengths of evidence and should not be
+merged.
+
+## A structure found and correctly refused, which is the model to copy
+
+At `0xfffffff0057a26f8` there is a table of **181 twelve-byte thunks**
+(`ADRP x16 / LDR x16,[x16,#imm] / BR x16`), spanning to `0xfffffff0057a2f68`.  The
+count matches the 181 original-family vtable entries exactly -- which is what made it
+tempting as a selector-to-slot bridge.
+
+Applying the guardrail -- reproduce a count before believing a number -- it fails:
+
+    thunks enumerated                                181
+    original-family vtable entries                   181     <-- the match
+    distinct imm12 values                            181, range 269..485
+    imm12 values that are a real vtable slot (<358)   80
+    imm12 values beyond the vtable entirely           101, range 359..485
+    thunk slots that are the fork's own               6  (290, 296, 306, 337, 338, 345)
+    original-family slots absent from the thunks      107, including all of 168-182
+
+101 of its immediates point past the end of a 358-slot vtable, so those are not
+display-vtable slots at all, and it disagrees with the original-family set on both
+sides.  **The matching 181 is a coincidence**, and it was reported as a refusal rather
+than as a bridge.  That is the discipline this project has been enforcing all interval
+and it was applied to the reporter's own tempting finding.
+
+## And the fork never learned the names either
+
+`vendor/UniXNU-qemu/scripts/build-native-legacy-display.py:87-98` **generates the
+entire 358-slot base-class declaration**.  It names exactly nine slots -- 184
+`isMainDisplay`, 188 `getDotPitch`, 213 `supportedFrameInfo`, 249
+`getDisplayDimensions`, 288 `startHardware`, 290 `kickSwapQueue`, 295
+`completeCurrentSwap`, 296 `validateSwap`, 337 `collectCompletionReports` -- and emits
+every other slot as `opaque{i}()` pure-virtual or `opaque{i}()` deprecated with
+`"Unclassified ABI: never call from source"`.
+
+So the fork's authors reconstructed the ABI slot-for-slot but never learned the method
+names.  The 181 names have to come from the kext binary and from nowhere else, and the
+nine the fork did name are the ones already in hand.
+
+## The kext is not on the OS volume, and the earlier evidence for that was also wrong
+
+A teammate corrected their own evidence here too: they had reported
+"`System/Library/Extensions` has 0 inodes", which was a bug in their script -- catalog
+paths come back prefixed with `root/`, so their `startswith` check never matched
+anything.  **The conclusion is right and the measurement offered for it was not.**  It
+is corroborated independently: `apfs-reader` walked the same volume, found 21 bundles
+under `/System/Library/Extensions` including `IOHIDFamily`, `IOUSBHostFamily` and
+`IOStreamFamily`, and found no `IOMobileFramebuffer.kext` anywhere in the
+43,028-directory catalog.
+
+The next artifact is the SystemOS cryptex (`044-76034-038.dmg`), a raw APFS container
+(`NXSB` at offset 32).  A walker with `BASE = 0` refused it:
+`block 15897 is not the container omap`.  Its container geometry differs from the OS
+volume's and needs its own BASE/block-size work before the same walker will open it.
+
+## Status
+
+Windows/real-guest: **none this interval -- the verification is a read of the kernel
+file's own bytes.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What changed is that task #38 has a validated instrument again: the decoder
+reproduces slot 182 in the documented position, so the missing piece is a decoded
+selector and the 181 names, not a working tool.**  THE HEADLINE is unchanged from AH
