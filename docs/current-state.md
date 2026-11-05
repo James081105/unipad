@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty third, addendum CW). THE HEADLINE is **THE OMAP IS UNAMBIGUOUS, AND THE RUN IS ONE ROOT PLUS 70 LEAVES -- A TWO-LEVEL TREE WHOSE ROOT CLAIMS LEVEL 3**. CV left two hypotheses for the level contradiction. **THE FIRST IS DEAD: the child-reference oid IS at offset 0. All 40 bytes of both references were dumped and the only 8-byte window in range is offset 0 -- offsets 8, 16, 24 and 32 all read above the block count -- giving oid 3720 and oid 3719.** **AND THE OMAP HAS EXACTLY ONE ENTRY PER OID: leaf 782659 holds 70 entries, oids 1214 through 1284 consecutive, every one at xid=13, mapping to blocks 770807 through 770877 consecutive. No duplicate oids, no stale xids, one candidate per lookup, so resolving 3719 and 3720 is not a guess -- each has exactly one entry at xid=13 pointing at 781228 and 781229.** **AND THE SHAPE OF THE RUN IS THE NEW CLUE: 770808 (oid 1216, the catalog root) has flags 0x0019 level 3 nkeys 2 and is the ONLY non-leaf in a run of 71 consecutive blocks; the other 70 are level-0 leaves (770809 nkeys 67, 770810 nkeys 59, 781228 and 781229 nkeys 67). 781228's eight header bytes are BYTE-IDENTICAL to 770809's (1a 00 00 00 43 00 00 00), so the omap's children are the same kind of leaf as the root's own siblings. A tree with one non-leaf root and seventy leaves is TWO LEVELS DEEP, so its root should read btn_level=1; it reads 3.** **SO THE REMAINING HYPOTHESIS IS NARROWED TO ONE: CV's second hypothesis, that the root's btn_level is misread, is the only live one, and it has a specific shape -- either btn_level is not a plain depth counter in this tree, or the field is not at +0x22 for this node. The first is testable against the run's shape: if 770808 is a two-level root then whatever the level field means, the tree is root-plus-leaves and the leaves are directly readable.** **WHAT THAT MEANS FOR TASK #38: the route to file records no longer depends on the child pointers at all. The omap gives oids 1217..1284 -> blocks 770809..770877 DIRECTLY, and those are leaves reachable without resolving any child pointer. Reading their records is the next step and needs only the leaf key parse, which CV already fixed and confirmed on the root's private-dir DIR_REC. BUT the leaves' 16-byte keys of type 13 (FILE_INFO) with obj_id 97 still fit no struct in raw.h, so that parse is still wrong and no file name has been read.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty fourth, addendum CX). THE HEADLINE is **OID 1216 IS THE CATALOG ROOT, THE LEAF GEOMETRY IS EXACTLY SELF-CONSISTENT, AND THE RECORD SHAPE IS NOT A CATALOG FILE RECORD**. oid 1216 is confirmed byte for byte: the volume superblock's +0x88 is c0 04 00 00 00 00 00 00 = 1216, and resolving it through the volume omap gives block 770808 with flags 0x0019, level 3, nkeys 2 -- so the node whose key area decoded private-dir is unambiguously the catalog root. **AND THE LEAF GEOMETRY IS EXACTLY SELF-CONSISTENT, WHICH VALIDATES THE READER: leaf 770809 (oid 1217) has toc=0x38, key=0x278, free=0x6a8, data=0x6d7; the key area is 1072 bytes / 67 keys = 16 bytes per key EXACTLY and the value area is 2345 bytes / 67 values = 35 bytes per value EXACTLY, with no remainder in either. So the TOC location, the forward key offsets, the backward value offsets and the area_len computation are all correct for this node, which closes the reader question CW raised.** **BUT THE RECORD SHAPE IS NOT A CATALOG FILE RECORD: every 16-byte key is two qwords -- a CONSTANT first qword (16 00 00 00 00 00 00 d0) and a second that rises by a fixed step of 0x4000 = 16384 per record -- and every 35-byte value is a 3-byte prefix (04 00 20) plus 32 bytes. A constant key prefix with a monotonically stepping second field, and values that are a short prefix plus 32 bytes, MATCHES NO CATALOG RECORD IN raw.h: not apfs_drec_key (8+2+name), not apfs_inode_key (8), not apfs_file_extent_key (8), not apfs_drec_hashed_key. So whatever these leaves hold, it is not the volume's file catalog.** **WHAT THIS MEANS, PLAINLY: the reader is right and the tree identification is right, but the blocks reached as leaves do not hold file records. Three possibilities, not distinguished here: (1) the catalog root's children are level-2 nodes as btn_level=3 implies, and oids 3719/3720/1217/1218 are something else, so I have been reading the wrong blocks; (2) the volume's catalog uses hashed keys throughout and the 32 bytes are name hashes with the constant prefix a per-tree key header not yet identified; (3) these leaves belong to a different tree sharing the omap.** **THE DECISIVE TEST IS CHEAP AND IS THE NEXT ACTION: read the volume's extentref tree (oid 4542) and snapshot-metadata tree (oid 4544) roots and compare their leaves' key and value shapes to these. If 770809's shape matches one of them, these leaves are that tree's and the catalog's own leaves are elsewhere; if it matches neither, the shape is the catalog's and the record struct still needs identifying.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18075,6 +18075,102 @@ and confirmed on the root's `private-dir` DIR_REC.
 
 **But the leaves' 16-byte keys of type 13 (FILE_INFO) with obj_id 97 still fit no struct
 in raw.h**, so that parse is still wrong and no file name has been read.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty fourth, addendum CX): oid 1216 IS the catalog root, the leaf geometry is exactly self-consistent, and the record shape is not a catalog file record
+
+## oid 1216 is confirmed as the catalog root, byte for byte
+
+Read from the volume superblock 782661:
+
+    +0x70  01 00 00 00 02 00 00 00 02 00 00 40 02 00 00 40
+    +0x80  40 f1 0b 00 00 00 00 00 c0 04 00 00 00 00 00 00
+    +0x90  be 11 00 00 00 00 00 00 c0 11 00 00 00 00 00 00
+
+    +0x74 apfs_root_tree_type      0x2
+    +0x78 apfs_extentref_tree_type 0x40000002
+    +0x7c apfs_snap_meta_tree_type 0x40000002
+    +0x80 apfs_omap_oid            782656
+    +0x88 apfs_root_tree_oid       1216       <- c0 04 00 00 00 00 00 00
+    +0x90 apfs_extentref_tree_oid  4542
+    +0x98 apfs_snap_meta_tree_oid  4544
+    +0x20 magic                    APSB
+
+`+0x88` is `c0 04 00 00 00 00 00 00` = **1216**, and resolving 1216 through the volume
+omap gives block **770808** with `flags 0x0019`, `level 3`, `nkeys 2`.  So the node whose
+key area decoded `private-dir` is unambiguously the catalog root, and CW's reading of it
+was right.
+
+## And the leaf geometry is exactly self-consistent, which validates the reader
+
+Leaf 770809 (oid 1217, named directly by the omap):
+
+    toc = 0x38   key = 0x278   free = 0x6a8   data = 0x6d7
+    key area   0x278..0x6a8 = 1072 bytes  /  67 keys  = 16 bytes per key   EXACT
+    free space 0x6a8..0x6d7 =   47 bytes
+    value area 0x6d7..0x1000 = 2345 bytes /  67 vals  = 35 bytes per value  EXACT
+
+Both areas divide by the key count with **no remainder**.  So the node reader -- the TOC
+location, the forward key offsets, the backward value offsets, and the `area_len`
+computation -- is correct for this node.  That closes the reader question CW raised.
+
+## But the record shape is not a catalog file record
+
+Every 16-byte key is two qwords: a **constant** first qword and a second that rises by a
+fixed step:
+
+    key[0]  16 00 00 00 00 00 00 d0 | 00 80 09 00 00 00 00 01
+    key[1]  16 00 00 00 00 00 00 d0 | 00 c0 09 00 00 00 00 01
+    key[2]  16 00 00 00 00 00 00 d0 | 00 00 0a 00 00 00 00 01
+    key[3]  16 00 00 00 00 00 00 d0 | 00 40 0a 00 00 00 00 01
+    ...     second qword steps by 0x4000 = 16384 every record
+
+Every 35-byte value is a 3-byte prefix and 32 bytes:
+
+    val[0]  04 00 20 | f9 45 5b fa 39 ab 2a 8b 15 b8 d3 1c 6e
+                     9c 8f cd 3c d8 60 9c 1d 0c d7 55 fc c0 d7 e5 b2 ca 81 22
+    val[1]  04 00 20 | 9b 51 7d 94 98 21 31 63 c5 2b ...
+
+A constant key prefix with a monotonically stepping second field, and values that are a
+short prefix plus 32 bytes, **matches no catalog record in raw.h** -- not `apfs_drec_key`
+(8 + 2 + name), not `apfs_inode_key` (8), not `apfs_file_extent_key` (8), not
+`apfs_drec_hashed_key`.  So whatever these leaves hold, it is not the volume's file
+catalog.
+
+## What this means, stated plainly
+
+The reader is right and the tree identification is right, but **the blocks reached as
+leaves do not hold file records.**  Three possibilities, and this interval does not
+distinguish them:
+
+1. The catalog root's children are level-2 nodes (as `btn_level = 3` implies) and oids
+   3719/3720/1217/1218 are something else entirely, so I have been reading the wrong
+   blocks.
+2. The volume's catalog uses hashed keys throughout and the 32 bytes are name hashes,
+   with the constant prefix a per-tree key header I have not identified.
+3. These leaves belong to a different tree that shares the omap.
+
+The decisive test is cheap and is the next action: **read the volume's extentref tree
+(oid 4542) and snapshot-metadata tree (oid 4544) roots and compare their leaves' key and
+value shapes to these.**  If 770809's shape matches one of them, these leaves are that
+tree's and the catalog's own leaves are elsewhere.  If it matches neither, the shape is
+the catalog's and the record struct still needs identifying.
 
 ## Status
 
