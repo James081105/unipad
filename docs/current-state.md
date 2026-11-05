@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-sixth, addendum BL). THE HEADLINE is **THE DISPLAY IS FULLY UP, WAS CALLED THREE TIMES, AND NEVER GOT A SWAP**. `read-display-counters.py` reads 27 `native_legacy_*` counters out of a live guest's kernel memory over QMP; all 27 resolved and the control passed. **THE DRIVER IS NOT HALF-UP: stage=10, which LegacyDisplayProbe.cpp:803 defines as the SUCCESS terminal state (`activeLegacyDisplay=display; activeGOPNub=nub`), init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4 with pm_status=0.** **AND THE WHOLE DOWNSTREAM CHAIN WAS NEVER ENTERED: the panic string at LegacyDisplayProbe.cpp:685 names the order the display path runs in -- `stage=%u PM=%u swap=%u/%u copy=%08x bytes=%llu retire=%u handoff=%u/%u` -- and PM ran to stage 4 while swap_validation_calls, transfer_calls, transfer_status (-1), transfer_bytes, retirement_calls and retired_frames are ALL still at the initial values their declarations set. That is "never invoked", not "returned zero".** **A CLIENT DID CALL THE DISPLAY, THREE TIMES, FROM PID 95, SUCCESSFULLY (client_calls=3, client_status=0) -- so the driver is reachable and answers. What never happened is a SWAP SUBMISSION.** **This settles task #27 with a measurement rather than a theory: the swap is not rejected, not failing validation, not erroring on the copy -- it is never submitted. Combined with addendum BK (148 screendumps over 1500 s, SpringBoard alive, one distinct frame) the two facts are the same fact from two sides: nothing writes the framebuffer because nothing ever asks the display to write it.** **It does not settle WHO pid 95 was or why it stopped at three calls: this boot stalled at three processes (the recorded non-determinism), so the pid is from an early state. THE NEXT MEASUREMENT IS THE SAME COUNTERS ON A BOOT THAT RAMPS -- one run of the same script, no build.** **And the geometry problem from BK is untouched: native_legacy_gop_width=800 and gop_height=600 on a panel unixnu_boot.SCREEN calls 1376x1024, and unixnu.toml names only Payloads/DarwinBoot.efi so QemuRamfb.efi cannot size it from this host. The display is presenting at the wrong size even if a swap were submitted.** **The instrument's guard earned its place: every counter that can mean "never invoked" carries that initial in the source and the script reads the initials from the same table, and a counter absent from the kernel prints ABSENT FROM KERNEL rather than 0 -- which is the distinction task #32 has asked for since it opened, and it fell out of this measurement rather than being bolted on.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display driver is fully up and reachable, and the swap that would put anything on the screen is never submitted.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-seventh, addendum BM). THE HEADLINE is **ADDENDUM BL'S CONCLUSION IS WRONG, AND IT IS TASK #32's DISTINCTION**. BL read 27 display counters and saw `native_legacy_swap_validation_calls = 0` and `native_legacy_transfer_calls = 0` still at their declared initials, then concluded "the swap is never submitted". **Every number in BL is correct; the conclusion does not follow, because the hooks that increment those counters are NEVER CALLED in this build.** Both are incremented only inside `package/LegacyDisplayProbe.cpp` -- `:304` inside `native_legacy_swap_validation_observed` (:300) and `:317` inside `native_legacy_transfer_observed` (:316) -- and grepping the linked driver for a call site returns only the definitions. **The one caller that exists is in a DIFFERENT REPOSITORY: `local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp:441`, and `vendor/UniXNU-qemu/drivers/NativeMobileDisplay/` DOES NOT EXIST.** The kernel is built from `vendor/UniXNU-qemu`, whose board.toml names `package/LegacyDisplayProbe.cpp`. The symbols are in the built kernel because the OBJECT is linked, not because anything calls it. **So `swap_validation_calls = 0` measures "this hook is dead code in this build", not "no swap was submitted" -- and the two are indistinguishable from the counter alone.** **WHAT BL's NUMBERS DO ESTABLISH: `native_legacy_client_calls` is incremented at :367 inside a LIVE code path, not inside a dead observer, so THAT one is real -- a client reached the display driver three times from pid 95 and every call returned success (client_calls=3, client_pid=95, client_status=0), with stage=10 (the success terminal state), init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4, pm_status=0, gop_width=800, gop_height=600. The driver is up, powered, and answering.** **And the ordering run adds the sequence a final-value table cannot show: pm_status -1->0, gop_width 0->800, gop_height 0->600, unit_scale_calls 0->1, unit_scale_status -1->0, registration_calls 0->1. The driver's own init runs to completion; what happens after it is exactly what the dead hooks were supposed to observe, and is now unobserved.** **SO TASK #32 IS NOT A NICETY AND IS NOT ONLY ABOUT THE CONSOLE EMITTERS: it was scoped to the spawn.seen/exec.seen family, and the same defect exists in the display counters, where it produced a wrong conclusion on the critical path one interval after the task was written. The gate needs to cover every counter this project reads. Its concrete form, which this measurement shows is sufficient: for every counter, name the function that increments it and prove that function has a call site in the linked driver; a counter whose only incrementer is uncalled must be reported as `hook_uncalled:` and never as a value.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now known is narrower and truer than BL claimed: the display is up and answering, and nothing in this build observes what happens after that.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14670,3 +14670,113 @@ Onsite: N/A.
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
 reached.  The display driver is fully up and reachable, and the swap that would
 put anything on the screen is never submitted.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-seventh, addendum BM): addendum BL's conclusion is wrong, and it is task #32's distinction
+
+## What BL got right, and what it got wrong
+
+BL read 27 `native_legacy_*` counters out of a live guest.  Every number in it is
+correct -- the initials were read from the driver's own declarations and the
+control passed.  What does not follow is the sentence built on two of them:
+
+    native_legacy_swap_validation_calls   0   <- "never invoked"
+    native_legacy_transfer_calls          0   <- "never invoked"
+    native_legacy_transfer_status        -1   <- "never invoked"
+
+BL read "never invoked" and concluded **"the swap is never submitted"**.  That is
+the reading of an instrument that works.  It is not a measurement of the guest.
+
+## Why, and it is three greps
+
+The counters are incremented in exactly one place each, both inside
+`package/LegacyDisplayProbe.cpp`:
+
+    :300  void native_legacy_swap_validation_observed(bool accepted,
+    :304      native_legacy_swap_validation_calls = ... + 1;
+    :316  __attribute__((noinline)) void native_legacy_transfer_observed(
+    :317      native_legacy_transfer_calls = ... + 1;
+
+**Neither function is called anywhere in the file it is defined in.**  Grepping the
+whole linked driver for a call site returns only the definitions.  The one caller
+that exists is in a *different repository*:
+
+    local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp:441
+        native_legacy_swap_validation_observed(accepted,reason,request,surface);
+
+and `vendor/UniXNU-qemu/drivers/NativeMobileDisplay/` **does not exist**.  The
+kernel is built from `vendor/UniXNU-qemu`, whose `board.toml` names
+`package/LegacyDisplayProbe.cpp` as the display driver.  The symbols are in the
+built kernel -- `native_legacy_swap_validation_observed` is present -- because the
+object is linked, not because anything calls it.
+
+**So `swap_validation_calls = 0` measures "this hook is dead code in this build",
+not "no swap was submitted".**  The two readings are indistinguishable from the
+counter alone, which is precisely the failure this project has recorded a dozen
+times: an instrument returns a value, the value is read as an answer, and the
+question it answered is a different one.
+
+## What BL's numbers DO establish
+
+Stripped of the dead hooks, the same run still says something solid, and it is
+worth keeping:
+
+    native_legacy_stage            10     <- the SUCCESS terminal state
+    native_legacy_init_result       1     <- init() succeeded
+    native_legacy_start_result      1     <- start() succeeded
+    native_legacy_surface_found     1
+    native_legacy_dt_attached       1
+    native_legacy_pm_stage          4     <- power management ran
+    native_legacy_pm_status         0
+    native_legacy_gop_width       800     <- and the geometry is 800x600
+    native_legacy_gop_height      600
+    native_legacy_client_calls      3     <- a client DID call, three times
+    native_legacy_client_pid       95
+    native_legacy_client_status     0     <- successfully
+
+`native_legacy_client_calls` is incremented at `:367`, inside a live code path --
+not inside one of the dead observers -- so **that one is a real measurement.**  A
+client reached the display driver three times from pid 95 and every call returned
+success.  The driver is up, powered, and answering.
+
+And the ordering run adds the sequence, which a final-value table cannot show:
+
+    FIRST CHANGE: native_legacy_pm_status        -1 -> 0
+    FIRST CHANGE: native_legacy_gop_width          0 -> 800
+    FIRST CHANGE: native_legacy_gop_height         0 -> 600
+    FIRST CHANGE: native_legacy_unit_scale_calls   0 -> 1
+    FIRST CHANGE: native_legacy_unit_scale_status -1 -> 0
+    FIRST CHANGE: native_legacy_registration_calls 0 -> 1
+
+The driver's own init sequence runs to completion.  What happens after it is
+exactly what the dead hooks were supposed to observe, and is now unobserved.
+
+## So task #32 is not a nicety, and it is not only about the console emitters
+
+Task #32 has been open since it was written as "make the gate distinguish
+'emitter never built' from 'not yet measured'".  It was scoped to the
+`spawn.seen`/`exec.seen` family.  **The same defect exists in the display
+counters, and it produced a wrong conclusion on the critical path one interval
+after the task was written.**  The gate needs to cover every counter this project
+reads, not only the console emitters.
+
+The concrete form of the gate, which this measurement shows is sufficient: for
+every counter, name the function that increments it and prove that function has a
+call site in the linked driver.  A counter whose only incrementer is uncalled must
+be reported as `hook_uncalled:` and never as a value.
+
+## Status
+
+Windows/real-guest: **a live guest, 27 counters read twice, plus the greps that
+show which of them can mean anything.**  The display driver reaches its success
+terminal state and answers a client three times; the swap path is unobserved.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, completed successfully.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is now known is narrower and truer than BL claimed: the display is
+up and answering, and nothing in this build observes what happens after that.**
+THE HEADLINE is unchanged from AH
