@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twelfth, addendum CB). THE HEADLINE is **BZ IS WRONG AS STATED -- BACKBOARDD SPAWNS, ON ANOTHER BOOT**. `enumerate-launchd-jobs.py` cross-checked the volume's job plists against the comms the guest spawned by comparing a COMM against the LABEL key -- `configd` against `com.apple.configd` -- so `s in jobs` was never true and it reported "spawned AND has a job plist: 0" for a boot on which configd, runningboardd and sleepd all have plists and all ran. **A cross-check that cannot match is not a negative.** Fixed by indexing each Label by its last component truncated to MAXCOMLEN (15). With the fix: 46 spawned comms have plists, including **backboardd** -- and `spawn-failed-input-run/guest-input.log`, a boot from 2026-11-04, carries `{"event":"spawn.seen","n":36,"comm":"backboardd",...}`. **So BZ's headline "launchd never spawns backboardd" is WRONG AS A GENERAL CLAIM; what BZ measured was true of its own boot.** **AND THE TWO RUNS ARE MIRROR IMAGES: on the 11-04 boot backboardd SPAWNED (n=36) and SpringBoard never did; on the 11-05 boot (41980452867) SpringBoard SPAWNED (pid 27) and backboardd never did. Exactly one of the two, and which one varies between boots. So the display is not frozen because a compositor is missing by design or by a gate that always refuses -- it is frozen on the boots where backboardd is the one that is missing.** **WHAT THIS DOES TO CA: its three eliminations (spawn type, user, binary) were sound for the boot they were measured on, but the question itself varies, so the discriminator is not a property of backboardd's plist at all. The open question is now the NON-DETERMINISM, not the job's keys.** **AND THE INSTRUMENT'S REMAINING LIMITATION: notifyd is in the spawned set but has no plist on this volume, so "has a job plist" is not exhaustive and the 63 "no plist found" entries mean "not on THIS volume". The backboardd conclusion does not depend on that direction -- it rests on a spawn.seen record naming backboardd, which is direct evidence, not an absence.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. BZ's headline is withdrawn.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirteenth, addendum CC). THE HEADLINE is **BACKBOARDD IS PRESENT IN 12 OF 14 BOOTS, AND THE SCREEN IS FROZEN ANYWAY**. 29 guest channel logs exist under local-private/boot53; counting each distinct boot once, and matching a comm OR a vname (the springboard.fork1 record spells the name `vname`, which is why the first pass of this survey reported SpringBoard=0 everywhere and would have been believed): **backboardd present in 12 of 14, SpringBoard in 4 of 14, BOTH in 2 of 14 (procwalk-scratch, screen-scratch).** **AND THE BOOT THAT SETTLES IT IS screen-scratch: backboardd AND SpringBoard both present, diag.legacy_display_status stage=10 surface_status=0 surface_found=1 dt=1, and it is the run that took 148 screendumps over 1500 s and found ONE DISTINCT FRAME -- the boot menu. Both processes present, display at its success terminal state, and still one frame. So the missing compositor is not the general blocker.** `display-refusal-run` says the same from the other side: backboardd present, five clients, the busiest with 15 calls and 11 failures across 14 selectors, display at stage 10 -- and still no frame. **WHAT THIS DOES TO THE LAST FOUR ADDENDA: BZ's "launchd never spawns backboardd" is FALSE (12 of 14); CA's three eliminations were measured on boots where backboardd was the absent one, so they explain those boots and not the screen; BY's "the only client is IOMFB_FDR_Loader" is true of MY boots but on display-refusal-run five clients called 14 selectors; and BV's "the swap/wait selector is never called" SURVIVES -- it was never called on the boot where a client called 14 other selectors either.** **WHAT SURVIVES IS THE CLIENT-SIDE EVIDENCE, and it is now the only lead: on the one boot where clients were busy they called 14 distinct selectors, were refused 11 of them, and never called selector 6 -- true whether or not backboardd is present. The screen is frozen on boots with and without backboardd, with and without SpringBoard, with one client and with five; what is constant is that no swap is ever submitted and no frame is ever presented.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. BZ's headline is withdrawn and CB's is withdrawn with it.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16195,3 +16195,84 @@ Onsite: N/A.
 reached.  BZ's headline is withdrawn: backboardd spawns on some boots and not
 others, and across the two boots measured exactly one of backboardd and
 SpringBoard came up.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirteenth, addendum CC): backboardd is present in 12 of 14 boots, and the screen is frozen anyway
+
+## The survey
+
+29 guest channel logs exist under `local-private/boot53`.  Counting each distinct
+boot once, and matching a comm OR a `vname` (the `springboard.fork1` record spells
+the name `vname`, which is why the first pass of this survey reported
+`SpringBoard=0` everywhere and would have been believed):
+
+    backboardd present      12 of 14
+    SpringBoard present      4 of 14
+    BOTH present             2 of 14   (procwalk-scratch, screen-scratch)
+
+So backboardd normally spawns.  BZ's "launchd never spawns backboardd" is false,
+and CB's "the two runs are mirror images" is false too -- two boots have both.
+
+## The boot that settles it
+
+`screen-scratch` has **backboardd AND SpringBoard**, and its display is fully up:
+
+    "event":"diag.legacy_display_status","stage":10,"surface_status":0,
+      "surface_found":1,"dt":1,"source":"XNU.LegacyDisplayProbe"
+
+and it is the run that took **148 screendumps over 1500 s** and found **one
+distinct frame: the boot menu** (`screen-evidence/boot-menu-at-t0.png`).
+
+**Both processes present, display at its success terminal state, and still one
+frame.**  So the missing compositor is not the general blocker.
+
+`display-refusal-run` says the same thing from the other side: backboardd present,
+**five clients**, the busiest with **15 calls and 11 failures across 14
+selectors**, display at stage 10 -- and still no frame.
+
+## What this does to the last four addenda
+
+    BZ   "launchd never spawns backboardd"            FALSE -- 12 of 14 boots
+    CA   three candidate causes eliminated            measured on boots where
+                                                      backboardd was the absent
+                                                      one, so they explain those
+                                                      boots and not the screen
+    BY   the only client is IOMFB_FDR_Loader          true of MY boots; on
+                                                      display-refusal-run five
+                                                      clients called 14 selectors
+    BV   the swap/wait selector is never called      SURVIVES -- it was never
+                                                      called on the boots where a
+                                                      client called 14 other
+                                                      selectors either
+
+**What survives is the client-side evidence, and it is now the only lead.**  On the
+one boot where clients were busy, they called 14 distinct selectors, were refused
+11 of them, and never called selector 6.  That is true whether or not backboardd
+is present.
+
+## So the honest state of the display question
+
+The screen is frozen on boots with and without backboardd, with and without
+SpringBoard, with one client and with five.  What is constant across all of them
+is that **no swap is ever submitted and no frame is ever presented**, and on the
+one boot where the client was busy the refusals are where it stopped.
+
+The process tree was a real finding for my own boots -- without backboardd there
+is no compositor at all -- but it is a *contributing* condition on those boots and
+not the cause of the frozen screen.
+
+## Status
+
+Windows/real-guest: **none this interval -- the survey is a host-side read of 14
+existing boot logs plus the saved screendump evidence and client table.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  BZ's headline is withdrawn and CB's is withdrawn with it: backboardd is
+present in 12 of 14 boots, and on the boot where both it and SpringBoard were
+present the display was still frozen at one frame.**  THE HEADLINE is unchanged
+from AH
