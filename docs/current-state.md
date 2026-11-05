@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred third, addendum BS). THE HEADLINE is **THE CALLER WAS ALREADY ASKED, AND THE ANSWER IS IN THE TREE**. BR derived the display failure to "the client never submits a swap" and called that a question about the caller. The caller was already asked: `display-clients.py` reads the framebuffer's USER CLIENT table out of a live guest, and its saved output records **5 clients (pids 86, 58, 95, 95, 74), the busiest being pid 58 with 15 calls and 11 failures across 14 distinct selectors -- ELEVEN of them refused with kIOReturnUnsupported (selectors 12, 22, 27, 29, 33, 50, 57, 79 x2, 84), with only 6, 74 and 88 succeeding. Selector 6, the swap/wait selector, was called ONCE and answered SUCCESS, so it is not the swap submission.** **THAT IS THE MEASURED SHAPE OF BR's ONE SENTENCE: the client does not decline to submit a swap, it is REFUSED ELEVEN OF THE FOURTEEN THINGS IT ASKS FOR.** **BUT IT IS A DIFFERENT BUILD: client-table.txt is kernel 2ebda0ec (run 41880912125) while addendum BL measured d2c5a914 (run 41980452867), so the selector table is evidence about the older one and is recorded with its kernel named.** **THE CURRENT KERNEL CAN MEASURE IT AGAIN WITH NO BUILD: client_calls, client_pid, client_status, client_object, client_class, slot_armed_count, prepare_calls and swap_validation_calls are ALL present, and interpose() is armed because client_observed (:625) is called from newUserClient (:401) and client_calls=3 with client_status=0 proves it ran. So re-running display-clients.py needs no build and no patch -- it needs a guest, and the guest is BLOCKED: the host is at 1.0 GB free because msedgewebview2 holds 6 GB and the user's own applications hold the rest, with no leaked process of ours. That is an environment limit, recorded as one rather than worked around by killing the user's applications.** **AND THE KICK-PATH GAP IS CONFIRMED BY ABSENCE: native_legacy_kick_calls is ABSENT from this kernel, which is task #36's premise proved from the image rather than asserted. The existing counters begin at transfer_observed, after both of kickOnce's gates, so the guest cannot say where kickOnce stops without a build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display blocker is now characterised from both ends: in source it is one gate (isValidated is never true), and on a guest it is a client refused eleven of fourteen selectors. Both are waiting on the same thing, which is a boot on a host with memory for one.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred fourth, addendum BT). THE HEADLINE is **A REAL BOOT, A PASSED CONTROL, AND NO CLIENT EVER OPENED THE FRAMEBUFFER**. `read-client-table.py` boots the guest, waits for a client to open the framebuffer, reads `static ClientStat seenClients[8]` over QMP, and exits the instant it has the table. On run 41980452867 the kernel sha256 d2c5a914 was verified against payload.json, __ZL11seenClients resolved at 0xfffffff00c146888, 10 of 10 counters resolved, and THE CONTROL PASSED (`Darwin Kernel Version 23.6.0: Thu Nov 5 06:52:05 UTC`). **Then 420 s of sampling, every sample client_calls=0 swap=0 prepare=0, and the script REFUSED rather than report a table it never read -- a client_calls=0 boot has no client table to print, and printing an empty one would read as "five clients, all idle".** **AND THAT IS NOT WHAT THIS KERNEL SAID LAST TIME: addendum BL, on the SAME kernel, measured client_calls=3, client_pid=95, client_status=0. Three client opens on one boot of d2c5a914, zero on another, with a byte-identical kernel whose sha256 was verified before the boot. That is the recorded non-determinism in its sharpest form: whether the framebuffer client reaches the display driver AT ALL varies between boots, so a single boot's client_calls is not a fact about the kernel.** **BR's CHAIN SURVIVES, because it never depended on client_calls being 3: swap_validation_calls=0, transfer_calls=0 and prepare_calls=0 on BOTH boots, so "no swap is ever submitted" holds across both and does not depend on the client count. What it does to BS is that the quoted selector table is from kernel 2ebda0ec, and this boot shows even "does a client open the framebuffer" is not stable within one kernel.** **AND IT CORRECTS BP: BP argued the payload kernel is stripped of local symbols, so symbol presence cannot separate dead from live. That was WRONG -- __ZL11seenClients, the mangled local-linkage spelling of a C++ file-scope static array, IS present, and display-clients.py had already recorded that in its own comment. What is true is narrower: static VARIABLES survive under their mangled names; static FUNCTIONS do not, because they were inlined. BP's conclusion stands on its own evidence but one of its supporting arguments was false.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is a real measurement with a name attached to its kernel, and what it says is that the display blocker is not merely that the client is refused -- on some boots of this kernel no client reaches the display at all.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15370,3 +15370,91 @@ reached.  The display blocker is now characterised from both ends: in source it 
 one gate (`isValidated` is never true), and on a guest it is a client refused
 eleven of fourteen selectors.  Both are waiting on the same thing, which is a boot
 on a host with memory for one.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred fourth, addendum BT): a real boot, a passed control, and no client ever opened the framebuffer
+
+## The measurement
+
+`local-private/tmp/read-client-table.py` boots the guest, waits for a client to
+open the framebuffer, reads `static ClientStat seenClients[8]` out of kernel
+memory over QMP, and exits the instant it has the table.  It runs against the
+kernel addendum BL measured:
+
+    run 41980452867, kernel sha256 d2c5a914668c... verified against payload.json
+    __ZL11seenClients      = 0xfffffff00c146888     <- resolved
+    __ZL15seenClientCount  = 0xfffffff00c146880     <- resolved
+    resolved 10 of 10 counters
+    version kstring: b'Darwin Kernel Version 23.6.0: Thu Nov  5 06:52:05 UTC'  <- THE CONTROL PASSED
+
+    then 420 s of sampling at 10 s, every sample:
+        client_calls=0    swap=0    prepare=0
+
+    REFUSED: no client ever opened the framebuffer within the 420s deadline,
+    so there is no table to read.  This is a silence, not a measurement.
+
+**The script refused rather than report a table it never read**, which is the
+behaviour it was written for: a `client_calls=0` boot has no client table to
+print, and printing an empty one would read as "five clients, all idle".
+
+## And that is not what this kernel said last time
+
+Addendum BL, on the SAME kernel, measured:
+
+    native_legacy_client_calls   3
+    native_legacy_client_pid    95
+    native_legacy_client_status  0
+
+**Three client opens on one boot of `d2c5a914`, zero on another.**  The kernel is
+byte-identical -- its sha256 was verified against `payload.json` before the boot
+-- so the difference is in the guest, not in the artifact.
+
+That is the recorded non-determinism, and this is the sharpest form it has taken:
+whether the framebuffer client reaches the display driver AT ALL varies between
+boots of the same kernel.  It means `client_calls=3` was never a stable property
+of this kernel, and neither is `client_calls=0`.  **A single boot's `client_calls`
+is not a fact about the kernel.**
+
+## What that does to the display conclusion
+
+BR's chain survives, because it never depended on `client_calls` being 3:
+
+    swap_validation_calls = 0   ->  validateSwap never ran, on BOTH boots
+    transfer_calls = 0          ->  kickOnce never got past GATE 2, on BOTH boots
+    prepare_calls = 0           ->  the scanout was never prepared, on BOTH boots
+
+Those three were zero on BL's boot AND on this one.  So "no swap is ever
+submitted" holds across both boots, and it does not depend on the client count.
+
+What it does to BS's framing: the client table BS quoted (`5 clients, pid 58,
+14 selectors, 11 refused`) is from kernel `2ebda0ec`, and this boot shows that even
+the question "does a client open the framebuffer" is not stable within one kernel.
+So the selector table is evidence about that boot of that kernel, and no more.
+
+## And it corrects addendum BP
+
+BP argued that the payload kernel is stripped of local symbols, so symbol presence
+cannot separate dead from live.  **That was wrong.**  `__ZL11seenClients` -- the
+mangled local-linkage spelling of a C++ file-scope `static` array -- is present in
+this kernel, and `display-clients.py` had already recorded that fact in its own
+comment.  What is true is narrower: **static VARIABLES survive under their mangled
+names; static FUNCTIONS do not**, because they were inlined.  BP's conclusion
+stands on its own evidence (AZ observed 512 `spawn.seen` records), but one of its
+supporting arguments was false and is corrected here.
+
+## Status
+
+Windows/real-guest: **a live guest, kernel sha256 verified against payload.json,
+the control passed, 420 s of sampling, 10 counters and the client table
+address resolved.**  No client opened the framebuffer on this boot.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is new is a real measurement with a name attached to its kernel,
+and what it says is that the display blocker is not merely that the client is
+refused -- on some boots of this kernel no client reaches the display at all.**  THE
+HEADLINE is unchanged from AH
