@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred eleventh, addendum CA). THE HEADLINE is **THE JOB IS LOADED, AND THREE CANDIDATE CAUSES ARE ELIMINATED**. `enumerate-launchd-jobs.py` walks the OS root volume and recovers every launchd job plist by Label -- 373 of them -- and `com.apple.backboardd` is one: UserName=mobile, ProgramArguments=['/usr/libexec/backboardd'], 18 MachServices including com.apple.iohideventsystem, PurpleWorkspacePort, PurpleSystemEventPort and com.apple.CARenderServer, RunAtLoad=True, KeepAlive=True, POSIXSpawnType=Interactive. **So launchd HAS the job, it is RunAtLoad and KeepAlive, and it still never spawns it -- the cause is in launchd's handling of this job, not a missing plist.** (`com.apple.SpringBoard` is ABSENT from this volume, which is expected: it is an app, not a daemon, and its job is not in /System/Library/LaunchDaemons. It runs at pid 27 regardless.) **CANDIDATE 1 REFUTED: only 3 of 373 plists carry a POSIXSpawnType -- backboardd Interactive (never spawned), runningboardd Adaptive (SPAWNED, pid 26), configd Interactive (SPAWNED, pid 37). configd is Interactive exactly like backboardd and spawned, so this port's launchd handles Interactive jobs fine.** **CANDIDATE 2 REFUTED: 240 of 373 plists carry UserName=mobile, and three SPAWNED jobs run as mobile -- sleepd, routined and peopled, all RunAtLoad=True and all in the spawn.seen records. So launchd spawns non-root jobs.** **CANDIDATE 3 IS UNANSWERED BECAUSE THE TEST IS INVALID: grepping the raw image returns 2 hits for /usr/libexec/backboardd and 2 for /usr/libexec/configd, but ZERO for /usr/libexec/sleepd -- and sleepd provably ran. A test whose control fails is not a negative.** **WHAT IS LEFT, AND IT IS THE NEXT HYPOTHESIS: the keys that distinguish backboardd from every spawned control are its MachServices -- 18 entries against configd's 10 and runningboardd's 3 -- and specifically com.apple.iohideventsystem, PurpleWorkspacePort, PurpleSystemEventPort and com.apple.CARenderServer. Hypothesis: launchd refuses the job because it cannot claim one of these services, most likely com.apple.iohideventsystem, which on this port is served by the native offline-hid-input driver rather than by an IOHIDEventSystem. Falsifiable by reading backboardd's job flags out of launchd's memory: the job should show loaded and un-promoted, and the refusal reason should name the service. One guest run, no build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is narrower is the cause of the frozen screen: the job is loaded, RunAtLoad, and never attempted, and it is not the spawn type and not the user.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twelfth, addendum CB). THE HEADLINE is **BZ IS WRONG AS STATED -- BACKBOARDD SPAWNS, ON ANOTHER BOOT**. `enumerate-launchd-jobs.py` cross-checked the volume's job plists against the comms the guest spawned by comparing a COMM against the LABEL key -- `configd` against `com.apple.configd` -- so `s in jobs` was never true and it reported "spawned AND has a job plist: 0" for a boot on which configd, runningboardd and sleepd all have plists and all ran. **A cross-check that cannot match is not a negative.** Fixed by indexing each Label by its last component truncated to MAXCOMLEN (15). With the fix: 46 spawned comms have plists, including **backboardd** -- and `spawn-failed-input-run/guest-input.log`, a boot from 2026-11-04, carries `{"event":"spawn.seen","n":36,"comm":"backboardd",...}`. **So BZ's headline "launchd never spawns backboardd" is WRONG AS A GENERAL CLAIM; what BZ measured was true of its own boot.** **AND THE TWO RUNS ARE MIRROR IMAGES: on the 11-04 boot backboardd SPAWNED (n=36) and SpringBoard never did; on the 11-05 boot (41980452867) SpringBoard SPAWNED (pid 27) and backboardd never did. Exactly one of the two, and which one varies between boots. So the display is not frozen because a compositor is missing by design or by a gate that always refuses -- it is frozen on the boots where backboardd is the one that is missing.** **WHAT THIS DOES TO CA: its three eliminations (spawn type, user, binary) were sound for the boot they were measured on, but the question itself varies, so the discriminator is not a property of backboardd's plist at all. The open question is now the NON-DETERMINISM, not the job's keys.** **AND THE INSTRUMENT'S REMAINING LIMITATION: notifyd is in the spawned set but has no plist on this volume, so "has a job plist" is not exhaustive and the 63 "no plist found" entries mean "not on THIS volume". The backboardd conclusion does not depend on that direction -- it rests on a spawn.seen record naming backboardd, which is direct evidence, not an absence.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. BZ's headline is withdrawn.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16096,3 +16096,102 @@ Onsite: N/A.
 reached.  What is narrower is the cause of the frozen screen: the job is loaded,
 `RunAtLoad`, and never attempted, and it is not the spawn type and not the user.**  THE
 HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twelfth, addendum CB): BZ is wrong as stated -- backboardd spawns, on another boot
+
+## The instrument defect that found it
+
+`enumerate-launchd-jobs.py` cross-checks the volume's job plists against the
+comms the guest spawned.  The first version compared a **comm** against the
+**Label** key -- `configd` against `com.apple.configd` -- so `s in jobs` was never
+true and it reported:
+
+    spawned AND has a job plist     : 0
+    spawned but NO job plist found  : 109
+
+**Zero, for a boot on which configd, runningboardd and sleepd all have plists and
+all ran.**  A cross-check that cannot match is not a negative.  Fixed by indexing
+each Label by its last component, truncated to `MAXCOMLEN` (15), because a comm is
+that component truncated: `com.apple.CloudKeychainProxy` -> `CloudKeychainPro`.
+
+With the fix:
+
+    spawned AND has a job plist     : 46
+        backboardd           <- com.apple.backboardd
+        configd              <- com.apple.configd
+        runningboardd        <- com.apple.runningboardd
+        sleepd               <- com.apple.sleepd
+        ... (42 more)
+    control configd            in both
+    control runningboardd      in both
+    control notifyd            NOT in both      <- a real limitation, see below
+    control sleepd             in both
+
+## And backboardd is in the spawned set
+
+`local-private/boot53/spawn-failed-input-run/guest-input.log`, a boot from
+2026-11-04, carries:
+
+    {"event":"spawn.seen","n":36,"comm":"backboardd","source":"XNU.posix_spawn"}
+
+**backboardd spawned, as spawn number 36, and never exited.**  So BZ's headline --
+"launchd never spawns backboardd" -- is **wrong as a general claim.**  What BZ
+measured was true of its own boot: on run 41980452867, backboardd appears in no
+comm field of the 93 `fork1.spawn` records and none of the 50 `spawn.seen` records.
+The generalisation from one boot to "never" is the error, and it is the same error
+addendum BT made in the other direction.
+
+## The two runs are mirror images
+
+                    2026-11-04 boot      2026-11-05 boot (41980452867)
+    backboardd      SPAWNED (n=36)        not spawned
+    SpringBoard     not spawned           SPAWNED (pid 27)
+    spawn.seen      155 records           50 records
+    exit.seen       64 records            24 records
+    fork1.spawn     emitter absent        93 records
+
+**Exactly one of the two, and which one varies between boots.**  On the 11-04 boot
+backboardd came up and SpringBoard never did; on the 11-05 boot SpringBoard came up
+and backboardd never did.  Neither boot had both.
+
+That reframes the whole display investigation.  It is not that a compositor is
+missing by design or by a gate that always refuses -- it is that **the two
+processes the port needs are mutually absent across the boots measured**, and the
+display is frozen on the boots where backboardd is the one that is missing.
+
+## What this does to CA
+
+CA eliminated three candidate causes for backboardd not spawning: the spawn type,
+the user, and the binary.  All three eliminations were sound *for the boot they
+were measured on* -- configd is Interactive and spawned on that boot, sleepd is
+`mobile` and spawned on that boot.  What CA could not have seen is that the
+question itself varies: on another boot backboardd spawns and SpringBoard does
+not, so the discriminator is not a property of backboardd's plist at all.
+
+**The open question is now the non-determinism, not the job's keys.**  Something
+decides, per boot, which of the two comes up.
+
+## The instrument's remaining limitation, recorded
+
+`notifyd` is in the guest's spawned set but has no plist on this volume -- the
+enumerator's own docstring records that some plists are not here.  So "has a job
+plist" is not exhaustive, and the 63 "spawned but NO job plist found" entries are
+"not on THIS volume" rather than "no plist".  The `backboardd` conclusion does not
+depend on that direction: it rests on a `spawn.seen` record naming backboardd,
+which is direct evidence and not an absence.
+
+## Status
+
+Windows/real-guest: **none this interval -- the finding comes from a guest run made
+on 2026-11-04 plus the fixed host-side cross-check of the volume's plists.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  BZ's headline is withdrawn: backboardd spawns on some boots and not
+others, and across the two boots measured exactly one of backboardd and
+SpringBoard came up.**  THE HEADLINE is unchanged from AH
