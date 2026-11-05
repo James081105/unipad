@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred fourteenth, addendum CD). THE HEADLINE is **BACKBOARDD IS THE CLIENT, IT IS REFUSED THREE SELECTORS, AND IT NEVER SUBMITS A SWAP**. A teammate found that `read-client-table.py` broke out of its sampling loop the instant a client opened the framebuffer and then killed QEMU, so the console channel stopped at the moment of measurement: 207 lines and 2 `job.open` records against 742 and 352 on the kernel that did reach bulk job discovery. **BZ read "backboardd was never attempted" off that truncated channel, and the absence was a window artifact produced by my own sampler. The truncated channel is preserved at local-private/boot53/truncated-channel-d2c5a914.log.** **Running the same script with the break removed, to a 1800 s deadline: backboardd is ALIVE at pid 58 and IS a framebuffer client; the channel carries `{"event":"spawn.seen","n":55,"comm":"backboardd"}`; C0 (pid 58) made 9 calls with 3 failures across selectors 8, 15, 22, 29, 33, 57, 74, 79 and 88 -- REFUSED on 15 (0xe00002bc), 29 (0xe00002c7) and 57 (0xe00002c7) -- registered NO notification port, and never called selector 6; C1 (pid 95) called selectors 8 and 28. stage=10, armed=358, lifted=60, swap_validation_calls=0, prepare_calls=0, transfer_calls=0.** **SO BY AND BZ ARE BOTH WITHDRAWN: BY's "the only client is IOMFB_FDR_Loader" is false (its process list was captured at t=605 s, before backboardd had spawned), and BZ's "launchd never spawns backboardd" is false. And the saved table from kernel 2ebda0ec, which the record called "the busiest client: pid=58", WAS BACKBOARDD ALL ALONG -- 15 calls and 11 failures there, 9 and 3 here, same pid, same process.** **THE BLOCKER, STATED FROM THE MEASUREMENT: backboardd opens the framebuffer, calls nine selectors, is refused three of them, registers no notification port, and never calls selector 6. With no swap submitted, validateSwap never runs, nothing is validated, kickOnce returns at GATE 2, and no transfer ever happens.** **STILL NOT KNOWN: which of selectors 15, 29 and 57 is the swap submission, and whether the absence of selector 6 follows from one of those refusals or is independent. The family that owns the dispatch table is a prebuilt Apple kext with no source in the tree. Note that 0xe00002c7 and 0xe00002bc are DIFFERENT refusals, so "the refusals" is not one thing.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the display blocker is now named rather than inferred: backboardd is alive and driving the framebuffer, it is refused three selectors, and it never submits a swap.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred fifteenth, addendum CE). THE HEADLINE is **THE FOUR SURVIVORS ARE NOT UNLIFTABLE, THEY ARE UNRECOGNISED**. Addendum AN lifted seven of eleven refusals and left four -- 12 (Unsupported), 15 (Error), 29 (Unsupported), 57 (Unsupported) -- recording "the lift worked, the screen did not move". Addendum CD measured backboardd refused on 15 (0xe00002bc), 29 (0xe00002c7) and 57 (0xe00002c7): three of AN's four survivors, named, on the current kernel. **AND `native_legacy_slot_is_refusing_stub` (LegacyDisplayProbe.cpp:571) lifts a slot only when its function is a BARE stub -- `MOV w0,#0x2c7` followed within eight words by `RET`, with NO `BL` anywhere before it, because the loop does `return false` on the first BL it sees. But 0x2c7 is the exact code selectors 29 and 57 returned, while slot_lifted_count is 60 and they were not lifted. So those functions DO contain the refusal constant and were skipped because they contain a BL -- they do real work first and refuse at the end.** **SO AN's FOUR SURVIVORS ARE NOT UNLIFTABLE, THEY ARE UNRECOGNISED -- a different problem with a different fix, and it is what AN's own hypothesis 2 pointed at ("a real implementation with a dead MOV w0,#0x2c7 tail").** **THE HYPOTHESIS: relax the classifier to scan for the `MOV w0,#0x2c7 ... RET` tail regardless of an earlier BL. Prediction: selectors 29 and 57 are lifted, slot_lifted_count rises above 60, and backboardd gets further still (AN already saw it get further when seven were lifted). THE FALSIFICATION IS EQUALLY SHARP: if those functions do not end in that tail -- if the status is computed rather than a constant -- the relaxed classifier lifts nothing, slot_lifted_count stays at 60, and the hypothesis is dead. The counter distinguishes the two without a screen.** **TWO DISTINCTIONS: selector 15 returns 0xe00002bc, NOT 0x2c7, so no classifier work will lift it -- a different code and a different cause; and selector 12 was not called at all on the boot CD measured, so nothing here says anything about it.** **WHAT IT NEEDS: one function changed in vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp (pinned 9782ddf), a build, and a boot. No new emitter and no new counter -- slot_lifted_count and the client table already answer it. The dispatch-row read AN asked for is still worth doing and a teammate is on it; it would confirm the BL-before-the-tail shape directly rather than by inference.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is a specific, cheap, falsifiable change with a named counter that will say whether it worked: the lift classifier's `return false` on a BL is what left four refusals standing.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16383,3 +16383,98 @@ Onsite: N/A.
 reached.  But the display blocker is now named rather than inferred: backboardd is
 alive and driving the framebuffer, it is refused three selectors, and it never
 submits a swap.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred fifteenth, addendum CE): the four survivors are not unliftable, they are unrecognised
+
+## The two facts that meet
+
+**Addendum AN**, measured earlier: seven of eleven refusals lifted, four survive
+-- `12` (Unsupported), `15` (Error), `29` (Unsupported), `57` (Unsupported) --
+"the lift worked, the screen did not move", and backboardd "got further into its
+probe rather than stopping at the same place".
+
+**Addendum CD**, measured this interval: backboardd (pid 58) was refused on
+
+    selector  15 -> 0xe00002bc
+    selector  29 -> 0xe00002c7
+    selector  57 -> 0xe00002c7
+
+Three of AN's four survivors, named, on the current kernel.
+
+## And the classifier, which is 14 lines
+
+`vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp:571`,
+`native_legacy_slot_is_refusing_stub(fn)`:
+
+    for each of the first 24 words:
+        if the word is not MOV (immediate):
+            if the word is a BL:  return false      <- NOT A STUB, STOP
+            continue
+        if it is not `MOV w0,#0x2c7`:  continue
+        if a RET follows within 8 words:  return true
+        return false
+
+So a slot is lifted only when its function is a **bare stub**: `MOV w0,#0x2c7`
+followed within eight words by `RET`, with **no `BL` anywhere before it**.
+
+## `0x2c7` is the code 29 and 57 returned
+
+`native_legacy_slot_lifted_count` is **60**, and selectors 29 and 57 still answer
+`0xe00002c7` -- the very constant the classifier looks for.  So those functions
+**do contain the refusal**; they were skipped because they contain a `BL`.  They
+do real work first and refuse at the end, and the classifier's `return false` on
+any `BL` excludes them before it ever looks for the tail.
+
+**So AN's four survivors are not unliftable.  They are unrecognised.**  That is a
+different problem with a different fix, and AN's two hypotheses both pointed at
+"a real implementation with a dead `MOV w0,#0x2c7` tail" -- which is exactly what
+the source now shows the classifier refuses to match.
+
+## The hypothesis, stated so it can be wrong
+
+**Relax the classifier to scan for the `MOV w0,#0x2c7 ... RET` tail regardless of
+an earlier `BL`.**  The prediction: selectors 29 and 57 are lifted to success,
+`slot_lifted_count` rises above 60, and backboardd gets further still -- AN
+already observed it get further when seven were lifted.
+
+**The falsification is equally sharp**: if those functions do not actually end in
+that tail -- if the status is computed rather than a constant -- the relaxed
+classifier lifts nothing, `slot_lifted_count` stays at 60, and the hypothesis is
+dead.  The counter distinguishes the two without a screen.
+
+## Two distinctions that must not be smoothed
+
+**Selector 15 is a different refusal.**  It returns `0xe00002bc`, not `0x2c7`, so
+no amount of classifier work will lift it -- it is a different code and a
+different cause.  AN called it `Error` and `29`/`57` `Unsupported`, and the
+measurement confirms they are not the same thing.
+
+**Selector 12 was not called at all** on the boot CD measured, so nothing this
+interval says anything about it.
+
+## What this needs, and what it does not
+
+A change to one function in `vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp`
+(the probe, pinned at `9782ddf`), a build, and a boot.  No new emitter, no new
+counter -- `slot_lifted_count` and the client table already answer it.
+
+The dispatch-row read addendum AN asked for is still worth doing and a teammate is
+on it: it would name the function behind each slot and confirm the `BL`-before-
+the-tail shape directly rather than by inference.  But the inference is now
+grounded in the returned constant, and the experiment is cheap either way.
+
+## Status
+
+Windows/real-guest: **none this interval -- the mechanism is read from the probe's
+source and tied to a status code measured on a live guest in addendum CD.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is new is a specific, cheap, falsifiable change with a named
+counter that will say whether it worked: the lift classifier's `return false` on
+a `BL` is what left four refusals standing.**  THE HEADLINE is unchanged from AH
