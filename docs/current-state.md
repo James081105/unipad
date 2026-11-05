@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty fourth, addendum CX). THE HEADLINE is **OID 1216 IS THE CATALOG ROOT, THE LEAF GEOMETRY IS EXACTLY SELF-CONSISTENT, AND THE RECORD SHAPE IS NOT A CATALOG FILE RECORD**. oid 1216 is confirmed byte for byte: the volume superblock's +0x88 is c0 04 00 00 00 00 00 00 = 1216, and resolving it through the volume omap gives block 770808 with flags 0x0019, level 3, nkeys 2 -- so the node whose key area decoded private-dir is unambiguously the catalog root. **AND THE LEAF GEOMETRY IS EXACTLY SELF-CONSISTENT, WHICH VALIDATES THE READER: leaf 770809 (oid 1217) has toc=0x38, key=0x278, free=0x6a8, data=0x6d7; the key area is 1072 bytes / 67 keys = 16 bytes per key EXACTLY and the value area is 2345 bytes / 67 values = 35 bytes per value EXACTLY, with no remainder in either. So the TOC location, the forward key offsets, the backward value offsets and the area_len computation are all correct for this node, which closes the reader question CW raised.** **BUT THE RECORD SHAPE IS NOT A CATALOG FILE RECORD: every 16-byte key is two qwords -- a CONSTANT first qword (16 00 00 00 00 00 00 d0) and a second that rises by a fixed step of 0x4000 = 16384 per record -- and every 35-byte value is a 3-byte prefix (04 00 20) plus 32 bytes. A constant key prefix with a monotonically stepping second field, and values that are a short prefix plus 32 bytes, MATCHES NO CATALOG RECORD IN raw.h: not apfs_drec_key (8+2+name), not apfs_inode_key (8), not apfs_file_extent_key (8), not apfs_drec_hashed_key. So whatever these leaves hold, it is not the volume's file catalog.** **WHAT THIS MEANS, PLAINLY: the reader is right and the tree identification is right, but the blocks reached as leaves do not hold file records. Three possibilities, not distinguished here: (1) the catalog root's children are level-2 nodes as btn_level=3 implies, and oids 3719/3720/1217/1218 are something else, so I have been reading the wrong blocks; (2) the volume's catalog uses hashed keys throughout and the 32 bytes are name hashes with the constant prefix a per-tree key header not yet identified; (3) these leaves belong to a different tree sharing the omap.** **THE DECISIVE TEST IS CHEAP AND IS THE NEXT ACTION: read the volume's extentref tree (oid 4542) and snapshot-metadata tree (oid 4544) roots and compare their leaves' key and value shapes to these. If 770809's shape matches one of them, these leaves are that tree's and the catalog's own leaves are elsewhere; if it matches neither, the shape is the catalog's and the record struct still needs identifying.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty fifth, addendum CY). THE HEADLINE is **THE 16/35 SHAPE IS THE EXTENTREF AND SNAP_META TREES' SHAPE, NOT THE CATALOG'S**. Resolving all three of the volume's tree oids through the volume omap: catalog root oid 1216 -> block 770808, flags 0x0019, level 3, 2 keys, key lengths {16:1, 24:1}, value lengths {40:2}; extentref root oid 4542 -> block 782059, flags 0x001a, level 0, 67 keys, key lengths {16:67}, value lengths {35:67}; snap_meta root oid 4544 -> block 782061, flags 0x001a, level 0, 67 keys, key lengths {16:67}, value lengths {35:67}. **THE EXTENTREF ROOT AND THE SNAPSHOT-METADATA ROOT HAVE EXACTLY THE SHAPE I COULD NOT IDENTIFY -- 67 keys of 16 bytes and 67 values of 35 bytes -- byte for byte the shape of blocks 770809, 781228 and 781229. So CX's third hypothesis is confirmed: those blocks are extentref or snapshot-metadata leaves, not catalog leaves, and the {16-byte key, 35-byte value} shape is a real record shape in this volume, just not the catalog's.** **WHICH MEANS CX's FIRST HYPOTHESIS IS BACK AND SHARPER: the catalog root's two child references resolve, unambiguously with one omap entry each, to blocks 781228 and 781229, which carry the extentref/snap_meta shape. A catalog root's children must be catalog nodes, so either the 40-byte child-reference value is not {oid, hash[32]} and I am reading the wrong oid out of it, or the omap entries for 3719/3720 point at blocks belonging to another tree. CX had narrowed this to "the reader is right and the tree identification is right"; the reader is right, but the tree identification of 781228/781229 as catalog leaves was WRONG, and that is what sent every leaf-record parse since CU astray.** **AND A NEW CONTRADICTION, THE MORE INTERESTING ONE: both the extentref root and the snapshot-metadata root resolve to LEVEL-0 LEAVES. A level-0 root means the entire tree fits in one block, which is not plausible for a real filesystem's extent reference tree -- it must record every file extent on the volume. So the omap resolution is returning LEAF blocks for oids that should be ROOT blocks. The catalog root resolved correctly, so the method works for at least one oid.** **THE LIKELY CAUSE, AND IT IS TESTABLE: the omap has entries at several xids and the lookup takes the last entry with oid <= target. If an oid appears at multiple xids, that picks a stale one. CX enumerated omap leaf 782659 and found one entry per oid for 1214..1284, but the leaves covering 4542, 4544 and 3719/3720 have not been fully enumerated.** **THE NEXT ACTION: enumerate the omap leaf covering oid 4542 -- the root's entry 4393 -> 781909 puts it in leaf 781909 -- and print every entry with its oid, xid and paddr. If oid 4542 appears more than once at different xids, the lookup must select by the tree's xid rather than by "last oid <= target", and that single fix may resolve the level contradiction for all three trees at once. If it appears once, the extentref tree genuinely is one block and the catalog's own leaves are still unfound.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18171,6 +18171,89 @@ The decisive test is cheap and is the next action: **read the volume's extentref
 value shapes to these.**  If 770809's shape matches one of them, these leaves are that
 tree's and the catalog's own leaves are elsewhere.  If it matches neither, the shape is
 the catalog's and the record struct still needs identifying.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty fifth, addendum CY): the 16/35 shape is the extentref and snap_meta trees' shape, NOT the catalog's
+
+## The test CX asked for, run
+
+Resolve all three of the volume's tree oids through the volume omap and compare their
+shapes:
+
+    catalog root    oid 1216  -> block 770808  flags 0x0019  level 3  nkeys 2
+                                  key lengths {16: 1, 24: 1}   value lengths {40: 2}
+    extentref root  oid 4542  -> block 782059  flags 0x001a  level 0  nkeys 67
+                                  key lengths {16: 67}         value lengths {35: 67}
+    snap_meta root  oid 4544  -> block 782061  flags 0x001a  level 0  nkeys 67
+                                  key lengths {16: 67}         value lengths {35: 67}
+
+**The extentref root and the snapshot-metadata root have exactly the shape I could not
+identify: 67 keys of 16 bytes and 67 values of 35 bytes.**  That is byte-for-byte the
+shape of blocks 770809, 781228 and 781229.
+
+So CX's third hypothesis is confirmed: **those blocks are extentref or snapshot-metadata
+leaves, not catalog leaves.**  The `{16-byte key, 35-byte value}` shape is a real record
+shape in this volume -- it just is not the catalog's.
+
+## Which also means CX's first hypothesis is back, and sharper
+
+The catalog root's two child references resolve (unambiguously, one omap entry each) to
+blocks 781228 and 781229 -- which carry the extentref/snap_meta shape.  **A catalog root's
+children must be catalog nodes.**  So one of these is true:
+
+1. The 40-byte child-reference value is not `{oid, hash[32]}`, and I am reading the wrong
+   oid out of it.
+2. The omap entries for 3719/3720 point at blocks belonging to another tree, which would
+   mean the omap lookup is returning the wrong block for those oids.
+
+CX had narrowed this to "the reader is right and the tree identification is right".  The
+reader is right; **the tree identification of 781228/781229 as catalog leaves was wrong**,
+and that is what sent every leaf-record parse since CU astray.
+
+## And a new contradiction, which is the more interesting one
+
+Both the extentref root and the snapshot-metadata root resolve to **level-0 leaves**.  A
+level-0 root means the entire tree fits in one block.  For a real filesystem's extent
+reference tree -- which must record every file extent on the volume -- that is not
+plausible.
+
+So the omap resolution is returning **leaf** blocks for oids that should be **root**
+blocks.  The catalog root resolved correctly (level 3, and its key area decoded
+`private-dir`), so the method works for at least one oid.  But for 4542 and 4544 it
+returns level-0 leaves.
+
+The likely cause, and it is testable: **the omap has entries at several xids and the
+lookup takes the last entry with `oid <= target`.**  If an oid appears at multiple xids,
+that picks a stale one.  CX enumerated omap leaf 782659 and found one entry per oid for
+1214..1284 -- but the leaves covering 4542 and 4544 have not been enumerated, and neither
+has the leaf covering 3719/3720 beyond the single hit already found.
+
+## The next action, concretely
+
+Enumerate the omap leaf that covers oid 4542 (the root's entry `4393 -> 781909` puts it in
+leaf **781909**) and print **every** entry with its oid, xid and paddr.  If oid 4542
+appears more than once at different xids, the lookup must select by the tree's xid rather
+than by "last oid <= target", and that single fix may resolve the level contradiction for
+all three trees at once.
+
+If it appears once, then the extentref tree genuinely is one block and the shape belongs
+to it, and the catalog's own leaves are still unfound.
 
 ## Status
 
