@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty seventh, addendum CQ). THE HEADLINE is **THE TWO CLAIMS I WAS ABOUT TO RECORD ARE BOTH WRONG -- THE AUTHORITATIVE HEADER WAS IN THE REPO ALL ALONG, AND THE VOLUME OID MATCHES**. After CO I measured the omap tree root once more, drafted the result as an addendum CP, then checked the premise before recording it -- and the check refuted it, so CP was never appended. The draft said btn_table_space = 0 cannot be right and that om_count reading 0 meant the omap read had failed a control. **BOTH WERE WRONG. btn_table_space is not a uint16; it is `struct apfs_nloc { __le16 off; __le16 len; }` -- I read the `off` half and stopped, and the `len` half is 448, a perfectly good TOC size for a 4096-byte node. There was never a zero. And there is NO om_count field in apfs_omap_phys; the field at +0x24 is om_snap_count, and zero is the CORRECT value for a container omap. I invented a field, read zero, and called the zero a control failure.** **THE ROOT IS THE SAME ONE A FOURTH TIME: I derived struct offsets by hand instead of reading the definition. The authoritative header was in this repository the whole time at local-private/tmp/apfsprogs/src/include/apfs/raw.h -- apfs_omap_phys at raw.h:94-105, apfs_omap_val at raw.h:122-126, apfs_nloc at raw.h:152-155, apfs_btree_node_phys at raw.h:177-187, apfs_nx_superblock at raw.h:952 with nx_fs_oid at raw.h:985. THE LESSON IS NOW SHARPER THAN "prove the instrument": for a documented on-disk format the definition IS the instrument, and hand-deriving offsets is guessing.** **MEASURED AGAINST THE AUTHORITATIVE STRUCT: block 782662's omap_phys matches field for field (om_flags=1, om_snap_count=0, om_tree_type=0x40000002, om_snapshot_tree_type=0x40000002, om_tree_oid=782663, om_snapshot_tree_oid=0), so the draft's "this read failed a control" is withdrawn. Block 782663's btree_node_phys gives btn_flags=0x0007, btn_level=0, btn_nkeys=1, btn_table_space {off=0, len=448}, btn_free_space {off=32, len=3488}; with apfsprogs' own formulas (apfsck/btree.c:338-340) toc=0x38, key=0x1f8, data area [0x1f8, 0x1000). TOC[0] = {k=0x10, v=0x20}, and the only reading that puts both in range is relative to the key-area start, giving a key at 0x208 of oid=1026, xid=14.** **AND THE CONTAINER NAMES THE VOLUME DIRECTLY, WHICH CONFIRMS THE KEY INDEPENDENTLY: nx_fs_oid[100] at +0xB8 has exactly ONE non-zero entry, fs[0] oid = 1026 -- and the omap key I read independently is oid = 1026. That exact match between two structures read by two different routes confirms the TOC is at 0x38, the key area at 0x1f8, and the kvoff k/v are relative to the key-area start. It also says the container has exactly one volume, virtual oid 1026, which is why om_snap_count is 0 and one omap entry is the right count.** **STILL NOT ESTABLISHED, and now exactly one thing: the omap VALUE's target. apfs_omap_val is confirmed at raw.h:122-126 as {u32 ov_flags; u32 ov_size; u64 ov_paddr} so the layout is not in doubt; the only non-zero 16 bytes below the key are at 0x1f8 giving ov_flags=0x0010ffff (not a valid mask), ov_size=0, ov_paddr=13 -- and BLOCK 13 IS TYPE 0x0C CHECKPOINT_MAP, NOT 0x0D FS. The TOC says v=0x20, pointing at 0x218, which is all zeros. The chain is verified container -> omap -> tree root -> TOC -> KEY and stops at the value.** **TWO SCANS NOW RECORDED AS INSTRUMENT FAILURES: enumerating omaps by the object-type byte at +0x18 gives 1600 hits of which 1592 are FALSE POSITIVES (that byte is validated only on blocks 0, 782662, 782663); and enumerating by "+0x30 points at a btree root" gives 152 hits whose +0x20..+0x2c words are mostly ASCII strings (Instrook, ProtocolCount, WEAKDAY_SPEAK, /rnkmk, entnatHlahtlUa). Only FIVE blocks carry the full 5-word omap signature and 782662 is one -- the others (4538, 4546, 6050, 782654) are unexamined. So the correct instrument is the 5-word signature, not either scan alone.** **THE RESUME PATH: scan for a block whose +0x20 is the APSB magic and whose +0x18 type is 0x0D FS (my earlier scan covered only blocks 0..64 and found none, which is NOT a negative about the container) -- that block is the volume superblock ov_paddr should name. Then read apfs_superblock's apfs_root_tree_oid and apfs_omap_oid from raw.h, again by reading the struct rather than deriving it. The OS volume's walker (local-private/tmp/enumerate-launchd-jobs.py) already recovers 373 plists from 044-76040-038.raw and repointing it at this container is the shortest path to IOMobileFramebuffer.framework.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty eighth, addendum CR). THE HEADLINE is **THE VOLUME SUPERBLOCKS AND OMAPS ARE FOUND, THE TREE IS A WALKABLE MULTI-LEVEL BTREE, AND THE 5-WORD SIGNATURE WAS OVER-FITTED**. apfs_superblock puts apfs_magic at +0x20 as a u32 (APSB = 0x42535041 LE); scanning all 806,400 blocks finds FIVE blocks with the magic, all of object type 0x0D FS: 4543, 4545, 4795, 782653, 782661. Five is not a failure -- APFS keeps one volume superblock per checkpoint. They disagree about the current omap: three name apfs_omap_oid=4540 / apfs_root_tree_oid=1028, while 782653 names 746223 / 1216 and 782661 names 782656 / 1216. Which is current is a transaction-id question and is NOT answered yet. **THE CORRECTION TO THE INSTRUMENT IS MINE AGAIN: CQ recorded the 5-word omap signature as the correct instrument, but it is OVER-FITTED to the container omap and misses every volume omap. om_flags is 1 for the container omap and 0 for volume omaps, so the signature found the container and would have silently skipped all three volumes. The correct discriminator is the object type at +0x18 being 0x0B cross-checked against om_tree_type == 0x40000002 -- and the earlier scan showed the type byte alone produces 1592 false positives out of 1600, so it must be the PAIR, not either alone.** **AND THE TREE IS A MULTI-LEVEL BTREE, WHICH IS WHAT MAKES IT WALKABLE: the volume omaps' trees have btn_flags = 0x0005, which is BTNODE_ROOT | BTNODE_FIXED_KV_SIZE WITHOUT BTNODE_LEAF, at btn_level = 1, with 2, 36 and 37 keys. A level-1 root with no LEAF flag is an internal node whose values are child block numbers rather than data records -- exactly right for an omap whose entries do not fit in one block, and exactly why nkeys is 2/36/37 rather than the 1 the container's root leaf showed. The walk is volume superblock -> apfs_omap_oid -> omap_phys.om_tree_oid (a level-1 internal root) -> child blocks (level-0 leaves) -> omap records {virtual oid, xid} -> {physical block}. The container's own omap is a level-0 root leaf with one key because a container maps one volume and needs no depth; both shapes are consistent with the same reader, which is the strongest evidence the reader is right.** **SO THE CHAIN IS OPEN END TO END WITH ONE NAMED GAP: verified is the container geometry, the container omap, its tree root and TOC, the volume superblocks by magic, the volume omaps, and the volume omap tree roots as level-1 internal nodes. The named gap is the CHILD POINTERS -- for a non-leaf node the TOC entry's v is a child block number rather than a record offset, and I have not yet read one. That is the single next measurement and it is a small one.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17489,6 +17489,96 @@ that before anyone reuses either.
    the equivalent walk on `044-76040-038.raw` and recovered 373 plists; repointing it at
    this container with the geometry above is the shortest path to
    `IOMobileFramebuffer.framework`.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty eighth, addendum CR): the volume superblocks and omaps are found, the tree is a walkable multi-level btree, and the 5-word signature was over-fitted
+
+## The volume superblocks, found by magic
+
+`apfs_superblock` (raw.h:1197-1225) puts `apfs_magic` at `+0x20` as a u32 (`APSB` =
+`0x42535041` LE).  Scanning all 806,400 blocks for it:
+
+    blocks with the APSB magic at +0x20 : 5
+    of those, object type 0x0D FS       : 5   (4543, 4545, 4795, 782653, 782661)
+
+Five is not a failure.  **APFS keeps one volume superblock per checkpoint**, so five
+is five historical snapshots.  They disagree about which omap is current, which is the
+expected shape:
+
+    block   apfs_omap_oid   apfs_root_tree_oid   apfs_extentref_oid   apfs_snap_meta_oid
+    4543    4540            1028                 4542                 4544
+    4545    4540            1028                 4542                 4544
+    4795    4540            1028                 4542                 4544
+    782653  746223          1216                 4542                 4544
+    782661  782656          1216                 4542                 4544
+
+Three of the five agree on omap 4540 / root tree 1028; the two newest disagree.  Which
+is current is a question about transaction ids, and it is **not** answered yet.
+
+## The correction to the instrument, and it is mine again
+
+Addendum CQ recorded "the correct instrument is the 5-word omap signature"
+(`om_flags=1, om_snap_count=0, om_tree_type=0x40000002,
+om_snapshot_tree_type=0x40000002`).  **That signature is over-fitted to the container
+omap and misses every volume omap:**
+
+    block   om_flags   tree     flags    level   nkeys   table_space
+    4540    0          4541     0x0005   1       2       {0, 576}
+    782656  0          782657   0x0005   1       36      {0, 576}
+    746223  0          746224   0x0005   1       37      {0, 576}
+    782662  1          782663   0x0007   0       1       {0, 448}   <- the container omap
+
+**`om_flags` is 1 for the container omap and 0 for volume omaps.**  So the signature
+found the container and would have silently skipped all three volumes.  The correct
+discriminator is the object type at `+0x18` being `0x0B`, cross-checked against
+`om_tree_type == 0x40000002` -- and the earlier scan showed that the type byte alone
+produces 1592 false positives out of 1600, so it must be the pair, not either alone.
+
+## And the tree is a multi-level btree, which is what makes it walkable
+
+The volume omaps' trees have **`btn_flags = 0x0005`**, which is
+`BTNODE_ROOT | BTNODE_FIXED_KV_SIZE` **without** `BTNODE_LEAF`, at **`btn_level = 1`**,
+with 2, 36 and 37 keys.
+
+**A level-1 root with no LEAF flag is an internal node: its values are child block
+numbers, not data records.**  That is exactly right for an omap whose entries do not
+fit in one block, and it is why `nkeys` is 2/36/37 rather than the 1 the container's
+root leaf showed.  So the walk is:
+
+    volume superblock -> apfs_omap_oid (4540 / 782656 / 746223)
+      -> omap_phys.om_tree_oid (4541 / 782657 / 746224), a level-1 internal root
+        -> child blocks, level-0 leaves
+          -> omap records {virtual oid, xid} -> {physical block}
+
+The container's own omap is a level-0 root leaf with one key, because a container maps
+one volume and needs no depth.  Both shapes are consistent with the same reader, which
+is the strongest evidence that the reader is right.
+
+## So the chain is open end to end, with one named gap
+
+Verified: container geometry, container omap, container omap tree root and its TOC,
+volume superblocks by magic, volume omaps, and volume omap tree roots as level-1
+internal nodes.
+
+**The named gap is the child pointers.**  For a non-leaf node the TOC entry's `v` is a
+child block number rather than a record offset, and I have not yet read one.  That is
+the single next measurement, and it is a small one.
 
 ## Status
 
