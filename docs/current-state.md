@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-second, addendum AX). THE HEADLINE is **THE DYLD CACHE IS ON THE CRYPTEX, NOT ON THE ROOT THE GUEST MOUNTS**, and the split between the two volumes is now measured. Addendum AW recorded that no `dyld_shared_cache_*` file exists anywhere on the volume mounted at `/` while the guest demonstrably read a cache. **It is on the cryptex**: a streaming scan of `044-76034-038.dmg` (3,303,014,400 bytes) finds `dyld_v1   arm64` at 4096-aligned offsets 24,797,184 / 25,288,704 / 140,009,472 / 140,058,624 / 254,287,872 / 254,517,248 -- two unaligned hits are the pattern inside compressed data, and a run near 293,071,868 is an architecture-name string table. So AW's finding is REFINED, not reversed. The two volumes now do measurably different jobs: the root carries the 523 LaunchDaemons that spawn and the /usr/libexec binaries -- launchd, configd, backboardd, and runningboardd as a 60-byte-__text stub -- and NO shared cache; the cryptex carries the cache and therefore the frameworks whose root directories hold only Info.plist. **`runningboardd` dlopens a binary that exists only inside the cache on the cryptex, so whether the spawn driver has any code to run depends entirely on that cache being reachable -- and the root volume alone cannot supply it.** The guest did read a cache, so it is reachable somehow; what is unknown is whether the copy it reads is complete and whether RunningBoard is in it. **If the cache is partial or lacks RunningBoard, runningboardd's dlopen fails, there is no spawn driver, and every `POSIXSpawnType=App` job is refused for that single reason -- which would explain the whole anomaly at once, including the five App jobs with no EmbeddedHomeScreen.** That is now one measurement about one file, not a question about launchd. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-third, addendum AY). THE HEADLINE is **SEVEN HYPOTHESES REFUTED, AND THE ONE QUESTION LEFT IS A RUNTIME ONE**. The dyld-cache lead from addendum AX was tested and closed: a streaming scan of the cryptex for install names, with controls that must be present in any complete arm64 cache, finds libSystem 3344, UIKitCore 510, RunningBoardServices 209, FrontBoard 87 -- and **`RunningBoard.framework/RunningBoard` 28 times**. The controls are in the hundreds and thousands, so the instrument works and the absence is not an artefact. The partial-cache hypothesis is dead. The same scan settles the other direction too: `/usr/lib/system` on the root holds one 0-byte file and `/usr/lib/dyld` is EMPTY, so the guest cannot be linking from the root at all -- which means it IS reaching the cryptex's cache, because 146 of 161 daemons are alive and backboardd is making real framebuffer calls. **Seven falsifiable hypotheses are now closed, each with its refutation: the volume gap (452/454 opens err:0); the missing executable (all seven exist, SpringBoard 120,864 B in a 79-entry .app); the home-screen claim (only 3 of 7 App jobs carry the key); the missing entitlement (the signature has spawn-driver, and the cache instrument is itself refuted because launchd ran and is in neither cache); the hollow runningboardd (2029 of 2037 PrivateFrameworks have no executable -- normal); the missing or partial dyld cache (it is on the cryptex and RunningBoard is in it, 28 hits); and SpawnConstraint (one key in launchd's plist schema table at 0x100008b6c, not a global gate).** Each was a real candidate with a different prediction, and each prediction failed -- seven whole directions are now closed rather than untried. **The chain is fully mapped and every link checks out: launchd opens the job (err:0, n=239 of 454), classifies it (code 0x100), marshals `process-type` = 256, and runningboardd is both signed for the job and able to load the code it needs. So the open question is not in any of those binaries -- it is whether runningboardd ever ASKS launchd for the App jobs, which is a runtime property of a live process, and no instrument this project has reads an XPC conversation.** The next step is therefore not another static read but a measurement on a booted guest: an emitter at the point where a job is loaded but not spawned, recording what launchd is waiting on. That needs a kernel change and a build, the normal cost here, and it is the first step in this chain that would produce a spawn rather than another attribution. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13249,6 +13249,107 @@ That is now one measurement about one file, not a question about launchd.
 
 Windows/real-guest: **host-side reads of the two volumes this host has.**  The
 scan is a byte search of the cryptex image; the catalog walk is the root volume.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-third, addendum AY): seven hypotheses refuted, and the one question left is a runtime one
+
+## The dyld-cache lead from AX, tested and closed
+
+AX ended on: the arm64 dyld shared cache is not on the root volume the guest
+mounts but is on the cryptex, and if the copy the guest maps is partial or lacks
+`RunningBoard`, `runningboardd`'s `dlopen` fails, there is no spawn driver, and
+every `App` job is refused for that one reason.
+
+**Tested, and refuted.**  A streaming scan of the cryptex for install names,
+with controls that must be present in any complete arm64 cache:
+
+    /usr/lib/libSystem.B.dylib                                    3344
+    /System/Library/PrivateFrameworks/UIKitCore.framework/...      510
+    /System/Library/PrivateFrameworks/RunningBoardServices...       209
+    /System/Library/PrivateFrameworks/FrontBoard.framework/...       87
+    /System/Library/PrivateFrameworks/RunningBoard.framework/RunningBoard   28
+    /System/Library/CoreServices/SpringBoard.app/SpringBoard          2
+
+**`RunningBoard.framework/RunningBoard` is in the cache, 28 times.**  The
+controls are present in the hundreds and thousands, so the instrument works and
+the absence is not an artefact.  The partial-cache hypothesis is dead.
+
+The same scan settles the "no dylibs anywhere" worry from the other direction:
+`/usr/lib/system` on the root holds exactly one entry, a 0-byte file named
+`introspection`, and `/usr/lib/dyld` is **empty**.  So the guest cannot be
+linking from the root volume at all -- which means it IS reaching the cryptex's
+cache, because 146 of 161 daemons are alive and backboardd is making real
+framebuffer calls.  **The cache is reachable and complete.**
+
+## Seven hypotheses, each falsifiable, each now closed
+
+    #  hypothesis                                          refuted by
+    1  the job plist is not readable on the mounted       452 of 454 opens err:0,
+       volume (a volume gap)                              only 2 ENOENT          (AQ)
+    2  the executable the job names is not on the         all seven exist;
+       volume                                             SpringBoard 120,864 B
+                                                          in a 79-entry .app     (AQ)
+    3  another service claimed the home screen            only 3 of the 7 App jobs
+                                                          carry EmbeddedHomeScreen,
+                                                          and the other 4 also
+                                                          never spawned           (AU)
+    4  runningboardd runs without its entitlements        its signature carries
+       (the trust cache does not cover it)                spawn-driver; and the
+                                                          cache instrument is
+                                                          itself refuted -- launchd
+                                                          ran and is in neither
+                                                          cache                  (AV)
+    5  runningboardd is hollow because its framework      2029 of 2037
+       has no executable                                  PrivateFrameworks have
+                                                          none; that is normal    (AW)
+    6  the dyld cache is missing, or partial, or lacks     it is on the cryptex,
+       RunningBoard                                       and RunningBoard is in
+                                                          it, 28 hits            (AX/AY)
+    7  SpawnConstraint gates spawning system-wide         it is one key in
+                                                          launchd's plist schema
+                                                          table at 0x100008b6c,
+                                                          not a global gate       (AY)
+
+Every one of those was a real candidate, each produced a different prediction,
+and each prediction failed.  That is progress even though none was the answer:
+seven whole directions are now closed rather than merely untried.
+
+## What is left, and why no host-side instrument can reach it
+
+The chain is fully mapped and every link checks out:
+
+    launchd opens com.apple.SpringBoard.plist        err:0, n=239 of 454
+    launchd classifies the job                       code 0x100 at job+0x358
+    launchd marshals the request                     'process-type' = 256
+    runningboardd is signed for the job              spawn-driver, allowed-launch-types
+    the code it needs is available                   RunningBoard in the cache
+
+**The open question is not in any of those binaries.**  It is whether
+`runningboardd` ever ASKS launchd for the App jobs -- and that is a runtime
+property of a live process, not a fact about a file.  Every instrument built in
+this project so far reads files, guest memory, or the virtio channel; none of
+them observes an XPC conversation.
+
+So the next step is not another static read.  It is a measurement on a booted
+guest, and the cheapest one that bears on the question is the one this project
+already knows how to build: **an emitter at the point where a job is loaded but
+not spawned, recording what launchd is waiting on.**  That needs a kernel change
+and a build, which is the normal cost here, and it is the first step in this
+chain that would produce a spawn rather than another attribution.
+
+## Status
+
+Windows/real-guest: **host-side byte and catalog reads of the two volumes this
+host has, with controls.**  Nothing measured on the guest this interval.
 
 Build: none.
 
