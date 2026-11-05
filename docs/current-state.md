@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-third, addendum AY). THE HEADLINE is **SEVEN HYPOTHESES REFUTED, AND THE ONE QUESTION LEFT IS A RUNTIME ONE**. The dyld-cache lead from addendum AX was tested and closed: a streaming scan of the cryptex for install names, with controls that must be present in any complete arm64 cache, finds libSystem 3344, UIKitCore 510, RunningBoardServices 209, FrontBoard 87 -- and **`RunningBoard.framework/RunningBoard` 28 times**. The controls are in the hundreds and thousands, so the instrument works and the absence is not an artefact. The partial-cache hypothesis is dead. The same scan settles the other direction too: `/usr/lib/system` on the root holds one 0-byte file and `/usr/lib/dyld` is EMPTY, so the guest cannot be linking from the root at all -- which means it IS reaching the cryptex's cache, because 146 of 161 daemons are alive and backboardd is making real framebuffer calls. **Seven falsifiable hypotheses are now closed, each with its refutation: the volume gap (452/454 opens err:0); the missing executable (all seven exist, SpringBoard 120,864 B in a 79-entry .app); the home-screen claim (only 3 of 7 App jobs carry the key); the missing entitlement (the signature has spawn-driver, and the cache instrument is itself refuted because launchd ran and is in neither cache); the hollow runningboardd (2029 of 2037 PrivateFrameworks have no executable -- normal); the missing or partial dyld cache (it is on the cryptex and RunningBoard is in it, 28 hits); and SpawnConstraint (one key in launchd's plist schema table at 0x100008b6c, not a global gate).** Each was a real candidate with a different prediction, and each prediction failed -- seven whole directions are now closed rather than untried. **The chain is fully mapped and every link checks out: launchd opens the job (err:0, n=239 of 454), classifies it (code 0x100), marshals `process-type` = 256, and runningboardd is both signed for the job and able to load the code it needs. So the open question is not in any of those binaries -- it is whether runningboardd ever ASKS launchd for the App jobs, which is a runtime property of a live process, and no instrument this project has reads an XPC conversation.** The next step is therefore not another static read but a measurement on a booted guest: an emitter at the point where a job is loaded but not spawned, recording what launchd is waiting on. That needs a kernel change and a build, the normal cost here, and it is the first step in this chain that would produce a spawn rather than another attribution. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-fourth, addendum AZ). THE HEADLINE is **LAUNCHD NEVER ATTEMPTS THE SPAWN, AND THE INSTRUMENT WAS ALREADY THERE**. Everything so far rested on "no `spawn.seen` for SpringBoard, so launchd declined it" -- but the emitter's own comment says it is PLACED INSIDE `if (error == 0 && !spawn_no_exec)`, so the success record only fires when posix_spawn SUCCEEDED. "No spawn.seen" is equally consistent with "launchd never called posix_spawn" and with "launchd called it and the kernel rejected it" -- different failures with different fixes, and every interval so far has been reading the first. **The same patch already carried the plug**: a failure-path emitter, `spawn.failed` with the errno and the parent's comm, placed before the `if (imgp != NULL)` cleanup so it covers all ~26 `goto bad` paths, and its comment names the exact ambiguity and says the errno alone separates the two. **The plug is verified to be in this kernel**: the block opens the SAME `XNU_OWNER_CACHE_MOUNT` guard as the `spawn.seen` block in the same file, that macro is live because `spawn.seen` fires 512 times, and a literal only that block contains (`spawn_failed.saturated`) is present once. The contiguous-literal count is explicitly NOT the evidence -- `spawn.seen` reads 0 as contiguous bytes while the guest emits 512 of them, because ld's SHF_MERGE|SHF_STRINGS pass splits them, which is fact 228's shape again. **THE MEASUREMENT: 0 `spawn.failed` records against 512 successful spawns in the deepest capture, and 0 in two more.** So the kernel is rejecting nothing: **launchd never calls posix_spawn for SpringBoard at all.** The decision is made entirely inside launchd's userspace job state machine, before any syscall -- nothing in this project's kernel can be changed to make it happen, because the spawn is never attempted. **That also costs the next measurement: it cannot be a kernel emitter on the spawn path, because that path is never reached.** The cheapest instrument that bears on it is whether runningboardd -- the entitled spawn driver that has to ASK for an App job -- is actually running its code or is alive and blocked; RunningBoard's first act as process manager is kernel-visible (`memorystatus`, `task_policy`), so an emitter there separates "runningboardd never asks" from "runningboardd asks and launchd refuses". **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13352,6 +13352,109 @@ Windows/real-guest: **host-side byte and catalog reads of the two volumes this
 host has, with controls.**  Nothing measured on the guest this interval.
 
 Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-fourth, addendum AZ): launchd never attempts the spawn, and the instrument was already there
+
+## The hole in the inference, and the plug
+
+Everything so far has rested on: no `spawn.seen` record for SpringBoard, so
+launchd did not spawn it.  The emitter's own comment in
+`zzz-native-springboard-events.patch` says where that record comes from:
+
+    PLACED INSIDE `if (error == 0 && !spawn_no_exec)`, AFTER
+    proc_exec_switch_task()
+
+**The success emitter only fires when `posix_spawn` SUCCEEDED.**  So "no
+`spawn.seen`" is equally consistent with "launchd never called posix_spawn" and
+with "launchd called it and the kernel rejected it".  Those are different
+failures and they have different fixes, and every interval so far has been
+reading the first.
+
+The same patch anticipated this.  Forty lines further down it carries a
+**failure-path emitter**, placed before the `if (imgp != NULL)` cleanup so it
+covers all ~26 `goto bad` paths:
+
+    {"event":"spawn.failed","n":<n>,"errno":<error>,"parent":"<p_comm>"}
+
+and its comment names the exact ambiguity:
+
+    Two explanations remain and only one leaves a trace:
+      1. launchd never attempts the spawn -- no trace at all.
+      2. launchd attempts it and posix_spawn returns an error.
+    ... The errno alone separates the two live hypotheses: ENOENT says the
+    binary is not where the plist says it is, EACCES or a signature error says
+    something else, and no record at all says launchd never tried.
+
+## Checking the plug is really in the kernel
+
+A negative from an emitter that is not compiled in is worthless, and this project
+has been bitten by exactly that -- the recorded fact that an emitter guard macro
+must match its object, where the same guard in the wrong file compiles the
+emitter out with a green build.
+
+Three checks:
+
+1. **The guard is the right one.**  The `spawn.failed` block opens
+   `#if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT` -- the SAME
+   macro, in the SAME file, as the `spawn.seen` block.
+2. **That macro is live in this kernel.**  `spawn.seen` fires 512 times in the
+   deepest capture, so the block is compiled.
+3. **A literal only that block contains is present.**  `spawn_failed.saturated`
+   appears once, contiguously, in the kernel.
+
+The contiguous-literal search is unreliable in general here and is NOT used as
+the evidence: `spawn.seen` reads 0 as contiguous bytes while the guest emits 512
+of them, because ld's `SHF_MERGE|SHF_STRINGS` pass splits the literals.  That is
+the recorded fact 228 shape, and it is why the guard argument above is the
+evidence rather than the byte count.
+
+## The measurement
+
+    longboot-input-run   1516 records, 512 spawn.seen, 454 job.open
+        spawn.failed records: 0
+    slot-lift-scratch    191 records, 137 spawn.seen
+        spawn.failed records: 0
+    spawn-failed-input-run  257 records, 155 spawn.seen
+        spawn.failed records: 0
+
+**Zero failed spawns against 512 successful ones.**  So hypothesis (2) is dead:
+the kernel is not rejecting anything.  **launchd never calls `posix_spawn` for
+SpringBoard.**
+
+## What that settles, and what it costs
+
+It settles the question the last seven intervals were circling: the decision is
+made entirely inside launchd's userspace job state machine, before any syscall.
+There is no kernel-side refusal, no signature failure, no missing binary at the
+point of exec.  Nothing in this project's kernel can be changed to make the
+spawn happen, because the spawn is never attempted.
+
+It also costs something: **the next measurement cannot be a kernel emitter on the
+spawn path, because that path is never reached.**  It has to observe launchd's
+decision, and launchd is a binary with no source in this repository.
+
+The cheapest instrument that bears on it is one this project can build: whether
+`runningboardd` -- the entitled spawn driver that has to ASK for an App job -- is
+actually running its code, or is alive and blocked.  RunningBoard's first act as
+process manager is kernel-visible (`memorystatus`, `task_policy`), so an emitter
+there separates "runningboardd never asks" from "runningboardd asks and launchd
+refuses".  That is a build, which is the normal cost here.
+
+## Status
+
+Windows/real-guest: **the three captures are real guest output** from the
+virtio channel on builds `exp-2026-11-05-slot-lift` (run 41937843171, kernel
+`75dab4f1`) and earlier.
+
+Build: none this interval.
 
 Onsite: N/A.
 
