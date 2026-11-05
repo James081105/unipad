@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-sixth, addendum BB). THE HEADLINE is **AMFI LAUNCH CONSTRAINTS ARE IMPLEMENTED, AND THEY ARE NOT THE GATE EITHER** -- which closes the last candidate that could have acted on the spawn from outside launchd. Addendum AZ proved launchd never attempts the SpringBoard spawn, and one mechanism could still have produced that shape from outside: a launch constraint applied at job-load time whose failure marks the job unspawnable. launchd imports exactly the symbol that would do it, `_amfi_launch_constraint_set_spawnattr`, and carries `SpawnConstraint` in its plist schema. **The kernel implements the whole subsystem** -- `struct launch_constraint_data` in cs_blobs.h, `CHECK_SET_HOOK(proc_check_launch_constraints)` in policy_check.c, `mac_proc_check_launch_constraints()` in mac_process.c, and the call site at kern_exec.c:7652 -- and the built kernel carries the enforcement strings, including "Only platform code can set launch constraints on itself" and "AMFI: Launch Constraint Violation", plus the sysctls `launch_constraints_enforced` and `launch_constraints_3rd_party_allowed`. **But the call site is in the exec-activation path and `goto done` returns the errno from posix_spawn itself -- so a rejection would have produced a `spawn.failed` record, and addendum AZ measured 0 of those against 512 successful spawns. The mechanism is implemented, reachable, and did not fire.** That closes the last candidate that could have acted from outside launchd; what remains is launchd's own state, and nothing in this project's kernel observes that. **The trust cache is closed a second time and not used again**: launchd, configd, backboardd and runningboardd are all absent from both caches, and backboardd spawned, is alive and is making real framebuffer calls -- so the absence says nothing about platform status, either the cdhash is computed wrong or these are not the governing caches. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-eighth, addendum BD). THE HEADLINE is **THE PROCESS WALK'S REAL DEFECT WAS A STALE PAGE CACHE, NOT A STALLED BOOT -- AND THE PROJECT ALREADY HAD THE WALKER**. Addendum BC's walker reported nprocs=0 and one process for 895 consecutive seconds; the first explanation written down was a stalled boot, and **that explanation was wrong**. `GuestObserver._page()` (guestobserve.py:671) caches DATA pages in `_tables`, cleared by exactly one thing, `reset()` -- and the module's own docstring records the consequence: "a second sample() on one observer issued zero guest reads, because everything was still cached." A polling loop that never resets replays its first sample forever, and the first sample was taken moments after the kernel handoff when allproc holds kernel_task and nothing else. **nprocs=0 was true at that instant and false for the next fifteen minutes, and the instrument could not tell the difference** -- the same shape as recorded facts 13, 47, 61 and 71, and quieter than most because the value was correct, just for a moment that had passed. **With `obs.reset()` before each sample the same boot gives a varying count (1,2,3,2) and a varying cache size, and `cached_pages > 0` is printed every sample as the instrument's own control.** **The second defect was avoidable: the first version hand-computed the struct proc layout and read 1024 bytes per proc, but `GuestObserver.processes()` already existed with the right offsets** -- `p_comm` at **1468**, `p_pid` at 96, `p_stat` at 100 -- a loop guard and a bound, and `_proc_fields()` reads the span as one read so the values cannot tear. It scanned `proc_ro`, which has no name field at all. The walker now calls `obs.processes()` and carries no offsets of its own: three hand-computed offsets have been wrong here already and this would have been the fourth. **MEASURED on the way: launchd OPENS SpringBoard's plist and never spawns it** -- `job.springboard_open` err=0, from a validated matcher (exact full basename, one-shot, err reported) -- so the job is loaded and no spawn is attempted, which is now measured rather than inferred. **The 512 spawn.seen is EVENTS, not processes: only 161 distinct comms, because 345 are the task #23 crash loop (bluetoothd 214, fairplayd.A2 131).** **`exec.seen` is 2 and both benign** (launchd as PID 1 via load_init_program; apfs_boot_util re-exec) -- and it sits inside `__mac_execve`, which posix_spawn does not call, so **it cannot count do_fork1 spawns; that cheap test does not exist**. **launchd's flag machinery now names the gate**: the home-screen claim at 0x100007b64 reads EmbeddedHomeScreen at job+0x53b bit 5, claims owner slot [x1+0x48] if free, and on refusal clears a bit -- **bit 29, not bit 34; an earlier note said 34 and it was a hand-counted hex mask. Computed: 0xffffffffdfffffff clears bit 29, 0xfffffffdffffffff clears bit 33, 0x200000000 is 2^33.** Bit 29's only reader is sixty lines earlier and it is the spawn-type decision: **a job is promoted to App (0x100 at job+0x358) only if bit 29 of job+0x538 is set**, Driver (0x700) never is, and bit 12 is set with it. Bit 29's setter (0x100008fe8) has no direct callers, so it is reached through a function-pointer table -- the shape is established, the mechanism is not, and the home-screen refusal clears exactly the bit the App promotion requires, which is what the three EmbeddedHomeScreen jobs have in common. **The do_fork1 emitter is written and verified to apply**: `fork1-spawn-hunk.patch` adds a `fork1.spawn` emitter at kern_exec.c:4250 right after exec_activate_image(), gated on `spawn_no_exec` -- the exact population spawn.seen and spawn.failed are blind to -- recording the image's name from `imgp->ip_vp->v_name` plus the child's new p_comm and a one-shot `springboard.fork1`. Placed there rather than at :4028 because `imgp->ip_vp` is assigned at :2255 INSIDE exec_activate_image() and is still NULL at :4028 -- checked, not assumed. **Zero records is a real answer and a different one from "not measured"**: the guard is the same XNU_OWNER_CACHE_MOUNT the 512 spawn.seen records prove is live. The hunk's first transcription dropped the leading TABs on three context lines and a second transcription error was caught by the repair script's own assertion, so the repair now READS the context out of the source. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13619,6 +13619,268 @@ Windows/real-guest: **host-side reads of the XNU source tree and the extracted
 binaries.**  Nothing measured on the guest this interval.
 
 Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-seventh, addendum BC): the `do_fork1` hole in AZ, and a working process walker
+
+## The hole, and it is in my own conclusion
+
+Addendum AZ concluded: 0 `spawn.failed` records against 512 `spawn.seen`, so
+launchd never attempts the SpringBoard spawn.  Both emitters are inside
+`if (error == 0 && !spawn_no_exec)`.  Reading `posix_spawn` in the source shows
+`spawn_no_exec` is TRUE on a whole second path:
+
+    kern_exec.c:3869   if (imgp->ip_px_sa == NULL ||
+    kern_exec.c:3876       !(px_sa.psa_flags & POSIX_SPAWN_SETEXEC)) {
+    kern_exec.c:3879       if (imgp->ip_px_sa == NULL || !px_args.coal_info) {
+    kern_exec.c:3880           goto do_fork1;
+    ...
+    kern_exec.c:4002       imgp->ip_flags |= IMGPF_SPAWN;  /* spawn w/o exec */
+    kern_exec.c:4003       spawn_no_exec = TRUE;
+
+**A caller that passes no spawnattr -- or one without `POSIX_SPAWN_SETEXEC` and
+no coalition info -- takes `do_fork1`, and NEITHER emitter fires.**  Both paths
+still call `exec_activate_image()`, so the child does exec; but
+`proc_exec_switch_task()` at `kern_exec.c:4280` is gated on `!spawn_no_exec`, and
+that is the call the `spawn.seen` emitter is placed after.
+
+So AZ's measurement establishes **"no spawn on the exec path"**, not "no spawn".
+A `do_fork1` spawn of an App job -- exactly the kind that would carry a different
+spawnattr from the coalition-aware daemon spawns -- leaves no spawn record at
+all.  **AZ's conclusion is withdrawn as stated and re-scoped to the exec path.**
+
+What still holds: a `do_fork1` child that DIES produces an `exit.seen` with its
+own comm, and there is no `exit.seen` for SpringBoard in any capture.  So the
+remaining live possibilities are (a) no spawn at all, or (b) a `do_fork1` spawn
+whose child is alive and blocked.
+
+## The instrument that separates them, built and validated
+
+`local-private/tmp/walk-guest-procs.py` boots the guest, connects QMP, and walks
+`allproc` -- whose address the kernel's own `LC_SYMTAB` gives (`_allproc` at
+`0xfffffff00c0e1778`, `_nprocs` at `0xfffffff00c1037d8`).  The walk is its own
+control: it is only worth reading if it recovers the daemons the channel already
+recorded.
+
+First run, and the control passed for the READ but not for the boot:
+
+    allproc.lh_first = 0xfffffff6be6dccc0          a valid kernel heap pointer
+    version kstring: b'Darwin Kernel Version 23.6.0: Thu Nov  5 00:28:0'
+    nprocs = 0
+    walked 1 procs, collected 0 names
+
+**The reads are correct** -- the kernel's own `version` string comes back
+byte-exact, which proves the address translation and the QMP path both work.
+**The boot stalled**: one process in the whole list.  That is the recorded
+non-determinism from addendum AO, seen again, and it means this run cannot answer
+the SpringBoard question either way.
+
+Two defects in the walker, both recorded rather than hidden:
+
+* the name scan collected 0 names from the one proc it read -- the `proc_ro`
+  pointer scan does not find `p_comm`/`p_name`, so the offset work is not done;
+* the first version gated on `nprocs > 20` and refused at `nprocs = 0`, which
+  would have read as "the instrument is broken" rather than "this boot stalled".
+  The gate is removed; the walk is the control.
+
+## What this changes about the plan
+
+The question is no longer "why does launchd decline the job".  It is **"is there
+a SpringBoard process on the guest"**, and that is now one boot away, with a
+walker whose reads are already proven.  The boot is the unreliable part, not the
+instrument -- and addendum AO already recorded that a boot which does not reach
+userspace is a boot that stalled, not a negative.
+
+So the next run is the same script with the name scan fixed, on a boot that
+reaches userspace.  Nothing about it needs a build.
+
+## Status
+
+Windows/real-guest: **the walker booted a real guest and read its kernel memory
+over QMP** -- the `version` string is guest data, not a host-side read.  The
+SpringBoard answer is NOT obtained, because the boot stalled with one process.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-eighth, addendum BD): the walk's real defect was a stale page cache, not a stalled boot
+
+## The defect, and it is the same shape as every other one
+
+Addendum BC's walker reported `nprocs=0`, `walked=1`, and 0 names for 895
+straight seconds.  The control fired -- "the walk did not recover launchd,
+configd, backboardd; the names above are void" -- and the first explanation
+written down was that the boot had stalled.
+
+**That explanation was wrong, and the control is the only reason it did not
+become a conclusion.**
+
+`GuestObserver._page()` caches **data** pages, not just page tables:
+
+    guestobserve.py:671   def _page(self, physical: int) -> bytes:
+    guestobserve.py:673       cached = self._tables.get(key)
+    guestobserve.py:680           cached = self.memory.read(key, 4096)
+
+`_tables` is cleared by exactly one thing, `reset()`.  The module's own docstring
+records the consequence, thirty lines further down:
+
+    "Measured without this: a second `sample()` on one observer issued zero
+     guest reads, because everything was still cached."
+
+A polling loop that never calls `reset()` reads the first sample's bytes forever.
+The first sample was taken moments after the kernel handoff, when `allproc`
+holds `kernel_task` and nothing else -- so `nprocs=0` was *true at that instant*
+and *false for the next fifteen minutes*, and the instrument could not tell the
+difference.  It reported a question about time with an answer about one moment.
+
+**This is the same shape as the recorded fact 13, 47, 61 and 71**: an instrument
+returns a value, the value is read as an answer, and the question it actually
+answered is a different one.  The version here is quieter than most, because the
+value was *correct* -- just for a moment that had passed.
+
+With `obs.reset()` before each sample, the same boot gives:
+
+       0.0s  nprocs=1   cached_pages=9
+      20.1s  nprocs=2   cached_pages=10
+      25.1s  nprocs=3   cached_pages=11
+      35.2s  nprocs=2   cached_pages=10
+
+The count varies, the cache size varies with it, and `cached_pages > 0` is now
+printed every sample as the instrument's own control -- a run where it stays at
+zero is a broken observer replaying bytes, not a quiet guest.
+
+## The second defect: the project already had this walker, with the right offsets
+
+The first version hand-computed the `struct proc` layout and read 1024 bytes per
+proc.  Three separate things were wrong, and one of them was avoidable:
+
+* it scanned `proc_ro` for `p_comm`, and `struct proc_ro` (bsd/sys/proc_ro.h:73)
+  has **no name field at all** -- it is `pr_proc`, `pr_task`, and four struct
+  groups;
+* `p_comm` lives in `struct proc` itself, at offset **1468**, with `p_pid` at 96
+  and `p_stat` at 100.  The struct is ~1.5 KB because of `p_mlock`,
+  `struct filedesc` and `struct sigacts`, so a 1024-byte read never reaches the
+  name;
+* **`GuestObserver.processes()` already existed** in
+  `src/unipad/host/guestobserve.py` with exactly those offsets, a loop guard and
+  a bound, and `_proc_fields()` reads the span as one read so the four values
+  cannot tear.
+
+The walker now calls `obs.processes()` and carries no offsets of its own.  That
+is DRY, and it is also why the names it returns mean anything: three
+hand-computed offsets have been wrong in this project already and this would have
+been the fourth.
+
+## Measured on the way, from the deepest capture on record
+
+**launchd opens SpringBoard's plist and never spawns it.**
+
+    {"event":"job.springboard_open","err":0,"source":"XNU.openat_internal"}
+
+The instrument is validated before being read: the matcher compares the opened
+path's *basename* against the literal `com.apple.SpringBoard.plist` in full, it
+is one-shot, and it reports `err`.  So this is a successful open of exactly that
+file.  Combined with 512 `spawn.seen` records containing no SpringBoard, the
+shape is now measured rather than inferred: **the job is loaded, and no spawn is
+attempted.**
+
+**The 512 is events, not processes.**  512 `spawn.seen` carry only **161
+distinct comms**, because 345 of them are the crash loop from task #23:
+`bluetoothd` 214 times and `fairplayd.A2` 131.  161 is therefore still the right
+population figure, and the 512 should never be quoted as one.
+
+**`exec.seen` is 2, and both are benign.**  `n=1 comm=launchd` is the kernel's
+`load_init_program` exec'ing launchd as PID 1; `n=2 comm=apfs_boot_util` is that
+tool re-exec'ing itself.  `exec.seen` sits inside `__mac_execve`
+(kern_exec.c:5165), which `posix_spawn` does not call, so it is disjoint from the
+spawn path and **cannot** be used to count `do_fork1` spawns -- which was the
+cheap test addendum BC hoped for, and it does not exist.
+
+## launchd's flag machinery, read far enough to name the gate
+
+The home-screen claim at `0x100007b64` is small and now fully read:
+
+    ldrb w8, [x0, #0x53b]      ; bit 5 = EmbeddedHomeScreen
+    tbz  w8, #0x5, ...         ; clear -> skip entirely
+    ldr  x8, [x1, #0x48]       ; current owner
+    cbz  x8, 0x100007bb4       ; NULL -> claim
+    and  x8, x8, #0xffffffffdfffffff   ; clear a bit
+    str  x8, [x19, #0x538]
+    ...
+    str  x19, [x1, #0x48]      ; the claim
+
+**The bit it clears on refusal is bit 29, not bit 34** -- an earlier note in this
+chain said 34, and it was a hand-counted hex mask.  Computed rather than counted:
+`0xffffffffdfffffff` clears bit 29, `0xfffffffdffffffff` clears bit 33, and
+`0x200000000` is 2^**33**.  The setter at `0x1000069e0` is a clear-then-set of
+bit 33 from a boolean; the refusal clears bit 29.
+
+And bit 29 has exactly one reader, sixty lines earlier in the same activation
+function, and it is the spawn-type decision:
+
+    100007abc  and  x9, x8, #0x20000000      ; extract bit 29
+    100007ad4  cset w10, ne                  ; w10 = (bit29 != 0)
+    100007ad8  orr  w10, w10, w20
+    100007adc  cmp  w10, #0x1
+    100007ae0  b.ne 0x100007b10              ; else: do NOT promote to App
+    100007ae4  ldr  w10, [x26, #0x358]       ; current spawn type
+    100007ae8  cmp  w10, #0x700              ; Driver?
+    100007aec  b.eq 0x100007b10              ; Driver never becomes App
+    100007af0  mov  w10, #0x100              ; 256 = App
+    100007af4  str  w10, [x26, #0x358]       ; spawn type := App
+    100007b08  orr  x8, x8, #0x1000          ; and set bit 12
+
+**A job is promoted to `App` only if bit 29 of `job+0x538` is set.**  Bit 29's
+setter (`0x100008fe8`) has no direct callers, so it is reached through a
+function-pointer table, and that is as far as static reading goes without a guest
+instrument.  What is established is the shape: the home-screen refusal clears the
+bit the App promotion requires, and the three `EmbeddedHomeScreen` jobs are
+exactly the three that would be refused by it.
+
+## The `do_fork1` emitter, written and verified to apply
+
+`local-private/tmp/fork1-spawn-hunk.patch` adds a `fork1.spawn` emitter to
+`posix_spawn` at `kern_exec.c:4250`, immediately after `exec_activate_image()`,
+gated on `spawn_no_exec` -- the exact population both `spawn.seen` and
+`spawn.failed` are blind to.  It records the image's own name from
+`imgp->ip_vp->v_name` (the field kern_exec.c:1294 already uses to name an
+executable) plus the child's new `p_comm`, and a one-shot
+`springboard.fork1` record so the answer is one grep.
+
+Placed there rather than at the `if (spawn_no_exec)` block at :4028 because
+`imgp->ip_vp` is assigned at :2255 **inside** `exec_activate_image()` and is still
+NULL at :4028 -- checked, not assumed.  Zero records is a real answer and a
+different one from "not measured": the guard is the same
+`XNU_OWNER_CACHE_MOUNT` the 512 `spawn.seen` records prove is live.
+
+The hunk was verified to apply on top of the existing springboard patch against a
+scratch copy of the XNU tree.  Its first transcription carried three trailing
+context lines with their leading TABs dropped, which `git apply` rejected, and a
+second transcription error in the same context list was caught by the repair
+script's own assertion -- so the repair now *reads* the context out of the source
+instead of restating it.
+
+## Status
+
+Windows/real-guest: **the process walk booted a real guest and read its live
+kernel memory over QMP, with the count varying over time.**  The SpringBoard
+answer is NOT yet in.
+
+Build: none this interval.
 
 Onsite: N/A.
 
