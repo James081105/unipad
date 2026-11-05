@@ -6,8 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval seventy-fourth, addendum AP). THE HEADLINE is **M8 ASKS FOR EVIDENCE FROM EMITTERS THAT WERE NEVER BUILT**. One command on the matched kernel: `springboard.running` is present (1 occurrence), `launchd.running` and `daemon.spawned` are present ZERO times, and the source tree says why -- `zzz-native-springboard-events.patch:25`: "which is why the launchd.running emitter's site cannot serve". So M8's pass_evidence names two records that cannot arrive, and the gate reports `evidence_absent:m8.original_launchd,m8.later_daemons`, which reads as "not measured yet" when the truth is "cannot be measured, because the emitter was never written". PRD requirement 6 asks for product defects, test defects and environment problems to be attributed separately, and this row conflates the first two. **The evidence M8 wants IS in the capture under different names**: `exec.seen n=1 comm=launchd source=XNU.__mac_execve` is the original launchd exec'ing, and 137 `spawn.seen` records across 96 distinct comms in `n` order are the daemons that followed. **A third thing must not be confused with either**: `spawn.seen` and `exec.seen` also read ZERO as contiguous bytes in the kernel while the guest emits 191 of them, because ld's SHF_MERGE|SHF_STRINGS pass splits the literals -- fact 228's shape again, and the third time a byte search of this image has produced a false answer. **M8 is misattributed, not wrong** -- NOT STARTED is correct, the reason is not. M9's `springboard.running` emitter DOES exist, so M9 is a real unmeasured requirement. **M9, M9a, M9b and M8 remain unproven.** THE HEADLINE is unchanged from AHwas found by a guard that refused to report a false negative. The attribution capture -- which was to name the slots behind the four surviving refusals -- went quiet 150 s into the boot, measured immediately, and would have reported `lifted: 0`, `358 unreadable`, `CAN ANSWER UNSUPPORTED BUT WAS LIFTED: 0` on the SAME kernel that lifted 60 the day before. The arm pass runs from `native_legacy_client_observed()`, which runs when backboardd opens the framebuffer, and at t+270 s it had not -- so the instrument was not absent, it had not been REACHED, and the run would have reported the harness's timing as a finding about the display. The guard now polls `native_legacy_slot_lifted_count` until it is non-zero and refuses the whole run if it never becomes so. **What the refusal exposed is bigger than the question it was asked: two boots of the SAME kernel, one reaching 165 spawns across 96 daemons and the other exec'ing launchd and going silent.** So a negative from one boot is not a negative -- it may be a boot that stalled. **Also fixed: a guest leaked by the previous run held the QMP port and the boot died reading it as a QEMU problem; and `netstat`'s output on this host is not UTF-8, so the port check connects a socket instead of parsing it.** **M9, M9a, M9b and M8 remain unproven.** THE HEADLINE is unchanged from AHbackboardd's failures went **11 -> 4** and it made an extra call (15 -> 16), the first movement on that number in the project's history. Build 41937843171 was green on the first attempt after five failures, kernel sha256 75dab4f1 verified against the payload's own declaration before the boot. **60 refusing stubs were lifted, and the kernel's classifier and the host's independent re-classification agree exactly** -- two instruments, two experiments, one number, and the list is addendum AC's 61 minus slot 337 which the earlier experiment had already lifted. Seven of the eleven refusals are now SUCCESS (22, 27, 33, 50, 74, 79, 84), four survive (12 Unsupported, 15 Error, 29 Unsupported, 57 Unsupported), and **four selectors backboardd had never reached are now succeeding** (6, 8, 17, 88) -- it got further into its probe rather than stopping at the same place. **The screen is still the UniXNU boot menu**: one screendump, 1,440,015 bytes, sha256 f54dadc07fb07106, and the image says green band, magenta band, the UniXNU logo, "Booting QEMU virt: source 4K XNU in 1s". So the refusals were A gate and were not THE gate. The channel shows the boot got much further: 165 spawns across 96 distinct daemons including backboardd, runningboardd, lockdownd and CommCenter. **Disclosed: the boot script connects the agent channel AFTER the kernel hand-off, so the early boot records are gone and the log starts at spawn n=29 -- it does not affect this measurement, which reads guest memory over QMP, but it means the channel evidence is a later window than intended.** **M9, M9a, M9b and M8 remain unproven.** THE HEADLINE is unchanged from AHFour builds failed on one instrument and the fourth failed with NO inline assembly anywhere in the file, which refuted the theory the third commit was written around. THE ACTUAL CAUSE is one character per declaration: **in C++ a namespace-scope declaration with no initializer is a DECLARATION, not a definition** -- clang emits nothing, the symbol does not exist in the object, and the link names a symbol spelled three lines above. Settled locally in seconds, because `ld64.lld` ships in this project's own msys64 tree and I had not looked: of five declaration forms the only one that fails to link either way is the one with no initializer, and its symbol is absent from `llvm-objdump -t` entirely. `volatile`, the section attribute, the `extern "C"` block and the archive shape NONE of it mattered. Three 40-minute cycles were spent reasoning about relocation models when the answer was a missing `=0`. THE LESSON, now in the tooling rather than in a feeling: **when a build fails, reproduce it locally before theorising about it.** The pre-flight now takes the declarations out of the file, asserts all four symbols are present in the object, and LINKS them both ways with the host's own ld64.lld -- directly and from an archive, because a defect that fires in only one shape looks intermittent. Mutation-tested six ways, all six caught. **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet.** THE HEADLINE is unchanged from AHASSEMBLY, and that was the fix: **-491 lines**, 507 lines of naked AArch64 becoming 119 lines of C++. The third build failed at the kernel LINK with the compile and the -Werror audit both green, every reference from inside the very object that defines the symbols -- and the first pass (`qemu_defconfig`) links this driver's objects DIRECTLY and succeeds while the second pass (`qemu_root_defconfig`, PRD 8.1's root chain) links them out of `libNativeLegacyDisplay.late.a` and fails. Same source, same object, different link shape, which is the worst possible shape for a defect because it looks intermittent. THE RULE: ld64 does not resolve an asm-created undefined reference against a definition in an archive member, and there is no form of the asm that avoids creating one -- `adrp sym` is refused outright, `adrp sym@GOTPAGE` is accepted but creates the reference, and `b sym` to a static function creates one too. So the LIFT never needed the thunks: a refusing stub writes NOTHING, so answering it needs only a function that returns kIOReturnSuccess, and the vtable entry is pointed straight at it. What is given up is the per-slot call count; what replaces it is the probe's own client table, which records per selector the status the display answered, and that was always the measurement. THE PRE-FLIGHT is now aimed at the rule rather than the symptom -- it refuses if ANY inline asm in the file names a symbol -- and it is mutation-tested five ways with all five caught. Five builds this interval, four failures, and the instrument is simpler than when it started, which is the outcome rather than a consolation. **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet.** THE HEADLINE is unchanged from AHcommits to build and NONE of them changed the instrument -- what changed three times was my confidence that it compiled, and the measurement it exists for still has not happened. TWO 40-minute builds failed, and BOTH were green on the pre-flight that existed at the time. Run 41906787039: six assembler errors, all of them the three `adrp` instructions, because the Apple kext relocation model refuses the ELF form and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF` -- and the pre-flight had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form, so it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". Run 41915052472: the compile passed and the -Werror object audit passed -- `NativeLegacyDisplay: -Werror build ... passed` is in the run's own log -- and then the kernel LINK failed with `ld: symbol(s) not found for architecture arm64` naming exactly these symbols, every reference from inside the very object that defines them. A symbol named from inline asm is emitted as an UNDEFINED reference no matter what, and ld only satisfies one against a real, GLOBAL definition -- neither a `static` symbol nor a TENTATIVE definition in `__DATA,__common` is one. THE PRE-FLIGHT now reads the declarations out of the file, assembles with the target the runner uses, and reads the assembled object's SYMBOL TABLE, refusing unless every asm-created undefined reference has a global definition; it is mutation-tested four ways and all four are caught. A pre-flight that validates the wrong question is worse than none, and this interval had two of them. THE COUNTEREXAMPLE is a third dispatch that went out with a mistyped SHA: the input-validation gate refused it in 0.3 seconds with `device_commit '630e141a4d8b...' != sources.lock.json device_repo.commit '630e141a1802...'`. Two checks aimed at the wrong question cost forty minutes each; one aimed at the right question cost nothing. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never linked.** THE HEADLINE is unchanged from AH run 41906787039, which pinned the display-vtable slot tracer, failed on six assembler errors -- every one of them the three `adrp` instructions -- because the Apple kext relocation model refuses `adrp xN, sym; add xN, xN, :lo12:sym` for a global and wants `sym@GOTPAGE` / `sym@GOTPAGEOFF`. THE PRE-FLIGHT WAS GREEN, and that is the finding: it had been assembled with `--target=aarch64-unknown-linux-gnu`, which is ELF, and ELF accepts the direct form. So it answered "is this valid AArch64" while the build asks "is this valid AArch64 under the Apple relocation model". A pre-flight that validates the wrong target is worse than none, because it converts a 40-minute failure into a false confidence. The replacement reads the asm OUT OF the file, assembles with the SAME target and mode the runner uses, asserts the register set and the relocations, and is mutation-tested. The same interval adds the other half of the instrument: `2bb2d1e` answers kIOReturnSuccess for every slot whose function is a refusing stub, because addendum AH lifted ONE refusal of twelve and nothing moved. The lift is safe because a refusing stub writes NOTHING -- its body is `MOV w0,#0x2c7` and a RET, so replacing it with `MOV w0,#0` changes exactly one register. One build now carries both, and it is dispatched on `fa8d73e`. **Also disclosed: a guard test pinning the board's kernel-argument count has been red since `aae08cd`, because the tests run then did not include the kernel-args files.** **M9, M9a, M9b and M8 remain unproven, and nothing is measured on the guest yet -- the instrument that would measure it has never compiled.** THE HEADLINE is unchanged from AH -- **the display experiment RAN, one refusal lifted, and the screen did not move** -- with one correction that matters more than it looks: **the static reach map CANNOT choose the next targets, and the reason is a BLR.** Selector 74's dispatch function makes 5 direct BL calls and 0 indirect BLR of its own; its five callees make 0 direct BL and **26 indirect BLR between them**. The virtual calls sit one level down, every one in a leaf, so a BL walk stops after six nodes and reports "selector 74 reaches nothing" for a selector whose refusal demonstrably came from slot 213. An earlier run of the map concluded "none of the ten remaining refused selectors reaches any refusing slot" -- that is WITHDRAWN; it was an instrument defect, not a finding, and it would have discarded the subclass-override plan for no reason. Addendum AB recorded this limitation as over-approximation; this is the under-approximation, which produces a confident false negative rather than a vague one. **So the next instrument must measure at runtime: task #29, interpose the DISPLAY's vtable the way the probe already interposes the client's and count calls per slot.** It belongs in `LegacyDisplayProbe.cpp` -- the device repository this project owns -- so it is deliverable with one commit and one pin bump. Design: naked ARM64 thunks using `x16`/`x17` (intra-procedure-call scratch) so a stub can increment a counter and `br` to the original without disturbing `x0`-`x7` or the return in `x0`; hook at `native_legacy_client_observed()` (:462), where the client is interposed and `native_legacy_object` is already set. **Everything from AH still stands:** build `exp-2026-11-05-display-refusal` (run 41880912125) built commit `5b83ab7` and the run's own log names it; backboardd's failures dropped 12 -> 11 with its call count unchanged at 15; selector 74 (`supportedFrameInfo`, slot 213) is now `kIOReturnSuccess`; selector 33 (`collectCompletionReports`, slot 337) is STILL `kIOReturnUnsupported` because the original completion helper discards that IOReturn -- confirmed, not argued; the one screendump that changed (t=121 s) is the UniXNU boot menu; and slot 213's function now begins `MOV w0,#0x2c2` with no `MOV w0,#0x2c7` anywhere, so the refusing-slot count dropping 61 -> 60 is confirmed a second way, independently of the client table. **What is left is a number: ten `kIOReturnUnsupported` and one `kIOReturnError` across selectors 12, 15, 22, 27, 29, 33, 50, 57, 79, 84 -- and no static way to say which of the 60 refusing slots they come through.** **ALSO FROM AH: the instrument had a defect that would have hidden all of it** -- the first measurement used 1176 as the `ClientStat` entry stride when the real struct is 2312 (it continues with `regs`, `reg[8]`, `sel6_*`, `seq[24]`, `original_external`/`register`), so every field read was right and the ENTRY was wrong; and the guard added to catch it tested `(object >> 40) == 0xFF`, which for a 48-bit address leaves 24 bits and is false for EVERY valid pointer, so it reported "NO SELF-CONSISTENT CLIENT MADE A CALL" against a table with backboardd in it. **A guard that rejects everything is worse than no guard.** That is the fourth time validating the instrument changed the answer and the second time the validator itself was the defect. **M9, M9a, M9b and M8 remain unproven.**
-Main repo at `b9d7fda`.
+Last updated: 2026-11-05 (interval seventy-sixth, addendum AR). THE HEADLINE is **LAUNCHD'S SPAWN-TYPE TABLE, AND WHAT `App` ACTUALLY SETS**. Addendum AQ showed launchd LOADS com.apple.SpringBoard.plist and declines to spawn it, with neither the volume nor the executable at fault. This interval reads the decision out of launchd's own binary -- extracted from the volume via a new multi-chunk decmpfs decoder (561,856 bytes, 9 chunks, Mach-O 64) -- and the `App` anomaly finally has a MECHANISM instead of a correlation. At 0x100003d8c launchd runs one strcmp chain over ProcessType/POSIXSpawnType and stores a code at `job+0x358`: Standard 0x300, Interactive 0x400, Background 0x500, Adaptive 0x600, Driver 0x700 -- and **`App` 0x100 plus flag bit 0x1000 at `job+0x538`, which no other type sets**. Confirmed a second way from launchd's own log table at 0x100070728, indexed by `code >> 8`, whose format string is `spawn type = %s (%lu)` and whose entry 1 is "app". Two independent routes agree on every entry. **This also explains a shape that confused the earlier analysis: the five `Background` jobs fail too, but `Background` sets no flag -- so App and Background are NOT one mechanism, and only `App`/`SystemApp` take the flagged branch.** What remains is narrow and specific: bit 12 of `job+0x538` has 345 readers and this interval did not reach its consumer; the two tools that found this are now built and validated. **Also fixed: the local-private/upstream/UniXNU-qemu mirror was stale at 5ef74a1 while the lock pins 9782ddf, which turned the acceptance cross-check red for a reason that had nothing to do with any change -- two checkouts of the same fork, and the test reads the one nobody edits.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is task #33.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -12441,3 +12440,305 @@ Onsite: N/A.
 that is correct; the reason it gives is not.  M9, M9a, M9b remain unproven, and
 M9's `springboard.running` emitter DOES exist in the kernel -- so M9 is a real
 unmeasured requirement, unlike M8.
+
+---
+
+# Interval 2026-11-05 (seventy-fifth, addendum AQ): the gate is not the framebuffer -- SpringBoard never spawns
+
+## The measurement that reframes the last six intervals
+
+Addendum AN lifted 60 refusing stubs, took backboardd's failures from 11 to 4,
+and the screen stayed on the UniXNU boot menu.  The question this interval asked
+is **why**, and it is not a display question.
+
+The deepest boot this project has recorded -- `longboot-input-run`, 1516 records
+-- carries this:
+
+```
+line  34  {"event":"exec.seen","n":1,"comm":"launchd","source":"XNU.__mac_execve"}
+line 239  {"event":"job.open","n":239,"job":"com.apple.SpringBoard.plist","err":0}
+line 1382 (the last spawn)  n=512
+```
+
+**launchd OPENS `com.apple.SpringBoard.plist` with `err:0`, and then spawns 273
+more processes without ever spawning SpringBoard.**  The boot is not stalling at
+the job; it is loading it and declining it.  That is a decision inside launchd,
+and it happens before any `posix_spawn` -- the emitter is on that path and it
+never fires for SpringBoard.
+
+## The two explanations that were never tested, and the first is now refuted
+
+Every prior interval argued about the decision from the plist's keys:
+
+    POSIXSpawnType      RAN                        NOT RAN
+    Standard/absent     29                        207
+    Interactive         35                         41
+    Adaptive            28                        165
+    App                  0                          7   <-- all seven
+    Background           0                          5   <-- all five
+
+`App` and `Background` are perfect separators, and the doc already said so was a
+correlation.  Two mechanisms produce that exact shape without launchd
+discriminating on the key at all, and **neither had ever been tested**:
+
+1. **the job plist is not readable on the volume the guest mounted** (a volume
+   gap), so launchd loads nothing and spawns nothing;
+2. **the executable the job names is not on that volume**, so the job fails to
+   load while being parsed.
+
+Both are now measured, on the OS root volume
+`044-76040-038.raw` (container NXSB xid 418, catalog root physical block 65684,
+983,966 records, and the walk's own node and record counts match the tree's
+`apfs_btree_info`).
+
+### (1) is refuted: 452 of 454 opens succeeded
+
+The same boot's 454 `job.open` records: **452 with `err:0`, 2 with `err:2`
+(ENOENT).**  Discovery ran to n=454 (last: `com.apple.locationd.plist`) while
+spawns continued to n=512, so launchd finished scanning and then went on
+spawning.  There is no volume gap behind the anomalous set.
+
+### (2) is refuted: all seven executables exist
+
+`local-private/tmp/does-app-executable-exist.py` resolves every App job's
+`ProgramArguments[0]` through the catalog:
+
+    com.apple.SpringBoard      /System/Library/CoreServices/SpringBoard.app/SpringBoard
+                               120,864 bytes, mode 0o100755   EXISTS
+    com.apple.checkerboard     /Applications/CheckerBoard.app/CheckerBoard
+                               487,248 bytes, mode 0o100775   EXISTS
+    com.apple.TextInput.kbd    /System/Library/TextInput/kbd    204,176   EXISTS
+    com.apple.assistivetouchd  .../AssistiveTouch.app/...     1,763,744   EXISTS
+    com.apple.BluetoothUIService                             165,888   EXISTS
+    com.apple.commandandcontrol                                82,464   EXISTS
+    com.apple.fullkeyboardaccess                             240,976   EXISTS
+
+`/System/Library/CoreServices/SpringBoard.app` holds **79 entries** including
+`Info.plist` (4,942 B), `_CodeSignature`, `PlugIns`, `DefaultIconState.plist` and
+the executable.  **0 of 7 App jobs point at a missing executable.**
+
+The controls that make those negatives worth reading -- configd, notifyd,
+runningboardd, backboardd, logd, all of which provably spawned in this very boot
+-- all resolve to an existing executable with mode 0755 on the same volume.
+
+## What the userland actually looks like, and it is mostly healthy
+
+The same capture, joined:
+
+    comm               spawns  exits  last code   first-spawn-n
+    launchd                  0      1          1   (exec n=1)
+    runningboardd            1      0          -   29
+    backboardd               1      0          -   32
+    lockdownd                1      0          -   38
+    CommCenter               1      0          -   42
+    apsd                     1      0          -   53
+    bluetoothd             214    300        256   39
+    fairplayd.A2           131    174          0   17
+
+**146 of 161 distinct comms spawned and never exited.**  runningboardd and
+backboardd are both alive.  The respawn storm is two daemons -- bluetoothd and
+fairplayd.A2 account for 345 of the 512 spawns -- not a collapsing userland.
+
+**And one `exit.seen` is a finding of its own**: `n=5, comm=launchd, code=1`,
+six lines after launchd's exec, with **no matching `exec.seen`**.  A process that
+fails to exec keeps its parent's `p_comm`, so that record is a spawn that died
+before it ever ran its binary.  It is the only one in the boot, it is early, and
+it is not SpringBoard -- but it is the shape a failed launch leaves, and it means
+the emitter pair can distinguish "never attempted" from "attempted and failed".
+
+## What launchd itself says, read out of the binary
+
+To ask launchd directly, the executable had to come off the volume -- which
+needed a multi-chunk decmpfs decoder, because every system binary on this image
+is chunked and the existing reader refused them all.  `sb-final.py` decoded
+SpringBoard's 2634-byte plist and then failed on every daemon with
+`multi-chunk resource fork (chunk ends at 25474, data_end=225004)`.
+
+`local-private/tmp/extract-system-file.py` now decodes it: configd is 596,768
+bytes across 10 chunks (9 x 65536 + 6944) and `/sbin/launchd` is 561,856 bytes
+across 9, both `0xfeedfacf`.  The format is in that file's docstring, measured
+rather than assumed.
+
+REA on Windows accepts PE targets only, so the binary was read with
+`llvm-objdump` plus a small xref walker (`launchd-xref.py`) that recovers
+`adr`/`adrp`+`add` targets from the disassembly text.  **The walker's first
+version reported "no xref" for every string in the binary** because it demanded
+a raw-instruction-bytes column that `--no-show-raw-insn` omits -- the same shape
+as fact 228 and the fifth time an instrument in this project answered a
+different question than the one asked.  Validated against `POSIXSpawnType`,
+which must be referenced, it finds four references.
+
+**launchd contains every one of these keys**: `POSIXSpawnType`,
+`EmbeddedHomeScreen`, `_LimitLoadFromClarityMode`, `SpawnConstraint`,
+`HopefullyExitsLast`, `ThrottleInterval`, `MachServices`, `ProcessType`,
+`RunAtLoad` -- plus the strings that name the gate:
+
+    com.apple.private.spawn-driver
+    Service (pid %d) does not have spawn driver entitlement
+    Service tried to claim home screen from: %s
+    _AbandonCoalition is only available to Application services.
+    com.apple.private.xpc.allowed-launch-types
+    UIKitApplication:
+    AlternateSystemApplication:
+    SystemApp
+    failed to marshall spawnattrs: offset = %u, left = %lu, expected = %lu
+
+So the `App` path is implemented in this launchd and it is gated on something.
+The lead is the spawn driver: on iOS the special spawn types are driven by an
+entitled client, and `runningboardd` -- alive in this boot -- is the one that
+would ask.
+
+## Five harness defects, all found by the controls, all mine
+
+1. **`sb-walk.py` read the inode's `uncompressed_size` at `+86`.**  The field is
+   at `+84`, which the file's own docstring said.  Every file read produced a
+   size of 2^48 and a `MemoryError`, and the run reported
+   `controls failed` -- which reads as a finding about the volume.
+2. **The same off-by-two was duplicated in the probe.**  Two copies of one parse,
+   fixed twice.
+3. **A "control read" that checked length, not content.**  `sb-walk`'s decoder
+   returns `size` zero bytes for a file it cannot decompress, so 2634 bytes of
+   zeros looked like a successful read of a 2634-byte plist.  The control now
+   asserts `Label == com.apple.SpringBoard`.
+4. **`'decmpfs' in xattrs[...]`** tested the bare string while the key is
+   `com.apple.decmpfs`, so `compressed=False` was printed for every compressed
+   file in the volume.
+5. **`read_stream`'s slice assignment resized the buffer**: `buf[a:b] =
+   img.block(phys)[:take]` with a 4096-byte block into a 225,054-byte slot
+   shrinks the bytearray to 4096.  Every multi-block file read as one block.
+
+Also: MSYS rewrites a leading `/usr/...` argument, so the extractor is run with
+`MSYS_NO_PATHCONV=1`.
+
+## Status
+
+Windows/real-guest: **PASS for the measurements above** -- they are host-side
+reads of the volume the guest mounts and of a capture from a real boot.
+
+Build: `exp-2026-11-05-slot-lift`, run 41937843171, kernel `75dab4f1`.  No new
+build this interval.
+
+Onsite: N/A.
+
+**The attribution of the last six intervals changes: the framebuffer refusals
+were downstream of a gate that is not the framebuffer.**  The screen is the boot
+menu because SpringBoard never started, and SpringBoard never started because
+launchd loaded its job and declined to spawn it -- not because the volume lacks
+the job or the executable, both of which are present and readable.  **M9, M9a,
+M9b, M8 and every §5.2 case remain unproven, and the wide-mode refusal
+experiment is now correctly DEPRIORITISED rather than abandoned: even if all
+four surviving refusals flip, nothing downstream of them can be measured until
+SpringBoard runs.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (seventy-sixth, addendum AR): launchd's spawn-type table, and what `App` actually sets
+
+## What was needed to read launchd at all
+
+Addendum AQ needed launchd's own code, and launchd is on the volume the guest
+mounts -- compressed.  `local-private/tmp/extract-system-file.py` now extracts
+it: `/sbin/launchd` is **561,856 bytes, 9 chunks, Mach-O 64**.  The chunked
+decmpfs format is in that file's docstring, measured rather than assumed:
+
+    resource fork, BIG-ENDIAN header: data_off(256), data_end, ?, trailer
+      data_end + trailer == fork length
+    at data_off: a magic u32, then the chunk count, then `count` pairs of
+      LITTLE-ENDIAN (offset, size), offsets relative to data_off
+    chunk i's zlib stream is at data_off + offset_i + 4 and runs size_i - 4
+
+The `+4` is the part that cost the most: `sb-final.py` read the same pair as
+`(hdr_size, payload)` and computed `zstart = tbl_off + hdr_size + 4` -- which is
+exactly `data_off + offset + 4`.  **It was right all along, and it only works
+when there is ONE chunk**, because it then reads the first pair as though it were
+the only one and refuses everything else.  configd is 596,768 bytes across 10
+chunks (9 x 65536 + 6944).
+
+REA on Windows accepts PE targets only, so the binary was read with
+`llvm-objdump` plus `launchd-xref.py`, which recovers `adr` / `adrp`+`add`
+targets from the disassembly text.  **Its first version reported "no xref" for
+every string in the binary** because the pattern demanded a raw-instruction-bytes
+column that `--no-show-raw-insn` omits.  Validated against `POSIXSpawnType`,
+which must be referenced, it finds four.  That is the sixth instrument in this
+project that answered a different question than the one asked, and the sixth
+time a control caught it.
+
+## The parser, and it is one strcmp chain
+
+At `0x100003d8c`, launchd compares the job's `ProcessType` (falling back to
+`POSIXSpawnType`) against a chain of strings and stores a code at
+**`job + 0x358`**:
+
+    string            code @+0x358    flag @+0x538
+    Standard          0x300           -
+    Interactive       0x400           -
+    Background        0x500           -
+    Adaptive          0x600           -
+    SystemApp         0x100           |= 0x3000
+    App               0x100           |= 0x1000     <-- SpringBoard
+    _AdaptiveUtility  0x600           (+0x368 = 17)
+    Driver            0x700           -
+    anything else     --              logs "Unknown ProcessType: %s"
+
+**`App` is the only type that sets a flag bit and a code no other type uses.**
+It is not "declined": it is classified differently, into a branch that the other
+types never enter.
+
+## Confirmed a second way, from launchd's own log table
+
+At `0x1000221b0` launchd formats a log line.  The format string is
+`"spawn type = %s (%lu)"`, and the name comes from a table at `0x100070728`
+indexed by **`code >> 8`**:
+
+    index  code    name
+    1      0x100   "app"                <-- App and SystemApp
+    2      0x200   "app (throttled)"
+    3      0x300   "standard"
+    4      0x400   "interactive"
+    5      0x500   "background"
+    6      0x600   "adaptive"
+    7      0x700   (null)
+
+Two independent routes -- the parser's constants and the log's name table --
+agree on every entry.  The role table at `0x100070760` is indexed by the field
+at `+0x35c` and formats `"spawn role = %s (%lu)"`.
+
+## What consumes it, and where the search stands
+
+The code at `+0x358` has 20 readers; two compare it against `0x100`:
+
+* **`0x100006da4`** -- for code `0x100`, ORs `0x2000000` into `+0x538`, and if
+  bit 60 is clear sets `+0x35c = 1` and ORs in `0x1000 << 48`.
+* **`0x1000221b0`** -- the log formatter above.
+
+The flag field at `+0x538` is a 64-bit bitfield with 345 readers.  Nearby ones
+test bits 44, 46, 38 and 56; bit 12 -- the one `App` sets -- is consumed
+somewhere this interval did not reach.
+
+## What this changes about the plan
+
+For roughly thirty intervals the `App` anomaly was a correlation: 7 of 7
+`App` jobs did not spawn, 0 of 92 that did spawn carry the type.  It is now a
+**mechanism with an address**: `App` sets code `0x100` and flag bit `0x1000`,
+and no other spawn type does.  The remaining question is narrow and specific --
+what reads bit 12 of `job + 0x538` and refuses -- and it is answerable with the
+same two tools, which now exist and are validated.
+
+**It also explains the shape that confused the earlier analysis.**  The five
+`Background` jobs never spawn either, and `Background` sets code `0x500` with no
+flag -- so "App and Background both fail" is not one mechanism.  Only `App`
+(and `SystemApp`) take the flagged branch.
+
+## Status
+
+Windows/real-guest: **the parser and the log table are host-side reads of the
+launchd binary extracted from the volume the guest mounts.**  Nothing here is
+measured on the guest.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path
+is task #33: find the consumer of bit 12 of `job + 0x538`.**  THE HEADLINE is
+unchanged from AH
