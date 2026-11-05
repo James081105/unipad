@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-fifth, addendum BA). THE HEADLINE is **THE ANOMALOUS SET IS 8, NOT "EVERY App JOB", AND FIVE OF THE ORIGINAL THIRTEEN SPAWN IN THE DEEPER BOOT**. `launchd-discriminator.txt` lists 13 RunAtLoad=true jobs whose daemon did not spawn and concludes POSIXSpawnType=App is a perfect separator (7 of 7 App jobs absent, 0 of 92 spawners carrying the type) -- but that split was computed against a boot with 92 spawned daemons, and the deepest capture on record has 161. Re-running the same 13 against it: **five spawn**, including AppleCredentialManagerDaemon (Interactive, root), containermanagerd (Interactive), accessoryupdaterd (Adaptive, _accessoryupdater), familynotificationd (Adaptive) and identityservicesd (Interactive) -- the very types the separator called safe. **The anomalous set is 8, not 13, and it is not a clean type split.** Three of the eight carry a visible per-job reason a QEMU guest cannot satisfy: iomfb_bics_daemon (LimitLoadToSessionType=System), safetyalertsd (LimitLoadToHardware={targettype:[D16,D17,D20,...]}) and sntpd (UserName=_sntpd). What remains is five -- SpringBoard, checkerboard, ClarityBoard, OTACrashCopier, axassetsd -- and the first three are exactly the three jobs carrying `EmbeddedHomeScreen`, the key the home-screen claim at 0x100007b64 gates on, while the last two are `ProcessType=Background` and **0 of 5 Background jobs spawn anywhere on the volume**. **So POSIXSpawnType=App remains a correlation, exactly as the state document has said since the discriminator was first written, and this interval's launchd parser work does not change that** -- the parser at 0x100003d8c and the marshaller at 0x100020d90 are real and now mapped, but the fork in that road is not where the eight jobs are being lost. **The next measurement is the five, not the seven: the home-screen claim for the three EmbeddedHomeScreen jobs, and whatever keeps Background jobs from spawning for the other two.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-sixth, addendum BB). THE HEADLINE is **AMFI LAUNCH CONSTRAINTS ARE IMPLEMENTED, AND THEY ARE NOT THE GATE EITHER** -- which closes the last candidate that could have acted on the spawn from outside launchd. Addendum AZ proved launchd never attempts the SpringBoard spawn, and one mechanism could still have produced that shape from outside: a launch constraint applied at job-load time whose failure marks the job unspawnable. launchd imports exactly the symbol that would do it, `_amfi_launch_constraint_set_spawnattr`, and carries `SpawnConstraint` in its plist schema. **The kernel implements the whole subsystem** -- `struct launch_constraint_data` in cs_blobs.h, `CHECK_SET_HOOK(proc_check_launch_constraints)` in policy_check.c, `mac_proc_check_launch_constraints()` in mac_process.c, and the call site at kern_exec.c:7652 -- and the built kernel carries the enforcement strings, including "Only platform code can set launch constraints on itself" and "AMFI: Launch Constraint Violation", plus the sysctls `launch_constraints_enforced` and `launch_constraints_3rd_party_allowed`. **But the call site is in the exec-activation path and `goto done` returns the errno from posix_spawn itself -- so a rejection would have produced a `spawn.failed` record, and addendum AZ measured 0 of those against 512 successful spawns. The mechanism is implemented, reachable, and did not fire.** That closes the last candidate that could have acted from outside launchd; what remains is launchd's own state, and nothing in this project's kernel observes that. **The trust cache is closed a second time and not used again**: launchd, configd, backboardd and runningboardd are all absent from both caches, and backboardd spawned, is alive and is making real framebuffer calls -- so the absence says nothing about platform status, either the cdhash is computed wrong or these are not the governing caches. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13532,6 +13532,93 @@ Windows/real-guest: **the join is a host-side read of a real capture** from
 parsed job table.
 
 Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-sixth, addendum BB): AMFI launch constraints are implemented, and they are not the gate either
+
+## Why this was worth checking
+
+Addendum AZ proved launchd never attempts the SpringBoard spawn, which pushed the
+decision into launchd's own state machine.  One mechanism could still have
+produced that shape from OUTSIDE launchd: a launch constraint applied at job-load
+time whose failure marks the job unspawnable.  launchd imports exactly the symbol
+that would do it:
+
+    _amfi_launch_constraint_set_spawnattr
+
+and carries the plist key `SpawnConstraint` in its schema table.
+
+## The kernel implements it, and the check is readable
+
+`local-private/upstream/xnu` has the whole subsystem:
+
+    osfmk/kern/cs_blobs.h:312        struct launch_constraint_data
+    bsd/kern/policy_check.c:181      CHECK_SET_HOOK(proc_check_launch_constraints)
+    security/mac_process.c:896       mac_proc_check_launch_constraints()
+    bsd/kern/kern_exec.c:7652        the call site
+
+and the built kernel carries the enforcement strings, including
+
+    "Only platform code can set launch constraints on itself"
+    "Only platform code can set launch constraints on its parent"
+    "Only platform code can set launch constraints on its responsible process"
+    "AMFI: Launch Constraint Violation..."
+
+plus the sysctls `launch_constraints_enforced` and
+`launch_constraints_3rd_party_allowed`.
+
+The call site is in the exec-activation path, immediately after the
+`ip_mac_return` and `ip_cs_error` checks:
+
+    /* call the launch constraints hook */
+    if ((error = mac_proc_check_launch_constraints(p, imgp,
+            &launch_constraint_reason)) != 0) {
+            signature_failure_reason = launch_constraint_reason;
+            goto done;
+    }
+
+`goto done` sets `error` and returns it from `posix_spawn` -- which the
+`spawn.failed` emitter from addendum AZ would have recorded.
+
+## So it is not the gate, and the reasoning is short
+
+**A launch-constraint rejection happens inside `posix_spawn` and returns an
+errno.  Addendum AZ measured 0 `spawn.failed` records against 512 successful
+spawns.  Therefore no launch constraint was ever rejected, for any job.**  The
+mechanism is implemented, it is reachable, and it did not fire.
+
+That closes the last candidate that could have acted on the spawn from outside
+launchd.  What remains is launchd's own state, and nothing in this project's
+kernel observes that.
+
+## The trust cache, closed for the second time
+
+The same line of reasoning made the trust cache look relevant again, because
+platform-code status is what the constraint check tests.  It is not usable:
+
+    launchd         c8a9970f...   static=0  staged=0
+    configd         188d2d47...   static=0  staged=0
+    backboardd      6f7752e8...   static=0  staged=0
+    runningboardd  00baf54d...   static=0  staged=0
+
+**backboardd spawned, is alive, and is making real framebuffer calls, and its
+cdhash is in neither cache either.**  So the absence says nothing about platform
+status -- either the cdhash is computed wrong or these caches are not the ones
+that govern.  Recorded as an instrument that does not work, and not used again.
+
+## Status
+
+Windows/real-guest: **host-side reads of the XNU source tree and the extracted
+binaries.**  Nothing measured on the guest this interval.
+
+Build: none.
 
 Onsite: N/A.
 
