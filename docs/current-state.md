@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-first, addendum AW). THE HEADLINE is **THE DYLD SHARED CACHE IS NOT ON THE VOLUME THE GUEST MOUNTS**, and it is the first candidate that would explain the whole App-job anomaly at once. Following addendum AV's redirect: `/usr/libexec/runningboardd` is a STUB -- 72,912 bytes but `__text` is 60 bytes, four `objc_msgSend` calls -- whose strings name `/System/Library/PrivateFrameworks/RunningBoard.framework/RunningBoard` (`PROJECT:RunningBoard-874.140.4`). The framework directory holds only `Info.plist` and `_CodeSignature`, which first read as "the stub loads a file that is not there, so there is no spawn driver" -- **and the control refutes it: 2029 of 2037 PrivateFrameworks directories have no standalone executable, because on iOS system frameworks live in the dyld shared cache. That layout is normal, and the hollow-process reading is withdrawn.** **But the cache itself is absent**: `/System/Library/dyld` and `/System/Library/Caches/com.apple.dyld` are both ABSENT (Caches holds only apticket.der, com.apple.factorydata and com.apple.kernelcaches), and a full catalog scan for any name containing dyld or shared_cache returns exactly ONE hit -- the `/usr/lib/dyld` directory. The guest DID read a cache (`dyld.cache_read` from `XNU._shared_region_map_and_slide`) and 146 of 161 daemons are alive with backboardd doing real work, so a cache reaches the guest from somewhere this scan did not look; the unexamined candidate is the SystemOS cryptex, which this host has and the guest does not mount at `/`. **This is a lead, not a conclusion.** The measurement that settles it: find the cache the guest actually maps and ask whether RunningBoard is in it. If it is, the search continues inside the framework. **If it is not -- or the cache is partial -- runningboardd's dlopen fails, there is no spawn driver, and every POSIXSpawnType=App job is refused for that one reason, which would explain the whole anomaly including the five App jobs with no EmbeddedHomeScreen.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval eighty-second, addendum AX). THE HEADLINE is **THE DYLD CACHE IS ON THE CRYPTEX, NOT ON THE ROOT THE GUEST MOUNTS**, and the split between the two volumes is now measured. Addendum AW recorded that no `dyld_shared_cache_*` file exists anywhere on the volume mounted at `/` while the guest demonstrably read a cache. **It is on the cryptex**: a streaming scan of `044-76034-038.dmg` (3,303,014,400 bytes) finds `dyld_v1   arm64` at 4096-aligned offsets 24,797,184 / 25,288,704 / 140,009,472 / 140,058,624 / 254,287,872 / 254,517,248 -- two unaligned hits are the pattern inside compressed data, and a run near 293,071,868 is an architecture-name string table. So AW's finding is REFINED, not reversed. The two volumes now do measurably different jobs: the root carries the 523 LaunchDaemons that spawn and the /usr/libexec binaries -- launchd, configd, backboardd, and runningboardd as a 60-byte-__text stub -- and NO shared cache; the cryptex carries the cache and therefore the frameworks whose root directories hold only Info.plist. **`runningboardd` dlopens a binary that exists only inside the cache on the cryptex, so whether the spawn driver has any code to run depends entirely on that cache being reachable -- and the root volume alone cannot supply it.** The guest did read a cache, so it is reachable somehow; what is unknown is whether the copy it reads is complete and whether RunningBoard is in it. **If the cache is partial or lacks RunningBoard, runningboardd's dlopen fails, there is no spawn driver, and every `POSIXSpawnType=App` job is refused for that single reason -- which would explain the whole anomaly at once, including the five App jobs with no EmbeddedHomeScreen.** That is now one measurement about one file, not a question about launchd. **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu because SpringBoard has still never spawned.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -13183,3 +13183,77 @@ Onsite: N/A.
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
 reached -- the screen is still the UniXNU boot menu because SpringBoard has
 still never spawned.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (eighty-second, addendum AX): the dyld cache is on the cryptex, not on the root the guest mounts
+
+## What AW left open, settled in one scan
+
+AW recorded: no `dyld_shared_cache_*` file anywhere on the volume mounted at `/`,
+while the guest demonstrably read a cache -- so the cache reaches it from
+somewhere the catalog scan did not look.  The unexamined candidate was the
+SystemOS cryptex, which this host has and the guest does not mount at `/`.
+
+**It is there.**  A streaming scan of
+`vendor/UniXNU/.cache/firmware/target-volumes/044-76034-038.dmg`
+(3,303,014,400 bytes) for the cache header magic finds `dyld_v1   arm64` at
+4096-aligned offsets:
+
+    24,797,184      25,288,704      140,009,472
+    140,058,624     254,287,872     254,517,248
+
+Two further hits at 18,629,503 and 24,314,011 are unaligned and are almost
+certainly the same byte pattern inside compressed data rather than headers.  A
+run of hits near 293,071,868 is an architecture-name string table
+(`x86_64`, `i386`, `ppc`, `armv6`), not a cache.
+
+So AW's finding is **refined, not reversed**: the arm64 dyld shared cache is
+absent from the OS root volume and present on the SystemOS cryptex.
+
+## The two volumes are doing measurably different jobs
+
+    OS root volume  (044-76040-038.raw, 6,077,580,800 bytes, mounted at /)
+        LaunchDaemons: 523 job plists -- the ones that spawn
+        /usr/libexec:  launchd, configd, notifyd, backboardd, runningboardd
+        NO dyld shared cache
+
+    SystemOS cryptex (044-76034-038.dmg, 3,303,014,400 bytes, NOT mounted at /)
+        the arm64 dyld shared cache
+        and therefore the frameworks whose directories on the root hold only
+        Info.plist and _CodeSignature
+
+`runningboardd` on the root is a 60-byte-`__text` stub that dlopens
+`/System/Library/PrivateFrameworks/RunningBoard.framework/RunningBoard` -- a
+binary that exists only inside the cache on the cryptex.  **So whether the spawn
+driver has any code to run depends entirely on that cache being reachable, and
+the root volume alone cannot supply it.**
+
+The guest did read a cache (`dyld.cache_read` from
+`XNU._shared_region_map_and_slide`), so it is reachable somehow.  What is not
+known is whether the copy it reads is the complete one, and specifically whether
+`RunningBoard` is in it.
+
+## What this makes of the anomaly
+
+If the cache the guest maps is complete, the stub loads and the search continues
+inside the framework.  **If it is partial, or if `RunningBoard` is not in it,
+runningboardd's dlopen fails, there is no spawn driver, and every
+`POSIXSpawnType=App` job is refused for that single reason** -- which would
+explain the whole anomaly at once, including the five `App` jobs that carry no
+`EmbeddedHomeScreen` and so cannot be explained by the home-screen claim.
+
+That is now one measurement about one file, not a question about launchd.
+
+## Status
+
+Windows/real-guest: **host-side reads of the two volumes this host has.**  The
+scan is a byte search of the cryptex image; the catalog walk is the root volume.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu because SpringBoard has still
+never spawned.**  THE HEADLINE is unchanged from AH
