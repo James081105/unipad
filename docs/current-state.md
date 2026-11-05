@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty third, addendum CM). THE HEADLINE is **CL's OMAP VERIFICATION IS WRONG -- THE OID MATCH IS A COINCIDENCE, AND ONLY THE GEOMETRY STANDS**. CL claimed the cryptex's container omap was verified at block 782662 on oid and type. **The type is wrong: 0xe is OBJECT_TYPE_FSTREE, not OBJECT_TYPE_OMAP (0x0B), and the object does not have the omap shape either -- om_count at +0x24 reads 0 where a container omap holds hundreds of entries. So block 782662 is not the omap. And the oid match is a coincidence: in this container the first 18 blocks read oid == block for every one, with types 0x01..0x09 in lockstep, so oids and block numbers coincide here as they do everywhere in APFS.** **WHAT SURVIVES IS ONLY THE GEOMETRY: magic NXSB at 32, nx_block_size 4096, nx_block_count 806,400 = 3,303,014,400 / 4096 exactly -- so no hidden offset, no UDIF wrapper, and BASE=0 with block_size=4096 is correct. The cryptex does not need its own BASE/block-size work.** **NOT VERIFIED: the omap's location, the btree below it, and the path to the kext binary. nx_omap_oid reads 782662 but the object there is not an omap, so either the field offset is wrong for this container or the value needs different interpretation.** **SO THE TEAMMATE'S ORIGINAL REFUSAL ("block 15897 is not the container omap") IS STILL UNEXPLAINED, and my explanation of it -- "the walker was reading the wrong block" -- was built on the same unverified omap claim and is WITHDRAWN with it.** **THE LESSON, which cost an addendum: I verified a field because it matched, without checking what the field meant. A match is not a confirmation; the constant has to be looked up and the shape has to be checked.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CL is corrected: the cryptex's geometry is known and its omap is not.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty fourth, addendum CN). THE HEADLINE is **CM IS WITHDRAWN -- CL WAS RIGHT, AND MY CORRECTION USED THE WRONG FIELD OFFSET**. CM "corrected" CL's claim that the cryptex's container omap is at block 782662, on the ground that its type reads 0xe (FSTREE) rather than 0x0B (OMAP). **CM was reading the wrong field: the object type is at +0x18, not +0x10, as a qword whose high half carries flag bits (0x40000000 = OBJ_VIRTUAL, 0x80000000 = OBJ_EPHEMERAL). Masked, block 0 = 0x01 NX_SUPERBLOCK, block 782662 = 0x0B OMAP, block 782663 = 0x02 BTREE -- exactly what om_tree_oid=782663 predicted and exactly what CL claimed. The 0x0e at +0x10 is a different field entirely.** **AND THE "NO BTRE MAGIC" DOUBT WAS ALSO WRONG: APFS btree_node_phys has NO magic field; +0x20 is btn_flags(2)/btn_level(2), so 07 00 00 00 reads as flags=0x0007 (BTNODE_ROOT|BTNODE_LEAF|BTNODE_FIXED_KV_SIZE) and level=0 -- precisely a root leaf node, which is what the omap's tree root should be. I was looking for a magic that does not exist in the format.** **SO CM IS WITHDRAWN IN FULL AND CL STANDS: BASE=0, block_size=4096, omap at block 782662, btree root at 782663 -- all verified against the object-type constants with block 0 as the known-value control.** **THE LESSON, the third this interval and the sharpest: CM corrected CL by looking up a constant and finding CL's wrong -- and CM's own constant was attached to the wrong field. Looking up the constant is necessary but not sufficient; the field offset has to be right too, and the check for that is a known-value control. Block 0 is that control: whatever offset you read the type from must yield 0x01 for the container superblock. I ran that control only AFTER writing CM.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17174,3 +17174,77 @@ Onsite: N/A.
 reached.  CL is corrected: the cryptex's geometry is known and its omap is not, so
 the route to the kext binary is exactly where it was before CL, minus one wrong
 claim.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty fourth, addendum CN): CM is WITHDRAWN -- CL was right, and my correction used the wrong field offset
+
+## The error, and it is mine again
+
+Addendum CM "corrected" addendum CL's claim that the cryptex's container omap is at
+block 782662, on the ground that the object there has `type = 0xe`, which is
+`OBJECT_TYPE_FSTREE` rather than `OBJECT_TYPE_OMAP` (`0x0B`).
+
+**CM was reading the wrong field.**  The object type is not at `+0x10`; it is at
+`+0x18`, as a qword whose high half carries flag bits.  Masking those off:
+
+    block      oid      raw @0x18       type
+    0          1        0x80000001      0x01  NX_SUPERBLOCK   <- correct for block 0
+    782662     782662   0x4000000b      0x0b  OMAP            <- the omap
+    782663     782663   0x40000002      0x02  BTREE           <- the omap's tree
+
+`0x40000000` is `OBJ_VIRTUAL` and `0x80000000` is `OBJ_EPHEMERAL`; the low byte is
+the type.  **Block 782662 is `OBJECT_TYPE_OMAP` and block 782663 is its `BTREE`** --
+exactly what `om_tree_oid = 782663` predicted, and exactly what CL claimed.
+
+The `0x0e` I read at `+0x10` is a different field, not the object type.  Blocks 0,
+782662 and 782663 all carry `0x0e` there while blocks 1 and 3 carry `0x01` and
+`0x02`, so it is not a constant either -- it is simply not the field I thought.
+
+## And the "no BTRE magic" doubt was also wrong
+
+CM flagged that block 782663's four bytes at `+32` read `07 00 00 00` rather than a
+`BTRE` magic, and treated that as doubt.  **There is no `BTRE` magic in APFS.**
+`btree_node_phys` has no magic field; `+0x20` is `btn_flags`(2) / `btn_level`(2), so
+`07 00 00 00` reads as `flags = 0x0007`, `level = 0x0000` -- and `0x0007` is
+`BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE` with level 0.  **That is
+precisely a root leaf node**, which is what the omap's tree root should be.  I was
+looking for a magic that does not exist in the format and reading its absence as
+doubt.
+
+## Net
+
+**CM is withdrawn in full.  CL stands:** the cryptex's container geometry is
+`BASE = 0`, `block_size = 4096`, and its container omap is at block **782662** with
+its btree root at **782663** -- all verified against the object-type constants and
+flag semantics rather than against a field that merely matched.
+
+The teammate's original refusal, `block 15897 is not the container omap`, remains
+unexplained -- but that is now a question about their walker, not about the
+container.
+
+## The lesson, which is the third this interval and the sharpest
+
+CM corrected CL by looking up a constant and finding CL's was wrong -- and CM's own
+constant was attached to the wrong field.  **Looking up the constant is necessary but
+not sufficient; the field offset has to be right too, and the check for that is a
+known-value control.**  Block 0 is that control: whatever offset you read the type
+from must yield `0x01` for the container superblock.  I ran that control only after
+writing CM, which is the order it should have been run in.
+
+Three corrections this interval now share one root: verifying a reading against a
+field, a boot, or a document without first proving the instrument on a known answer.
+
+## Status
+
+Windows/real-guest: **none this interval -- the correction is a read of the cryptex
+file's own objects, validated against block 0 as the known-value control.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  CM is withdrawn and CL is restored: the cryptex's omap is at block 782662
+and its btree at 782663, both verified against the object-type enum with block 0 as
+the control.**  THE HEADLINE is unchanged from AH
