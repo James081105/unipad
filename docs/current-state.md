@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval seventy-sixth, addendum AR). THE HEADLINE is **LAUNCHD'S SPAWN-TYPE TABLE, AND WHAT `App` ACTUALLY SETS**. Addendum AQ showed launchd LOADS com.apple.SpringBoard.plist and declines to spawn it, with neither the volume nor the executable at fault. This interval reads the decision out of launchd's own binary -- extracted from the volume via a new multi-chunk decmpfs decoder (561,856 bytes, 9 chunks, Mach-O 64) -- and the `App` anomaly finally has a MECHANISM instead of a correlation. At 0x100003d8c launchd runs one strcmp chain over ProcessType/POSIXSpawnType and stores a code at `job+0x358`: Standard 0x300, Interactive 0x400, Background 0x500, Adaptive 0x600, Driver 0x700 -- and **`App` 0x100 plus flag bit 0x1000 at `job+0x538`, which no other type sets**. Confirmed a second way from launchd's own log table at 0x100070728, indexed by `code >> 8`, whose format string is `spawn type = %s (%lu)` and whose entry 1 is "app". Two independent routes agree on every entry. **This also explains a shape that confused the earlier analysis: the five `Background` jobs fail too, but `Background` sets no flag -- so App and Background are NOT one mechanism, and only `App`/`SystemApp` take the flagged branch.** What remains is narrow and specific: bit 12 of `job+0x538` has 345 readers and this interval did not reach its consumer; the two tools that found this are now built and validated. **Also fixed: the local-private/upstream/UniXNU-qemu mirror was stale at 5ef74a1 while the lock pins 9782ddf, which turned the acceptance cross-check red for a reason that had nothing to do with any change -- two checkouts of the same fork, and the test reads the one nobody edits.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path is task #33.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval seventy-seventh, addendum AS). THE HEADLINE is **BIT 12 IS WRITTEN AND NEVER EXTRACTED**. Addendum AR named the fork: `App` is the only spawn type that sets bit 12 of `job+0x538`. This interval hunted its consumer with a purpose-built walker that follows each of the 345 readers of that field forward and reports every conditional that depends on it -- 203 do something testable -- and the answer is a negative that redirects the search. launchd keeps one `lsr` accessor per flag bit at 0x100004b30, and the positions present are 1, 2, 3, 5, 6, 8, 9, 10, 16, 23, 24, 30, 33, 34, 52, 54 -- **11 and 12 are absent**. The translator at 0x1000034a8 consumes bits 25, 26, 33, 34, 52 and 54. The only reader that discriminates on `App`, 0x100006da4, compares the CODE at +0x358 against 0x100 and sets attributes without refusing anything. **So bit 12 is a write-only marker as far as launchd's own `__text` goes -- which is not 'bit 12 does nothing' but 'its consumer is not a branch here'**, and the stronger candidate is that it leaves the process in a marshalled spawnattr: launchd carries the string "failed to marshall spawnattrs: offset = %u, left = %lu, expected = %lu", a serialisation failure path. Task #33's next step is therefore no longer 'find the branch that tests bit 12' but 'find what the flag is marshalled into and who reads it'. **The caveat travels with the negative: this is a static scan of one binary and establishes only that no instruction in launchd extracts bit 12.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -12741,4 +12741,84 @@ Onsite: N/A.
 
 **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the critical path
 is task #33: find the consumer of bit 12 of `job + 0x538`.**  THE HEADLINE is
+unchanged from AH
+
+---
+
+# Interval 2026-11-05 (seventy-seventh, addendum AS): bit 12 is written and never extracted
+
+## The question, and the tool built to answer it
+
+Addendum AR ended with: `App` sets bit 12 of `job + 0x538`, the field has 345
+readers, and the consumer was not reached.  Grepping for `#0x1000` finds only
+the five WRITERS and no testers, so the question is whether bit 12 is consumed
+through a mask a grep does not name, or not consumed at all.
+
+`local-private/tmp/launchd-bit12-consumers.py` answers it without guessing at
+the encoding: for each of the 345 `ldr xN, [xM, #0x538]` sites it follows the
+loaded register forward and reports every instruction that makes a conditional
+depend on it.  **203 of the 345 do something testable with the value.**
+
+## The accessor series, and the bit that is missing from it
+
+At `0x100004b30` launchd keeps one accessor per flag bit, each an `lsr` by the
+bit's position.  The positions present are:
+
+    1, 2, 3, 5, 6, 8, 9, 10, 16, 23, 24, 30, 33, 34, 52, 54
+
+**11 and 12 are not there.**  A direct `lsr #11` or `lsr #12` appears exactly
+twice in the whole binary, and neither is in that series.
+
+The translator at `0x1000034a8` packs the flag field into `job + 0xec` and
+consumes bits 25 (`tbnz w24, #0x19`), 26 (`#0x1a`), 33 (`lsr #11` + `#0x400000`),
+34 (`lsr #18` + `#0x10000`), 52 (`tbnz x24, #0x34`) and 54 (`lsr #39` +
+`#0x8000`).  **Not bit 12.**
+
+The one reader that does discriminate on `App` is `0x100006da4`, already
+recorded in AR: it compares the CODE at `+0x358` against `0x100`, not the flag,
+and it only sets attributes -- bit 25, and if bit 60 is clear then role = 1 and
+bits 48-51.  It refuses nothing.
+
+## What the negative means, stated rather than implied
+
+**Bit 12 is a write-only marker as far as this binary's static reach goes.**
+That is not "bit 12 does nothing"; it is "bit 12's consumer is not a branch in
+launchd's own code".  Two candidates, and the second is the stronger:
+
+1. the flag is copied around as part of a struct and compared wholesale;
+2. **the flag leaves launchd in a marshalled spawnattr and is consumed
+   elsewhere.**
+
+(2) has direct support in the binary.  launchd carries the string
+
+    failed to marshall spawnattrs: offset = %u, left = %lu, expected = %lu
+
+which is a serialisation failure path -- so job attributes, including this flag
+field, are marshalled out of the process.  Once they are, no amount of reading
+launchd's own branches will find the consumer, because the consumer is on the
+other side of the message.
+
+## What this changes about the plan
+
+Task #33's next step is no longer "find the branch that tests bit 12".  It is
+"find what launchd marshals the flag into, and what reads it".  The instrument
+for that is the same one that produced AR and AS -- `llvm-objdump` plus the xref
+walker, both now validated -- aimed at the marshalling site rather than at the
+flag field.
+
+**And a caveat that has to travel with the negative:** this is a STATIC scan of
+one binary.  It establishes that no instruction in launchd's `__text` extracts
+bit 12.  It does not establish that bit 12 is unused, and the difference between
+those two sentences is the difference between a finding and an overstatement.
+
+## Status
+
+Windows/real-guest: **host-side static analysis of launchd extracted from the
+volume the guest mounts.**  Nothing measured on the guest this interval.
+
+Build: none.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven.**  THE HEADLINE is
 unchanged from AH
