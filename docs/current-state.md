@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-seventh, addendum BM). THE HEADLINE is **ADDENDUM BL'S CONCLUSION IS WRONG, AND IT IS TASK #32's DISTINCTION**. BL read 27 display counters and saw `native_legacy_swap_validation_calls = 0` and `native_legacy_transfer_calls = 0` still at their declared initials, then concluded "the swap is never submitted". **Every number in BL is correct; the conclusion does not follow, because the hooks that increment those counters are NEVER CALLED in this build.** Both are incremented only inside `package/LegacyDisplayProbe.cpp` -- `:304` inside `native_legacy_swap_validation_observed` (:300) and `:317` inside `native_legacy_transfer_observed` (:316) -- and grepping the linked driver for a call site returns only the definitions. **The one caller that exists is in a DIFFERENT REPOSITORY: `local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp:441`, and `vendor/UniXNU-qemu/drivers/NativeMobileDisplay/` DOES NOT EXIST.** The kernel is built from `vendor/UniXNU-qemu`, whose board.toml names `package/LegacyDisplayProbe.cpp`. The symbols are in the built kernel because the OBJECT is linked, not because anything calls it. **So `swap_validation_calls = 0` measures "this hook is dead code in this build", not "no swap was submitted" -- and the two are indistinguishable from the counter alone.** **WHAT BL's NUMBERS DO ESTABLISH: `native_legacy_client_calls` is incremented at :367 inside a LIVE code path, not inside a dead observer, so THAT one is real -- a client reached the display driver three times from pid 95 and every call returned success (client_calls=3, client_pid=95, client_status=0), with stage=10 (the success terminal state), init_result=1, start_result=1, surface_found=1, dt_attached=1, pm_stage=4, pm_status=0, gop_width=800, gop_height=600. The driver is up, powered, and answering.** **And the ordering run adds the sequence a final-value table cannot show: pm_status -1->0, gop_width 0->800, gop_height 0->600, unit_scale_calls 0->1, unit_scale_status -1->0, registration_calls 0->1. The driver's own init runs to completion; what happens after it is exactly what the dead hooks were supposed to observe, and is now unobserved.** **SO TASK #32 IS NOT A NICETY AND IS NOT ONLY ABOUT THE CONSOLE EMITTERS: it was scoped to the spawn.seen/exec.seen family, and the same defect exists in the display counters, where it produced a wrong conclusion on the critical path one interval after the task was written. The gate needs to cover every counter this project reads. Its concrete form, which this measurement shows is sufficient: for every counter, name the function that increments it and prove that function has a call site in the linked driver; a counter whose only incrementer is uncalled must be reported as `hook_uncalled:` and never as a value.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now known is narrower and truer than BL claimed: the display is up and answering, and nothing in this build observes what happens after that.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-eighth, addendum BN). THE HEADLINE is **THE TASK #32 GATE IS BUILT, AND IT IS NOT YET TRUSTWORTHY**. `check-counter-hooks.py` takes the driver the kernel links (`vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp`, named by board.toml), finds every counter it defines, finds the function that increments each, and proves that function has a call site -- no build, no guest. **It independently confirms addendum BM and finds MORE dead hooks: swap_validation_calls, swap_accepted_count, copy_n, gpu_fallbacks, prepare_calls and prepare_failures are all `hook_uncalled`. Six counters whose only incrementer is never called, and BL read two of them as facts about the guest.** **BUT THE GATE IS NOT YET TRUSTWORTHY, and the false NEGATIVE is the dangerous one: it reports `native_legacy_transfer_calls ok (incremented by ['__attribute__'])` for a counter BM proved is dead, because the definition line is `__attribute__((noinline)) void native_legacy_transfer_observed(...)` and my function-name regex binds `__attribute__` as the name, then counts other `__attribute__(` occurrences as call sites. A gate that reports ok for a dead hook is worse than no gate -- it converts a known defect into a green check, the same shape as the recorded fact about a pre-flight that validated the wrong target.** **And a false POSITIVE: it reports client_calls and registration_calls as hook_uncalled when they read 3 and 1 on a live guest, because those functions are called through a vtable or function pointer (the driver interposes one at :626) and a textual grep for `name(` cannot see it.** **Both classes share one root: the check reasons about text where it needs the call graph. The fix is not a better regex but the symbol table -- does anything in the linked objects reference this symbol -- which llvm-objdump on the built kext answers directly and which this project already uses elsewhere.** **What survives: the six hook_uncalled verdicts, corroborated by BM's independent route. And the concrete form of task #32's gate, now written down: for every counter, name the function that increments it and prove that function has a call site in the linked driver; a counter whose only incrementer is uncalled is reported as hook_uncalled: and never as a value. The proof must come from the object's relocations, not the source text.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display driver carries six counters that cannot mean anything, and the gate that would keep them out of a conclusion is built but not yet trustworthy.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14780,3 +14780,92 @@ Onsite: N/A.
 reached.  What is now known is narrower and truer than BL claimed: the display is
 up and answering, and nothing in this build observes what happens after that.**
 THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-eighth, addendum BN): the task #32 gate is built, and it is not yet trustworthy
+
+## The gate, and what it confirms
+
+`local-private/tmp/check-counter-hooks.py` takes the driver the kernel links
+(`vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp`, which `board.toml` names),
+finds every counter it defines, finds the function that increments each, and
+proves that function has a call site.  It needs no build and no guest -- it is a
+source check, which is the point: it would have caught addendum BL's error in
+seconds on the host rather than after a 15-minute boot.
+
+It independently confirms addendum BM, and finds more dead hooks than BM did:
+
+    native_legacy_swap_validation_calls   hook_uncalled: native_legacy_swap_validation_observed
+    native_legacy_swap_accepted_count     hook_uncalled: native_legacy_swap_validation_observed
+    native_legacy_copy_n                  hook_uncalled: native_legacy_copy_timing_observed
+    native_legacy_gpu_fallbacks           hook_uncalled: native_legacy_gpu_fallback_observed
+    native_legacy_prepare_calls           hook_uncalled: native_legacy_prepare_scanout
+    native_legacy_prepare_failures        hook_uncalled: native_legacy_prepare_scanout
+
+**Six counters whose only incrementer is never called.**  So the display driver
+carries a large observability surface of which a substantial part is dead code,
+and BL read two of the dead ones as facts about the guest.
+
+## The two defect classes, and the false negative is the dangerous one
+
+The gate is not yet trustworthy, and the reason matters more than its verdicts.
+
+**A false negative.**  It reports
+
+    native_legacy_transfer_calls   ok (incremented by ['__attribute__'])
+
+for a counter addendum BM proved is dead.  The cause is my own parser: the
+definition line is `__attribute__((noinline)) void native_legacy_transfer_observed(...)`,
+and the function-name regex binds `__attribute__` as the name.  It then finds
+other `__attribute__(` occurrences, counts them as call sites, and concludes the
+function is live.  **A gate that reports `ok` for a dead hook is worse than no
+gate**, because it converts a known defect into a green check -- the same shape as
+the recorded fact about a pre-flight that validated the wrong target and reported
+green while the build was red.
+
+**A false positive.**  It reports
+
+    native_legacy_client_calls     hook_uncalled: native_legacy_client_enter
+    native_legacy_registration_calls hook_uncalled: native_legacy_registration_observed
+
+for counters that read **3** and **1** respectively on a live guest.  So those
+functions ARE called -- through a vtable or a function pointer, which a textual
+grep for `name(` cannot see.  The display driver interposes a vtable
+(`interpose(client, native_legacy_client_pid)` at :626), so this is expected
+rather than surprising.
+
+**Both classes have the same root:** the check reasons about text where it needs
+to reason about the call graph.  The fix is not a better regex.  It is to answer
+the question the symbol table can answer -- does anything in the linked objects
+reference this symbol -- which is what `llvm-objdump` on the built kext gives
+directly, and which the project already uses elsewhere.
+
+## What survives, and what it buys
+
+The six `hook_uncalled` verdicts stand, because they are confirmed by the
+independent route addendum BM took: the incrementer is defined and never called,
+and the only caller anywhere in the tree is in a directory that does not exist in
+the repo the kernel is built from.
+
+What it buys is the concrete form of task #32's gate, now written down rather than
+described: **for every counter, name the function that increments it and prove
+that function has a call site in the linked driver; a counter whose only
+incrementer is uncalled is reported as `hook_uncalled:` and never as a value.**
+The proof has to come from the object's relocations, not from the source text.
+
+## Status
+
+Windows/real-guest: **none this interval -- the gate is a host-side source
+check.**  The six `hook_uncalled` verdicts are corroborated by addendum BM's
+independent route; the two false verdicts are defects in the gate and are recorded
+rather than hidden.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  The display driver carries six counters that cannot mean anything, and
+the gate that would keep them out of a conclusion is built but not yet
+trustworthy.**  THE HEADLINE is unchanged from AH
