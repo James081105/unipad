@@ -55,6 +55,33 @@ from unipad.host.unixnu_boot import MEMORY_MIB, SHARED_WINDOW_BASE
 
 REPO = Path(__file__).resolve().parents[2]
 
+
+def _qemu_facing_dir(tmp_path: Path) -> Path:
+    """A directory QEMU can actually open a file in.
+
+    WHY.  `pmemsave` takes a FILENAME, and QEMU opens it on the host.  On a
+    Windows account whose name is not ASCII, this host's temp path is not ASCII
+    either, and the pinned QEMU cannot open such a path at all:
+
+        Could not open 'C:\\...\\pytest-of-<non-ascii user>\\pytest-1404\\
+        test_the_host_can_read_the_win0\\known.bin': No such file or directory
+
+    ENOENT for a file whose parent directory exists is a path QEMU could not
+    resolve, not a missing directory -- and it made this test fail on a host
+    where the very same read succeeds the moment the path is ASCII.  Measured:
+    with `--basetemp=.scratch/pt-ascii` the test passes unchanged.
+
+    The fallback is `.scratch/` inside the repository, which is untracked and a
+    normal test location (PRD 12 forbids putting test temp under
+    local-private/).  Nothing about the measurement changes: only the spelling
+    of the path the bytes are written to.
+    """
+    if str(tmp_path).isascii():
+        return tmp_path
+    fallback = REPO / ".scratch" / "window-readable"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
 #: Where the pinned QEMU lives on this host.  Absent on a fresh checkout, and
 #: absent is a skip rather than a failure -- the same shape the plan uses for
 #: the private upstream clones.
@@ -165,7 +192,8 @@ def test_the_host_can_read_the_window_and_the_framebuffer_over_qmp(tmp_path: Pat
         "-monitor", "none",
         "-serial", "none",
     ]
-    log = tmp_path / "qemu-stderr.log"
+    work = _qemu_facing_dir(tmp_path)
+    log = work / "qemu-stderr.log"
     process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=log.open("wb"))
     client = None
     try:
@@ -174,7 +202,7 @@ def test_the_host_can_read_the_window_and_the_framebuffer_over_qmp(tmp_path: Pat
         assert status.get("return", {}).get("running") is True, status
 
         def read(address: int, size: int, name: str) -> int:
-            target = tmp_path / name
+            target = work / name
             reply = client.execute(
                 "pmemsave", val=address, size=size, filename=str(target)
             )
