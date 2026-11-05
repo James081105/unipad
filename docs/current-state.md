@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty second, addendum CL). THE HEADLINE is **THE SYSTEMOS CRYPTEX'S CONTAINER GEOMETRY IS SOLVED, AND THE WALKER WAS READING THE WRONG BLOCK**. A teammate reported the cryptex refused their walker with BASE=0: "block 15897 is not the container omap", which read as a geometry problem. **It is not. Read directly from the superblock: magic NXSB at 32, nx_block_size 4096, nx_block_count 806,400 (3,303,014,400 / 4096 = 806,400 exactly), nx_omap_oid 782662. BASE=0 and block_size=4096 are correct -- the block count matches the file size to the byte, so there is no hidden offset and no UDIF wrapper. And the omap object at block 782662 verifies on both fields: oid=782662, type=0xe (OBJECT_TYPE_OMAP).** **SO THE WALKER WAS READING BLOCK 15897, WHICH IS NOT THE OMAP BLOCK AT ALL. The geometry was never the problem; the block was.** **VERIFIED: the superblock, the block size, the block count against the file size, and the omap object's oid and type at 782662. NOT VERIFIED: the btree chain below it -- om_tree_oid reads as 782663 (omap_oid + 1, suspiciously adjacent and possibly a coincidence), and the object there has type 0xe but the four bytes at +32 read 07 00 00 00 rather than the BTRE magic a btree root should carry. So the omap is confirmed and the tree below it is not.** **WHAT THIS BUYS: the recorded next step for task #38 is done for the container level, with the exact values BASE=0, block_size=4096, omap_oid=782662 (verified on oid and type). A walker pointed at 782662 instead of 15897 should get past the refusal.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The cryptex's container level is no longer a blocker; the btree below the omap is unverified, and the kext binary is still not in reach.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred twenty third, addendum CM). THE HEADLINE is **CL's OMAP VERIFICATION IS WRONG -- THE OID MATCH IS A COINCIDENCE, AND ONLY THE GEOMETRY STANDS**. CL claimed the cryptex's container omap was verified at block 782662 on oid and type. **The type is wrong: 0xe is OBJECT_TYPE_FSTREE, not OBJECT_TYPE_OMAP (0x0B), and the object does not have the omap shape either -- om_count at +0x24 reads 0 where a container omap holds hundreds of entries. So block 782662 is not the omap. And the oid match is a coincidence: in this container the first 18 blocks read oid == block for every one, with types 0x01..0x09 in lockstep, so oids and block numbers coincide here as they do everywhere in APFS.** **WHAT SURVIVES IS ONLY THE GEOMETRY: magic NXSB at 32, nx_block_size 4096, nx_block_count 806,400 = 3,303,014,400 / 4096 exactly -- so no hidden offset, no UDIF wrapper, and BASE=0 with block_size=4096 is correct. The cryptex does not need its own BASE/block-size work.** **NOT VERIFIED: the omap's location, the btree below it, and the path to the kext binary. nx_omap_oid reads 782662 but the object there is not an omap, so either the field offset is wrong for this container or the value needs different interpretation.** **SO THE TEAMMATE'S ORIGINAL REFUSAL ("block 15897 is not the container omap") IS STILL UNEXPLAINED, and my explanation of it -- "the walker was reading the wrong block" -- was built on the same unverified omap claim and is WITHDRAWN with it.** **THE LESSON, which cost an addendum: I verified a field because it matched, without checking what the field meant. A match is not a confirmation; the constant has to be looked up and the shape has to be checked.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CL is corrected: the cryptex's geometry is known and its omap is not.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17102,3 +17102,75 @@ Onsite: N/A.
 reached.  The cryptex's container level is no longer a blocker; the btree below the
 omap is unverified, and the kext binary is still not in reach.**  THE HEADLINE is
 unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred twenty third, addendum CM): CL's omap verification is WRONG -- the oid match is a coincidence, and only the geometry stands
+
+## The error
+
+Addendum CL claimed the SystemOS cryptex's container omap was verified:
+
+    the omap object at block 782662 verifies on both fields:
+    oid=782662  type=0xe  (OBJECT_TYPE_OMAP)
+
+**The type is wrong.**  `0xe` is `OBJECT_TYPE_FSTREE`; `OBJECT_TYPE_OMAP` is `0x0B`.
+And the object does not have the omap shape either -- `om_count` at `+0x24` reads
+**0**, where a container omap holds hundreds of entries.  So block 782662 is not the
+omap.
+
+**And the oid match is a coincidence.**  In an APFS container, object ids routinely
+equal their block numbers -- the first 18 blocks of this very container read
+`oid == block` for every one, with types `0x01` through `0x09` in lockstep.  So
+"the object at block 782662 has oid 782662" is not evidence that it is the omap; it
+is evidence that oids and block numbers coincide here, which they do everywhere.
+
+I checked the type constant against the enum *after* writing CL, which is the order
+it should have been checked in.  A field that matches is not a field that confirms.
+
+## What survives, and it is only the geometry
+
+**Verified:** `magic NXSB` at offset 32, `nx_block_size = 4096`, and
+`nx_block_count = 806,400` -- which equals `3,303,014,400 / 4096` exactly.  So there
+is no hidden offset and no UDIF wrapper, and `BASE = 0` with `block_size = 4096` is
+correct.  That part of CL stands and it is the part that answers "does the cryptex
+need its own BASE/block-size work": it does not.
+
+**NOT verified:** the omap's location, the btree below it, and therefore the whole
+path to the kext binary.  `nx_omap_oid` reads as 782662 from the superblock, but the
+object there is not an omap, so either the field offset is wrong for this container
+or the value needs interpreting differently.  Both are open.
+
+## What this does to the cryptex route
+
+It does not close it, and CL overstated it.  The honest state:
+
+    the container geometry is known and correct      <- CL's surviving half
+    the omap is NOT located                           <- CL's wrong half
+    the kext binary is still not in reach
+
+The teammate's original refusal -- `block 15897 is not the container omap` -- is
+still unexplained, and my explanation of it ("the walker was reading the wrong
+block") was built on the same unverified omap claim.  **That explanation is withdrawn
+with it.**
+
+## The lesson, which is the recorded one and cost an addendum
+
+I verified a field because it matched, without checking what the field meant.  The
+oid matched, the type did not mean what I said it meant, and the object did not have
+the shape the type claimed.  **A match is not a confirmation; the constant has to be
+looked up, and the shape has to be checked.**
+
+## Status
+
+Windows/real-guest: **none this interval -- the correction is a read of the cryptex
+file's own objects against the APFS object-type enum.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  CL is corrected: the cryptex's geometry is known and its omap is not, so
+the route to the kext binary is exactly where it was before CL, minus one wrong
+claim.**  THE HEADLINE is unchanged from AH
