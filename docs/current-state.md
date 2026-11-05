@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval eighty-ninth, addendum BE). THE HEADLINE is **SPRINGBOARD IS RUNNING ON THE GUEST, WHICH REFUTES THE THEORY THIS CHAIN HAS BEEN BUILT ON**. Walking the guest's live `allproc` over QMP with the project's own `GuestObserver.processes()` -- resetting the page cache before every sample, because `_page()` caches DATA pages for the observer's lifetime and a loop that never resets replays its first sample forever -- gave a curve of 1, 11, 69, **99 processes at the peak**, still climbing when the window closed. **`SpringBoard` is PRESENT and RUNNING**, alongside launchd (pid 1), runningboardd (pid 26), backboardd, CommCenter, lockdownd, MobileGestaltHel, securityd, apsd, imagent, locationd, nfcd and 58 others -- 74 distinct names. **This refutes every interval since the discriminator**: the blocker was framed as "launchd declines POSIXSpawnType=App jobs" -- 7 of 7, then 5 of 5 after addendum BA -- and addendum AZ sharpened it to "launchd never calls posix_spawn for SpringBoard" on the strength of 0 spawn.failed records against 512 spawn.seen. **The spawn happened.** Two facts now stand together and each constrains the other: **`spawn.seen` holds NO SpringBoard record in any capture, and SpringBoard IS in the process list.** The only consistent reading is that the spawn took the `do_fork1` route -- kern_exec.c:3880 jumps there for a caller with no spawnattr, or none with POSIX_SPAWN_SETEXEC and no coalition info, and falls through to `spawn_no_exec = TRUE` at :4002 -- which is what the `fork1.spawn` emitter built this interval (unixnu 439c31cb, run 41980452867) exists to confirm directly. Until it reports this is the reading the evidence supports, not one it proves. **What is NOT refuted: `job.springboard_open` err=0 still holds, so launchd loads the plist -- that is now the BEGINNING of the story, not the end.** **Three things in the same table do not fit the old theory and are worth more than the refutation: `checkerboard` and `ClarityBoard` are ABSENT while SpringBoard is present, though all three carry EmbeddedHomeScreen, so the home-screen claim at 0x100007b64 cannot be the reason -- SpringBoard is not missing; `runningboardd` is absent from the union though addendum BB recorded it alive; and `backboardd` is absent from the largest snapshot while recorded alive elsewhere, which is a SAMPLING defect and not a walk defect -- the run kept only the largest snapshot's names, and a process not alive at that instant says nothing about the walk, so the script now unions across every sample and judges the control on the union.** **SO THE QUESTION CHANGED, AND IT IS A BETTER ONE: not "why does launchd not spawn SpringBoard" but "WHAT IS SPRINGBOARD BLOCKED ON". It is alive, it is not in spawn.seen, and the screen is still the UniXNU boot menu -- the process exists and the thing the PRD asks for does not. `p_stat` is now recorded per process for exactly that reason.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is now confirmed running.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-first, addendum BG). THE HEADLINE is **THE `do_fork1` POPULATION IS MEASURED, AND THE PROCESS TABLE HAS A DEFECT**. Addendum BE inferred the do_fork1 route from one instrument's silence; the same boot now supplies a second and the two disagree by a number. **`spawn.seen`'s own counter says 59 spawn events across 53 distinct comms, `exit.seen` says 28 exits, and the process list at the peak holds 99 rows / 91 DISTINCT pids. With kernel_task and launchd aside, 59 spawn events cannot account for 91 live processes, so at least 32 were created by something spawn.seen does not record.** The emitter's counter is a per-boot monotonic count, so 59 is not an estimate, and the process list is read independently of it -- which makes this a measurement rather than an inference. **SpringBoard is one of the 32: pid 27, with 0 of the 53 spawn.seen comms naming it, and runningboardd at pid 26 immediately before it.** So the reading addendum BC qualified and BE inferred is now supported by two instruments that share no code path. **THE DEFECT: the 99 rows carry only 91 distinct pids, with eight duplicated -- 43, 68, 71, 104, 105, 108, 113, 116 -- and in every one the second row is `xpcproxy` paired with a row that is not (pid=43 biomed + xpcproxy; pid=116 fairplayd.A2 + xpcproxy). A pid is unique while its proc is allocated, so two rows cannot share one.** The shape points at the name field: PROC_P_COMM=1468 and PROC_SPAN=1485, and if `struct proc` is in fact smaller than 1485 in this kernel then `blob[1468:1485]` reads past one proc into the next zone allocation -- which would yield another process's name, and xpcproxy is by far the most numerous process here (38 of 99 rows). **That is a hypothesis, not a finding, and it does not explain a duplicated pid, because the pid sits at offset 96, 1372 bytes inside the same span, and would be unaffected -- so there are two defects here and only the second is explained.** **CONSEQUENCE, PLAINLY: the 99 and the 91 are both unsafe to quote until this is settled. What survives it is the SpringBoard finding -- SpringBoard appears exactly once, at pid 27, and no spawn.seen record names it -- because that does not depend on the count.** **HOW TO SETTLE IT, CHEAPLY: the walk already has the answer and discards it. `GuestObserver.processes()` returns a `Process` carrying `address`, and the script prints only pid, state and name. Printing the address settles it in one run: two rows with DIFFERENT addresses mean the walk is reading the wrong struct; the SAME address means it visited one proc twice and `processes()`' loop guard did not fire. Those are different bugs with different fixes, and neither can be chosen from the current output.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached -- the screen is still the UniXNU boot menu even though SpringBoard is confirmed running at pid 27.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14075,3 +14075,164 @@ reached -- the screen is still the UniXNU boot menu even though SpringBoard is
 now confirmed running.**  THE HEADLINE is unchanged from AH
 
 Control verdict, from the run: PASSED on the union.  The first corrected run kept only the largest snapshot's names and its control failed on backboardd, which had simply not been alive at that instant -- while launchd and configd WERE there and had already proved the offsets.  The run reported here unions across every sample, and backboardd, launchd and configd are all present: 74 distinct names ever seen, 99 processes at the peak.  The walk works.
+
+---
+
+# Interval 2026-11-05 (ninetieth, addendum BF): the `p_stat` anomaly in BE is not one
+
+## What BE flagged, and why it was wrong
+
+Addendum BE closed by recording that all 99 rows of the process table read
+`p_stat = 2` (`SRUN`) and calling that "the first thing that does not fit" -- on
+the grounds that a guest where every daemon is on a run queue is not a guest
+where anything is waiting.
+
+**It fits exactly.**  `p_stat` is assigned in five places in the whole tree:
+
+    bsd_init.c:526       kernproc->p_stat = SRUN;
+    kern_fork.c:751      child_proc->p_stat = SRUN;      <-- every child at fork
+    kern_fork.c:1020     child_proc->p_stat = SIDL;      <-- during fork only
+    kern_exec.c:2073     p->p_stat = SSTOP;
+    kern_sig.c:2312..    sig_proc->p_stat = SRUN / SSTOP;   on signal delivery
+    kern_exit.c:2612,    p->p_stat = SZOMB;
+    kern_exit.c:2642
+
+**`p_stat = SSLEEP` appears nowhere in the tree.**  XNU stopped maintaining a
+sleeping state in the proc; that lives in the scheduler and the thread now.  So
+the field can only ever read `SRUN` for a live, unstopped, non-zombie process,
+which is every one of the 99.
+
+So the reading is a property of the field, not of the guest, and the conclusion
+BE drew from it -- that `p_stat` cannot yet be trusted -- is withdrawn.  The
+pids beside it were always the reason to trust the offsets: `p_pid` at 96
+returns 0, 1, 24, 25, 26, 27 ... 118 with the gaps a process table has, and
+`p_stat` at 100 is four bytes further into the same span read as one piece.
+
+## What this costs, and it is not nothing
+
+"**What is SpringBoard blocked on**" was going to be answered from `p_stat`, and
+that field cannot answer it.  A SpringBoard in state `U` would have said
+"waiting on something"; there is no `U` to read.
+
+So the next instrument has to observe what SpringBoard is waiting *for* rather
+than what state it is in, and the candidates are the ones that already exist in
+this project's kernel: the syscall or Mach-trap it is parked in, or the object
+it is blocked on.  That is a build, which is the normal cost here, and it is a
+better-targeted one than the `fork1.spawn` emitter would have been for this
+question -- though that emitter is still the right instrument for the question it
+was built for, namely whether the SpringBoard spawn took the `do_fork1` route.
+
+## The pids, recorded because they are the anchor for everything above
+
+    pid 0     kernel_task
+    pid 1     launchd
+    pid 26    runningboardd        <-- immediately before SpringBoard
+    pid 27    SpringBoard
+    pid 37    configd
+
+`runningboardd` at 26 and SpringBoard at 27 is what a spawn driver that was asked
+for an App job and asked launchd looks like, and it is now measured rather than
+inferred.
+
+## Status
+
+Windows/real-guest: **three greps in the XNU source tree plus the process-table
+reading from addendum BE.**  Nothing new measured on the guest this interval.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, still in progress at the
+time of writing.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is
+confirmed running at pid 27.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-first, addendum BG): the `do_fork1` population is measured, and the process table has a defect
+
+## The measurement: two instruments, one boot, and they disagree by 32
+
+Addendum BE established that SpringBoard is in the guest's process list while
+`spawn.seen` holds no record of it, and read that as the `do_fork1` route.  That
+was one instrument's silence.  The same boot now supplies a second, and the two
+disagree by a number:
+
+    spawn.seen counter, its own n:      59 spawn events, 53 distinct comms
+    exit.seen counter, its own n:       28 exits
+    the process list at the peak:       99 rows, 91 DISTINCT pids
+
+**`kernel_task` and `launchd` aside, 59 spawn events cannot account for 91 live
+processes.**  At least 32 of them were created by something `spawn.seen` does not
+record.  That is the `do_fork1` population, and it is now **measured** -- the
+emitter's counter is a per-boot monotonic count, so "59" is not an estimate, and
+the process list is read independently of it.
+
+SpringBoard is one of the 32: it is pid 27, and 0 of the 53 `spawn.seen` comms is
+SpringBoard.  `runningboardd` is pid 26, immediately before it.
+
+So the reading addendum BC qualified and addendum BE inferred is now supported by
+two instruments that do not share a code path: **the SpringBoard spawn took the
+route neither `spawn.seen` nor `spawn.failed` can see.**  The `fork1.spawn`
+emitter being built as run 41980452867 will name the binary directly, which is
+the difference between "the population is 32 and SpringBoard is in it" and "this
+record says SpringBoard".
+
+## The defect in the process table, recorded rather than smoothed over
+
+The 99 rows carry only **91 distinct pids**.  Eight pids appear twice --
+43, 68, 71, 104, 105, 108, 113 and 116 -- and in every one of the eight the
+second row is `xpcproxy`, paired with a row that is not:
+
+    pid=43    biomed          pid=43    xpcproxy
+    pid=116   fairplayd.A2    pid=116   xpcproxy
+
+**A pid is unique while its proc is allocated, so two rows cannot share one.**
+Either the walk is reading one proc's fields out of a neighbour's memory, or
+`le_next` is being followed somewhere it should not be.
+
+The shape points at the name field.  `PROC_P_COMM = 1468` and
+`PROC_SPAN = PROC_P_COMM + 17 = 1485`, and the module's own docstring asserts
+`struct proc` is "1468+17 bytes".  If the struct is in fact *smaller* than 1485
+in this kernel, then `blob[1468:1485]` reads past the end of one proc into the
+next allocation in the zone -- which would produce a name belonging to a
+different process, and `xpcproxy` is by far the most numerous process on the
+system (38 of the 99 rows).  That is consistent with what is seen, but it is a
+hypothesis and not a finding: **the pids beside the names are correct, and
+`p_pid` at 96 is 1372 bytes inside the same span, so the span itself is being
+read.**
+
+What is NOT consistent: a duplicated pid cannot come from a clobbered name,
+because the pid is at offset 96 and would be unaffected.  So there are two
+defects here, not one, and only the second is explained.
+
+**Consequence, stated plainly: the 99 and the 91 are both unsafe to quote until
+this is settled.**  What survives it is the SpringBoard finding -- SpringBoard
+appears exactly once, at pid 27, and no `spawn.seen` record names it -- because
+that does not depend on the count.
+
+## How to settle it, and it is cheap
+
+The walk already has everything it needs and throws the answer away:
+`GuestObserver.processes()` returns a `Process` with an `address` field, and the
+script prints only pid, state and name.  **Printing the address settles it in one
+run**: if the eight duplicated pids come from two rows with *different*
+addresses, the walk is reading the wrong struct; if the same address, the walk
+visited one proc twice and `processes()`' loop guard did not fire.  Those are
+different bugs with different fixes, and neither can be chosen from the current
+output.
+
+## Status
+
+Windows/real-guest: **two instruments read from one real boot** -- the emitter's
+own counters from the virtio channel, and the live process list over QMP.  Both
+are guest data.
+
+Build: `exp-2026-11-05-fork1-spawn`, run 41980452867, still in progress.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached -- the screen is still the UniXNU boot menu even though SpringBoard is
+confirmed running at pid 27.**  THE HEADLINE is unchanged from AH
