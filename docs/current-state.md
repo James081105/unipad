@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred fifteenth, addendum CE). THE HEADLINE is **THE FOUR SURVIVORS ARE NOT UNLIFTABLE, THEY ARE UNRECOGNISED**. Addendum AN lifted seven of eleven refusals and left four -- 12 (Unsupported), 15 (Error), 29 (Unsupported), 57 (Unsupported) -- recording "the lift worked, the screen did not move". Addendum CD measured backboardd refused on 15 (0xe00002bc), 29 (0xe00002c7) and 57 (0xe00002c7): three of AN's four survivors, named, on the current kernel. **AND `native_legacy_slot_is_refusing_stub` (LegacyDisplayProbe.cpp:571) lifts a slot only when its function is a BARE stub -- `MOV w0,#0x2c7` followed within eight words by `RET`, with NO `BL` anywhere before it, because the loop does `return false` on the first BL it sees. But 0x2c7 is the exact code selectors 29 and 57 returned, while slot_lifted_count is 60 and they were not lifted. So those functions DO contain the refusal constant and were skipped because they contain a BL -- they do real work first and refuse at the end.** **SO AN's FOUR SURVIVORS ARE NOT UNLIFTABLE, THEY ARE UNRECOGNISED -- a different problem with a different fix, and it is what AN's own hypothesis 2 pointed at ("a real implementation with a dead MOV w0,#0x2c7 tail").** **THE HYPOTHESIS: relax the classifier to scan for the `MOV w0,#0x2c7 ... RET` tail regardless of an earlier BL. Prediction: selectors 29 and 57 are lifted, slot_lifted_count rises above 60, and backboardd gets further still (AN already saw it get further when seven were lifted). THE FALSIFICATION IS EQUALLY SHARP: if those functions do not end in that tail -- if the status is computed rather than a constant -- the relaxed classifier lifts nothing, slot_lifted_count stays at 60, and the hypothesis is dead. The counter distinguishes the two without a screen.** **TWO DISTINCTIONS: selector 15 returns 0xe00002bc, NOT 0x2c7, so no classifier work will lift it -- a different code and a different cause; and selector 12 was not called at all on the boot CD measured, so nothing here says anything about it.** **WHAT IT NEEDS: one function changed in vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp (pinned 9782ddf), a build, and a boot. No new emitter and no new counter -- slot_lifted_count and the client table already answer it. The dispatch-row read AN asked for is still worth doing and a teammate is on it; it would confirm the BL-before-the-tail shape directly rather than by inference.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is new is a specific, cheap, falsifiable change with a named counter that will say whether it worked: the lift classifier's `return false` on a BL is what left four refusals standing.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred sixteenth, addendum CF). THE HEADLINE is **THE PID DISCREPANCY IS RESOLVED, AND FACT 202 CORROBORATES THE BLOCKER FROM THE METAL SIDE**. Fact 202 recorded `client_pid=74`; BY measured 86 (IOMFB_FDR_Loader); CD measured backboardd at 58. **Fact 202 carries the reconciling evidence in the same measurement: `native_qemu_metal_owners = 1801675106 = b'back'` -- backboardd holds the window. So fact 202's client_pid=74 WAS BACKBOARDD. The pid that is backboardd is 74 on that boot and 58 on the one CD measured, and BY's 86 was a different process on a boot whose channel was truncated before backboardd spawned. The pids are not stable across boots -- exactly what addendum BS recorded.** **AND FACT 202 CORROBORATES THE BLOCKER FROM THE METAL SIDE, INDEPENDENTLY: it read native_gop_wait_stats[0]=0 and got a three-part answer on two independent boots -- (1) the Metal plugin loaded, opened the accelerator, and is HELD BY BACKBOARDD (owners=b'back', grants=1); (2) it never asked the presenter for a frame (handoff_probes=0, handoff_opens=0, handoff_calls=0, scanout_maps=0, wait_stats[0]=0); (3) the display driver never produced a validated swap (prepare=0, retirement=0, transfer=0). (2) is upstream of (3) and both are zero -- the same conclusion CD reached from the client-table side, arrived at from the GPU side, on different boots.** **AND FACT 202's Y1 INDEPENDENTLY CONFIRMS HOW TO READ THE ZERO: native_legacy_swap_validation_observed increments REGARDLESS of outcome, so swap_validation_calls=0 means "no swap was ever submitted for validation", corroborated by swap_accepted_count=0 AND swap_rejected_count=0 both being zero. That forecloses the reading "a swap was submitted and rejected" -- if one had been, swap_rejected_count would be non-zero.** **WHAT THE TWO DIRECTIONS TOGETHER SETTLE: client side (CD) -- backboardd opens the framebuffer, calls nine selectors, is refused three, registers no notification port, never calls selector 6; GPU side (202) -- the Metal plugin is loaded and held by backboardd but its scanout thread never reaches the presenter's hand-off. Both consistent with one cause: no swap is ever submitted, so nothing downstream can run.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is firmer is that two independent directions, on different boots, agree on one cause -- and that the pid that looked like a discrepancy was backboardd all along.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16478,3 +16478,91 @@ Onsite: N/A.
 reached.  What is new is a specific, cheap, falsifiable change with a named
 counter that will say whether it worked: the lift classifier's `return false` on
 a `BL` is what left four refusals standing.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred sixteenth, addendum CF): the pid discrepancy is resolved, and fact 202 corroborates the blocker from the Metal side
+
+## The discrepancy, resolved
+
+Fact 202 recorded `native_legacy_client_calls=5`, `client_pid=74`.  Addendum BY
+measured `client_pid=86` and named that process `IOMFB_FDR_Loader`.  Addendum CD
+measured backboardd at pid 58.  Three numbers, and a teammate left them
+unreconciled.
+
+Fact 202 carries the reconciling evidence in the same measurement:
+
+    native_qemu_metal_owners = 1801675106 = b'back'   <- backboardd holds the window
+
+**So fact 202's `client_pid=74` was backboardd.**  The pid that is backboardd is 74
+on that boot and 58 on the one CD measured, and BY's 86 was a *different process*
+(`IOMFB_FDR_Loader`) that happened to be the last client opener on a boot whose
+channel was truncated before backboardd spawned.
+
+**The pids are not stable across boots** -- which is exactly what addendum BS
+recorded when it refused to read the old table's "pid=58" as a property of a later
+kernel.  Three addenda later that refusal is vindicated: pid 58 was backboardd on
+one boot and an `xpcproxy` on another.
+
+## And fact 202 corroborates the blocker from the Metal side, independently
+
+Fact 202 read `native_gop_wait_stats[0] = 0` -- the one counter that separates "the
+client never ran" from "it ran and was refused" -- and got a three-part answer on
+two independent boots:
+
+    1. the Metal plugin loaded, opened the accelerator, and is HELD BY BACKBOARDD
+       (`native_qemu_metal_opens` 0->1, `owners = b'back'`, `grants=1`)
+    2. it never asked the presenter for a frame:
+       handoff_probes=0, handoff_opens=0, handoff_calls=0, scanout_maps=0,
+       wait_stats[0]=0
+    3. the display driver never produced a validated swap:
+       prepare_calls=0, retirement_calls=0, transfer_calls=0
+
+**(2) is upstream of (3)**, and both are zero.  That is the same conclusion CD
+reached from the client-table side, arrived at from the GPU side, on different
+boots.
+
+## And fact 202's Y1 independently confirms how to read the zero
+
+Fact 202 established that `native_legacy_swap_validation_observed` increments
+**regardless of outcome** -- it is the last statement in the function, after both
+the accepted and the rejected branch.  So `swap_validation_calls = 0` means "no swap
+was ever submitted for validation", and it is corroborated by
+`swap_accepted_count = 0` **and** `swap_rejected_count = 0` both being zero.
+
+That matters because it forecloses the reading "a swap was submitted and rejected":
+if one had been, `swap_rejected_count` would be non-zero.  **The zero is a
+never-submitted, not a refused**, which is what addenda BV, BW and CD each
+concluded from the client side.
+
+## What the two directions together settle
+
+    client side (CD)   backboardd opens the framebuffer, calls nine selectors, is
+                      refused three, registers no notification port, never calls
+                      selector 6
+    GPU side (202)     the Metal plugin is loaded and held by backboardd, but its
+                      scanout thread never reaches the presenter's hand-off
+
+Both are consistent with one cause: **no swap is ever submitted**, so nothing
+downstream of the submission can run -- not the validation, not the transfer, not
+the GPU hand-off.
+
+And addendum CE now names the specific thing standing between backboardd and a
+submission: the lift classifier at `LegacyDisplayProbe.cpp:571` returns false on
+the first `BL` it sees, so selectors 29 and 57 -- which answer `0x2c7`, the exact
+constant it searches for -- were never lifted.
+
+## Status
+
+Windows/real-guest: **none this interval -- this addendum reconciles a pid recorded
+in fact 202 with two measured this interval, and ties fact 202's GPU-side zeros to
+CD's client-side ones.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is firmer is that two independent directions, on different boots,
+agree on one cause -- and that the pid that looked like a discrepancy was
+backboardd all along.**  THE HEADLINE is unchanged from AH
