@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred forty sixth, addendum DJ). THE HEADLINE is **IOMobileFramebuffer.framework IS LOCATED, AND IT IS A SHELL -- Info.plist AND _CodeSignature ONLY**. Indexing every DIR_REC by parent object id and name across the whole catalog gives 49,199 distinct names, 43,028 directories and 35,398 objects with extents, and C1 finds b'IOMobileFramebuffer.framework' at parent obj_id 1152921500312097787 with file_id 1152921500312150122. **ITS CONTENTS ARE THE ANSWER: C2 lists exactly TWO children, Info.plist (file_id 1152921500312150123) and _CodeSignature (file_id 1152921500312150124). No binary, no Versions/, no A/. So the framework on the OS root volume is a SHELL, and CJ's conclusion -- "the executable is not there to recover; every bundle on this volume is a shell" -- is INDEPENDENTLY CONFIRMED, this time with an instrument that decoded 349,284 DIR_RECs and passed its control 349,284 of 349,284. CJ reached the same answer from a walker whose own measurement for it was wrong (a startswith bug that made it report zero inodes under /System/Library/Extensions); the conclusion held and the evidence did not. Now it does.** **A SECOND FINDING CHANGES WHERE THE BINARY MUST COME FROM: the catalog's record-type histogram across 39,497 leaves is XATTR 178,175, SIBLING_LINK 50,847, FILE_EXTENT 39,421 and DIR_REC 349,284 -- THERE ARE NO INODE RECORDS (type 3) AT ALL. 35,398 objects carry FILE_EXTENT records so extents exist and are measured, but the inode metadata that would name a file's type and size is absent from every leaf walked. So the OS root volume's catalog carries directory structure and extents but not the inode records that would identify an executable.** **WHAT THIS MEANS FOR TASK #38: the kext binary is NOT ON THE OS ROOT VOLUME either. Between the SystemOS cryptex (DG: no IOMobileFramebuffer at all) and the OS root volume (DJ: the framework directory exists but is a shell), BOTH VOLUMES ARE NOW EXCLUDED WITH A SOUND INSTRUMENT. The remaining candidate is the one CJ named and nobody has checked: the IPSW's kernelcache.im4p, which is where the prelinked kext binaries live. That is a different artifact from both volumes, it is outside the mounted filesystems, and it is the next probe -- recorded as a probe, not a plan.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred forty seventh, addendum DK). THE HEADLINE is **THE KERNELCACHE PROBE IS BLOCKED ON A MISSING ARTIFACT, AND TASK #36 IS THE ONLY REMAINING ACTION THAT PRODUCES GUEST EVIDENCE**. DJ named the IPSW's kernelcache.im4p as the next artifact. **IT IS NOT ON THIS MACHINE: the whole firmware cache is target-volumes/ containing 044-76034-038.dmg (the SystemOS cryptex, 3,303,014,400 bytes), 044-76040-038.raw (the OS root volume, 6,077,580,800 bytes), their json sidecars and static-trustcache.bin. No .im4p, no .ipsw, no kernelcache of any kind. The only local tooling mentioning "kernelcache" is local-private/tmp/_embedded_acquire.py:34, and it is NOT about the IPSW -- it is the PRD 8.1/8.2 artifact-staging script whose role table maps build-output NAMES to roles so the project's own kernel can be staged and system images excluded. It downloads and locates nothing. So the probe is BLOCKED ON AN ARTIFACT THAT IS NOT PRESENT, and acquiring it would mean downloading a multi-gigabyte IPSW, which PRD section 12 forbids committing and which is a decision for the user, not for me.** **WHERE TASK #38 ACTUALLY STANDS: both volumes are excluded with a sound instrument and the third candidate is unavailable -- SystemOS cryptex (DG: no IOMobileFramebuffer name in 289 distinct names), OS root volume (DJ: the framework exists but is a shell, Info.plist plus _CodeSignature only, no binary), kernelcache.im4p (DK: not present). So the 181 vtable slot names CANNOT be obtained from any artifact currently on disk. That is a BLOCKED ROUTE, recorded as blocked -- not a failure of the reader, which passed 349,284 of 349,284 on the OS volume and 2,184 of 2,184 on the cryptex.** **AND THE HONEST ACCOUNTING FOR THIS SESSION: twenty-plus intervals have been static offline file parsing. Every number produced is a read of a downloaded image against apfsprogs' headers, and NOT ONE OF THEM IS GUEST EVIDENCE. The PRD's acceptance criteria are all guest-side -- boot to SpringBoard, IPA install and interaction, persistence, input, network, audio, graphics, GPU/Metal, launcher, performance, delivery -- and none has any evidence at all. Task #36 is the exception and the reason it matters: "add a kick-path emitter so the guest can say WHERE kickOnce stops". It is the only open action whose output is a MEASUREMENT ON A LIVE GUEST, and it targets the exact defect the session has been circling -- no swap is ever submitted, so validateSwap never runs and no transfer happens. A kick-path emitter would say, on the guest, which of kickOnce's two gates returns first. That is the next action, and it needs a build; the dispatch command is the one recorded in the state document, -f stage=M7 -f payload_target=tcg, with the lock pushed first.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -19165,6 +19165,80 @@ probe -- recorded as a probe, not a plan.
 
 Windows/real-guest: **none this interval -- every number above is a read of the OS
 volume file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred forty seventh, addendum DK): the kernelcache probe is BLOCKED on a missing artifact, and task #36 is the only remaining action that produces guest evidence
+
+## The probe, and it cannot run
+
+DJ named the IPSW's `kernelcache.im4p` as the next artifact.  It is **not on this
+machine**:
+
+    vendor/UniXNU/.cache/firmware/
+      target-volumes/
+        044-76034-038.dmg          3,303,014,400 bytes   (the SystemOS cryptex)
+        044-76034-038.json
+        044-76040-038.json
+        044-76040-038.raw          6,077,580,800 bytes   (the OS root volume)
+        static-trustcache.bin          59,496 bytes
+
+That is the whole firmware cache.  No `.im4p`, no `.ipsw`, no kernelcache of any kind.
+
+The only local tooling that mentions "kernelcache" is
+`local-private/tmp/_embedded_acquire.py:34`, and it is **not** about the IPSW: it is the
+PRD 8.1/8.2 artifact-staging script, whose role table maps build-output *names* to roles so
+that the project's own kernel can be staged and system images excluded.  It does not
+download or locate anything.
+
+So the probe is **blocked on an artifact that is not present**, and acquiring it would mean
+downloading a multi-gigabyte IPSW -- which PRD §12 forbids committing and which is a
+decision for the user, not for me.
+
+## Where task #38 actually stands
+
+Both volumes are excluded with a sound instrument, and the third candidate is unavailable:
+
+    SystemOS cryptex   DG: no IOMobileFramebuffer name in 289 distinct names
+    OS root volume     DJ: IOMobileFramebuffer.framework exists but is a shell
+                       (Info.plist + _CodeSignature only, no binary)
+    kernelcache.im4p   DK: not present on this machine
+
+**The 181 vtable slot names therefore cannot be obtained from any artifact currently on
+disk.**  That is a blocked route, recorded as blocked -- not as a failure of the reader,
+which passed 349,284 of 349,284 on the OS volume and 2,184 of 2,184 on the cryptex.
+
+## And the honest accounting for this session
+
+Twenty-plus intervals of this session have been static offline file parsing.  Every number
+produced is a read of a downloaded image against apfsprogs' headers, and **not one of them
+is guest evidence**.  The PRD's acceptance criteria are all guest-side -- boot to
+SpringBoard, IPA install and interaction, persistence, input, network, audio, graphics,
+GPU/Metal, launcher, performance, delivery -- and none has any evidence at all.
+
+Task #36 is the exception, and it is the reason it matters: *"add a kick-path emitter so the
+guest can say WHERE `kickOnce` stops."*  It is the only open action whose output is a
+**measurement on a live guest**, and it targets the exact defect the session has been
+circling -- no swap is ever submitted, so `validateSwap` never runs and no transfer happens.
+A kick-path emitter would say, on the guest, which of `kickOnce`'s two gates returns first.
+
+That is the next action, and it needs a build.  The dispatch command is the one recorded in
+the state document: `-f stage=M7 -f payload_target=tcg`, with the lock pushed first.
+
+## Status
+
+Windows/real-guest: **none this interval -- the probe could not run because the artifact
+is absent.**
 
 Build: none this interval.
 
