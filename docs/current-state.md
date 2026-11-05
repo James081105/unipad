@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundredth, addendum BP). THE HEADLINE is **THE CONSOLE-EMITTER GATE IS POSITIVE-ONLY, AND THE PROJECT HAD ALREADY SAID SO**. BO fixed the display-counter gate by widening its search scope; this interval attempted the console half of task #32 the obvious way -- the emitters are string literals, so search the kernel image for the literal -- and it would have published SIX WRONG VERDICTS. `spawn.seen` was reported NOT BUILT, and addendum AZ observed 512 spawn.seen records from a live guest. **THE REASON IS WRITTEN IN THE ARTIFACT'S OWN COMMENT: "AND THE LITERAL WILL NOT BE GREPPABLE IN THE IMAGE, which is measured and not guessed: ld's SHF_MERGE|SHF_STRINGS pass split the exec record's 30-byte literal into a 16-byte head plus a shared tail, so exec.seen counts ZERO as a contiguous byte string in the kernel that carries it. The record arrives on the wire complete." A literal passed to native_console_report as a whole object survives; a literal copied byte-by-byte out of a block-scope static char const does not.** **SO THE RULE IS: a literal FOUND is sound (the emitter is built); a literal NOT FOUND proves NOTHING. The two directions are not symmetric, and the script now prints NOT PROVEN BY THIS METHOD rather than NOT BUILT. The console half of task #32 therefore CANNOT be answered by image search -- the information is not in the image in the form the search wants. What survives is the positive half: springboard.fork1, spawn.saturated and exec.saturated are BUILT, and springboard.fork1's literal survives precisely because it is passed whole.** **THE LESSON IS THE RECORDED ONE: I built an instrument the project had already refuted, in a comment inside the very patch under test, and would have published six verdicts contradicting a live-guest measurement. Read the artifact's own record before reasoning about it. BO's correction and this one are the same mistake in two costumes -- in BO the grep was scoped to the wrong tree, here to the wrong artifact.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. Two gates were built this interval: one fixed by widening its scope, one narrowed to the only half of itself that is sound. Neither is a step toward the screen.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred first, addendum BQ). THE HEADLINE is **EVERY CONSOLE EMITTER IS BUILT, SO EVERY CONSOLE SILENCE IS "NOT MEASURED"**. BP established that searching the image for an emitter's literal is positive-only, because ld's SHF_MERGE|SHF_STRINGS pass splits a literal into a shared head and tail. **The sound route was in the patch's structure all along: a `#if defined(MACRO)` block compiles or does not compile AS A UNIT, so if any emitter in a block has its literal in the image, every emitter in that block is compiled. `spawn.saturated` is BUILT (its literal is passed whole to native_console_report, so it survives the merge pass); `spawn.seen` is twenty lines earlier in the same #XNU_OWNER_CACHE_MOUNT block; therefore spawn.seen is built.** **TWELVE OF TWELVE: exec.saturated, exit.saturated, spawn.saturated, spawn_failed.saturated and springboard.fork1 are BUILT by literal; exec.first, exec.seen, exit.seen, fork1.spawn, spawn.failed, spawn.seen and springboard.running are BUILT BY GUARD BLOCK, with both guard macros proved compiled by siblings whose literals are present.** **WHAT THAT SETTLES IS THE WHOLE OF TASK #32: no console-emitter silence anywhere in this project's record is "never built" -- every one is a real "not measured". The distinction now holds for both halves: display counters are proved live from the linked call graph over BOTH trees (BO) with ABSENT FROM KERNEL reported separately from 0, and console emitters are proved built by literal or by guard block (BQ).** **AND IT CONFIRMS RATHER THAN OVERTURNS THE do_fork1 WORK: spawn.seen is a sound instrument, it sits inside `if (error == 0 && !spawn_no_exec)`, and spawn_no_exec is TRUE on the do_fork1 path -- which is exactly why POSIXSpawnType=App jobs leave no spawn.seen record and needed the springboard.fork1 emitter to be seen at all.** **THE TWO GATES HAD THE SAME SHAPE OF DEFECT, caught two ways: check-counter-hooks.py was scoped to ONE of two linked trees and reported six live hooks dead (fixed by widening the scope); check-console-emitters-built.py was scoped to the ARTIFACT when the answer was in the PATCH's structure (fixed by reasoning about the guard block and refusing to print a negative the method cannot support). A gate that reports a confident negative it cannot support is worse than no gate, and both were caught by asking whether a known-true case survives the same check.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What is now settled is narrower than the goal and firmer than anything before it: every instrument this project reads is built, so every silence in the record is a real silence about the guest and not an artifact of the build.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15066,3 +15066,94 @@ Onsite: N/A.
 reached.  Two gates were built this interval: one fixed by widening its scope,
 one narrowed to the only half of itself that is sound.  Neither of them is a
 step toward the screen.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred first, addendum BQ): every console emitter is BUILT, so every console silence is "not measured"
+
+## The sound route, which was in the patch's structure all along
+
+BP established that searching the image for an emitter's literal is
+positive-only: `ld`'s `SHF_MERGE|SHF_STRINGS` pass splits a literal into a shared
+head and tail, so `spawn.seen` counts zero as a contiguous byte string in a kernel
+that emits it.
+
+But the patch is structured.  Every emitter sits inside an `#if defined(MACRO)`
+block, and **a block compiles or does not compile as a unit.**  So if any emitter
+in a block has its literal in the image, that block was compiled, and so was
+every other emitter in it.
+
+`spawn.saturated` is BUILT -- its literal is passed whole to
+`native_console_report` rather than assembled byte-by-byte from a block-scope
+static, so it survives the merge pass.  `spawn.seen` is twenty lines earlier in
+the same `#if defined(XNU_OWNER_CACHE_MOUNT)` block.  Therefore `spawn.seen` is
+built.
+
+## The result: twelve for twelve
+
+    exec.saturated           BUILT (its literal is in the image)
+    exit.saturated           BUILT (its literal is in the image)
+    spawn.saturated          BUILT (its literal is in the image)
+    spawn_failed.saturated   BUILT (its literal is in the image)
+    springboard.fork1        BUILT (its literal is in the image)
+
+    exec.first               BUILT BY GUARD BLOCK (#XNU_OWNER_CACHE_MOUNT)
+    exec.seen                BUILT BY GUARD BLOCK (#XNU_NATIVE_VIRTIO_CONSOLE)
+    exit.seen                BUILT BY GUARD BLOCK (#XNU_NATIVE_VIRTIO_CONSOLE)
+    fork1.spawn              BUILT BY GUARD BLOCK (#XNU_OWNER_CACHE_MOUNT)
+    spawn.failed             BUILT BY GUARD BLOCK (#XNU_OWNER_CACHE_MOUNT)
+    spawn.seen               BUILT BY GUARD BLOCK (#XNU_OWNER_CACHE_MOUNT)
+    springboard.running      BUILT BY GUARD BLOCK (#XNU_OWNER_CACHE_MOUNT)
+
+**Twelve of twelve, and the two guard macros are both proved compiled by
+siblings whose literals are present.**  `local-private/tmp/prove-console-emitters-built.py`
+does this and never prints NOT BUILT.
+
+## What that settles, and it is the whole of task #32
+
+**No console-emitter silence anywhere in this project's record is "never
+built".**  Every one of them is a real "not measured".  That is the distinction
+task #32 was opened to make, and it now holds for both halves:
+
+    display counters   the incrementer is called, proved from the linked call
+                       graph over both trees (BO), and ABSENT FROM KERNEL is
+                       reported separately from 0.
+    console emitters   the emitter is built, proved by literal or by guard block
+                       (BQ), so a record that never arrived was never triggered.
+
+And it confirms rather than overturns the `do_fork1` work: `spawn.seen` is a
+sound instrument, it is inside `if (error == 0 && !spawn_no_exec)`, and
+`spawn_no_exec` is TRUE on the `do_fork1` path -- which is exactly why
+`POSIXSpawnType=App` jobs leave no `spawn.seen` record and needed the
+`springboard.fork1` emitter to be seen at all.
+
+## The two gates, side by side
+
+Both were built this interval and both had the same shape of defect, caught two
+different ways:
+
+    check-counter-hooks.py    scoped to ONE of two linked trees; six live hooks
+                              reported dead.  Fixed by widening the scope.
+    check-console-emitters-   scoped to the ARTIFACT when the answer was in the
+    built.py                  PATCH's structure.  Fixed by reasoning about the
+                              guard block, and by refusing to print a negative
+                              the method cannot support.
+
+A gate that reports a confident negative it cannot support is worse than no gate.
+Both of these did, and both were caught by asking whether a known-true case
+survives the same check.
+
+## Status
+
+Windows/real-guest: **none this interval -- both gates are host-side source and
+image checks.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What is now settled is narrower than the goal and firmer than anything
+before it: every instrument this project reads is built, so every silence in the
+record is a real silence about the guest and not an artifact of the build.**  THE
+HEADLINE is unchanged from AH
