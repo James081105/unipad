@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-ninth, addendum BO). THE HEADLINE is **ADDENDUM BM IS WRONG, THE SWAP HOOK IS WIRED, AND BL STANDS**. BM read `swap_validation_calls = 0` and `transfer_calls = 0`, grepped `vendor/UniXNU-qemu`, found only definitions, and concluded the symbols are in the kernel because the object is linked and not because anything calls it. **The observation was right and the inference was backwards: the caller is in the other repository BECAUSE THAT IS WHERE THE DRIVER LIVES. The kext `native-legacy-display` links TWO trees -- `vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp` (the probe, which DEFINES the counters) and `local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp` (the driver, which CALLS the observers; a submodule pinned by sources.lock.json, on disk at 5b83ab7 matching the superproject gitlink). vendor/UniXNU-qemu has NO drivers/ directory, so a grep scoped to it can only ever return the definition -- a grep scoped to one of two linked trees is not a call-graph check.** **ALL FOUR OBSERVERS ARE CALLED: registration_observed at NativeLegacyDisplay.cpp:130, client_enter at :399, swap_validation_observed at :365, and transfer_observed at TWELVE sites (:169, 171, 174, 181, 198, 203, 212, 217, 230, 254, 261, 270), plus copy_timing at :259, gpu_fallback at :273, retirement at :290, prepare_scanout at :171/203/229 and gop_mapping at :422. NONE of them is dead code.** **SO BL's ZERO IS A MEASUREMENT, AND SHARPER THAN BL COULD SAY: the measured boot's own payload.json kernel_args carries `offline-legacy-validate=1`, and NativeLegacyDisplay.cpp:322 reads exactly that argument (`PE_parse_boot_argn("offline-legacy-validate")`). The swap_validation_observed call is at :365, OUTSIDE that `if`, so it runs whenever validateSwap runs at all -- therefore a zero says validateSwap WAS NEVER INVOKED. Not invoked-and-declined, not invoked-and-rejected, not dead code. That is BL's "the swap is never submitted" with the mechanism named: the vtable method that would validate a swap is never reached.** **THIS COSTS BM IN FULL and the six `hook_uncalled` verdicts the first check-counter-hooks.py produced -- all six false positives from the same scope error. It costs NOTHING in BL. It does not touch BM's other content, which stands: the ordering run's first-change sequence, stage=10, init_result=1, start_result=1, gop_width=800, gop_height=600, client_calls=3 from pid 95.** **THE GATE IS FIXED AND ITS REAL DEFECT WAS SCOPE, NOT REGEX: check-counter-hooks.py now searches BOTH linked trees (203 files), treats an address taken (`&name`) as a reference as well as a call, and strips `__attribute__` before parsing definitions; it now reports `0 counter(s) whose only incrementer is never called` with every call site named. The proposed fix at the time -- llvm-objdump on the built kext -- would not have worked either: no kext on this host (the build is in CI), no binutils, and the payload kernel is stripped of local symbols, so symbol presence cannot separate dead from live (wrappedExternal reads ABSENT while swap_stage reads present, purely because one is `static` and the other `extern "C"`).** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What changed is that the display path is known to be INSTRUMENTED AND UN-ENTERED rather than uninstrumented: the swap is never submitted because validateSwap is never invoked, and that is a question about the CALLER, not about the hook.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundredth, addendum BP). THE HEADLINE is **THE CONSOLE-EMITTER GATE IS POSITIVE-ONLY, AND THE PROJECT HAD ALREADY SAID SO**. BO fixed the display-counter gate by widening its search scope; this interval attempted the console half of task #32 the obvious way -- the emitters are string literals, so search the kernel image for the literal -- and it would have published SIX WRONG VERDICTS. `spawn.seen` was reported NOT BUILT, and addendum AZ observed 512 spawn.seen records from a live guest. **THE REASON IS WRITTEN IN THE ARTIFACT'S OWN COMMENT: "AND THE LITERAL WILL NOT BE GREPPABLE IN THE IMAGE, which is measured and not guessed: ld's SHF_MERGE|SHF_STRINGS pass split the exec record's 30-byte literal into a 16-byte head plus a shared tail, so exec.seen counts ZERO as a contiguous byte string in the kernel that carries it. The record arrives on the wire complete." A literal passed to native_console_report as a whole object survives; a literal copied byte-by-byte out of a block-scope static char const does not.** **SO THE RULE IS: a literal FOUND is sound (the emitter is built); a literal NOT FOUND proves NOTHING. The two directions are not symmetric, and the script now prints NOT PROVEN BY THIS METHOD rather than NOT BUILT. The console half of task #32 therefore CANNOT be answered by image search -- the information is not in the image in the form the search wants. What survives is the positive half: springboard.fork1, spawn.saturated and exec.saturated are BUILT, and springboard.fork1's literal survives precisely because it is passed whole.** **THE LESSON IS THE RECORDED ONE: I built an instrument the project had already refuted, in a comment inside the very patch under test, and would have published six verdicts contradicting a live-guest measurement. Read the artifact's own record before reasoning about it. BO's correction and this one are the same mistake in two costumes -- in BO the grep was scoped to the wrong tree, here to the wrong artifact.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. Two gates were built this interval: one fixed by widening its scope, one narrowed to the only half of itself that is sound. Neither is a step toward the screen.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14974,3 +14974,95 @@ reached.  What changed is that the display path is now known to be instrumented
 and un-entered rather than uninstrumented: the swap is never submitted because
 `validateSwap` is never invoked, and that is a question about the caller, not
 about the hook.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundredth, addendum BP): the console-emitter gate is positive-only, and the project had already said so
+
+## What was attempted, and what it would have published
+
+BO fixed the display-counter gate.  The console half of task #32 -- the original
+scope, the `spawn.seen` / `exec.seen` family -- was still open, and it looked
+answerable on this host with no build and no guest: the emitters are string
+literals, so search the kernel image for the literal.  Built or not built.
+
+`local-private/tmp/check-console-emitters-built.py` did that, and reported:
+
+    springboard.running      NOT BUILT
+    springboard.fork1        BUILT
+    spawn.seen               NOT BUILT
+    spawn.failed             NOT BUILT
+    spawn.do                 NOT BUILT
+    spawn.saturated          BUILT
+    exec.seen                NOT BUILT
+    exec.first               NOT BUILT
+    exec.saturated           BUILT
+
+**Six of those nine verdicts would have been wrong.**  `spawn.seen` is one of
+them, and addendum AZ observed **512 `spawn.seen` records** from a live guest.
+
+## Why, and it is written in the artifact's own comment
+
+The patch that carries these emitters records the defect in its own text:
+
+    AND THE LITERAL WILL NOT BE GREPPABLE IN THE IMAGE, which is measured and
+    not guessed: ld's SHF_MERGE|SHF_STRINGS pass split the exec record's 30-byte
+    literal into a 16-byte head plus a shared tail, so exec.seen counts ZERO as
+    a contiguous byte string in the kernel that carries it.  The record arrives
+    on the wire complete.  The block-scope static is what proves the code is
+    there.
+
+So the linker's string-merging pass splits a literal across a shared head and
+tail.  The record arrives complete on the wire; the contiguous byte string is
+simply not in the image.  A literal that is passed to `native_console_report` as
+a whole object survives; a literal that is only copied byte-by-byte out of a
+block-scope `static char const` does not.
+
+The extracted bytes show it directly.  Around `springboard.fork1` the image holds
+`{"event":"fork1.board.running","comm":"SpringBoard",...` complete, and then
+`{"event":"spawn.` and `{"event":"exec.s` cut off mid-name -- the merge pass's
+head/tail split, visible in the raw bytes.
+
+## The rule this leaves behind
+
+**A literal FOUND in the image is sound: the emitter is built.  A literal NOT
+FOUND proves nothing.**  The two directions are not symmetric, and the script now
+says so -- it prints `NOT PROVEN BY THIS METHOD` rather than `NOT BUILT`, with
+the reason attached.
+
+That means the console half of task #32 **cannot** be answered by image search.
+It is not a matter of a better search: the information is not in the image in the
+form the search wants.  What survives is the positive half, which is worth
+having -- `springboard.fork1`, `spawn.saturated` and `exec.saturated` are
+BUILT, and `springboard.fork1` is the one whose literal survives precisely
+because it is passed whole rather than assembled from a block-scope static.
+
+## The lesson, which is the recorded one
+
+I built an instrument the project had already refuted, in a comment inside the
+very patch under test, and would have published six verdicts that contradicted a
+measurement taken on a live guest.  **Read the artifact's own record before
+reasoning about it** -- the same lesson as the recorded fact about a green run's
+manifest naming the commits it actually built.  The grep for `spawn.seen` in the
+image was a plausible-looking question with an unsound answer, and the only thing
+that caught it was asking whether a known-observed record survived the same
+search.
+
+BO's correction and this one are the same mistake in two costumes: in BO the
+grep was scoped to the wrong tree, here it was scoped to the wrong artifact.
+Both produced confident negatives from an instrument that could not answer the
+question asked.
+
+## Status
+
+Windows/real-guest: **none this interval.**  The guest numbers were all read
+earlier and none of them changes; what changes is which of them may be believed.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  Two gates were built this interval: one fixed by widening its scope,
+one narrowed to the only half of itself that is sound.  Neither of them is a
+step toward the screen.**  THE HEADLINE is unchanged from AH
