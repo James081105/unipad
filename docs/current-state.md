@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred twenty ninth, addendum CS). THE HEADLINE is **THE CRYPTEX ROUTE IS CLOSED END TO END -- THE CONTAINER OMAP MAPS VOLUME OID 1026 TO SUPERBLOCK 782661**. Addendum CR left one named gap: for a non-leaf node the TOC entry's v is a child block number rather than a record offset. I tried to guess it and got overlapping offsets, because I had two rules wrong, and BOTH ARE STATED EXPLICITLY IN apfsprogs' own reader (apfsck/btree.c). **RULE 1: value offsets run BACKWARDS from the end of the value area -- `off_in_area = area_len - entry->v; *off = node->data + off_in_area;` with `area_len = blocksize - node->data - (is_root ? sizeof(apfs_btree_info) : 0)` (btree.c:504-516). Keys run forward from node->key; values run backward from the end. I had been reading v forward from the key area, which is why every value I read was garbage. RULE 2: an omap value's length depends on leafness -- `len = node_is_leaf(node) ? 16 : 8` (btree.c:486), 16 for a leaf record {flags,size,paddr} and 8 for a non-leaf child pointer. sizeof(apfs_btree_info) is 40 (raw.h:224-230) and ROOT|LEAF|FIXED = 0x1|0x2|0x4 (raw.h:138-140), so 0x0007 is a root leaf, 0x0005 a non-leaf root, 0x0006 a leaf.** **THE CONTAINER OMAP NAMES THE VOLUME: root 782663 is a root leaf with nkeys 1, toc=0x38, key=0x1f8, free=0x218, data=0xfb8, area_len=32; its key is (oid=1026, xid=14) and its value is flags=0x0, size=4096, paddr=782661 -- and BLOCK 782661 IS ONE OF THE FIVE APSB VOLUME SUPERBLOCKS. size=4096 is exactly one block, right for a superblock. So the container omap maps volume oid 1026 to volume superblock 782661. That is the THIRD independent confirmation of the same volume: nx_fs_oid[0]=1026 (CQ), the container omap's key oid=1026, and now its value paddr pointing at an APSB block.** **AND THE VOLUME OMAP'S CHILDREN ARE ALL WELL-FORMED: root 782657 is a non-leaf root (flags 0x0005) at level 1 with 36 keys, toc=0x38, key=0x278, free=0x4c8, data=0xeb0, area_len=296. Every entry maps (oid, xid=13) to a child, and EVERY CHILD is object type 0x03 BTREE_NODE with flags 0x0006 (LEAF|FIXED_KV_SIZE, no ROOT) at level 0 -- precisely what a level-1 root's children must be. 6 of 6 keys in bounds, 6 of 6 values in bounds, 6 of 6 children well-formed, and the v values step by 8, matching the 8-byte child-pointer length exactly.** **SO THE FULL CHAIN IS VERIFIED END TO END: container superblock (block 0, NXSB) -> nx_omap_oid 782662 (omap_phys, verified field for field) -> om_tree_oid 782663 (root leaf, 1 key) -> {oid 1026, xid 14} -> {size 4096, paddr 782661} -> volume superblock 782661 (APSB) -> apfs_omap_oid 782656 -> om_tree_oid 782657 (non-leaf root, 36 keys) -> child leaves (type 0x03, flags 0x0006, level 0) -> omap records {virtual oid, xid} -> {physical block}.** **WHAT THIS BUYS TASK #38: the volume's catalog tree is reachable through the same walk one level further on -- the volume superblock's apfs_root_tree_oid (1216 for 782661) resolves through this omap to a physical block, and the catalog's file records are APFS_TYPE_DIR_REC / APFS_TYPE_FILE_EXTENT entries in its leaves, so IOMobileFramebuffer.framework would be a DIR_REC in that tree. This is the first time the route to the kext binary has been walked to the volume's own omap with every control passing. It is still not the binary and it is not a guest measurement.** **THE LESSON IS THE FIFTH AND IS NOW A RULE: five corrections this interval came from the same root, deriving a layout instead of reading the definition. The rule that follows: for any documented on-disk format, open the reference implementation's reader before reading a single field. apfsprogs was in this repository for all of them, and every one of the five errors was avoided by reading a function I had not looked at.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirtieth, addendum CT). THE HEADLINE is **THE OMAP LOOKUP WORKS AND REACHES THE CATALOG ROOT, BUT THE DESCENT INTO THE CATALOG FAILS**. Using the rules validated in CS, volume superblock 782661's apfs_root_tree_oid=1216 resolves through the volume omap: node 782657 (level 1, 36 keys) entry[0] oid=1214 -> child 782659 (level 0 leaf, 70 keys) entry[1] oid=1216 -> value flags=0x8 size=4096 paddr=770808. **The descent is clean and controlled: it terminates at a leaf, finds the entry whose oid is exactly the target, and returns a one-block object. flags=0x8 is APFS_OMAP_VAL_NOHEADER, which is why the block's first 32 bytes are zero.** **AND THE CATALOG ROOT IS FOUND WITH ITS REAL FLAGS: block 770808 has btn_flags 0x0019 = ROOT | HASHED | NOHEADER, btn_level 3, btn_nkeys 2, btn_table_space {0, 64}, btn_free_space {40, 3816}, and both free lists APFS_BTOFF_INVALID. 0x0019 has NO APFS_BTNODE_FIXED_KV_SIZE, so the catalog is a VARIABLE-LENGTH KV tree whose TOC entries are apfs_kvloc (8 bytes: k.off, k.len, v.off, v.len), not the 4-byte apfs_kvoff the omap uses. APFS_BTNODE_MASK is 0x001f so every set bit is valid, and a level-3 root with 2 keys is a plausible shape for a real catalog.** **BUT THE DESCENT INTO THE CATALOG FAILS: reading the root as a variable-KV node gives toc=0x38 key=0x78 free=0xa0 data=0xf88 area_len=80, and entries [0] k@0x78 len=24 v@0xfb0 len=40 -> child 3720 and [1] k@0x90 len=16 v@0xf88 len=40 -> child 3719. BOTH CHILDREN ARE ENTIRELY ZERO BLOCKS -- 48 zero bytes at both +0x00 and +0x20 -- so they are not btree nodes and the child oids are wrong. The tell is the value length: 40 bytes, where a non-leaf value should be an 8-byte child oid. apfsprogs does not special-case the catalog the way it does the omap (the `len = node_is_leaf(node) ? 16 : 8` rule is omap-only, btree.c:486); it takes entry->v.len verbatim. So either the kvloc parse is misaligned, or the key/value area boundaries are wrong for this node, or both. THE ROUTE THEREFORE STOPS AT THE CATALOG ROOT -- it does not reach a catalog leaf and it does not reach IOMobileFramebuffer.framework.** **VERIFIED: container geometry, container omap, its tree root, the volume superblock by magic, the volume omap, its tree root and leaves, the omap lookup itself, and the catalog tree root's own header. NOT VERIFIED: anything below the catalog root -- the two child oids it produced are zero blocks, so that read is wrong and nothing downstream of it exists.** **THE NEXT ACTION: fix the variable-KV node reader before descending again. The control is the one that settled the omap -- every child a level-N root names must itself be a well-formed level-(N-1) node with valid flags, nkeys > 0 and areas in order. Both children here fail that, so the reader is wrong, not the tree. Concretely, re-read the apfs_kvloc handling in apfsprogs/src/apfsck/btree.c around node_locate_key / node_locate_data (the else branches, lines 439-447 and 507-514) and check the area_len computation for a root with a 40-byte footer, then re-run the descent. The omap lookup in local-private/tmp/walk-to-catalog.py is correct and should be reused unchanged.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -17694,6 +17694,102 @@ reading the definition.**  The rule that follows: for any documented on-disk for
 open the reference implementation's reader before reading a single field.  apfsprogs was
 in this repository for all of them, and every one of the five errors was avoided by
 reading a function I had not looked at.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header and reader.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirtieth, addendum CT): the omap lookup WORKS and reaches the catalog root, but the descent into the catalog FAILS
+
+## The omap lookup, and it works
+
+Using the rules validated in CS, the volume superblock 782661's
+`apfs_root_tree_oid = 1216` resolves through the volume omap:
+
+    volume superblock 782661: apfs_omap_oid=782656  apfs_root_tree_oid=1216
+    volume omap 782656:      om_tree_oid=782657
+    node 782657 lvl 1 keys 36 leaf=False: entry[0] oid=1214 xid=13
+      -> child 782659
+    node 782659 lvl 0 keys 70 leaf=True: entry[1] oid=1216 xid=13
+      -> value flags=0x8 size=4096 paddr=770808
+
+    virtual oid 1216 -> physical block 770808 (size 4096, xid 13)
+
+**The descent is clean and controlled**: it terminates at a leaf, finds the entry whose
+oid is exactly the target, and returns a one-block object.  `flags=0x8` is
+`APFS_OMAP_VAL_NOHEADER` (raw.h:111), which is why the block's first 32 bytes are zero.
+
+## And the catalog root is found, with its real flags
+
+Block 770808, reading `btree_node_phys` at `+0x20`:
+
+    btn_flags  0x0019   = ROOT | HASHED | NOHEADER      (raw.h:138-142)
+    btn_level  3
+    btn_nkeys  2
+    btn_table_space {off=0, len=64}
+    btn_free_space  {off=40, len=3816}
+    btn_key_free_list {0xffff, 0}   btn_val_free_list {0xffff, 0}   <- APFS_BTOFF_INVALID
+
+`0x0019` has **no** `APFS_BTNODE_FIXED_KV_SIZE` (`0x0004`), so the catalog is a
+**variable-length KV tree**: its TOC entries are `apfs_kvloc` (8 bytes:
+`k.off, k.len, v.off, v.len`, raw.h:160-163), not the 4-byte `apfs_kvoff` the omap uses.
+`APFS_BTNODE_MASK` is `0x001f`, so every set bit is valid.  A level-3 root with 2 keys
+is a plausible shape for a real catalog.
+
+## But the descent into the catalog FAILS, and here is the failure
+
+Reading the root as a variable-KV node:
+
+    toc=0x38  key=0x78  free=0xa0  data=0xf88  area_len=80
+    [0] k@0x78  len=24  v@0xfb0 len=40  -> child 3720
+    [1] k@0x90  len=16  v@0xf88 len=40  -> child 3719
+
+**Both children are entirely zero blocks.**  Blocks 3720 and 3719 read as 48 zero bytes
+at both `+0x00` and `+0x20`, so they are not btree nodes and the child oids are wrong.
+
+The tell is the value length: **40 bytes**.  For a non-leaf node the value should be an
+8-byte child oid.  apfsprogs does not special-case the catalog the way it does the omap
+(`len = node_is_leaf(node) ? 16 : 8` is omap-only, btree.c:486); it takes
+`entry->v.len` verbatim.  So either the kvloc parse is misaligned, or the key/value area
+boundaries are wrong for this node, or both.
+
+**The route therefore stops at the catalog root.**  It does not reach a catalog leaf, and
+it does not reach `IOMobileFramebuffer.framework`.
+
+## What is verified and what is not
+
+**Verified:** container geometry, container omap, container omap tree root, the volume
+superblock by magic, the volume omap, the volume omap tree root and its leaves, the omap
+lookup itself, and the catalog tree root's own header.
+
+**Not verified:** anything below the catalog root.  The two child oids it produced are
+zero blocks, so that read is wrong and nothing downstream of it exists.
+
+## The next action, concretely
+
+Fix the variable-KV node reader before descending again.  The control is the same one
+that settled the omap: **every child a level-N root names must itself be a well-formed
+level-(N-1) node** -- valid flags, `nkeys > 0`, and areas in order.  Both children here
+fail that, so the reader is wrong, not the tree.
+
+Concretely, re-read `apfs_kvloc` handling in `apfsprogs/src/apfsck/btree.c` around
+`node_locate_key` / `node_locate_data` (the `else` branches, lines 439-447 and 507-514)
+and check the `area_len` computation for a root with a 40-byte footer.  Then re-run the
+descent.  The omap lookup in
+`local-private/tmp/walk-to-catalog.py` is correct and should be reused unchanged.
 
 ## Status
 
