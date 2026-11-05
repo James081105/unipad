@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval ninety-eighth, addendum BN). THE HEADLINE is **THE TASK #32 GATE IS BUILT, AND IT IS NOT YET TRUSTWORTHY**. `check-counter-hooks.py` takes the driver the kernel links (`vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp`, named by board.toml), finds every counter it defines, finds the function that increments each, and proves that function has a call site -- no build, no guest. **It independently confirms addendum BM and finds MORE dead hooks: swap_validation_calls, swap_accepted_count, copy_n, gpu_fallbacks, prepare_calls and prepare_failures are all `hook_uncalled`. Six counters whose only incrementer is never called, and BL read two of them as facts about the guest.** **BUT THE GATE IS NOT YET TRUSTWORTHY, and the false NEGATIVE is the dangerous one: it reports `native_legacy_transfer_calls ok (incremented by ['__attribute__'])` for a counter BM proved is dead, because the definition line is `__attribute__((noinline)) void native_legacy_transfer_observed(...)` and my function-name regex binds `__attribute__` as the name, then counts other `__attribute__(` occurrences as call sites. A gate that reports ok for a dead hook is worse than no gate -- it converts a known defect into a green check, the same shape as the recorded fact about a pre-flight that validated the wrong target.** **And a false POSITIVE: it reports client_calls and registration_calls as hook_uncalled when they read 3 and 1 on a live guest, because those functions are called through a vtable or function pointer (the driver interposes one at :626) and a textual grep for `name(` cannot see it.** **Both classes share one root: the check reasons about text where it needs the call graph. The fix is not a better regex but the symbol table -- does anything in the linked objects reference this symbol -- which llvm-objdump on the built kext answers directly and which this project already uses elsewhere.** **What survives: the six hook_uncalled verdicts, corroborated by BM's independent route. And the concrete form of task #32's gate, now written down: for every counter, name the function that increments it and prove that function has a call site in the linked driver; a counter whose only incrementer is uncalled is reported as hook_uncalled: and never as a value. The proof must come from the object's relocations, not the source text.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The display driver carries six counters that cannot mean anything, and the gate that would keep them out of a conclusion is built but not yet trustworthy.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval ninety-ninth, addendum BO). THE HEADLINE is **ADDENDUM BM IS WRONG, THE SWAP HOOK IS WIRED, AND BL STANDS**. BM read `swap_validation_calls = 0` and `transfer_calls = 0`, grepped `vendor/UniXNU-qemu`, found only definitions, and concluded the symbols are in the kernel because the object is linked and not because anything calls it. **The observation was right and the inference was backwards: the caller is in the other repository BECAUSE THAT IS WHERE THE DRIVER LIVES. The kext `native-legacy-display` links TWO trees -- `vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp` (the probe, which DEFINES the counters) and `local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp` (the driver, which CALLS the observers; a submodule pinned by sources.lock.json, on disk at 5b83ab7 matching the superproject gitlink). vendor/UniXNU-qemu has NO drivers/ directory, so a grep scoped to it can only ever return the definition -- a grep scoped to one of two linked trees is not a call-graph check.** **ALL FOUR OBSERVERS ARE CALLED: registration_observed at NativeLegacyDisplay.cpp:130, client_enter at :399, swap_validation_observed at :365, and transfer_observed at TWELVE sites (:169, 171, 174, 181, 198, 203, 212, 217, 230, 254, 261, 270), plus copy_timing at :259, gpu_fallback at :273, retirement at :290, prepare_scanout at :171/203/229 and gop_mapping at :422. NONE of them is dead code.** **SO BL's ZERO IS A MEASUREMENT, AND SHARPER THAN BL COULD SAY: the measured boot's own payload.json kernel_args carries `offline-legacy-validate=1`, and NativeLegacyDisplay.cpp:322 reads exactly that argument (`PE_parse_boot_argn("offline-legacy-validate")`). The swap_validation_observed call is at :365, OUTSIDE that `if`, so it runs whenever validateSwap runs at all -- therefore a zero says validateSwap WAS NEVER INVOKED. Not invoked-and-declined, not invoked-and-rejected, not dead code. That is BL's "the swap is never submitted" with the mechanism named: the vtable method that would validate a swap is never reached.** **THIS COSTS BM IN FULL and the six `hook_uncalled` verdicts the first check-counter-hooks.py produced -- all six false positives from the same scope error. It costs NOTHING in BL. It does not touch BM's other content, which stands: the ordering run's first-change sequence, stage=10, init_result=1, start_result=1, gop_width=800, gop_height=600, client_calls=3 from pid 95.** **THE GATE IS FIXED AND ITS REAL DEFECT WAS SCOPE, NOT REGEX: check-counter-hooks.py now searches BOTH linked trees (203 files), treats an address taken (`&name`) as a reference as well as a call, and strips `__attribute__` before parsing definitions; it now reports `0 counter(s) whose only incrementer is never called` with every call site named. The proposed fix at the time -- llvm-objdump on the built kext -- would not have worked either: no kext on this host (the build is in CI), no binutils, and the payload kernel is stripped of local symbols, so symbol presence cannot separate dead from live (wrappedExternal reads ABSENT while swap_stage reads present, purely because one is `static` and the other `extern "C"`).** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. What changed is that the display path is known to be INSTRUMENTED AND UN-ENTERED rather than uninstrumented: the swap is never submitted because validateSwap is never invoked, and that is a question about the CALLER, not about the hook.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -14869,3 +14869,108 @@ Onsite: N/A.
 reached.  The display driver carries six counters that cannot mean anything, and
 the gate that would keep them out of a conclusion is built but not yet
 trustworthy.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (ninety-ninth, addendum BO): addendum BM is wrong, the swap hook is wired, and BL stands
+
+## The error, stated plainly
+
+BM read `native_legacy_swap_validation_calls = 0` and `transfer_calls = 0`,
+grepped `vendor/UniXNU-qemu` for a call site, found only the definitions, found
+one caller in `local-private/upstream/UniXNU`, observed that
+`vendor/UniXNU-qemu/drivers/NativeMobileDisplay/` does not exist, and concluded
+**"the symbols are in the built kernel because the OBJECT is linked, not because
+anything calls it."**
+
+**The last observation is correct and the inference from it is backwards.**  The
+caller is in the other repository *because that is where the driver lives.*  The
+kext `native-legacy-display` links two trees, not one:
+
+    vendor/UniXNU-qemu/package/LegacyDisplayProbe.cpp
+        -- the PROBE: it defines the counters and the observers that increment them.
+    local-private/upstream/UniXNU/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp
+        -- the DRIVER: it calls the observers.  A git submodule pinned by
+        sources.lock.json, on disk at 5b83ab7, matching the superproject gitlink.
+
+`vendor/UniXNU-qemu` has no `drivers/` directory at all, so grepping it for a
+call site can only ever return the definition.  **A grep scoped to one of two
+linked trees is not a call-graph check, and it produced a confident negative.**
+
+## The four observers are all called, from the driver
+
+    native_legacy_registration_observed   <- NativeLegacyDisplay.cpp:130
+    native_legacy_client_enter            <- NativeLegacyDisplay.cpp:399
+    native_legacy_swap_validation_observed<- NativeLegacyDisplay.cpp:365
+    native_legacy_transfer_observed       <- NativeLegacyDisplay.cpp:169, 171, 174, 181,
+                                              198, 203, 212, 217, 230, 254, 261, 270
+    native_legacy_copy_timing_observed    <- NativeLegacyDisplay.cpp:259
+    native_legacy_gpu_fallback_observed   <- NativeLegacyDisplay.cpp:273
+    native_legacy_retirement_observed     <- NativeLegacyDisplay.cpp:290
+    native_legacy_prepare_scanout         <- NativeLegacyDisplay.cpp:171, 203, 229
+    native_legacy_gop_mapping_observed    <- NativeLegacyDisplay.cpp:422
+
+`transfer_observed` alone has twelve call sites.  **None of these is dead code.**
+
+## So BL's zero is a measurement, and it is sharper than BL could say
+
+With the hook wired and the boot argument set, a zero means the function never
+ran.  The measured boot's own `kernel_args` carries
+`offline-legacy-validate=1` (read out of the run's `payload.json`), and
+`NativeLegacyDisplay.cpp:322` reads exactly that argument:
+
+    unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
+    if(enabled==1 && logicalPM && primary && bootMapping && request) {
+
+`native_legacy_swap_validation_observed(accepted,reason,request,surface)` is at
+:365, *outside* that `if`, so it runs whenever `validateSwap` runs at all.  **A
+zero therefore says `validateSwap` was never invoked** -- not that it was invoked
+and declined, not that it was invoked and rejected, and not that it is dead code.
+
+That is BL's "the swap is never submitted", now with the mechanism named: the
+vtable method that would validate a swap is never reached.
+
+## What this costs, and what it does not touch
+
+**It costs addendum BM in full**, and it costs the six `hook_uncalled` verdicts
+the first version of `check-counter-hooks.py` produced -- all six were false
+positives from the same scope error.  **It costs nothing in BL**: every number in
+BL was right and its conclusion was right.
+
+**It does not touch** BM's other content, which stands on its own: the ordering
+run's first-change sequence, `stage=10`, `init_result=1`, `start_result=1`,
+`gop_width=800`, `gop_height=600`, and `client_calls=3` from pid 95.
+
+## The gate, fixed, and what its real defect was
+
+`local-private/tmp/check-counter-hooks.py` now searches **both** linked trees
+(203 source files) instead of one, treats an address taken (`&name`) as a
+reference as well as a call, and strips `__attribute__((...))` before parsing
+definitions.  Its verdict is now `0 counter(s) whose only incrementer is never
+called`, with every incrementer's call sites named and filed.
+
+**Its defect was never the regex.**  It was the search scope, and no amount of
+regex work would have found it -- the first version's false negative and false
+positive were both symptoms of looking at the wrong set of files.  That is worth
+recording because the fix that was proposed at the time, `llvm-objdump` on the
+built kext, would not have worked either: there is no kext on this host (the
+build is in CI), there is no binutils, and the payload kernel is stripped of
+local symbols, so symbol presence cannot distinguish dead from live --
+`wrappedExternal` reads ABSENT while `native_legacy_swap_stage` reads present,
+purely because one is `static` and the other is `extern "C"`.
+
+## Status
+
+Windows/real-guest: **none this interval -- the whole correction is host-side:
+a grep with the right scope, a submodule pin check, and the measured boot's own
+kernel_args.**  The guest numbers were all read earlier and none of them changes.
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  What changed is that the display path is now known to be instrumented
+and un-entered rather than uninstrumented: the swap is never submitted because
+`validateSwap` is never invoked, and that is a question about the caller, not
+about the hook.**  THE HEADLINE is unchanged from AH
