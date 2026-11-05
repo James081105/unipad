@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred seventeenth, addendum CG). THE HEADLINE is **CE IS REFUTED -- 60 LIFTABLE, 0 ALMOST-LIFTABLE, AND THE 60 MATCHES THE MEASUREMENT**. `classify-display-slots.py` reads the display's vtable straight out of the kernel file: a teammate established it is a STATIC INITIALISER (`__ZTV19NativeLegacyDisplay` at 0xfffffff007206690) so no boot and no build are needed, and caught the off-by-two -- `_ZTV` points 16 bytes before the address point, so reading from the symbol shifts every slot index by +2. **TWO VALIDATIONS: 3 of 3 fork-declared methods land at their declared slots (288 startHardware, 290 kickSwapQueue, 296 validateSwap), and the offline classifier finds EXACTLY 60 liftable slots against a `slot_lifted_count` of 60 measured on a live guest -- so the vtable read is right and the classifier logic is transcribed faithfully.** **AND THE HYPOTHESIS FAILS: SKIPPED despite a 0x2c7 tail = 0. No slot in the display's vtable contains `MOV w0,#0x2c7 ... RET` without also being a bare stub, so CE's proposed change would lift nothing, slot_lifted_count would stay at 60, and the falsification CE itself named is what happened. CE IS REFUTED and task #39 is closed as refuted.** **WHAT THAT ELIMINATES IS THE USEFUL PART: the four surviving refusals (12, 15, 29, 57 -- CD measured backboardd hit 15, 29 and 57) DO NOT COME FROM THE DISPLAY'S VTABLE. All 358 slots have been read and there is nothing left in them to lift. So the refusals come from the CLIENT's vtable (which interpose() wraps at slots 168 and 175 -- and CD measured that backboardd registered NO notification port, so slot 175 was never exercised) or from a family helper reached directly. The teammate's selector bridge was the instrument for that and it FAILED ITS OWN VALIDATION -- slot 182 in 0 of 81 selectors, and following a BL landed in a degenerate sweep of `ldr x16,[x16,#imm]` over consecutive offsets, which is data decoded as instructions. Reporting that failure rather than a number was correct, and task #38 still has no instrument.** **ONE HYPOTHESIS ELIMINATED FOR THE COST OF A FILE READ -- possible only because the vtable is static data in the image rather than something only a running guest holds, which nobody knew until the teammate looked.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred eighteenth, addendum CH). THE HEADLINE is **CF's PID-RESOLUTION CLAIM IS WITHDRAWN -- I CARRIED A PID ACROSS BOOTS, WHICH IS WHAT BS WARNED ABOUT**. CF read that fact 202 carries both `native_qemu_metal_owners = 1801675106 = b'back'` and `client_pid=74` and concluded they were "in the same measurement". **Fact 202's own text introduces `client_pid=74` as 第二次启动 -- the SECOND BOOT. The owners reading is from the first, so a pid from one boot cannot be carried onto a name from another. That is the exact error addendum BS recorded and I repeated three addenda later: I wrote the warning "pids are not stable across boots" and then violated it.** **THE HONEST STATUS OF FACT 202's client_pid=74 IS UNKNOWN -- that boot's process list was never captured. Independently, pid 74 is PerfPowerService in both boots where a named list exists, which is not evidence about fact 202's boot.** **WHAT SURVIVES IS BETTER GROUNDED THAN WHAT CF SAID: the byte decoding checks out (1801675106 = 0x6b636162, little-endian 62 61 63 6b = b'back'; big-endian would be b'kcab'), but the four-byte width is not what makes it decisive -- the symbol is `volatile char native_qemu_metal_owners[9][17]`. What makes it decisive is the invariant at QemuMetalAccelerator.cpp:158-161: `server = !strncmp(name,"backboardd",...)` and then the loop touches SLOT 0 AND NOTHING ELSE, every other process starting at slot 1. Slot 0 <==> backboardd. Fact 181 already recorded this on 2026-10-31; CF restated the conclusion without the ground.** **AND THE FRAGILITY: nothing in the value `back` distinguishes backboardd from backlightd -- a real daemon in backboardd's own MachServices. The disambiguation comes ENTIRELY from the slot-0 invariant, not from the bytes; the full 17-byte name is in the same symbol and was not read.** **AND "PIDS ARE NOT STABLE" IS STRONGER THAN CF CLAIMED: not two data points but two boots of the IDENTICAL kernel (both run 41980452867, both verifying sha256 d2c5a914), which makes the test stricter than across kernels. Of 72 pids in both, 59 keep the same name (82%) and 13 differ (18%), eleven of them xpcproxy -> real daemon, with the mechanism visible: run7 holds 25 xpcproxy pids, run8 holds 17, because xpcproxy is a per-request proxy launchd respawns constantly. Scope stated because it bounds the claim: these are the only two named process lists in the tree, so the figure is two boots -- enough to refute "pids are stable", not enough to quantify a rate.** **WHAT SURVIVES FROM CD, UNCHANGED: backboardd is a framebuffer client -- run8's C0, pid 58, 9 calls with 3 failures, refused on selectors 15, 29 and 57, no notification port, never selector 6. That measurement named its own process in its own sample and does not depend on any of this.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. CF's headline is withdrawn.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -16651,3 +16651,106 @@ reached.  CE is refuted and #39 is closed as refuted: the display's vtable holds
 nothing left to lift, so the four surviving refusals come from somewhere else --
 most likely the client's own vtable, which CD showed was never even exercised past
 the open.**  THE HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred eighteenth, addendum CH): CF's pid-resolution claim is withdrawn -- I carried a pid across boots, which is what BS warned about
+
+## The error, stated plainly
+
+CF read that fact 202 carries both `native_qemu_metal_owners = 1801675106 = b'back'`
+and `client_pid=74`, and concluded "fact 202's `client_pid=74` WAS backboardd" --
+"in the same measurement".
+
+Fact 202's own text does not say that.  It reads, in order:
+
+    native_qemu_metal_opens ... native_qemu_metal_owners = 1801675106 = b'back'
+    ... **第二次启动** `native_legacy_client_calls=5`、`client_pid=74`、`client_status=0`
+
+**`client_pid=74` is introduced as 第二次启动 -- the second boot.**  The owners
+reading is from the first.  They are not in the same measurement, and a pid from one
+boot cannot be carried onto a name from another.
+
+**That is the exact error addendum BS recorded and I then repeated three addenda
+later**: "Pids are not stable across boots", written when I refused to read the old
+table's "pid=58" as a property of a later kernel.  I wrote the warning and then
+violated it.
+
+## The honest status of fact 202's `client_pid=74`
+
+**UNKNOWN.**  That boot's process list was never captured, so nothing in the tree
+identifies its pid 74.  Independently, in both boots where a named process list
+exists, **pid 74 is `PerfPowerService`** -- which is not evidence about fact 202's
+boot, only about the two that were captured.
+
+## What survives, and it is better grounded than what CF said
+
+The "backboardd holds the Metal window" half of CF is right, and a teammate supplied
+the reason it is right -- which CF did not have.
+
+The byte decoding checks out: `1801675106 = 0x6b636162`, little-endian
+`62 61 63 6b` = `b'back'`; big-endian would be `b'kcab'`.  But the four-byte width is
+not what makes it decisive, and the symbol is not a uint32 -- it is
+`volatile char native_qemu_metal_owners[9][17]`, and the reader takes four bytes at
+the array base.
+
+What makes it decisive is an invariant in
+`QemuMetalAccelerator.cpp:158-161`:
+
+    char name[17] = {};
+    proc_selfname(name, sizeof name);
+    const bool server = !strncmp(name, "backboardd", sizeof name);
+    for (unsigned i = server ? 0 : 1; i < (server ? 1u : QM_SLOTS); i++) {
+
+`server` is true only when `proc_selfname` returns exactly `"backboardd"`, and then
+the loop touches **slot 0 and nothing else**; every other process starts at slot 1.
+**Slot 0 ⟺ backboardd.**  Fact 181 already recorded this invariant on 2026-10-31;
+CF restated the conclusion without the ground.
+
+**And the fragility that comes with it:** nothing in the value `back` distinguishes
+backboardd from `backlightd` -- a real daemon that sits in backboardd's own
+MachServices list.  The disambiguation comes *entirely* from the slot-0 invariant,
+not from the bytes.  The full 17-byte name is in the same symbol and was not read.
+
+## And "pids are not stable" is stronger than CF claimed
+
+Not two data points.  Two boots of the **identical kernel** (both run 41980452867,
+both verifying sha256 `d2c5a914` in their own headers) -- which makes the test
+stricter than across kernels, not looser.  Of 72 pids appearing in both:
+
+    59 keep the same name (82%)
+    13 differ (18%)
+
+and eleven of the thirteen are `xpcproxy` in one boot and a real daemon in the
+other, with the mechanism visible in the same data: run7 holds **25** xpcproxy pids,
+run8 holds **17**.  xpcproxy is a per-request proxy launchd respawns constantly, so
+those pids recycle between samples.
+
+The client set also changed outright: run7's only framebuffer client was
+`IOMFB_FDR_Loader` (pid 86, zero calls); run8's were backboardd (pid 58, 9 calls / 3
+failures) and pid 95, and `IOMFB_FDR_Loader` never opened the framebuffer at all.
+
+**Scope, stated because it bounds the claim:** these are the only two named process
+lists in the tree, so the 13-disagreement figure is two boots.  It is enough to
+refute "pids are stable"; it is not enough to quantify a rate.
+
+## What survives from CD, unchanged
+
+backboardd is a framebuffer client -- run8's C0, pid 58, 9 calls with 3 failures,
+refused on selectors 15, 29 and 57, no notification port, never selector 6.  That
+measurement named its own process in its own sample and does not depend on any of
+this.
+
+## Status
+
+Windows/real-guest: **none this interval -- the correction comes from reading fact
+202's own text and the accelerator's source.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  CF's headline is withdrawn: fact 202's `client_pid=74` is UNKNOWN, not
+resolved, and the reason is an error I had already written a warning about.**  THE
+HEADLINE is unchanged from AH
