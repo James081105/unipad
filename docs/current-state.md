@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred thirty fifth, addendum CY). THE HEADLINE is **THE 16/35 SHAPE IS THE EXTENTREF AND SNAP_META TREES' SHAPE, NOT THE CATALOG'S**. Resolving all three of the volume's tree oids through the volume omap: catalog root oid 1216 -> block 770808, flags 0x0019, level 3, 2 keys, key lengths {16:1, 24:1}, value lengths {40:2}; extentref root oid 4542 -> block 782059, flags 0x001a, level 0, 67 keys, key lengths {16:67}, value lengths {35:67}; snap_meta root oid 4544 -> block 782061, flags 0x001a, level 0, 67 keys, key lengths {16:67}, value lengths {35:67}. **THE EXTENTREF ROOT AND THE SNAPSHOT-METADATA ROOT HAVE EXACTLY THE SHAPE I COULD NOT IDENTIFY -- 67 keys of 16 bytes and 67 values of 35 bytes -- byte for byte the shape of blocks 770809, 781228 and 781229. So CX's third hypothesis is confirmed: those blocks are extentref or snapshot-metadata leaves, not catalog leaves, and the {16-byte key, 35-byte value} shape is a real record shape in this volume, just not the catalog's.** **WHICH MEANS CX's FIRST HYPOTHESIS IS BACK AND SHARPER: the catalog root's two child references resolve, unambiguously with one omap entry each, to blocks 781228 and 781229, which carry the extentref/snap_meta shape. A catalog root's children must be catalog nodes, so either the 40-byte child-reference value is not {oid, hash[32]} and I am reading the wrong oid out of it, or the omap entries for 3719/3720 point at blocks belonging to another tree. CX had narrowed this to "the reader is right and the tree identification is right"; the reader is right, but the tree identification of 781228/781229 as catalog leaves was WRONG, and that is what sent every leaf-record parse since CU astray.** **AND A NEW CONTRADICTION, THE MORE INTERESTING ONE: both the extentref root and the snapshot-metadata root resolve to LEVEL-0 LEAVES. A level-0 root means the entire tree fits in one block, which is not plausible for a real filesystem's extent reference tree -- it must record every file extent on the volume. So the omap resolution is returning LEAF blocks for oids that should be ROOT blocks. The catalog root resolved correctly, so the method works for at least one oid.** **THE LIKELY CAUSE, AND IT IS TESTABLE: the omap has entries at several xids and the lookup takes the last entry with oid <= target. If an oid appears at multiple xids, that picks a stale one. CX enumerated omap leaf 782659 and found one entry per oid for 1214..1284, but the leaves covering 4542, 4544 and 3719/3720 have not been fully enumerated.** **THE NEXT ACTION: enumerate the omap leaf covering oid 4542 -- the root's entry 4393 -> 781909 puts it in leaf 781909 -- and print every entry with its oid, xid and paddr. If oid 4542 appears more than once at different xids, the lookup must select by the tree's xid rather than by "last oid <= target", and that single fix may resolve the level contradiction for all three trees at once. If it appears once, the extentref tree genuinely is one block and the catalog's own leaves are still unfound.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred thirty sixth, addendum CZ). THE HEADLINE is **THE STALE-XID HYPOTHESIS IS DEAD, AND THE NON-LEAF INVENTORY SHOWS A LEVEL-3 ROOT WITH ONLY LEVEL-1 CHILDREN**. CY proposed the omap lookup picks a stale entry when an oid appears at several xids. Three omap leaves were enumerated in full: leaf 781118 (oids 3609..3720, 112 keys), leaf 782659 (oids 1214..1284, 70 keys) and leaf 782022 (oids 4505..4616, 112 keys). **ZERO DUPLICATE OIDS AND EVERY ENTRY AT xid 13, so there is no stale entry to pick and the lookup is not the problem. CY's proposed cause is dead.** **AND THE NON-LEAF INVENTORY IS THE REAL FINDING: the mapped blocks' levels are {0:67, 1:2, 3:1} in leaf 782659, {0:110, 1:2} in leaf 781118 and {0:111, 1:1} in leaf 782022. The only non-leaf, non-root blocks in the whole volume are at LEVEL 1: oid 1216 -> 770808 flags 0x0019 LEVEL 3 (the catalog root), oid 1278 -> 770871, oid 1279 -> 770872, oid 3635 -> 781144, oid 3697 -> 781206 and oid 4565 -> 782082, all flags 0x0018 LEVEL 1. THERE ARE NO LEVEL-2 NODES ANYWHERE, so a level-3 root's children cannot be level 2 because there are none to be. The level field is not behaving as a plain depth counter, and CY's second hypothesis -- that the root's btn_level is misread -- is the only one left standing.** **WHAT THE TREE'S SHAPE ACTUALLY IS: the catalog's own oid range is 1214..1284 and within it there is one level-3 root, two level-1 nodes and sixty-six level-0 leaves -- a three-tier tree whose root reports level 3 instead of 2. Combined with the catalog root's two child references resolving to level-0 leaves (oids 3719 and 3720), the consistent reading is that the root's children ARE leaves, the tree is two tiers, and btn_level is off by one or means something else. Under that reading 781228/781229 ARE catalog leaves and the {16-byte key, 35-byte value} shape is shared by more than one tree.** **THAT IS WEAKER THAN CX'S AND CONTRADICTS IT: CX claimed the 16/35 shape belongs to the extentref and snap_meta trees and therefore that 781228/781229 are not catalog leaves. This interval's inventory does not support that -- the extentref root (oid 4542) maps to a level-0 leaf too, exactly as the catalog's children do, so "resolves to a level-0 leaf" distinguishes nothing.** **SO THE OPEN QUESTION IS NARROWER THAN EITHER CX OR CZ STATED: is the {16-byte key, 35-byte value} shape the catalog's or another tree's? The decisive test is no longer about levels or omaps -- both are now clean -- but about the records. The catalog root's key area decoded private-dir as a DIR_REC under obj_id 1, so a catalog leaf must contain DIR_REC keys with type 9 in the top four bits; leaf 781228's 67 keys all read type 13. If the catalog's leaves hold DIR_RECs and 781228 holds none, 781228 is not a catalog leaf.** **THE NEXT ACTION: fix the leaf key parse using the root as the instrument, as CV did. The root's keys are 24 and 16 bytes and decode as apfs_drec_key (8 + 2 + name); the leaf's keys are 16 bytes starting with a constant qword. Find the key struct in raw.h whose length is 16 and whose first field is obj_id_and_type -- apfs_file_extent_key is 8 + 8 = 16 and is the obvious candidate, with the second qword being phys_block_num. Test it: if the leaf's second qword is a block number rising by 16384 per record, these are FILE_EXTENT records and the block is an extent-bearing tree, not the catalog.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. No frame has rendered, no IPA has been installed, no SpringBoard interaction has occurred, and there is no guest evidence for persistence, input, network, audio, graphics, GPU/Metal, launcher, performance or delivery.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -18254,6 +18254,102 @@ all three trees at once.
 
 If it appears once, then the extentref tree genuinely is one block and the shape belongs
 to it, and the catalog's own leaves are still unfound.
+
+## Status
+
+Windows/real-guest: **none this interval -- every number above is a read of the
+cryptex file's own objects against apfsprogs' authoritative header.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  No frame has rendered, no IPA has been installed, no SpringBoard
+interaction has occurred, and there is no guest evidence for persistence, input,
+network, audio, graphics, GPU/Metal, launcher, performance or delivery.**  THE
+HEADLINE is unchanged from AH
+
+---
+
+# Interval 2026-11-05 (one hundred thirty sixth, addendum CZ): the stale-xid hypothesis is DEAD, and the non-leaf inventory shows a level-3 root with only level-1 children
+
+## The hypothesis CY proposed, tested and killed
+
+CY proposed that the omap lookup takes "the last entry with `oid <= target`" and so picks
+a stale entry when an oid appears at several xids.  Three omap leaves were enumerated in
+full:
+
+    leaf 781118  oids 3609..3720   112 keys   duplicate oids: 0   xids: {13: 112}
+    leaf 782659  oids 1214..1284    70 keys   duplicate oids: 0   xids: {13: 70}
+    leaf 782022  oids 4505..4616   112 keys   duplicate oids: 0   xids: {13: 112}
+
+**Zero duplicate oids, and every entry at xid 13.**  So there is no stale entry to pick,
+and the lookup is not the problem.  CY's proposed cause is dead.
+
+## And the non-leaf inventory, which is the real finding
+
+Across those three leaves, the mapped blocks' levels are:
+
+    leaf 782659 (catalog's oid range)  levels {0: 67, 1: 2, 3: 1}
+    leaf 781118 (catalog children)     levels {0: 110, 1: 2}
+    leaf 782022 (extentref's range)    levels {0: 111, 1: 1}
+
+The only non-leaf, non-root blocks in the whole volume are at **level 1**:
+
+    oid 1216 -> block 770808  flags 0x0019  LEVEL 3   <- the catalog root
+    oid 1278 -> block 770871  flags 0x0018  LEVEL 1
+    oid 1279 -> block 770872  flags 0x0018  LEVEL 1
+    oid 3635 -> block 781144  flags 0x0018  LEVEL 1
+    oid 3697 -> block 781206  flags 0x0018  LEVEL 1
+    oid 4565 -> block 782082  flags 0x0018  LEVEL 1
+
+**There are no level-2 nodes anywhere.**  A level-3 root's children must be level 2, and
+there are none to be.  So the level field is not behaving as a plain depth counter, and
+CY's second hypothesis -- that the root's `btn_level` is misread -- is the only one left
+standing.
+
+## What the shape of the tree actually is
+
+The catalog's own oid range is 1214..1284, and within it there is one level-3 root, two
+level-1 nodes and sixty-six level-0 leaves.  That is a three-tier tree -- root, level 1,
+leaves -- whose root reports level 3 instead of 2.  Combined with the catalog root's two
+child references resolving to level-0 leaves (oids 3719 and 3720), the consistent reading
+is:
+
+**the root's children are leaves, the tree is two tiers, and `btn_level` is off by one or
+means something else.**  Under that reading the catalog root's children at oids 3719/3720
+-> blocks 781228/781229 *are* catalog leaves, and the {16-byte key, 35-byte value} shape
+found on them -- which is also the shape of the extentref and snap_meta roots -- is a
+shape shared by more than one tree in this volume.
+
+That is a weaker conclusion than CX's, and it contradicts CX.  **CX claimed the 16/35
+shape belongs to the extentref and snap_meta trees and therefore that 781228/781229 are
+not catalog leaves.  This interval's inventory does not support that:** the extentref root
+(oid 4542) maps to a level-0 leaf too, exactly as the catalog's children do, so "resolves
+to a level-0 leaf" distinguishes nothing.
+
+## So the open question is narrower than either CX or CY stated
+
+**Is the {16-byte key, 35-byte value} shape the catalog's, or another tree's?**  The
+decisive test is no longer about levels or omaps -- both are now clean.  It is about the
+records: read the 67 records of a block whose tree membership is *known* and compare.
+
+The catalog root's key area decoded `private-dir` as a DIR_REC under obj_id 1.  **A
+catalog leaf must therefore contain DIR_REC keys -- type 9 in the top four bits.**  Leaf
+781228's 67 keys all read type 13.  If the catalog's leaves hold DIR_RECs and 781228
+holds none, 781228 is not a catalog leaf.  That single check settles it, and it has not
+been run because the leaf key parse is still wrong.
+
+## The next action, concretely
+
+Fix the leaf key parse using the root as the instrument, exactly as CV did.  The root's
+keys are 24 and 16 bytes and decode as `apfs_drec_key` (8 + 2 + name).  The leaf's keys
+are 16 bytes and start with a constant qword.  **Find the key struct in raw.h whose
+length is 16 and whose first field is `obj_id_and_type`** -- `apfs_file_extent_key` is
+8 + 8 = 16 and is the obvious candidate, with the second qword being `phys_block_num`.
+Test it: if the leaf's second qword is a block number that rises by 16384 per record,
+these are FILE_EXTENT records and the block is an extent-bearing tree, not the catalog.
 
 ## Status
 
