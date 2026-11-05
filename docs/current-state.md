@@ -6,7 +6,7 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-05 (interval one hundred eighth, addendum BX). THE HEADLINE is **THE POWERED WORD IS SET, SO THE NAMED CANDIDATE IS ELIMINATED**. BW's only open question had one named candidate: the driver's comment at NativeLegacyDisplay.cpp:87 says that without the powered word the user client's wait (selector 6) answers kIOReturnBusy forever "and the compositor never presents", and that no counter measures whether the state setter took. **It is now measured, by reading the word out of the display object: on run 41980452867 with kernel sha256 d2c5a914 verified and the control passed, ramped to 124 processes and the client opening the framebuffer at t=604.8s, +5836 (the REQUESTED half) is 0x1 and +5840 (the POWERED word) is 0x1. So the state setter took, and the failure mode the comment describes is NOT in effect.** **THE CANDIDATE IS ELIMINATED, and that is the result: nothing in the display driver's power path explains the frozen screen. The zero words at +5820 and +5824 are consistent with everything already measured (no swap completed, nothing presented); the non-zero words at +5808 (0x320) and +5812 (0x258) are state the driver did not set and this measurement does not interpret.** **AND IT EXPOSED A DEFECT IN MY OWN INSTRUMENT: the notification-port print sat AFTER the `continue` for clients with no selector calls, so the one client that matters -- the one that opened the framebuffer and made no external-method call at all -- was exactly the one whose port registration was never shown. registerNotificationPort is the other slot interpose() wraps and is recorded in reg[] rather than in calls, so a client can register a port with zero external-method calls, and the compositor's swap-completion wait hangs off that port. Fixed: the port registration is printed first, before any continue.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. The one hypothesis the source offered is measured and refuted, and the next run asks the question this one was supposed to: did the compositor register a notification port before it went quiet.** THE HEADLINE is unchanged from AH
+Last updated: 2026-11-05 (interval one hundred ninth, addendum BY). THE HEADLINE is **THE FRAMEBUFFER'S ONLY CLIENT IS IOMFB_FDR_Loader, AND BACKBOARDD IS ABSENT**. The sampling loop now captures the process list in the SAME sample as the client table, so a pid reads as a name rather than a number that shifts between boots. On run 41980452867 with kernel sha256 d2c5a914 verified and the control passed, 73 processes are alive: **pid 27 SpringBoard, pid 86 IOMFB_FDR_Loader -- the framebuffer's ONLY client -- and pid 87 IOMFB_bics_daemo. C0 (pid 86) registered NO notification port and made NO external-method call at all.** **AND BACKBOARDD IS NOT IN THE GUEST: a grep of the 73-process list for "backboard" returns ZERO. The compositor that owns the framebuffer on iOS never spawned, so the chain is not "the compositor submits a swap and something refuses it" but "the compositor does not exist, so nothing ever submits a swap". SpringBoard is alive at pid 27 and never opened the framebuffer, because on iOS SpringBoard does not open it -- backboardd does, on SpringBoard's behalf.** **WHAT THAT DOES TO THE LAST EIGHT ADDENDA: BO through BX are all still true and all still measured, but they characterised, in increasing detail, a display driver waiting for a client that does not exist. None was wrong; none was the blocker. The blocker is one level up, and it was visible in the process list the whole time -- which is why the process list is now captured in the same sample as the table.** **WHY THE OLD TABLE MISLED: the saved table from kernel 2ebda0ec reported "the busiest client: pid=58, 14 selectors, 11 refused", and in this boot pid 58 is an xpcproxy. Pids are not stable across boots, so that table's pid 58 was a different process and its identity was never recorded. This run captures the name in the same sample as the counts, so the two cannot drift apart.** **THE OPEN QUESTION IS TASK #33: why does backboardd not spawn? SpringBoard is running, so launchd spawned that; backboardd is a POSIXSpawnType=App job, and addenda BA-BJ established that App jobs are spawned without POSIX_SPAWN_SETEXEC and take the do_fork1 path. So the question is whether launchd declines the backboardd job or spawns it and it fails to come up -- and the springboard.fork1 emitter, proved BUILT in BQ, records every do_fork1 child by name. That measurement needs no build.** **M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not reached. But the display blocker has moved: it was never the display driver, and it was never a refused swap. The compositor that would drive the framebuffer is not in the guest.** THE HEADLINE is unchanged from AH
 
 ---
 
@@ -15803,3 +15803,108 @@ reached.  The one hypothesis the source offered is now measured and refuted, and
 the next run asks the question this one was supposed to: did the compositor
 register a notification port before it went quiet.**  THE HEADLINE is unchanged
 from AH
+
+---
+
+# Interval 2026-11-05 (one hundred ninth, addendum BY): the framebuffer's only client is IOMFB_FDR_Loader, and backboardd is absent
+
+## The measurement
+
+The sampling loop now captures the process list in the SAME sample as the client
+table, so a pid can be read as a name rather than as a number that shifts between
+boots.  Run 41980452867, kernel sha256 `d2c5a914` verified against `payload.json`,
+control passed, ramped past 120 processes, client opened the framebuffer at
+t=593.8 s.
+
+73 processes alive.  Among them:
+
+    pid 27     SpringBoard
+    pid 86     IOMFB_FDR_Loader   <== a framebuffer client
+    pid 87     IOMFB_bics_daemo
+
+and the client table:
+
+    C0  pid=86   object=0xfffffff58cd7fc00   calls=0   fails=0
+        registered NO notification port
+        opened it and called NOTHING (no external-method call at all)
+
+**The framebuffer's only client is `IOMFB_FDR_Loader`** -- the IOMobileFramebuffer
+field-diagnostic loader.  It opens the framebuffer, registers no notification
+port, and issues no external-method call.  `IOMFB_bics_daemo`, the other
+framebuffer-named daemon, is alive and does not even open it.
+
+## And backboardd is not in the guest at all
+
+A grep of the 73-process list for `backboard` returns **zero**.  The compositor
+that owns the framebuffer on iOS never spawned.
+
+So the chain is not:
+
+    the compositor submits a swap and something refuses it
+
+it is:
+
+    the compositor does not exist, so nothing ever submits a swap
+
+**SpringBoard is alive at pid 27 and never opened the framebuffer**, because on
+iOS SpringBoard does not open it -- backboardd does, on SpringBoard's behalf.
+With backboardd absent, the display driver is a fully-instrumented, fully-powered,
+fully-traced service with exactly one client, and that client is a diagnostic
+loader with nothing to say.
+
+## What that does to the last eight addenda
+
+BO through BX are all still true and all still measured.  What changes is what
+they were measuring.  They characterised, in increasing detail, a display driver
+waiting for a client:
+
+    BO   the swap hook is wired, not dead code
+    BP   the console emitters are built, so the silences are real
+    BQ   twelve of twelve emitters proved built
+    BR   kickOnce returns at GATE 2 because nothing is ever validated
+    BT   client_calls=0 on a boot that never ramped
+    BU   the boot ramps at ~470 s; 420 s was too short
+    BV   the swap/wait selector is never called
+    BW   two ramped boots agree; 60 slots lifted
+    BX   the powered word IS set, so the named candidate is eliminated
+
+**Every one of those is a fact about a driver with no compositor.**  None of them
+was wrong; none of them was the blocker.  The blocker is one level up, and it was
+visible in the process list the whole time -- which is why the process list is now
+captured in the same sample as the table.
+
+## Why the old client table misled, and why this one cannot
+
+The saved table from kernel `2ebda0ec` reported "the busiest client: pid=58, 14
+selectors, 11 refused".  In this boot pid 58 is an `xpcproxy`.  **Pids are not
+stable across boots**, so that table's "pid 58" was a different process and its
+identity was never recorded.  This run captures the name in the same sample as the
+counts, so the two cannot drift apart -- which is the whole reason this conclusion
+is available now and was not then.
+
+## The open question, and it is task #33
+
+**Why does backboardd not spawn?**  SpringBoard is running, so launchd spawned
+*that*.  backboardd is a `POSIXSpawnType=App` job, and addenda BA-BJ established
+that App jobs are spawned without `POSIX_SPAWN_SETEXEC` and take the `do_fork1`
+path.  So the question is whether launchd declines the backboardd job, or spawns
+it and it fails to come up -- and the `springboard.fork1` emitter, proved BUILT in
+BQ, records every `do_fork1` child by name.
+
+That is the next measurement, and it needs no build: the `fork1` records are
+already on the virtio console channel.
+
+## Status
+
+Windows/real-guest: **a live guest on run 41980452867, kernel sha256 verified
+against payload.json, control passed, 73 processes named, the client table read,
+and the framebuffer's only client identified as `IOMFB_FDR_Loader`.**
+
+Build: none this interval.
+
+Onsite: N/A.
+
+**M9, M9a, M9b, M8 and every §5.2 case remain unproven, and the end goal is not
+reached.  But the display blocker has moved: it was never the display driver, and
+it was never a refused swap.  The compositor that would drive the framebuffer is
+not in the guest.**  THE HEADLINE is unchanged from AH
