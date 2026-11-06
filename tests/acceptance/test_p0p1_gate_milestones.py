@@ -453,6 +453,17 @@ def test_the_host_view_refuses_a_path_outside_every_root(tmp_path: Path) -> None
         view.relativise(Path("Z:/elsewhere/serial.log"))
 
 
+def test_scratch_fixtures_do_not_enter_the_host_evidence_index(tmp_path: Path) -> None:
+    scratch = tmp_path / ".scratch" / "pytest-run"
+    scratch.mkdir(parents=True)
+    (scratch / "guest.log").write_text('{"event":"xnu.page_tables"}\n', encoding="utf-8")
+    real = tmp_path / "boot" / "guest.log"
+    real.parent.mkdir()
+    real.write_text('{"event":"xnu.interrupts"}\n', encoding="utf-8")
+    view = HostView(roots=(tmp_path,), repo_root=tmp_path)
+    assert view.find("**/guest.log") == ("boot/guest.log",)
+
+
 def test_the_host_view_window_is_read_rather_than_the_whole_file(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1070,6 +1081,94 @@ def test_a_fake_guest_record_cannot_unblock_a_guest_milestone(tmp_path: Path) ->
     assert result.verdict.kind != VerdictKind.PASS
     assert result.verdict.kind == VerdictKind.BLOCKED
     assert result.unmet_blockers == ("xnu_initialised",)
+
+
+def test_m8_rejects_launchd_as_its_own_later_daemon(tmp_path: Path) -> None:
+    """PID 1's own exec cannot satisfy M8's later-daemon evidence."""
+    (tmp_path / "guest.log").write_text(
+        json.dumps({"event": "launchd.running", "pid": 1,
+                    "program": "/sbin/launchd", "source": "XNU.load_init_program"})
+        + "\n"
+        + json.dumps({"event": "daemon.spawned", "pid": 1,
+                      "comm": "launchd", "source": "XNU.__mac_execve"})
+        + "\n",
+        encoding="utf-8",
+    )
+    view = _view_for(tmp_path)
+    assert gate._PROBES["p.launchd_running"](view).ok
+    assert not gate._PROBES["p.daemon_spawned"](view).ok
+
+
+def test_m8_requires_launchd_and_later_daemon_in_same_ordered_guest_log(
+    tmp_path: Path,
+) -> None:
+    """Old runs cannot be combined into a synthetic M8 pass."""
+    (tmp_path / "old-guest.log").write_text(
+        json.dumps({"event": "launchd.running", "pid": 1,
+                    "program": "/sbin/launchd", "source": "XNU.load_init_program"})
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "new-guest.log").write_text(
+        json.dumps({"event": "daemon.spawned", "pid": 7,
+                    "comm": "apfs_boot_util", "source": "XNU.__mac_execve"})
+        + "\n",
+        encoding="utf-8",
+    )
+    view = _view_for(tmp_path)
+    assert gate._PROBES["p.launchd_running"](view).ok
+    assert not gate._PROBES["p.daemon_spawned"](view).ok
+
+
+def test_m8_accepts_a_later_non_launchd_daemon_from_same_log(tmp_path: Path) -> None:
+    (tmp_path / "guest.log").write_text(
+        json.dumps({"event": "launchd.running", "pid": 1,
+                    "program": "/sbin/launchd", "source": "XNU.load_init_program"})
+        + "\n"
+        + json.dumps({"event": "daemon.spawned", "pid": 7,
+                      "comm": "apfs_boot_util", "source": "XNU.__mac_execve"})
+        + "\n",
+        encoding="utf-8",
+    )
+    view = _view_for(tmp_path)
+    launchd = gate._PROBES["p.launchd_running"](view)
+    daemon = gate._PROBES["p.daemon_spawned"](view)
+    assert launchd.ok
+    assert daemon.ok, daemon.detail
+    assert daemon.facts["daemon_pid"] == 7
+    assert daemon.facts["daemon_comm"] == "apfs_boot_util"
+    assert launchd.refs[0].path == daemon.refs[0].path == "guest.log"
+
+
+@pytest.mark.parametrize("daemon", [
+    {"pid": 0, "comm": "kernel_task"},
+    {"pid": 1, "comm": "helper"},
+    {"pid": 7, "comm": "launchd"},
+    {"pid": "7", "comm": "notifyd"},
+    {"pid": 7, "comm": ""},
+    {"comm": "notifyd"},
+])
+def test_m8_rejects_invalid_later_process_identity(tmp_path: Path, daemon: dict) -> None:
+    records = [
+        {"event": "launchd.running", "pid": 1, "program": "/sbin/launchd",
+         "source": "XNU.load_init_program"},
+        {"event": "daemon.spawned", "source": "XNU.__mac_execve", **daemon},
+    ]
+    (tmp_path / "guest.log").write_text(
+        "\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+    assert not gate._PROBES["p.daemon_spawned"](_view_for(tmp_path)).ok
+
+
+def test_m8_rejects_daemon_record_before_launchd(tmp_path: Path) -> None:
+    records = [
+        {"event": "daemon.spawned", "pid": 7, "comm": "notifyd",
+         "source": "XNU.__mac_execve"},
+        {"event": "launchd.running", "pid": 1, "program": "/sbin/launchd",
+         "source": "XNU.load_init_program"},
+    ]
+    (tmp_path / "guest.log").write_text(
+        "\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+    assert not gate._PROBES["p.daemon_spawned"](_view_for(tmp_path)).ok
 
 
 def test_a_serial_log_is_not_a_guest_channel(tmp_path: Path) -> None:

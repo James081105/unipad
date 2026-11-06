@@ -283,7 +283,7 @@ def _observed_guest_events(snapshot: Mapping[str, Observation]) -> set[str]:
 # ---------------------------------------------------------------------------
 
 #: Directories never walked when looking for run evidence.
-_PRUNE = {".git", "__pycache__", ".pytest_cache", "node_modules", "local-private"}
+_PRUNE = {".git", "__pycache__", ".pytest_cache", ".scratch", "node_modules", "local-private"}
 
 #: Path fragments that mark a *simulation* producer.  Evidence found under one of
 #: these can never satisfy an ``onsite`` requirement: a witness that points at a
@@ -1509,8 +1509,107 @@ _guest_probe("p.system_mount", "guest mount relations", ("system.mount",))
 _guest_probe(
     "p.dyld_cache_read", "a guest process read the dyld shared cache", ("dyld.cache_read",)
 )
-_guest_probe("p.launchd_running", "the original launchd is running", ("launchd.running",))
-_guest_probe("p.daemon_spawned", "later daemons started in order", ("daemon.spawned",))
+
+
+def _is_m8_launchd(payload: dict[str, Any]) -> bool:
+    return (
+        payload.get("event") == "launchd.running"
+        and type(payload.get("pid")) is int
+        and payload["pid"] == 1
+        and payload.get("program") == "/sbin/launchd"
+        and payload.get("source") == "XNU.load_init_program"
+    )
+
+
+def _m8_guest_pair(view: HostView) -> tuple[
+    str, int, dict[str, Any], int, dict[str, Any], bool
+] | None:
+    """Find launchd and a later non-PID-1 daemon in the same guest log.
+
+    Guest logs are accumulated over many boots.  M8 cannot be assembled from a
+    launchd record in one boot and a daemon record in another, and PID 1's own
+    successful exec is not evidence of a later daemon.
+    """
+    grouped: dict[str, list[tuple[int, dict[str, Any], bool]]] = {}
+    for relative, line, payload, simulation in _guest_records(view):
+        if payload.get("event") in ("launchd.running", "daemon.spawned"):
+            grouped.setdefault(relative, []).append((line, payload, simulation))
+
+    for relative in sorted(grouped, key=lambda path: (_is_simulation_path(path), path)):
+        records = sorted(grouped[relative], key=lambda item: item[0])
+        launchd = next((item for item in records
+                        if _is_m8_launchd(item[1])), None)
+        if launchd is None:
+            continue
+        daemon = next((item for item in records
+                       if item[1].get("event") == "daemon.spawned"
+                       and isinstance(item[1].get("pid"), int)
+                       and item[1]["pid"] > 1
+                       and isinstance(item[1].get("comm"), str)
+                       and item[1]["comm"]
+                       and item[1]["comm"].lower() != "launchd"
+                       and item[1].get("source") == "XNU.__mac_execve"
+                       and item[0] > launchd[0]), None)
+        if daemon is not None:
+            return (relative, launchd[0], launchd[1], daemon[0], daemon[1],
+                    launchd[2] or daemon[2])
+    return None
+
+
+@_probe("p.launchd_running", "the original PID-1 /sbin/launchd is running")
+def _probe_launchd_running(view: HostView) -> Observation:
+    pair = _m8_guest_pair(view)
+    if pair is not None:
+        relative, line, _launchd, _daemon_line, _daemon, simulation = pair
+    else:
+        launchds = [entry for entry in _guest_records(view) if _is_m8_launchd(entry[2])]
+        if not launchds:
+            return Observation(
+                "p.launchd_running", False, "no original PID-1 /sbin/launchd record",
+            )
+        relative, line, _launchd, simulation = min(
+            launchds, key=lambda entry: (entry[3], entry[0], entry[1]))
+    digest = view.sha256(relative)
+    return Observation(
+        "p.launchd_running", True,
+        "PID 1 /sbin/launchd was observed in %s" % relative,
+        refs=(EvidenceRef(
+            path=relative, kind="guest_log", sha256=digest,
+            digest_reason=None if digest else "unreadable",
+            scope=EvidenceScope.SIMULATION if simulation else EvidenceScope.ONSITE,
+            witness=None if simulation else "%s:%d:launchd.running" % (relative, line),
+        ),),
+        facts={"present": ["launchd.running"],
+               "simulated": {"launchd.running": True} if simulation else {}},
+    )
+
+
+@_probe("p.daemon_spawned", "a later non-launchd daemon started after PID 1")
+def _probe_daemon_spawned(view: HostView) -> Observation:
+    pair = _m8_guest_pair(view)
+    if pair is None:
+        return Observation(
+            "p.daemon_spawned", False,
+            "no pid>1 non-launchd daemon followed launchd in the same guest log",
+        )
+    relative, _launchd_line, _launchd, line, daemon, simulation = pair
+    digest = view.sha256(relative)
+    return Observation(
+        "p.daemon_spawned", True,
+        "pid=%s comm=%s followed launchd in %s"
+        % (daemon.get("pid"), daemon.get("comm"), relative),
+        refs=(EvidenceRef(
+            path=relative, kind="guest_log", sha256=digest,
+            digest_reason=None if digest else "unreadable",
+            scope=EvidenceScope.SIMULATION if simulation else EvidenceScope.ONSITE,
+            witness=None if simulation else "%s:%d:daemon.spawned" % (relative, line),
+        ),),
+        facts={"present": ["daemon.spawned"],
+               "daemon_pid": daemon.get("pid"),
+               "daemon_comm": daemon.get("comm")},
+    )
+
+
 _guest_probe("p.springboard_running", "SpringBoard is running", ("springboard.running",))
 _guest_probe(
     "p.springboard_interaction",
@@ -2444,7 +2543,7 @@ _register(
         tier="blocking",
         prd_citation="docs/PRD.md:214",
         goal="原始用户态 launchd 运行",
-        implementation="NOT STARTED",
+        implementation="CODE COMPLETE",
         pass_evidence=(
             _req(
                 "m8.original_launchd",
@@ -2474,7 +2573,7 @@ _register(
             "本阶段最大的风险不是缺证据，而是未来极易把测试程序当 launchd；附录 A 与 "
             "testing-strategy D2 已把它列入「出现即判未验证」。",
         ),
-        field_unverified=("原始 launchd 与后续守护进程——零证据",),
+        field_unverified=("持续运行稳定性与 SpringBoard 交互需独立实测",),
     )
 )
 
