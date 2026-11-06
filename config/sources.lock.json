@@ -1,8 +1,8 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "2ea22e4fe80f152f39f656adf49082f4483e46fa",
-    "commit_note": "Moved 2026-11-06 from 995bfa7. Task #41: the probe records every selector's FIRST argument set, not selector 6's alone.  Addendum EI withdrew the identification of selector 6 as the swap -- it is the WAIT (NativeLegacyDisplay.cpp:91-93) -- so the submission must be recognised by its argument shape, and a swap is a SwapSetLayer / SwapSetBackgroundColor request (NativeLegacyRequest.h:4-5).  ClientStat grows from 2312 to 4720 bytes and display-clients.py's ctypes mirror is updated to match.",
+    "commit": "1865bd98beeaf25789c28dd2ce1077c4b1947ea5",
+    "commit_note": "Moved 2026-11-06 from 2ea22e4 after run 42146732326 failed the owned-vtable audit: slot 200's submitSwap declaration and implementation were compiled, but the allowlist and exact owned-set assertion omitted the new slot. The generator now uses one owned_concrete_slots tuple for both checks; tests/unit/test_native_legacy_display_abi.py guards declaration/list consistency. Previous pin note: moved from 995bfa7. Task #41: the probe records every selector's FIRST argument set, not selector 6's alone. Addendum EI withdrew the identification of selector 6 as the swap -- it is the WAIT (NativeLegacyDisplay.cpp:91-93) -- so the submission must be recognised by its argument shape, and a swap is a SwapSetLayer / SwapSetBackgroundColor request (NativeLegacyRequest.h:4-5). ClientStat grows from 2312 to 4720 bytes and display-clients.py's ctypes mirror is updated to match.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
     "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
