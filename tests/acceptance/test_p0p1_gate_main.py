@@ -1350,8 +1350,10 @@ def test_the_cross_check_accepts_the_real_driver_status_output(tmp_path: Path) -
     Skipped when the pinned clones under local-private/ are absent, which is
     the case for a fresh checkout of this repository.
     """
-    base = REPO_ROOT / "local-private" / "upstream" / "UniXNU"
-    device = REPO_ROOT / "local-private" / "upstream" / "UniXNU-qemu"
+    source_root = Path(os.environ.get(
+        "UNIPAD_TEST_SOURCE_ROOT", REPO_ROOT / "local-private" / "upstream"))
+    base = source_root / "UniXNU"
+    device = source_root / "UniXNU-qemu"
     # The guard must ask about the driver the step will actually invoke.  The
     # step's default DRIVER is "vendor/UniXNU/unixnu" resolved against the
     # *device repository*, which is where the workflow puts it -- not against
@@ -1959,7 +1961,15 @@ print("wrote %s" % out)
 
 
 def _bash() -> str:
-    for candidate in ("bash", "bash.exe"):
+    candidates = ["bash", "bash.exe"]
+    if os.name == "nt" and (git := shutil.which("git")):
+        # A PATH entry named bash.exe may be the WSL launcher, rather than a
+        # shell that can execute these Windows paths and the fixture's shims.
+        git_root = Path(git).resolve().parent.parent
+        # Git's bin/bash.exe launcher prepends its own tools to PATH; invoking
+        # the actual shell in usr/bin preserves the fixture's leading shims.
+        candidates[:0] = [str(git_root / "usr/bin/bash.exe"), str(git_root / "bin/bash.exe")]
+    for candidate in candidates:
         located = shutil.which(candidate)
         if located:
             return located
@@ -1969,7 +1979,7 @@ def _bash() -> str:
 def _shim(path: Path, body: str) -> Path:
     """An executable shim on the scratch PATH."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
+    path.write_text(body, encoding="utf-8", newline="\n")
     path.chmod(0o755)
     return path
 
@@ -2131,6 +2141,10 @@ class _ScratchRepo:
             log.unlink()
         prefix = self.bindir if not darwin else f"{self.darwindir}{os.pathsep}{self.bindir}"
         env = dict(os.environ)
+        # User shell startup scripts can prepend system binaries before the
+        # fixture's Darwin/tool shims. Test the supplied environment directly.
+        env.pop("BASH_ENV", None)
+        env.pop("ENV", None)
         env["PATH"] = f"{prefix}{os.pathsep}{env.get('PATH', '')}"
         env["PYTHONIOENCODING"] = "utf-8"
         command = [
