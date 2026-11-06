@@ -6,9 +6,25 @@ The numbered facts behind every claim here live in
 [`implementation-plan.md`](implementation-plan.md); this file says where things
 stand and what to run next, not why.
 
-Last updated: 2026-11-06 (slot-200 repair follow-up). THE HEADLINE is **the slot-200 generator audit is repaired and repinned: device repo `1865bd98beeaf25789c28dd2ce1077c4b1947ea5`, main `288517d`, build run `42169331996` in progress.** Run `42146732326` failed after the slot-200 declaration compiled because two owned-slot checks still used the old list. Commit `1865bd9` puts slot 200 in one `owned_concrete_slots` tuple used by both checks; the main repo pins that full SHA and adds `tests/unit/test_native_legacy_display_abi.py`. The focused Windows suite passes with portable Git Bash. M6-M12 and real display/IPA interaction remain unverified until a matched artifact boots.
+Last updated: 2026-11-06 (M8 patch replay repair). THE HEADLINE is **the M8 launchd/daemon patch is restored in UniXNU commit `12e2743e510ddcd27bf9243b4f10b46e0c5d1eae`, and the patch pipeline now passes three consecutive local passes.** The former second-pass failure came from reverse-checking patch context modified by later patches; `build-xnu-4k-baseline.sh` now records each patch content hash in the XNU work tree's `.git` directory, skips it on subsequent passes, and clears stamps for the three intentionally reversed late patches. `local-private/tmp/repro-patch-twopass.py` reports pass 1 `applied 60, skipped 0`, passes 2-3 `applied 3, skipped 57`, `ALL PASSES CLEAN`. M8 is **not yet build- or guest-verified**; the current main lock pins this commit and the next step is the `build-macos` M8 runner.
 
-**Latest verification.** Baseline generator test fails because the old script has no `owned_concrete_slots`; the modified copy passes; rollback restores the baseline hash. The real macOS run has passed source acquisition, IPSW/kernelcache publication, header pre-seeding, and LLVM installation, and is currently bootstrapping Mesa/Turnip. When it completes, read `native_legacy_kick_once_gate` and `native_legacy_kick_once_reason` first; do not infer M9 from a screenshot.
+**Latest guest evidence is from the prior kernel, not M8.** The 30-minute capture at `local-private/boot-mount-42169331996/capture-30m/guest-input.log` has `exec.seen` for `launchd` and `apfs_boot_util`, `springboard.fork1` naming `SpringBoard`, and `job.springboard_open` with `err=0`; it has no `launchd.running`, `daemon.spawned`, `springboard.running`, or `springboard.interaction`. Thus M8 remains UNVERIFIED and M9/M9a remain vetoed by the screenshot-only/wallpaper-only gate. The focused patch suites passed 50 tests; no new kernel artifact has been built from commit `12e2743` yet.
+
+**Prior runner pin result.** Device repo `1865bd98beeaf25789c28dd2ce1077c4b1947ea5`, main `288517d`, build run `42169331996` completed successfully (job `127733194465`). The slot-200 generator audit fix uses one `owned_concrete_slots` tuple for both checks and adds `tests/unit/test_native_legacy_display_abi.py`. That artifact remains the matched input for the capture described above.
+
+**Latest verification.** Baseline generator test fails because the old script has no `owned_concrete_slots`; the modified copy passes; rollback restores the baseline hash. Run `42169331996` has now completed successfully (job `127733194465`), publishing the owner-data and boot-input artifacts. Read `native_legacy_kick_once_gate` and `native_legacy_kick_once_reason` from the matched inputs first; do not infer M9 from a screenshot.
+
+**Run status correction.** The older headline above says “in progress”; the
+completed run result in the paragraph here supersedes that wording.
+
+**Evidence plumbing update.** The Windows launcher now records a `display` block
+inside `LaunchResult.evidence`/`launch.json`: argv-derived route, framebuffer
+presence, audio state, and the requested geometry/rotation when the argv came
+from `build_args`. A `virtio-gpu` launch explicitly carries
+`resolution_not_configured` and `rotation_not_configured`; a caller-supplied
+argv with no request context leaves requested fields absent. This closes the
+PRD 9.2 evidence gap without promoting M9/M9a: no guest frame or interaction
+has been newly verified.
 
 ---
 

@@ -1335,56 +1335,32 @@ def test_the_m8_patch_is_in_the_pinned_tree_at_all():
     :func:`tests.vendor_paths.require` was written for, and this is the same
     discriminator applied to a file that did not exist when it was written.
 
-    **AND IT IS CURRENTLY HELD BACK ON PURPOSE, WHICH THIS TEST MUST SAY OUT
-    LOUD RATHER THAN LET IT LOOK LIKE AN OVERSIGHT.**
-
-    M8 breaks the build's SECOND kernel pass, and the failure names a file
-    nobody was editing:
+    The build's second pass used to misclassify M8 as unapplied, and the
+    failure named a file nobody was editing:
 
         error: patch failed: bsd/kern/kern_exec.c:183
         error: bsd/kern/kern_exec.c: patch does not apply
         build-xnu-4k-baseline.sh: line 44: git -C .cache/xnu-work apply --check
 
-    ``build-xnu-4k-baseline.sh`` applies ``patches/xnu/*.patch`` TWICE -- once
-    in the bootstrap pass (``XNU_BOOTSTRAP=1``) and again after the archive
-    builders -- and its loop decides whether to re-apply with
-    ``git apply --reverse --check``.  That test is not sound for M8: M8's third
-    hunk inserts inside ``load_init_program()``'s ``if (!error) {`` block, which
-    is also the trailing context of ``offline-owner-systemos-mount.patch``'s
-    ``@@ -7186,7 +7520,7 @@`` hunk.  With M8 applied, the mount patch can no longer be
-    reversed, so the loop tries to apply it again and fails at the include line
-    its first hunk already changed.
-
-    Isolated by experiment, not by reasoning: with M7 and M8 both present the
-    second pass fails; with M7 alone it is clean; with M8 alone it fails.  The
-    reproduction is ``local-private/tmp/repro-patch-twopass.py``, which replays
-    both passes and is the instrument that found this -- the single-pass
-    ``repro-patch-order.py`` reports "all patches applied" and is blind to it.
-
-    So M8 is removed from the pinned tree until one of two things happens: its
-    emitter moves to a site that does not split the mount patch's context, or
-    the build script's already-applied test stops depending on reversibility.
-    M6, M7 and the install diagnostics are unaffected and are measured in the
-    same build.
+    ``build-xnu-4k-baseline.sh`` applies ``patches/xnu/*.patch`` twice -- once
+    in the bootstrap pass and again after the archive builders.  Its old
+    reverse-check could fail after a later patch changed the context around an
+    already-applied patch, so it tried to apply that patch a second time.  The
+    build now records each patch's content hash in the work tree's ``.git``
+    directory; the second pass uses that stamp and replays only the three late
+    patches that are intentionally reversed first.  The reproduction
+    ``local-private/tmp/repro-patch-twopass.py`` runs three passes and asserts
+    this behavior.
     """
     if not (REPO / "vendor" / "UniXNU" / "patches").is_dir():
         pytest.skip("the pinned vendor tree is not acquired")
     patch = _m8_patch()
-    if patch is None:
-        held = REPO / "local-private" / "tmp" / "parked-patches" / M8_PATCH_NAME
-        assert held.is_file(), (
-            f"{M8_PATCH_NAME} is neither in the pinned tree nor parked, so the "
-            "hold-back recorded in this test's docstring has no evidence behind "
-            "it and M8 has simply been lost"
-        )
-        pytest.xfail(
-            f"{M8_PATCH_NAME} is held back: it breaks the build's second kernel "
-            "pass by splitting offline-owner-systemos-mount.patch's trailing "
-            "context.  Reproduce with local-private/tmp/repro-patch-twopass.py. "
-            "Restoring it requires moving the emitter or fixing the build "
-            "script's already-applied test."
-        )
-    assert patch is not None
+    assert patch is not None, f"{M8_PATCH_NAME} must be pinned in the vendor tree"
+    build_script = _m8_require_build_script().read_text(encoding="utf-8")
+    assert "PATCH_STAMP_DIR=.cache/xnu-work/.git/unipad-patch-stamps" in build_script
+    assert 'shasum -a 256 "$PATCH"' in build_script
+    assert 'if [ -f "$PATCH_STAMP" ]; then' in build_script
+    assert 'rm -f "$PATCH_STAMP_DIR/$(shasum -a 256 "$LATE_PATCH"' in build_script
 
 
 def test_the_m8_records_are_valid_json():
