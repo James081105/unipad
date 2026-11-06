@@ -1,7 +1,7 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "32dec7505debc52ab515af34a6a433bcfaf723e8",
+    "commit": "2ea22e4fe80f152f39f656adf49082f4483e46fa",
     "commit_note": "Moved 2026-11-06 from 995bfa7. Task #41: the probe records every selector's FIRST argument set, not selector 6's alone.  Addendum EI withdrew the identification of selector 6 as the swap -- it is the WAIT (NativeLegacyDisplay.cpp:91-93) -- so the submission must be recognised by its argument shape, and a swap is a SwapSetLayer / SwapSetBackgroundColor request (NativeLegacyRequest.h:4-5).  ClientStat grows from 2312 to 4720 bytes and display-clients.py's ctypes mirror is updated to match.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
@@ -124,10 +124,10 @@
       "path": "drivers/NativeMetal"
     },
     {
-      "commit": "c75e5ed0fe4c7a4d19fca2be8b9c7f4b6da5df6f",
+      "commit": "8d7ad6fd9626e180598d133227033c66b3d1f244",
       "commit_note": "Moved 2026-11-06 to c75e5ed. The display publishes as NativeLegacyDisplay of class IOMobileFramebufferLegacy (an IOService, not an IOMobileFramebuffer), and no driver source publishes the name IOMobileFramebufferService, so the UI stack's match cannot succeed. registerService now also publishes under that name, gated by offline-legacy-register=1.",
       "path": "drivers/NativeMobileDisplay",
-      "gitlink_commit": "c75e5ed0fe4c7a4d19fca2be8b9c7f4b6da5df6f"
+      "gitlink_commit": "8d7ad6fd9626e180598d133227033c66b3d1f244"
     },
     {
       "commit": "d4d22d9819b0162eda49f6402235dddc2279410d",
