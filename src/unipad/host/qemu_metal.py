@@ -181,7 +181,20 @@ DRAWING_COUNTERS: Tuple[Tuple[str, int], ...] = (
 
 #: Every group, so an instrument can ask for all of them without naming three
 #: tuples and risking one.
-GROUPS = (QMETAL_COUNTERS, GOP_COUNTERS, DRAWING_COUNTERS)
+# An opt-in discovery service has no rendering implementation. Stage 4 records
+# registry publication; it must never be interpreted as a rendered frame.
+SOFTWARE_DISCOVERY_COUNTERS: Tuple[Tuple[str, int], ...] = (
+    ("native_software_discovery_stage", 4),
+    ("native_software_discovery_status", 4),
+    ("native_software_discovery_parent_bytes", 4),
+    ("native_software_discovery_child_bytes", 4),
+    ("native_software_discovery_inherits", 4),
+    ("native_software_discovery_metal_properties", 4),
+    ("native_software_discovery_object", 8),
+    ("native_software_discovery_registry_id", 8),
+)
+
+GROUPS = (QMETAL_COUNTERS, GOP_COUNTERS, DRAWING_COUNTERS, SOFTWARE_DISCOVERY_COUNTERS)
 
 
 def spec() -> Dict[str, int]:

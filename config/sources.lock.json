@@ -1,12 +1,12 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "d4541e88c32f4c89b3d60dac1e6e88923e04ef86",
-    "commit_note": "Moved 2026-11-07 from 1865bd9: withdraw the false slot-200 submitSwap declaration and owned slot. Exact original-artifact guards distinguish selector 17 gamma-table input (3084 bytes, slot 200, status return) from selector 5 swap submission (1288 bytes, slot 178). The observed slot-200 void override tail-called the kicker and returned 0x2 to backboardd; no actual swap was submitted. See docs/experiments/2026-11-07-display-selector.md.",
+    "commit": "172b7888d50563ee16d55ef0acb760c458f8bd1b",
+    "commit_note": "Moved 2026-11-07 from d4541e8: default-off unipad-software-discovery option publishes a dedicated empty subclass of the audited original IOAcceleratorES. It implements discovery only, with no rendering or GPU user client. Four exact original-base fingerprints and all 168 compiled virtual entries are checked. The corrected inherited gamma slot and real selector-5/slot-178 swap path are retained. Build/runtime publication remain unverified; see docs/experiments/2026-11-07-software-discovery.md.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
     "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
-    "branch": "codex/display-selector-contract"
+    "branch": "codex/software-discovery"
   },
   "feeds": [
     {
