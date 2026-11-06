@@ -1,12 +1,12 @@
 {
   "description": "Pinned source versions for UniPad experiments (PRD 8.1 inputs). Every run must be reproducible from this file plus the recorded hashes.",
   "device_repo": {
-    "commit": "1865bd98beeaf25789c28dd2ce1077c4b1947ea5",
-    "commit_note": "Moved 2026-11-06 from 2ea22e4 after run 42146732326 failed the owned-vtable audit: slot 200's submitSwap declaration and implementation were compiled, but the allowlist and exact owned-set assertion omitted the new slot. The generator now uses one owned_concrete_slots tuple for both checks; tests/unit/test_native_legacy_display_abi.py guards declaration/list consistency. Previous pin note: moved from 995bfa7. Task #41: the probe records every selector's FIRST argument set, not selector 6's alone. Addendum EI withdrew the identification of selector 6 as the swap -- it is the WAIT (NativeLegacyDisplay.cpp:91-93) -- so the submission must be recognised by its argument shape, and a swap is a SwapSetLayer / SwapSetBackgroundColor request (NativeLegacyRequest.h:4-5). ClientStat grows from 2312 to 4720 bytes and display-clients.py's ctypes mirror is updated to match.",
+    "commit": "d4541e88c32f4c89b3d60dac1e6e88923e04ef86",
+    "commit_note": "Moved 2026-11-07 from 1865bd9: withdraw the false slot-200 submitSwap declaration and owned slot. Exact original-artifact guards distinguish selector 17 gamma-table input (3084 bytes, slot 200, status return) from selector 5 swap submission (1288 bytes, slot 178). The observed slot-200 void override tail-called the kicker and returned 0x2 to backboardd; no actual swap was submitted. See docs/experiments/2026-11-07-display-selector.md.",
     "repo": "https://github.com/James081105/UniXNU-qemu",
     "upstream_commit": "97b75b1f63c6b7e895cd7646029db741d5fe5488",
     "upstream_repo": "https://github.com/xVanTuring/UniXNU-qemu",
-    "branch": "unipad/qemu-metal-bridge-stubs"
+    "branch": "codex/display-selector-contract"
   },
   "feeds": [
     {
@@ -124,10 +124,10 @@
       "path": "drivers/NativeMetal"
     },
     {
-      "commit": "8d7ad6fd9626e180598d133227033c66b3d1f244",
-      "commit_note": "Moved 2026-11-06 to c75e5ed. The display publishes as NativeLegacyDisplay of class IOMobileFramebufferLegacy (an IOService, not an IOMobileFramebuffer), and no driver source publishes the name IOMobileFramebufferService, so the UI stack's match cannot succeed. registerService now also publishes under that name, gated by offline-legacy-register=1.",
+      "commit": "11af5c627a0d90680c2fc9f62bf6dd7957f0c741",
+      "commit_note": "Moved 2026-11-07 from 8d7ad6f: remove the incorrect void submitSwap override at slot 200. Selector 17 forwards a user gamma table and consumes an IOReturn; the actual swap submission is inherited slot 178, driven by selector 5. Preserve the inherited gamma method and existing swap machinery. gitlink_commit now records the actual gitlink in UniXNU 953a5e5; source_pins deliberately overrides it with commit.",
       "path": "drivers/NativeMobileDisplay",
-      "gitlink_commit": "8d7ad6fd9626e180598d133227033c66b3d1f244"
+      "gitlink_commit": "5b83ab7f1fa3c0535a4499959e7e2ad4318d8e5b"
     },
     {
       "commit": "d4d22d9819b0162eda49f6402235dddc2279410d",
