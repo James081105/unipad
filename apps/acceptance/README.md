@@ -21,8 +21,11 @@ On a Mac with Xcode selected:
 python3 scripts/macos/build-acceptance-apps.py --out build/acceptance-apps-RUN
 ```
 
-The manual `build-acceptance-apps` Actions workflow selects macOS 14 / Xcode
-16.2. Each build preserves compiler commands, SDK/tool versions, source hashes,
+The manual `build-acceptance-apps` Actions workflow uses the same available
+`macos-latest` runner family as the system build. Its resolved Xcode/SDK versions
+are recorded; the runner label itself is not a frozen toolchain. The legacy
+application lifecycle targets iPadOS 17; newer-SDK deprecations remain visible
+compiler warnings. Each build preserves compiler commands, SDK/tool versions, source hashes,
 commit, codesign verification, Mach-O load commands, IPA hashes and package
 precheck results in `manifest.json`. It fails on a Simulator platform, wrong
 architecture, encrypted executable or missing signature. Use a new output

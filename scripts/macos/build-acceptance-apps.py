@@ -86,6 +86,7 @@ def main() -> int:
                 executable = app / name
                 run([compiler, "-target", "arm64-apple-ios17.0", "-isysroot", sdk,
                      "-fobjc-arc", "-O2", "-Wall", "-Wextra", "-Werror",
+                     "-Wno-error=deprecated-declarations",
                      f"-DUNIPAD_NOTES={int(notes)}", str(SOURCE),
                      "-framework", "UIKit", "-framework", "Foundation",
                      "-o", str(executable)], commands)
