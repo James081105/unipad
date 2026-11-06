@@ -1582,6 +1582,28 @@ def test_the_daemon_emitter_is_inside_the_error_free_block():
     )
 
 
+def test_the_daemon_emitter_skips_pid_one_launchd():
+    """The later-daemon event cannot be consumed by PID 1's launchd exec.
+
+    ``load_init_program`` emits ``launchd.running`` for PID 1.  The daemon
+    record must therefore wait for a successful exec from a later process;
+    otherwise the one-shot flag is consumed by launchd and M8 never observes
+    the required subsequent daemon.
+    """
+    text = _m8_text()
+    emitter = _find(text, "native_m8_report_daemon(proc_t p)")
+    one_shot = _find_after(text, "if (native_m8_daemon_reported)", emitter)
+    pid_guard = _find_after(text, "if (p->p_pid <= 1)", emitter)
+    assert emitter < pid_guard < one_shot, (
+        "the PID 1 guard must run before the one-shot flag is consumed"
+    )
+    guard_close = _find_close(text, pid_guard)
+    guard_body = "\n".join(text.split("\n")[pid_guard:guard_close + 1])
+    assert "return;" in guard_body, (
+        "the PID 1 guard must return without emitting or consuming the event"
+    )
+
+
 def test_the_m8_console_reference_is_strong_not_weak():
     """``native_console_report`` is a STRONG reference in this patch too.
 
