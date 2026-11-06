@@ -97,6 +97,63 @@ Each record contains exact baseline, modified, rollback and restored commands,
 literal outputs, statuses and hashes. Rollback was tested on another copy;
 the modified files remain changed.
 
-New build and Windows validation results are recorded below when observed.
+## Build follow-through and next capture
+
+Main `2db23e6d8b2d0a91fb2bfcfaf80e42c36c874c29` is pushed. All 17 selected
+selector-contract/submodule-acquisition/repin checks pass. Its full Windows
+preflight and pinned integration run
+[42267182279](https://github.com/James081105/unipad/actions/runs/42267182279)
+also passes. The complete CI log is retained at
+`E:/UniPadEvidence/2026-11-07-m8/ci-42267182279.log`.
+
+Build [42267229495](https://github.com/James081105/unipad/actions/runs/42267229495)
+was dispatched from that exact main commit with stage=M7, payload_target=tcg,
+gpu_broker=0 and the pinned UniXNU/device commits above. The full build now
+concludes **success**. Boot-inputs artifact `13533046166` contains 310,401,057
+bytes; the downloaded ZIP SHA-256 matches the upload log:
+`428c8a3b64a9233211bee42772afa311f775e1320be407f0fb17508aa28eb670`.
+All ten selected bundle members were staged, and every declared manifest and
+payload digest agrees. The full build and staging logs are preserved at
+`E:/UniPadEvidence/2026-11-07-m8/build-42267229495.log` and
+`E:/UniPadEvidence/2026-11-07-m8/stage-42267229495.log`.
+
+The actual new payload kernel SHA-256 is
+`791a592634f413560e89585d751eb2bd99b83c1eb27bf6c40e222d14426c1360`.
+Its compiled slot 200 equals original-family slot 200, `0xfffffff005795c44`,
+and no `NativeLegacyDisplay::submitSwap` symbol remains. The real swap slot
+178 remains `0xfffffff00578f224`. Both original selector dispatch rows match
+their exact byte guards. The reopened binary check is
+`E:/UniPadEvidence/2026-11-07-m8/compiled-selector-42267229495.txt`.
+
+Original slot 200 is itself a short `kIOReturnUnsupported` stub. The retained
+boot configuration has `offline-legacy-lift-refusals=1`, which may replace it
+with the experiment's generic success function in the live object's vtable.
+A successful selector result under that configuration does not establish
+gamma processing. The new trace therefore records the effective and pre-lift
+slots 178/200, the success-function address and the armed/lifted counts.
+
+The next trace reuses the matched capture harness and its 1,800-second window.
+Its optional run/bundle/device settings now select the new artifact explicitly.
+Large QEMU scratch and duplicate evidence can be placed on E: through
+`UNIPAD_SUSTAINED_SCRATCH` and `UNIPAD_SUSTAINED_DUPLICATE`; the channel logs,
+process snapshots, client tables and summaries stay inside the project.
+
+The trace additionally imports `unipad.host.qemu_metal.spec()` rather than
+copying its counter widths, samples PM/state words and preserves the display's
+registration-property XML. `SharedWindow.cpp` requires the shared-window
+fw_cfg item, which the baseline command does not provide; `QemuMetalPublish.cpp`
+requires that window's stage 4 before publication. GPU addon files alone do
+not publish a kernel accelerator. These are source/configuration observations;
+the added counters will measure the runtime state. The GPU-to-CPU scanout
+fallback copies an already rendered frame and does not supply a compositor.
+No Windows QM request backend is implemented in `src/unipad`; the module named
+`qemu_metal.py` supplies counter specifications and parsing.
+
+The matched Windows trace is now running at
+`local-private/boot-m8-42267229495/display-client-trace/`; its QEMU scratch and
+duplicate evidence are on E:. The client decoder source hash was checked
+against exact device `d4541e8` and remains unchanged at
+`c9548ae3c80c6f2809e878b9d7061086262bff478eb2792005365135fbe44d55`.
+No new frame, interaction or late client-table result is claimed yet.
 The full PRD remains active: M9/M9a, real input, runtime IPA import, app
 interaction and persistent Data have not passed.
